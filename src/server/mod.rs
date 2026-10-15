@@ -94,10 +94,8 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
         };
         let srv = srv.clone();
         tokio::spawn(async move {
-            if let Err(e) = srv.handle(conn).await {
-                // 单连接错误不致命
-                let _ = e;
-            }
+            // 单连接错误不致命
+            let _ = srv.handle(conn).await;
         });
     }
 }

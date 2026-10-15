@@ -9,7 +9,7 @@
 //! - codeload / objects / release-assets / github.com 的 releases/download、
 //!   archive 路径：镜像 only，按 plans.json mirrors 板块的链序串行取用
 //!   （禁并发竞速，2026-10-15 裁定），链全灭 502
-use super::upstream::{self, mitm_h1_client, request_budget, BoxBody, Incoming};
+use super::upstream::{self, mitm_h1_client, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
 use crate::pool::{self, dial::Dialed, LogFn};
@@ -301,6 +301,47 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
 /// 嗅探/探测读出的字节：最终写回时拼到响应体前端。
 #[derive(Clone)]
 struct PeekPrefix(Vec<u8>);
+/// 复用缓存 h2 连接发一次请求。Some(Ok)=成功可直接交付；Some(Err)=POST 等
+/// 非简单方法复用失效不重发，直接报错；None=缓存未命中或连接已死，落回串发。
+async fn try_cached(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    name: &str,
+    is_simple: bool,
+    is_content: bool,
+    path: &str,
+    t0: Instant,
+    body: &Option<Bytes>,
+) -> Option<Result<hyper::Response<BoxBody>, String>> {
+    let up = upstream::cached_h2(host)?;
+    let timed = tokio::time::timeout(
+        REQUEST_BUDGET,
+        upstream::h2_send(&up, build_request(out, body), body),
+    );
+    match timed.await {
+        Ok(Ok(resp)) => {
+            info.set(&up.ip);
+            if !name.is_empty() {
+                pool::serial_note(name, &up.ip, "ok");
+            }
+            if is_content {
+                pool::content_direct_ok(host);
+            }
+            (log)(&format!(
+                "[上游] {host}{path} 复用连接, {}ms",
+                t0.elapsed().as_millis()
+            ));
+            Some(Ok(resp))
+        }
+        _ => {
+            upstream::drop_h2(host, &up.ip);
+            (log)(&format!("[MITM] {host} 复用连接失效({}), 重走串发", up.ip));
+            (!is_simple).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
+        }
+    }
+}
 /// 直连串发测试 = 完整 HTTP 请求逐个试：每个候选发真请求，响应头到手 = 成功
 /// 连(该 IP 置顶)；超时/黑洞 = 垫底自动换下一个；循环上限 24 防病态；
 /// POST 等非简单方法不重发(只试一次)。
@@ -326,34 +367,12 @@ async fn get_direct(
     }
     // 复用优先：上次完整成功的那条 h2 连接还活着就直接发请求 —— 零拨号
     // 零握手。失败 = 连接已死, 清槽落回串发新拨号（POST 同样只试这一次）。
-    if let Some(up) = upstream::cached_h2(host) {
-        let timed = tokio::time::timeout(
-            request_budget(),
-            upstream::h2_send(&up, build_request(out, body), body),
-        );
-        match timed.await {
-            Ok(Ok(resp)) => {
-                info.set(&up.ip);
-                if !name.is_empty() {
-                    pool::serial_note(name, &up.ip, "ok");
-                }
-                if is_content {
-                    pool::content_direct_ok(host);
-                }
-                (log)(&format!(
-                    "[上游] {host}{path} 复用连接, {}ms",
-                    t0.elapsed().as_millis()
-                ));
-                return Ok(resp);
-            }
-            _ => {
-                upstream::drop_h2(host, &up.ip);
-                (log)(&format!("[MITM] {host} 复用连接失效({}), 重走串发", up.ip));
-                if !is_simple {
-                    return Err("POST 等非简单方法不重发(复用连接失效)".to_string());
-                }
-            }
-        }
+    if let Some(r) = try_cached(
+        log, out, host, info, name, is_simple, is_content, &path, t0, body,
+    )
+    .await
+    {
+        return r;
     }
     // per-host 拨号单飞：并发请求同时未命中缓存时，只放一个进串发拨号，
     // 其余在 host 锁上排队 —— 首拨成功入槽后，队列里的请求全部重查缓存
@@ -365,33 +384,12 @@ async fn get_direct(
     if name == "edge" && is_content && pool::content_direct_open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    if let Some(up) = upstream::cached_h2(host) {
-        let timed = tokio::time::timeout(
-            request_budget(),
-            upstream::h2_send(&up, build_request(out, body), body),
-        );
-        match timed.await {
-            Ok(Ok(resp)) => {
-                info.set(&up.ip);
-                if !name.is_empty() {
-                    pool::serial_note(name, &up.ip, "ok");
-                }
-                if is_content {
-                    pool::content_direct_ok(host);
-                }
-                (log)(&format!(
-                    "[上游] {host}{path} 复用连接, {}ms",
-                    t0.elapsed().as_millis()
-                ));
-                return Ok(resp);
-            }
-            _ => {
-                upstream::drop_h2(host, &up.ip);
-                if !is_simple {
-                    return Err("POST 等非简单方法不重发(复用连接失效)".to_string());
-                }
-            }
-        }
+    if let Some(r) = try_cached(
+        log, out, host, info, name, is_simple, is_content, &path, t0, body,
+    )
+    .await
+    {
+        return r;
     }
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
         // 每 attempt 串发拨号 + h2 握手（boring Chrome 指纹 + 伪装/真名 SNI，
@@ -416,7 +414,7 @@ async fn get_direct(
             }
         };
         let timed = tokio::time::timeout(
-            request_budget(),
+            REQUEST_BUDGET,
             upstream::h2_send(&up, build_request(out, body), body),
         );
         match timed.await {

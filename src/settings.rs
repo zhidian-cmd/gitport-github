@@ -213,12 +213,9 @@ pub fn remove_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// 当前 PAC 是我们设置的才还原（备份回填或删除），并清备份落盘。
-/// 还原用户原配置时也要排除"我们的旧 PAC"，避免把死端口 PAC 当原配置写回。
-fn clear_if_ours(key: &RegKey, cur: &str) {
-    if !is_our_pac(cur) {
-        return;
-    }
+/// 恢复备份或直接删除（调用前已判定当前 PAC 是我们设的）：回填用户原配置，
+/// 否则清掉；随后清备份落盘 + 广播刷新 + 存盘。
+fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
     if !backup.is_empty() && !is_our_pac(&backup) {
         let _ = key.set_value("AutoConfigURL", &backup);
@@ -229,6 +226,15 @@ fn clear_if_ours(key: &RegKey, cur: &str) {
     *state().our_pac.lock().unwrap() = String::new();
     refresh_wininet();
     let _ = save();
+}
+
+/// 当前 PAC 是我们设置的才还原（备份回填或删除）。
+/// 还原用户原配置时也要排除"我们的旧 PAC"，避免把死端口 PAC 当原配置写回。
+fn clear_if_ours(key: &RegKey, cur: &str) {
+    if !is_our_pac(cur) {
+        return;
+    }
+    restore_or_clear(key);
 }
 
 // ---------- 窗口/托盘/开关状态 ----------
@@ -352,22 +358,10 @@ fn heal_stale_proxy() {
         return;
     };
     let cur = get_auto_config_url(&key);
-    if cur.is_empty() {
-        return; // 本来就干净
+    if cur.is_empty() || !is_our_pac(&cur) {
+        return; // 本来就干净，或是用户自己的配置：绝不触碰
     }
-    if !is_our_pac(&cur) {
-        return; // 是用户自己的配置：绝不触碰
-    }
-    let backup = state().proxy_backup.lock().unwrap().clone();
-    if !backup.is_empty() && !is_our_pac(&backup) {
-        let _ = key.set_value("AutoConfigURL", &backup);
-    } else {
-        let _ = key.delete_value("AutoConfigURL");
-    }
-    *state().proxy_backup.lock().unwrap() = String::new();
-    *state().our_pac.lock().unwrap() = String::new();
-    refresh_wininet();
-    let _ = save();
+    restore_or_clear(&key);
 }
 
 // ---------- 开机自启 ----------

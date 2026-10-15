@@ -105,68 +105,50 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg)
 }
 
-/// 系统根证书 PEM（BoringSSL set_ca_file 加载用）。等价 Go 的 x509.SystemCertPool 与
-/// rustls 版 system_roots。加载失败返回 None（调用方回退 set_default_verify_paths）。
-/// 惰性缓存（进程内一次加载）。
-pub fn system_root_pem() -> Option<String> {
-    static PEM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PEM.get_or_init(|| {
-        let mut buf = String::new();
-        let mut added = 0usize;
-        match rustls_native_certs::load_native_certs() {
-            CertificateResult { certs, .. } => {
-                for c in certs {
-                    // DER → PEM 用 boring 自带 X509::to_pem（无需外部 base64 依赖）
-                    let x = X509::from_der(c.as_ref()).ok()?;
-                    buf.push_str(&String::from_utf8_lossy(&x.to_pem().ok()?));
-                    added += 1;
-                }
+/// 系统根证书（X509 列表，进程内一次加载）。等价 Go 的 x509.SystemCertPool 与
+/// rustls 版 system_roots。单条解析失败跳过不放大（一颗坏证书不再废掉整池）；
+/// 全部失败返回 None（调用方回退 set_default_verify_paths）。
+fn system_root_certs() -> Option<&'static [X509]> {
+    static CERTS: std::sync::OnceLock<Option<Vec<X509>>> = std::sync::OnceLock::new();
+    CERTS.get_or_init(|| {
+        let mut out = Vec::new();
+        let CertificateResult { certs, .. } = rustls_native_certs::load_native_certs();
+        for c in certs {
+            if let Ok(x) = X509::from_der(c.as_ref()) {
+                out.push(x);
             }
         }
-        if added == 0 {
-            None
-        } else {
-            Some(buf)
-        }
+        (!out.is_empty()).then_some(out)
     })
-    .clone()
-}
-
-/// 写临时 CA 文件供 set_ca_file 加载（进程唯一名，幂等覆盖）。
-fn ca_file_for(pem: &str) -> std::io::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "gh_link_ca_{}_{}.pem",
-        std::process::id(),
-        tmp_seq()
-    ));
-    std::fs::write(&path, pem)?;
-    Ok(path)
-}
-
-/// 临时文件唯一序号：并行测试各写各的 CA/链，防互覆盖（随机 CA 竞态会导致
-/// 客户端信任锚与服务端链不匹配 → 误报 self-signed）。
-static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn tmp_seq() -> usize {
-    TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    .as_deref()
 }
 
 /// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）。
 /// - Sni：SNI=host，校验名=host
-/// - NoSni：不发 SNI（不调 set_hostname），校验名=host
 /// - Fake(name)：SNI=name，校验名=host（先按 host 建，再覆盖 SNI 扩展）
-/// roots 为注入的信任锚（测试用）；真实路径传 None → 系统根。
+/// ca_pem 为注入的信任锚 PEM（测试用，内存解析零临时文件）；真实路径传
+/// None → 系统根（进程内一次解析，X509StoreBuilder 内存注入，无磁盘 I/O）。
 /// 开启 GREASE + ALPN h2,http/1.1（Chrome 指纹 + 上游必须 h2）。
 fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
     let mut ctx_b = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io_err(format!("BoringSSL 上下文初始化失败: {e}")))?;
-    match ca_pem {
-        Some(pem) => {
-            // 信任锚注入：官方客户端姿势 set_ca_file（SSL_CTX_load_verify_locations）
-            let ca_file = ca_file_for(pem)?;
-            ctx_b
-                .set_ca_file(&ca_file)
-                .map_err(|e| io_err(format!("CA 加载失败: {e}")))?;
+    // 信任锚：测试注入 PEM 优先，否则系统根；两者皆空 → set_default_verify_paths
+    let roots = match ca_pem {
+        Some(pem) => Some(
+            X509::stack_from_pem(pem.as_bytes())
+                .map_err(|e| io_err(format!("CA PEM 解析失败: {e}")))?,
+        ),
+        None => system_root_certs().map(<[X509]>::to_vec),
+    };
+    match roots {
+        Some(certs) => {
+            let mut sb = boring::x509::store::X509StoreBuilder::new()
+                .map_err(|e| io_err(format!("根证书 store 初始化失败: {e}")))?;
+            for c in certs {
+                sb.add_cert(c)
+                    .map_err(|e| io_err(format!("根证书载入失败: {e}")))?;
+            }
+            ctx_b.set_cert_store_builder(sb);
         }
         None => {
             ctx_b
@@ -218,7 +200,7 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
 /// 对已建立的 TCP 连接按形态完成 BoringSSL 握手（Chrome 指纹）。
 /// 末尾强制断言协商出 h2（对照 Go dialOne 的 ALPN 检查）。
 pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl(host, mode, system_root_pem().as_deref())?;
+    let ssl = client_ssl(host, mode, None)?;
     let tls = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
@@ -281,7 +263,7 @@ pub async fn dial_one(
 /// 与上游 mitm_h1_client 对齐）。返回类型与 Dialed::Tls 一致（BoringTls），
 /// 上游 MirrorConnector 可直接包入 Dialed。
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl(host, MODE_SNI, system_root_pem().as_deref())?;
+    let ssl = client_ssl(host, MODE_SNI, None)?;
     let tcp = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         TcpStream::connect((host, 443)),
@@ -320,8 +302,15 @@ mod tests {
     use super::*;
     use boring::pkey::PKey;
     use boring::ssl::SslAcceptor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// 测试链文件唯一序号：并行测试各写各的链，防互覆盖。
+    static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+    fn tmp_seq() -> usize {
+        TMP_SEQ.fetch_add(1, Ordering::SeqCst)
+    }
 
     /// boring 官方测试证书目录（BoringSSL 自带，链/根/密钥齐全）。
     /// 用官方材料而非 rcgen 自签链：官方材料能被 boring 客户端完整信任，
@@ -500,8 +489,7 @@ mod tests {
                 let tcp = TcpStream::connect((ip, 443))
                     .await
                     .map_err(|e| format!("TCP 连接失败: {e}"))?;
-                let ssl = client_ssl(host, mode, system_root_pem().as_deref())
-                    .map_err(|e| format!("client_ssl: {e}"))?;
+                let ssl = client_ssl(host, mode, None).map_err(|e| format!("client_ssl: {e}"))?;
                 tokio_boring::SslStreamBuilder::new(ssl, tcp)
                     .connect()
                     .await

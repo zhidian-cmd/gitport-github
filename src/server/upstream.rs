@@ -179,10 +179,8 @@ pub fn mitm_h1_client() -> LegacyClient<MirrorConnector, BoxBody> {
         .pool_max_idle_per_host(0)
         .build(connector)
 }
-/// 请求预算：一次上游请求的总预算（秒）。
-pub fn request_budget() -> std::time::Duration {
-    std::time::Duration::from_secs(8)
-}
+/// 请求预算：一次上游请求的总预算。
+pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
 /// 重写上游请求：绝对 URL 化 + 剥编码/代理头。返回 (host, 请求)。
 pub fn upstream_request(

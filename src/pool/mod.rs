@@ -299,12 +299,8 @@ fn seed_db() -> HashMap<String, Vec<String>> {
 
 const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
 
-struct SerialState {
-    plans: Vec<SerialPlan>,
-}
-
 struct SerialTab {
-    pools: HashMap<String, SerialState>,
+    pools: HashMap<String, Vec<SerialPlan>>,
     cool: HashMap<String, Instant>, // 全灭冷却
     /// 镜像使用链：内容域 host -> 有序镜像列表（串行逐个用，禁并发竞速）。
     /// 顺序来源：内置默认(实测) / UI 校准半自动重排 / 手改。
@@ -334,8 +330,8 @@ pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     let tab = g.as_ref().unwrap();
     let mut out = HashMap::new();
     for name in SERIAL_POOLS {
-        if let Some(st) = tab.pools.get(*name) {
-            out.insert(name.to_string(), st.plans.clone());
+        if let Some(plans) = tab.pools.get(*name) {
+            out.insert(name.to_string(), plans.clone());
         }
     }
     out
@@ -362,10 +358,10 @@ fn encode_plans(
                 }
                 // sni 恒非空（真名/伪装）；空值条目（旧表残留）落盘省略键
                 if p.sni.is_empty() {
-                    b.push_str(&format!("    {{\"ip\": \"{}\"}}", esc(&p.ip)));
+                    b.push_str(&format!("    {{\"ip\": {}}}", esc(&p.ip)));
                 } else {
                     b.push_str(&format!(
-                        "    {{\"ip\": \"{}\", \"sni\": \"{}\"}}",
+                        "    {{\"ip\": {}, \"sni\": {}}}",
                         esc(&p.ip),
                         esc(&p.sni)
                     ));
@@ -387,8 +383,8 @@ fn encode_plans(
             if i > 0 {
                 b.push(',');
             }
-            let items: Vec<String> = chain.iter().map(|m| format!("\"{}\"", esc(m))).collect();
-            b.push_str(&format!("\n    \"{}\": [{}]", esc(host), items.join(", ")));
+            let items: Vec<String> = chain.iter().map(|m| esc(m)).collect();
+            b.push_str(&format!("\n    {}: [{}]", esc(host), items.join(", ")));
         }
         b.push_str("\n  }");
     }
@@ -396,8 +392,11 @@ fn encode_plans(
     b
 }
 
+/// JSON 字符串字面量（含引号，serde 全量转义）：控制字符/反斜杠/引号都不产
+/// 坏 JSON。旧手写版只转 \ 和 "，值里混入控制字符会写出非法 plans.json，
+/// 下次启动解析失败 → 用户手排表被种子覆盖。
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    serde_json::to_string(s).expect("字符串序列化不会失败")
 }
 
 /// 原子写 plans.json。
@@ -523,7 +522,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 }
             }
         }
-        tab.pools.insert((*name).to_string(), SerialState { plans });
+        tab.pools.insert((*name).to_string(), plans);
     }
     // 镜像链归一：未知 host / 池外镜像丢弃；缺失 host 用内置默认链（实测
     // TTFB 序）；池内新增镜像追加到每条链尾部（对齐种子补缺思想）。
@@ -592,10 +591,10 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
 /// sni 形态 → dial_one 模式（裸域名 = 伪装，走 "fake:<sni>" 前缀；
 /// 兼容旧表带 "fake:" 前缀的写法，两种格式行为一致）。
 /// MODE_SNI = 真名形态（Fastly 边缘专用，按 SNI 路由证书）。
+/// 旧表 "nosni" 由 serial_load 读入时按 IP 族归一，此处不再特判。
 pub fn plan_mode(sni: &str) -> String {
     match sni {
         dial::MODE_SNI => dial::MODE_SNI.to_string(),
-        "nosni" => plan_mode("baidu.com"),
         _ => format!(
             "{}{}",
             dial::MODE_FAKE_PFX,
@@ -611,12 +610,12 @@ pub fn plan_mode(sni: &str) -> String {
 fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front: bool, why: &str) {
     let mut g = SERIAL.lock().unwrap();
     let tab = g.as_mut().unwrap();
-    let Some(st) = tab.pools.get_mut(pool_name) else {
+    let Some(pool_plans) = tab.pools.get_mut(pool_name) else {
         return;
     };
     let mut hit = Vec::new();
     let mut rest = Vec::new();
-    for p in &st.plans {
+    for p in &*pool_plans {
         if match_fn(p) {
             hit.push(p.clone());
         } else {
@@ -635,12 +634,12 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
         v.extend(hit);
         v
     };
-    if new_plans == st.plans {
+    if new_plans == *pool_plans {
         return; // 顺序没变：不写盘不打日志
     }
-    let old_head = st.plans.first().map(|p| p.ip.clone());
+    let old_head = pool_plans.first().map(|p| p.ip.clone());
     let new_head = new_plans.first().map(|p| p.ip.clone());
-    st.plans = new_plans;
+    *pool_plans = new_plans;
     tab.dirty = true;
     if old_head != new_head {
         if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
@@ -676,21 +675,19 @@ pub async fn serial_dial(
                 return Err(format!("串发冷却中(全灭后约 {remain}s), 快速失败"));
             }
         }
-        let st = tab.pools.get(pool_name);
-        if st.map(|s| s.plans.is_empty()).unwrap_or(true) {
+        if tab
+            .pools
+            .get(pool_name)
+            .map(|p| p.is_empty())
+            .unwrap_or(true)
+        {
             return Err(format!("串发表为空({pool_name})"));
         }
     }
 
     let snapshot = {
         let g = SERIAL.lock().unwrap();
-        g.as_ref()
-            .unwrap()
-            .pools
-            .get(pool_name)
-            .unwrap()
-            .plans
-            .clone()
+        g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
     let mut last_err: Option<String> = None;
@@ -858,9 +855,7 @@ pub fn content_direct_fail(host: &str) {
 }
 
 /// 域名 → 所属池名（config 唯一路由真相，"" = 非池域名）。
-pub fn pool_for(host: &str) -> &'static str {
-    crate::config::pool_for(host)
-}
+pub use crate::config::pool_for;
 
 #[cfg(test)]
 mod tests {
@@ -889,11 +884,7 @@ mod tests {
         // 空串返回残缺 "fake:" —— 调用方(serial_dial)对空值兜底 "baidu.com";
         // 裸域名/带 fake: 前缀均归伪装; MODE_SNI 直通
         assert_eq!(plan_mode(""), "fake:", "空串须由调用方兜底");
-        assert_eq!(
-            plan_mode("nosni"),
-            plan_mode("baidu.com"),
-            "旧表 nosni 归伪装"
-        );
+        // 旧表 "nosni" 由 serial_load 归一（shape_for_ip），plan_mode 不再特判
         assert_eq!(
             plan_mode("baidu.com"),
             format!("{}baidu.com", dial::MODE_FAKE_PFX)
@@ -1007,7 +998,7 @@ mod tests {
         let ps = {
             let g = SERIAL.lock().unwrap();
             let tab = g.as_ref().unwrap();
-            tab.pools.get("core").unwrap().plans.clone()
+            tab.pools.get("core").unwrap().clone()
         };
         // ech/非法被滤; 旧表 real 条目按 IP 族归一为伪装; 种子补缺追加在尾部
         assert_eq!(
@@ -1028,7 +1019,7 @@ mod tests {
         let edge_ps = {
             let g = SERIAL.lock().unwrap();
             let tab = g.as_ref().unwrap();
-            tab.pools.get("edge").unwrap().plans.clone()
+            tab.pools.get("edge").unwrap().clone()
         };
         // 种子补缺: .133 内容域条目是新版本边缘, 用户旧表没有 → 自动追加
         assert!(edge_ps.len() >= 3, "edge 至少含旧表 3 条: {edge_ps:?}");
@@ -1081,7 +1072,7 @@ mod tests {
         serial_load(&dir, Some(log));
         let ps = {
             let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("edge").unwrap().plans.clone()
+            g.as_ref().unwrap().pools.get("edge").unwrap().clone()
         };
         assert_eq!(
             ps[0].ip, "140.82.112.29",
@@ -1244,7 +1235,7 @@ mod tests {
         let base_len = seen.lock().unwrap().len(); // 初始表日志条数
         let base = {
             let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("core").unwrap().plans.clone()
+            g.as_ref().unwrap().pools.get("core").unwrap().clone()
         };
         let head = base[0].ip.clone();
         // 同 IP 重复置顶：顺序没变 → 不写盘、不打日志
@@ -1260,7 +1251,7 @@ mod tests {
         {
             let g = SERIAL.lock().unwrap();
             assert!(g.as_ref().unwrap().dirty, "表头轮换该置 dirty");
-            let ps = &g.as_ref().unwrap().pools.get("core").unwrap().plans;
+            let ps = g.as_ref().unwrap().pools.get("core").unwrap();
             assert_eq!(ps[0].ip, other, "新表头应是置顶 IP");
         }
         let lines = seen.lock().unwrap();
@@ -1281,7 +1272,7 @@ mod tests {
         reset_state(&dir);
         let base = {
             let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("core").unwrap().plans.clone()
+            g.as_ref().unwrap().pools.get("core").unwrap().clone()
         };
         assert!(base.len() >= 6, "初始表过小: {}", base.len());
         let key = base[3].clone();
@@ -1294,7 +1285,6 @@ mod tests {
                 .pools
                 .get("core")
                 .unwrap()
-                .plans
                 .last()
                 .unwrap()
                 .clone()
@@ -1305,7 +1295,7 @@ mod tests {
         serial_move("core", |p| p.ip == ip0, true, "ok");
         let head = {
             let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("core").unwrap().plans[0].clone()
+            g.as_ref().unwrap().pools.get("core").unwrap()[0].clone()
         };
         assert_eq!(head.ip, ip0);
     }
