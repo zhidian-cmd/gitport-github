@@ -1,0 +1,65 @@
+[package]
+name = "viaduct"
+version = "0.1.0"
+edition = "2021"
+description = "多站点加速代理工作台 —— 串发表驱动的本地加速代理（前身 github_link / FreeProxy）"
+license = "Apache-2.0"
+# 建仓后取消注释并填实际地址:
+# repository = "https://github.com/<account>/viaduct"
+
+[[bin]]
+name = "viaduct"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+h2 = "0.4"
+tower-service = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = { version = "0.8", features = ["json"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = { version = "0.3", features = ["macros", "local-offset"] }
+winreg = "0.56"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_DataExchange",
+  "Win32_System_Ole",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_WindowsAndMessaging",
+] }
+wry = "0.56"
+tao = "0.34"
+tray-icon = "0.24"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+# boring 4.22：dial.rs 的 Chrome 指纹直连腿（GREASE + Chrome 默认套件/扩展
+# 顺序 + ALPN h2 + SNI/校验名解耦）—— BoringSSL 即 Chrome 同款 TLS 实现，
+# 等价 utls HelloChrome 的 Rust 落地。boring-sys 声明 links="boringssl"，
+# 一个依赖图只允许一份 BoringSSL native，勿引入第二份。
+boring = "4"
+tokio-boring = "4"
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

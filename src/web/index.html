@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Viaduct 工作台</title>
+<link rel="stylesheet" href="/style.css">
+<script>
+// 渲染自愈看门狗(治两类"整块内容消失"):
+// 1) DOM 截断: WebView2 网络栈随系统代理刷新重启时可能把正在浏览的页面
+//    拦腰截断半截重载, 断处之后的 DOM 整块丢失。body 尾部的 app.js 不会执行,
+//    所以看门狗放 head —— 截断后仍会跑, 发现哨兵元素缺失就整页重载。
+// 2) 合成器停帧(实测主因, 2026-10-10 CDP 实锤): 窗口隐藏到托盘再恢复后,
+//    WebView2 合成器卡在旧画面不再重绘 —— DOM 完整(455 节点全在)但屏幕
+//    下半截永远是旧画面/黑块, 重启才恢复。药方: 轻推布局(zoom 1.0001 再
+//    复原)强制全量失效重绘, 已在用户窗口实时验证立竿见影。定时+可见性
+//    变化时各推一次, 设置页界面开销可忽略。60s 内最多整页重载 3 次。
+(function () {
+  var KEY = "fp_dom_heal", N = 3, WIN = 60000;
+  function nudgePaint() {
+    var d = document.documentElement;
+    d.style.zoom = "1.0001";
+    void d.offsetHeight; // 强制同步 reflow, 全量失效合成器帧
+    d.style.zoom = "";
+    void d.offsetHeight;
+  }
+  function heal() {
+    if (!document.getElementById("toast") || !document.getElementById("view-logs")) {
+      var now = Date.now(), arr = [];
+      try { arr = JSON.parse(sessionStorage.getItem(KEY) || "[]"); } catch (e) {}
+      arr = arr.filter(function (t) { return now - t < WIN; });
+      if (arr.length < N) { arr.push(now); sessionStorage.setItem(KEY, JSON.stringify(arr)); location.reload(); }
+    } else {
+      nudgePaint(); // DOM 完整但画面可能停帧: 轻推合成器
+    }
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    // 滚动确定性: 页面每次加载一律从顶部开始。
+    // 根因(CDP 全链路实测 2026-10-10): 分流开关刷新系统代理(WinINET)曾令旧版
+    // WebView2 重载页面 + Chromium 会话恢复把滚动位置带回半中央 —— DOM/服务端/
+    // 渲染管线全程完好, 但上半页卡片被卷出视野、MITM 下方本就是页尾留白,
+    // 体感即"开关/卡片消失"。显式 scrollRestoration=manual + 回顶, 位置不再漂移。
+    try { history.scrollRestoration = "manual"; } catch (e) {}
+    try { sessionStorage.removeItem("fp_scrollY"); } catch (e) {}
+    requestAnimationFrame(function () { scrollTo(0, 0); });
+    // 根滚动器保险丝: 本机 WebView2 根滚动器滚动时底部 scrollY px 不重绘(CDP 实测
+    // painted = viewport - scrollY)。CSS 已锁 html overflow:hidden, 这里再兜底——
+    // 任何路径(滚轮链接/锚点/脚本)若把根滚出 0, 立即弹回, 绝不停在非零位置。
+    window.addEventListener("scroll", function () {
+      if (window.scrollY !== 0) scrollTo(0, 0);
+    }, { passive: true });
+    setTimeout(heal, 800);
+  });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) setTimeout(heal, 300); });
+  window.addEventListener("focus", function () { setTimeout(heal, 300); });
+  setInterval(heal, 4000);
+})();
+</script>
+</head>
+<body>
+  <aside class="side">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 9a8 8 0 0 1 16 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <path d="M7.5 11a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".5"/>
+        <circle cx="12" cy="16.5" r="3" fill="currentColor"/>
+      </svg>
+      <div class="brand-txt">
+        <div class="name">Viaduct</div>
+        <div class="sub">跨站加速工作台</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-group">监控</div>
+      <a href="#overview" class="item" data-view="overview">概览</a>
+      <a href="#pools"    class="item" data-view="pools">IP 池<span class="cnt" id="navPools"></span></a>
+      <a href="#logs"     class="item" data-view="logs">运行日志</a>
+      <div class="nav-group">控制</div>
+      <a href="#settings" class="item" data-view="settings">设置</a>
+    </nav>
+
+    <div class="side-foot">
+      <span class="run-dot" id="dot"></span>
+      <div class="foot-txt">
+        <div class="foot-state" id="footState">已停止</div>
+        <div class="foot-sub"><span id="footPort">127.0.0.1:7810</span> · <span id="footVer">v?</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="top-txt">
+        <h1 id="pageTitle">概览</h1>
+        <p class="top-sub" id="pageSub">代理状态与 GitHub 连通性一览</p>
+      </div>
+    </header>
+
+    <div class="views">
+      <!-- 概览 -->
+      <section id="view-overview" class="view active">
+        <div class="hero-grid">
+          <div class="panel hero-addr">
+            <span class="label">代理地址</span>
+            <div class="addr-row">
+              <code class="addr" id="addr">127.0.0.1:7810</code>
+              <button class="btn sm" id="copyAddr">复制</button>
+            </div>
+            <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
+          </div>
+        </div>
+
+        <div class="grid3">
+          <a class="statcard" href="#logs">
+            <span class="label">代理服务</span>
+            <span class="value" id="sRun">已停止</span>
+            <span class="meta" id="sPortMeta">127.0.0.1:7810</span>
+          </a>
+          <a class="statcard" href="#pools">
+            <span class="label">接入与加速</span>
+            <span class="badges">
+              <span class="badge" id="bMitm">MITM 关</span>
+            </span>
+            <span class="meta" id="sDomains">分流域名 20 个</span>
+          </a>
+          <a class="statcard" href="#pools">
+            <span class="label">串发候选</span>
+            <span class="value"><span id="sPoolCount">0</span> 条</span>
+            <span class="meta">按表逐个重试 · 通者置顶</span>
+          </a>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>最近日志</h2>
+            <a href="#logs" class="link">查看全部 →</a>
+          </div>
+          <div id="logsMini" class="log-mini"></div>
+        </div>
+      </section>
+
+      <!-- IP 池 -->
+      <section id="view-pools" class="view">
+        <div class="view-toolbar">
+          <p class="hint">串发模式: plans.json 是唯一 IP 来源 —— 按表逐个试连, 一个失败连下一个; 通的置顶失败的垫底, 全灭冷却 30 秒。候选不够直接手改 plans.json(改完重启生效)</p>
+        </div>
+        <div id="poolCards" class="pool-grid"></div>
+      </section>
+
+      <!-- 设置 -->
+      <section id="view-settings" class="view">
+        <div class="panel">
+          <div class="set-row">
+            <div class="set-info">
+              <h2>开机自启动</h2>
+              <p>登录 Windows 后自动运行并启动代理服务, 直接驻留系统托盘(不弹窗口)</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swAutostart"><span class="track"></span></label>
+          </div>
+          <div class="set-row">
+            <div class="set-info">
+              <h2>关闭窗口时缩到系统托盘</h2>
+              <p>开启后点 ✕ 只是隐藏窗口, 代理继续在后台运行; 托盘左键显示工作台, 右键退出</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swTray"><span class="track"></span></label>
+          </div>
+        </div>
+        <div class="panel">
+          <p class="hint" style="margin:0 0 6px">分流接管 = 免插件的可选项: 开关开启且代理运行中时, 本程序以 PAC 脚本接管系统代理, 只有对应站点经本代理加速, 其余流量不受影响; 全部关闭时不碰系统代理, 用插件/手动接入照常可用。代理停止时自动还原接管前的系统代理。</p>
+          <div class="set-row">
+            <div class="set-info">
+              <h2>GitHub 分流接管</h2>
+              <p>开启后 GitHub 系站点自动经本代理, 无需浏览器插件</p>
+            </div>
+            <label class="switch"><input type="checkbox" id="swGh" checked><span class="track"></span></label>
+          </div>
+        </div>
+        <div class="feature-card">
+          <div class="feature-info">
+            <h2>MITM 模式</h2>
+            <p class="hint" style="margin-top:5px">伪装 SNI / 无 SNI 形态与拦截页化解仅在开启时生效, 作用与流程图见 README「MITM 模式」章节</p>
+          </div>
+          <button class="btn primary" id="mitmBtn">开启</button>
+        </div>
+        <div class="feature-card">
+          <div class="feature-info">
+            <h2>镜像链校准</h2>
+            <p class="hint" style="margin-top:5px">为 raw / gist / avatars / codeload 等 8 类有镜像的资源各维护一条镜像使用顺序链(串行取用, 不并发竞速)。点击校准会用内置的稳定模板文件逐个实测各镜像当前速度, 按实测快慢自动重排各资源的链序并保存。全程约 30~90 秒, 期间可正常上网</p>
+            <pre id="calResult" class="hint" style="margin-top:8px;white-space:pre-wrap;display:none;max-height:260px;overflow:auto"></pre>
+          </div>
+          <button class="btn primary" id="calBtn">校准</button>
+        </div>
+      </section>
+
+      <!-- 运行日志 -->
+      <section id="view-logs" class="view">
+        <div class="panel grow">
+          <div class="panel-head">
+            <h2>运行日志</h2>
+            <div class="row head-row">
+              <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+              <button class="btn sm" onclick="copyText(document.getElementById('logsBox').textContent)">复制全部</button>
+              <button class="btn sm" onclick="document.getElementById('logsBox').textContent=''">清空</button>
+            </div>
+          </div>
+          <div id="logsBox"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

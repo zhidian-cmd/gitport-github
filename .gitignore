@@ -1,0 +1,40 @@
+# ---- Rust / Cargo 构建产物 ----
+/target/
+
+# ---- dist 交付物中的本地生成与敏感文件（源�?assets/icon.ico 保留入库�?----
+/dist/viaduct.exe
+/dist/icon.ico
+/dist/ca.crt
+/dist/ca.key
+/dist/plans.json
+/dist/plans.json.bak*
+/dist/settings.json
+/dist/*.WebView2/
+/dist/*.log
+/dist/*.txt
+
+# ---- 验证/诊断日志（用户已要求不落盘，防误提交�?----
+*.log
+probe*_out.txt
+diag*.txt
+/testlog*.txt
+/cargo_add_out.txt
+
+# ---- 验证脚本（一次�?调试用，不入库；src/ 源码�?build.rs 不受影响�?----
+/bench_go.py
+/check_crates.py
+/curl_probe.py
+/e2e_check.py
+/mitm_e2e.py
+/pe_check.py
+/port_probe.py
+/probe2.py
+/probe3.py
+/probe4.py
+/stop_go.py
+/tls_probe.py
+
+# ---- 运行期杂�?----
+.sessions/
+
+.workbuddy/
