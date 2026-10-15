@@ -182,7 +182,8 @@ pub fn mitm_h1_client() -> LegacyClient<MirrorConnector, BoxBody> {
 /// 请求预算：一次上游请求的总预算。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 重写上游请求：绝对 URL 化 + 剥编码/代理头。返回 (host, 请求)。
+/// 重写上游请求：绝对 URL 化 + 剥代理头；accept-encoding 仅嗅探型 host
+/// （github.com/api）剥离，其余放行压缩（见函数内注释）。返回 (host, 请求)。
 pub fn upstream_request(
     req: &hyper::Request<Incoming>,
     host: &str,
@@ -197,10 +198,19 @@ pub fn upstream_request(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
+    // accept-encoding 策略（2026-10-15）：gh_defuse 要读明文 HTML 头 4KB 判拦截页，
+    // 只有 github.com / api.github.com 强制身份编码（HTML 文档 300~400KB，代价可忍）；
+    // 其余 host（assets/内容域/avatars 等从不嗅探响应体）放行浏览器原生压缩。
+    // 此前全量裸传是"进仓库慢"主因 —— 实测仓库页 327KB→gzip 44.5KB（7.3x），
+    // 31 个 CSS 合计 3.34MB→507KB（6.6x），129 个 JS 同理。
+    let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();
-        if low == "accept-encoding" || low == "proxy-connection" || low == "proxy-authorization" {
-            continue; // 强制身份编码，防上游返回无法解码的压缩体
+        if (sniffed && low == "accept-encoding")
+            || low == "proxy-connection"
+            || low == "proxy-authorization"
+        {
+            continue;
         }
         out = out.header(k, v);
     }
