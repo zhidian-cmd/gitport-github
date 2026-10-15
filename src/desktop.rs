@@ -1,6 +1,7 @@
 //! 桌面框架 —— tao 原生窗口 + wry(WebView2 渲染 WebUI) + tray-icon 系统托盘。
 //! 对应 Go 版 webview_go + energye/systray 的语义：
-//! - ✕ 且开"关闭到托盘" → 隐藏窗口(吞掉关闭)；未开 → 退出
+//! - ✕ 且开"关闭到托盘" → 释放整个 WebView2 收进托盘(点击托盘重建; 托盘态
+//!   无 Chromium 进程, 占用≈headless)
 //! - 窗口被外部销毁(WebView2 运行时事件) → 自愈重建(代理保持运行)
 //! - 托盘左键/菜单「显示工作台」→ 有窗则显示聚焦，无窗则按需创建
 //! - 窗口矩形退出时记忆、启动时恢复；无记录则居中偏下
@@ -299,6 +300,9 @@ pub fn run(args: DesktopArgs) -> ! {
     }
 
     let quitting = Arc::new(AtomicBool::new(false));
+    // 主动收起到托盘的标记: CloseRequested 置位, 供 Destroyed 事件区分
+    // "自己收的"(不重建, 保持 headless 态)与"外部销毁"(自愈重建)。
+    let tray_hidden = Arc::new(AtomicBool::new(false));
     let slot2 = slot.clone();
     let quitting2 = quitting.clone();
     let on_quit2 = on_quit.clone();
@@ -341,10 +345,17 @@ pub fn run(args: DesktopArgs) -> ! {
                 ..
             } => {
                 if settings::close_to_tray() {
-                    let g = slot.lock().unwrap();
-                    if let Some(w) = &g.win {
-                        w.set_visible(false);
-                    }
+                    // 托盘化 = 彻底释放 WebView2(扮演 headless): 7 个 Chromium
+                    // 进程(实测 ~286MB commit)全部退出, 只剩代理核心 ~12MB;
+                    // 点击托盘走 ShowWindow 的"无窗则建窗"路径重建。
+                    // 先存窗口矩形, 再放 WebView(持有 controller)后放窗口;
+                    // 随后的 Destroyed 事件由 tray_hidden 标记拦截, 不自愈。
+                    save_window_rect(&slot);
+                    tray_hidden.store(true, Ordering::SeqCst);
+                    let mut g = slot.lock().unwrap();
+                    g.wv = None;
+                    g.win = None;
+                    (log)("工作台已收起到托盘, WebView2 已释放(点击托盘重开)");
                 } else {
                     do_quit(control_flow);
                 }
@@ -373,7 +384,11 @@ pub fn run(args: DesktopArgs) -> ! {
                     g.win = None;
                     g.wv = None;
                 }
-                if !quitting.load(Ordering::SeqCst) {
+                if quitting.load(Ordering::SeqCst) {
+                    // 退出流程中: 不重建
+                } else if tray_hidden.swap(false, Ordering::SeqCst) {
+                    // 主动收起到托盘: 保持无窗(headless 态), 等托盘点击再建
+                } else {
                     (log)("工作台窗口被外部销毁, 自愈重建(代理保持运行)");
                     if create_window(&slot, elwt, &url, &log) {
                         (log)("工作台窗口重建成功");
