@@ -108,24 +108,18 @@ pub async fn dial_h2(
     };
     h2_from_dialed(host, conn_io, &ip, form, log).await
 }
-/// 在自管 h2 连接上发一次请求：请求头从 out 重建, 体按 replay 注入
-/// （SendStream 发送, 不阻塞连接复用）。响应体 RecvStream 转 BoxBody,
-/// 流控窗口逐块即时释放（h2 必须显式放窗, 否则大响应死锁）。
-pub async fn h2_send(
-    up: &H2Upstream,
-    out: hyper::Request<BoxBody>,
-    body: &Option<Bytes>,
-) -> Result<hyper::Response<BoxBody>, String> {
-    let mut send = up.send.clone();
-    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
-    let (parts, _) = out.into_parts();
-    let has_body = body.as_ref().map_or(false, |b| !b.is_empty());
+/// 流式直通响应头预算（秒）：git push 大包时 GitHub 收完包并解包校验才回
+/// 响应头, 2GB@1MB/s ≈ 35 分钟 —— 给足 30 分钟。黑洞上游（收包不应答）由
+/// 客户端侧超时/中止兜底。
+pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
+/// 从 out 重建 h2 请求头：剥 h1 hop-by-hop 头 —— 浏览器/git 在隧道内可能
+/// 以 http/1.1 发请求, h1 遗留头转发给 h2 会被判 malformed（RFC 7540
+/// §8.1.2.2）。
+fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, String> {
     let mut builder = hyper::Request::builder()
-        .method(parts.method.clone())
-        .uri(parts.uri.clone());
-    for (k, v) in parts.headers.iter() {
-        // h2 禁止 connection 类头(RFC 7540 §8.1.2.2) —— 浏览器在隧道内
-        // 可能以 http/1.1 发请求, h1 遗留头直接转发会被 h2 判 malformed
+        .method(out.method())
+        .uri(out.uri());
+    for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
         if matches!(
             low.as_str(),
@@ -135,16 +129,13 @@ pub async fn h2_send(
         }
         builder = builder.header(k, v);
     }
-    let request = builder.body(()).map_err(|e| e.to_string())?;
-    let (resp_fut, mut send_stream) = send
-        .send_request(request, !has_body)
-        .map_err(|e| format!("h2 发送: {e}"))?;
-    if has_body {
-        let b = body.as_ref().unwrap();
-        send_stream
-            .send_data(b.clone(), true)
-            .map_err(|e| format!("h2 请求体: {e}"))?;
-    }
+    builder.body(()).map_err(|e| e.to_string())
+}
+/// h2 响应头 future → Response<BoxBody>。体 RecvStream 逐块即时放窗
+/// （h2 必须显式 release_capacity, 否则大响应死锁）。
+pub async fn h2_recv_response(
+    resp_fut: h2::client::ResponseFuture,
+) -> Result<hyper::Response<BoxBody>, String> {
     let resp = resp_fut.await.map_err(|e| format!("h2 响应: {e}"))?;
     let (parts, mut recv) = resp.into_parts();
     let body_stream = futures_util::stream::poll_fn(move |cx| match recv.poll_data(cx) {
@@ -162,6 +153,92 @@ pub async fn h2_send(
         parts,
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
+}
+/// 在自管 h2 连接上发一次请求：请求头从 out 重建, 体按 replay 注入
+/// （SendStream 发送, 不阻塞连接复用）。
+pub async fn h2_send(
+    up: &H2Upstream,
+    out: &hyper::Request<BoxBody>,
+    body: &Option<Bytes>,
+) -> Result<hyper::Response<BoxBody>, String> {
+    let mut send = up.send.clone();
+    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
+    let request = h2_request_head(out)?;
+    let has_body = body.as_ref().map_or(false, |b| !b.is_empty());
+    let (resp_fut, mut send_stream) = send
+        .send_request(request, !has_body)
+        .map_err(|e| format!("h2 发送: {e}"))?;
+    if has_body {
+        send_stream
+            .send_data(body.as_ref().unwrap().clone(), true)
+            .map_err(|e| format!("h2 请求体: {e}"))?;
+    }
+    h2_recv_response(resp_fut).await
+}
+/// 流式直通·预泵段：重建请求头并以 EOS=false 发出，返回 (响应future, 发送流)。
+/// 此段失败 = 连接已死且客户端体未被触碰 —— 调用方可安全换新拨重试。
+pub async fn h2_stream_head(
+    up: &H2Upstream,
+    out: &hyper::Request<BoxBody>,
+) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
+    let mut send = up.send.clone();
+    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
+    let request = h2_request_head(out)?;
+    let (resp_fut, stream) = send
+        .send_request(request, false)
+        .map_err(|e| format!("h2 发送: {e}"))?;
+    Ok((resp_fut, stream))
+}
+/// 流式直通·请求体泵：客户端体帧 → SendStream，按对端授予的发送窗口分片
+/// 发送（reserve_capacity/poll_capacity 背压，单次 send_data 严禁超窗口）。
+/// 响应头先到时调用方已把响应交付客户端 —— 泵的失败仅记日志，绝不覆盖真实
+/// 业务响应（响应优先语义）。客户端体读取出错（中断）时不补 EOS 直接弃流：
+/// 上游按 RST 丢弃截断体 —— git pack 尾部带校验和，截断包必须被服务端拒绝，
+/// 若补 EOS 反而会让上游把截断包当完整包处理。
+pub fn h2_spawn_pump(mut send: h2::SendStream<Bytes>, mut body: BoxBody, log: LogFn) {
+    tokio::spawn(async move {
+        let mut sent: u64 = 0;
+        loop {
+            let frame = match body.frame().await {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => {
+                    (log)(&format!(
+                        "[上游] 请求体泵: 客户端体读取失败(已发 {sent}B), 弃流不补 EOS: {e}"
+                    ));
+                    return;
+                }
+                None => break,
+            };
+            let mut chunk = match frame.into_data() {
+                Ok(d) => d,
+                Err(_) => break, // 尾帧（trailer 类）：按体结束处理
+            };
+            while !chunk.is_empty() {
+                send.reserve_capacity(chunk.len());
+                match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                    Some(Ok(n)) if n > 0 => {
+                        let piece = chunk.split_to(n.min(chunk.len()));
+                        sent += piece.len() as u64;
+                        if let Err(e) = send.send_data(piece, false) {
+                            (log)(&format!("[上游] 请求体泵中止(已发 {sent}B): {e}"));
+                            return;
+                        }
+                    }
+                    Some(Ok(_)) => {} // 授予 0：继续等下次窗口唤醒
+                    Some(Err(e)) => {
+                        (log)(&format!("[上游] 请求体泵窗口错误(已发 {sent}B): {e}"));
+                        return;
+                    }
+                    None => {
+                        (log)(&format!("[上游] 请求体泵: 上游重置流(已发 {sent}B)"));
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = send.send_data(Bytes::new(), true); // 干净收尾: EOS
+        (log)(&format!("[上游] 请求体泵完成: {sent}B"));
+    });
 }
 /// 每 host 拨号单飞闸：并发请求同时缓存未命中时，只有一个真正进串发拨号，
 /// 其余排队等待 —— 首拨成功入槽后，队列里的请求全部直走复用路径。

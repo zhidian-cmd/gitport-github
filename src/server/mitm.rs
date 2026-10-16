@@ -177,28 +177,45 @@ async fn mitm_http(
     let Ok((out, _)) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
-    // 有界请求体缓冲(≤1MB)：建连失败换路重试时可安全重放
+    let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
+    let path = path_of(req.uri());
+    // 流式直通判定（2026-10-16 方案一落地）：git 智能协议 POST（push/fetch
+    // 包传输）或声明体积超限的请求不进有界缓冲 —— 缓冲路径下 >1MB 的请求
+    // 一律 502, git push 大包必挂。GET/HEAD 无体不涉及。
+    let mut streaming_reason = stream_decision(req.method(), &path, declared_content_len(&req));
+    let mut overflow_prefix: Option<Vec<u8>> = None;
     let mut replay: Option<Bytes> = None;
-    let mut buf = Vec::new();
-    let limit = upstream::MAX_REPLAY_BODY + 1;
-    while let Some(frame) = http_body_util::BodyExt::frame(req.body_mut()).await {
-        match frame {
-            Ok(f) => {
-                if let Ok(data) = f.into_data() {
-                    buf.extend_from_slice(&data);
-                    if buf.len() > limit {
-                        break;
+    if streaming_reason.is_none() {
+        // 有界请求体缓冲(≤1MB)：建连失败换路重试时可安全重放。
+        // 读超限不再 502 —— 已读前缀作为首块, 转流式继续泵送剩余体。
+        let mut buf = Vec::new();
+        let limit = upstream::MAX_REPLAY_BODY + 1;
+        while let Some(frame) = http_body_util::BodyExt::frame(req.body_mut()).await {
+            match frame {
+                Ok(f) => {
+                    if let Ok(data) = f.into_data() {
+                        buf.extend_from_slice(&data);
+                        if buf.len() > limit {
+                            break;
+                        }
                     }
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
+        }
+        if buf.len() > upstream::MAX_REPLAY_BODY {
+            streaming_reason = Some("实际超限(缓冲转流式)");
+            overflow_prefix = Some(buf);
+        } else if !buf.is_empty() {
+            replay = Some(Bytes::from(buf));
         }
     }
-    if !buf.is_empty() {
-        if buf.len() > upstream::MAX_REPLAY_BODY {
-            return mitm_unavailable(&req, &host);
-        }
-        replay = Some(Bytes::from(buf));
+    if let Some(reason) = streaming_reason {
+        let body = match overflow_prefix {
+            Some(prefix) => chain_prefix_body(prefix, incoming_to_body(req.into_body())),
+            None => incoming_to_body(req.into_body()),
+        };
+        return stream_passthrough(&log, &out, &host, &info, body, reason).await;
     }
     let out_body = match &replay {
         Some(b) => out.map(|_| {
@@ -208,12 +225,10 @@ async fn mitm_http(
         }),
         None => out,
     };
-    let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     // 镜像 only 域（不直连）：codeload / objects / release-assets 大文件域、
     // github.com 的 releases/download 与 archive 路径（git 智能协议路径除外）。
     // 镜像链全灭 → 直接 502，不回落直连。
     // githubusercontent 内容域不在此列 —— 直连优先（1s 内 200），失败回落镜像链。
-    let path = path_of(req.uri());
     if is_simple && (is_big_file_host(&host) || is_release_asset_path(&host, &path)) {
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
             return write_upstream(resp, "mirror", &info);
@@ -267,6 +282,146 @@ async fn mitm_http(
         }
     }
     write_upstream(resp, "direct", &info)
+}
+/// 流式直通判定：Some(原因) = 不进缓冲直接流式；None = 有界缓冲(≤1MB)。
+/// git 智能协议 POST（push/fetch 包传输端点）与声明超限（含 GB 级 PUT）
+/// 必流式；声明未超限但实际超限的在缓冲读满后转流式（不丢请求也不 502）。
+fn stream_decision(
+    method: &Method,
+    path: &str,
+    declared_len: Option<u64>,
+) -> Option<&'static str> {
+    if *method == Method::GET || *method == Method::HEAD {
+        return None;
+    }
+    if *method == Method::POST
+        && (path.ends_with("/git-receive-pack") || path.ends_with("/git-upload-pack"))
+    {
+        return Some("git 智能协议");
+    }
+    if declared_len.map_or(false, |n| n as usize > upstream::MAX_REPLAY_BODY) {
+        return Some("声明超限");
+    }
+    None
+}
+fn declared_content_len(req: &hyper::Request<Incoming>) -> Option<u64> {
+    req.headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+/// hyper Incoming（错误类型 hyper::Error）→ BoxBody（错误类型 io::Error）。
+fn incoming_to_body(body: Incoming) -> BoxBody {
+    let mut body = body;
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        match hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx) {
+            std::task::Poll::Ready(Some(Ok(f))) => std::task::Poll::Ready(Some(Ok(f))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(e))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    });
+    BoxBody::new(http_body_util::StreamBody::new(stream))
+}
+/// 前缀字节 + 尾体拼接（http_body_util 0.1 无 Chain 组合子，手写）：
+/// 先吐 prefix 一帧，再透传 rest 的全部帧。缓冲转流式用（已读的 ≤1MB+1
+/// 前缀必须原样发给上游，剩余体继续泵送）。
+fn chain_prefix_body(prefix: Vec<u8>, rest: BoxBody) -> BoxBody {
+    let mut prefix = Some(prefix);
+    let mut rest = rest;
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        if let Some(p) = prefix.take() {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(p)))));
+        }
+        hyper::body::Body::poll_frame(std::pin::Pin::new(&mut rest), cx)
+    });
+    BoxBody::new(http_body_util::StreamBody::new(stream))
+}
+/// 纯 502 兜底（非 GET 失败路径；GET 的自动刷新页见 mitm_unavailable）。
+fn plain_502() -> axum::response::Response<BoxBody> {
+    axum::response::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(BoxBody::new(
+            http_body_util::Full::new(Bytes::from_static(b"upstream unavailable"))
+                .map_err(|never| std::io::Error::other(never)),
+        ))
+        .unwrap()
+}
+/// 流式直通：请求体不进缓冲，边收边泵给上游（h2 背压分片）。单次尝试
+/// 语义（同既有"非简单方法不重发"）：预泵段失败 = 连接死且体未动，允许
+/// 换新拨重试一次；体泵启动后体已部分消耗，失败只记日志不重试。响应头
+/// 一到立即交付客户端（响应优先），泵的非致命错误绝不覆盖真实响应。
+async fn stream_passthrough(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    body: BoxBody,
+    reason: &str,
+) -> axum::response::Response<BoxBody> {
+    let name = pool::pool_for(host);
+    let path = path_of(out.uri());
+    let t0 = Instant::now();
+    let mut body = Some(body);
+    // 连接选择：缓存优先（git 场景 info/refs 前置 GET 通常已暖好连接）；
+    // 预泵失败允许新拨重试一次（体未触碰, 重放安全）。
+    let (fut, send, up) = 'conn: {
+        if let Some(up) = upstream::cached_h2(host) {
+            match upstream::h2_stream_head(&up, out).await {
+                Ok((fut, send)) => break 'conn (fut, send, up),
+                Err(e) => {
+                    upstream::drop_h2(host, &up.ip);
+                    (log)(&format!("[流式] {host}{path} 缓存连接失效({e}), 新拨重试"));
+                }
+            }
+        }
+        match upstream::dial_h2(name, host, CancellationToken::new(), log).await {
+            Ok(up) => match upstream::h2_stream_head(&up, out).await {
+                Ok((fut, send)) => break 'conn (fut, send, up),
+                Err(e) => {
+                    upstream::drop_h2(host, &up.ip);
+                    (log)(&format!("[流式] {host}{path} 新拨连接握手即死({e})"));
+                }
+            },
+            Err(e) => (log)(&format!("[流式] {host}{path} 拨号失败: {e}")),
+        }
+        (log)(&format!("[流式] {host}{path} 两条连接腿均失败, 放弃"));
+        return plain_502();
+    };
+    if let Some(b) = body.take() {
+        upstream::h2_spawn_pump(send, b, log.clone());
+    }
+    let timed = tokio::time::timeout(
+        std::time::Duration::from_secs(upstream::STREAM_HEAD_BUDGET_SECS),
+        upstream::h2_recv_response(fut),
+    )
+    .await;
+    match timed {
+        Ok(Ok(resp)) => {
+            info.set(&up.ip);
+            if !name.is_empty() {
+                pool::serial_note(name, &up.ip, "ok");
+            }
+            (log)(&format!(
+                "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
+                t0.elapsed().as_millis()
+            ));
+            write_upstream(resp, "stream", &info)
+        }
+        Ok(Err(e)) => {
+            (log)(&format!("[流式] {host}{path} 上游响应失败: {e}"));
+            plain_502()
+        }
+        Err(_) => {
+            (log)(&format!(
+                "[流式] {host}{path} 响应头预算({}s)超时",
+                upstream::STREAM_HEAD_BUDGET_SECS
+            ));
+            plain_502()
+        }
+    }
 }
 fn path_of(uri: &http::Uri) -> String {
     uri.path_and_query()
@@ -326,9 +481,10 @@ async fn try_cached(
     body: &Option<Bytes>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
     let up = upstream::cached_h2(host)?;
+    let attempt_req = build_request(out, body);
     let timed = tokio::time::timeout(
         REQUEST_BUDGET,
-        upstream::h2_send(&up, build_request(out, body), body),
+        upstream::h2_send(&up, &attempt_req, body),
     );
     match timed.await {
         Ok(Ok(resp)) => {
@@ -434,9 +590,10 @@ async fn get_direct(
                 continue;
             }
         };
+        let attempt_req = build_request(out, body);
         let timed = tokio::time::timeout(
             REQUEST_BUDGET,
-            upstream::h2_send(&up, build_request(out, body), body),
+            upstream::h2_send(&up, &attempt_req, body),
         );
         match timed.await {
             Ok(Ok(resp)) => {
@@ -593,13 +750,7 @@ fn mitm_unavailable(
     host: &str,
 ) -> axum::response::Response<BoxBody> {
     if req.method() != Method::GET {
-        return axum::response::Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(b"upstream unavailable"))
-                    .map_err(|never| std::io::Error::other(never)),
-            ))
-            .unwrap();
+        return plain_502();
     }
     let ui_port = config::webui_port();
     let html = format!(
@@ -668,9 +819,10 @@ async fn dns_direct_fetch(
                 continue;
             }
         };
+        let attempt_req = build_request(out, body);
         let timed = tokio::time::timeout(
             REQUEST_BUDGET,
-            upstream::h2_send(&up, build_request(out, body), body),
+            upstream::h2_send(&up, &attempt_req, body),
         );
         match timed.await {
             Ok(Ok(resp)) => {
@@ -1116,5 +1268,49 @@ mod tests {
             "codeload.github.com",
             "/x/y/legacy.tar.gz"
         ));
+    }
+
+    /// 流式直通判定契约（2026-10-16 方案一）：git 智能协议 POST 与声明
+    /// 超限必流式；GET/HEAD 与常规小体不流式；超限值恰为 MAX_REPLAY_BODY
+    /// 时不流式（缓冲路径的合法上界）。
+    #[test]
+    fn stream_decision_contract() {
+        use upstream::MAX_REPLAY_BODY;
+        // git 智能协议 POST：必流式
+        assert_eq!(
+            stream_decision(
+                &Method::POST,
+                "/fastgh/fgit.git/git-receive-pack",
+                Some(100)
+            ),
+            Some("git 智能协议")
+        );
+        assert_eq!(
+            stream_decision(&Method::POST, "/fastgh/fgit.git/git-upload-pack", None),
+            Some("git 智能协议")
+        );
+        // info/refs 是 GET（无体），不流式
+        assert_eq!(
+            stream_decision(
+                &Method::GET,
+                "/fastgh/fgit.git/info/refs?service=git-receive-pack",
+                None
+            ),
+            None
+        );
+        // 声明超限（含 PUT 大文件场景）：必流式；上界内不流式
+        assert_eq!(
+            stream_decision(&Method::PUT, "/some/upload", Some(MAX_REPLAY_BODY as u64 + 1)),
+            Some("声明超限")
+        );
+        assert_eq!(
+            stream_decision(&Method::POST, "/api/x", Some(MAX_REPLAY_BODY as u64)),
+            None
+        );
+        // 未知体积（chunked）不流式：交给缓冲读满后转流式兜底
+        assert_eq!(stream_decision(&Method::POST, "/api/x", None), None);
+        // GET/HEAD 永不流式（无体）
+        assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
+        assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
     }
 }
