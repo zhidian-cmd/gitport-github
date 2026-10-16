@@ -385,22 +385,33 @@ async fn get_direct(
         return r;
     }
     // per-host 拨号单飞：并发请求同时未命中缓存时，只放一个进串发拨号，
-    // 其余在 host 锁上排队 —— 首拨成功入槽后，队列里的请求全部重查缓存
-    // 直走复用（一波页面 27 并发各自拨号的握手风暴 → 一拨全用）。
+    // 其余在 host 锁上排队 —— 首拨成功入槽后，队列里的请求全部放单飞、
+    // 锁外并发走复用（一波页面 27 并发各自拨号的握手风暴 → 一拨全用）。
+    // 教训（2026-10-16 实测）：锁只能罩"拨号等待"，缓存命中后的请求必须
+    // 放到锁外发 —— 原实现持锁直到响应头返回，冷启动单页 129 个并发请求
+    // 逐个排队、各占 ~250ms（一个 RTT），正是 34s FCP / 布局跳动的真凶。
     let dial_lock = upstream::host_dial_lock(host);
-    let _dial_guard = dial_lock.lock().await;
+    let mut guard = Some(dial_lock.lock().await);
     // 拿到锁后重查熔断：排队期间排在前面的请求可能已把该 host 拨到熔断
     // —— 否则队列里每个成员都会再烧一次 8s 黑洞预算（一波头像逐个 8s）
     if name == "edge" && is_content && pool::content_direct_open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    if let Some(r) = try_cached(
-        log, out, host, info, name, is_simple, is_content, &path, t0, body,
-    )
-    .await
-    {
-        return r;
+    // 首拨已被前面请求完成：立即放单飞，队列全员锁外并发复用
+    if upstream::cached_h2(host).is_some() {
+        guard.take();
+        if let Some(r) = try_cached(
+            log, out, host, info, name, is_simple, is_content, &path, t0, body,
+        )
+        .await
+        {
+            return r;
+        }
+        // 极端竞态：复用连接在查与发之间又死了 —— 重新拿锁落回串发拨号
+        guard = Some(dial_lock.lock().await);
     }
+    // 串发拨号期间持续持锁（单飞）；所有 return 路径上随函数结束释放
+    let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
         // 每 attempt 串发拨号 + h2 握手（boring Chrome 指纹 + 伪装/真名 SNI，
         // fresh 语义）：失败 attempt 的连接即弃，坏连接复用不可能发生；
