@@ -237,6 +237,16 @@ async fn mitm_http(
                     path_of(req.uri())
                 ));
             }
+            // 末路兜底: 系统 DNS 直连腿 —— 池表 IP 漂移(GitHub 边缘迁移,
+            // 如 2026-10 assets .154→.215)时按系统解析自愈。仅 GET/HEAD。
+            if is_simple {
+                match dns_direct_fetch(&log, &out_body, &host, &info, &replay).await {
+                    Ok(r) => return write_upstream(r, "dns", &info),
+                    Err(de) => {
+                        (log)(&format!("[MITM] {host}{path} DNS 直连腿也失败({de})"));
+                    }
+                }
+            }
             return mitm_unavailable(&req, &host);
         }
     };
@@ -607,6 +617,70 @@ code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decora
                 .map_err(|never| std::io::Error::other(never)),
         ))
         .unwrap()
+}
+// ---------- 系统 DNS 直连腿(末路兜底) ----------
+/// 串发池全灭且(内容域)镜像链也失败后, 按系统解析的当前 IP 真名 SNI 直拨
+/// —— GitHub 边缘 IP 迁移(如 2026-10 assets .154→.215)导致池表过期的自愈
+/// 路径: 系统解析拿到的就是当下有效的边缘。仅 GET/HEAD 调用(POST 不重发)。
+/// 成功后入连接缓存, 后续同 host 请求自动走复用快路径。
+async fn dns_direct_fetch(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    body: &Option<Bytes>,
+) -> Result<hyper::Response<BoxBody>, String> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|e| format!("系统 DNS 解析失败: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} 系统 DNS 无解析记录"));
+    }
+    (log)(&format!(
+        "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
+        addrs.len()
+    ));
+    for addr in addrs.iter().take(4) {
+        let ip = addr.ip().to_string();
+        let conn = match pool::dial::dial_one(host, &ip, pool::dial::MODE_SNI, true).await {
+            Ok(c) => c,
+            Err(e) => {
+                (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
+                continue;
+            }
+        };
+        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", log).await {
+            Ok(u) => u,
+            Err(e) => {
+                (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
+                continue;
+            }
+        };
+        let timed = tokio::time::timeout(
+            REQUEST_BUDGET,
+            upstream::h2_send(&up, build_request(out, body), body),
+        );
+        match timed.await {
+            Ok(Ok(resp)) => {
+                info.set(&ip);
+                upstream::store_h2(host, up); // 入缓存: 后续请求走复用快路径
+                (log)(&format!(
+                    "[DNS直连] {host}{} 新连接 {ip}, 成功",
+                    path_of(out.uri())
+                ));
+                return Ok(resp);
+            }
+            _ => {
+                upstream::drop_h2(host, &ip);
+                (log)(&format!("[DNS直连] {host} <- {ip} 请求失败, 换下个解析 IP"));
+            }
+        }
+    }
+    Err(format!(
+        "{host} 系统 DNS 直连腿全灭({} 个候选)",
+        addrs.len().min(4)
+    ))
 }
 // ---------- 镜像串行链：按链逐个用，禁并发竞速 ----------
 /// 镜像串行链：按 plans.json mirrors 板块的链序逐个取用（链头=校准出的

@@ -234,9 +234,9 @@ pub fn serial_pool(name: &str) -> bool {
 /// 本边缘主证书（2026-10-14 实测，推翻"按 SNI 路由证书"旧结论）：
 /// - .133 内容域边缘：伪装 SNI 会被边缘挂起（握手 OK 但 HTTP 0 回包），
 ///   只能真名；其主证书 SAN 覆盖 *.github.com/*.github.io/*.githubusercontent.com
-/// - .153(.io)/.154(.assets)：伪装 SNI HTTP 正常 —— ClientHello 不暴露 github
-///   域名，GFW 无法按 SNI 阻断（raw 真名被 RST 即前车之鉴），主证书 SAN
-///   恰好覆盖各自域族，按真 host 校验照常通过
+/// - .153(.io)/.154/.215(.assets, 2026-10 GitHub 迁移的新代边缘)：伪装 SNI
+///   HTTP 正常 —— ClientHello 不暴露 github 域名，GFW 无法按 SNI 阻断
+///   （raw 真名被 RST 即前车之鉴），主证书 SAN 恰好覆盖各自域族，按真 host 校验照常通过
 /// 其余（GitHub 主站边缘，含 auth 主机）伪装 —— 任意 SNI 返覆盖真名的证书。
 /// 用于种子展开与旧表空/legacy 值归一；表内显式写法优先（Fastly 三段除外，
 /// 见 serial_load —— 形态由边缘行为决定，显式写法对它们无意义）。
@@ -279,15 +279,16 @@ fn host_family(host: &str) -> &'static str {
 }
 
 /// 条目是否服务该 host：
-/// - Fastly 三族 host 只认对应末段的条目（形态跟随条目：.133 真名、
-///   .153/.154 伪装，均为该边缘实测可用形态）
+/// - Fastly 各族 host 只认对应末段的条目（形态跟随条目：.133 真名、
+///   .153/.215/.154 伪装，均为该边缘实测可用形态；assets 族 2026-10 起
+///   GitHub 迁至 .215 新边缘，.154 旧边缘保留兼容）
 /// - 其余 host（主站/auth）只认非 Fastly 段的伪装条目
 /// 不对口的条目跳过（不试也不垫底）——否则每类请求都会把另一类 IP
 /// 试败垫底，排序永远 ping-pong。
 fn entry_serves(host: &str, p: &SerialPlan) -> bool {
     match host_family(host) {
         "content" => fastly_last_octet(&p.ip) == Some("133"),
-        "assets" => fastly_last_octet(&p.ip) == Some("154"),
+        "assets" => matches!(fastly_last_octet(&p.ip), Some("154") | Some("215")),
         "io" => fastly_last_octet(&p.ip) == Some("153"),
         _ => fastly_last_octet(&p.ip).is_none() && plan_mode(&p.sni) != plan_mode(dial::MODE_SNI),
     }
@@ -983,6 +984,16 @@ mod tests {
         assert!(entry_serves(
             "octocat.github.io",
             &mk("185.199.108.153", dial::MODE_SNI)
+        ));
+        // .215 新代 assets 边缘(2026-10 GitHub 迁移): 伪装, 只服务 assets 族
+        assert_eq!(shape_for_ip("185.199.108.215"), "baidu.com");
+        assert!(entry_serves(
+            "github.githubassets.com",
+            &mk("185.199.108.215", "baidu.com")
+        ));
+        assert!(!entry_serves(
+            "avatars.githubusercontent.com",
+            &mk("185.199.110.215", "baidu.com")
         ));
         // 非 Fastly 族 host 只认非 Fastly 段的伪装条目
         assert!(entry_serves(

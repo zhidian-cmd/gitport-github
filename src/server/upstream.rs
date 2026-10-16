@@ -57,8 +57,31 @@ pub fn drop_h2(host: &str, ip: &str) {
         g.remove(host);
     }
 }
-/// 串发拨号 + h2 握手（boring 拨号 ALPN 已协商 h2）。连接驱动 future 必须
-/// 常驻 —— spawn 到后台直到连接自然结束。
+/// 已拨好的连接(Dialed) → h2 握手。连接驱动 future 必须常驻 —— spawn 到
+/// 后台直到连接自然结束。dial_h2(串发腿)与 dns_direct_fetch(系统 DNS 兜底
+/// 腿)共用。
+pub async fn h2_from_dialed(
+    host: &str,
+    conn_io: Dialed,
+    ip: &str,
+    form: &str,
+    log: &LogFn,
+) -> Result<H2Upstream, String> {
+    let (send, conn) = h2::client::handshake(conn_io)
+        .await
+        .map_err(|e| format!("h2 握手失败: {e}"))?;
+    tokio::spawn(async move {
+        let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
+    });
+    (log)(&format!(
+        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手)"
+    ));
+    Ok(H2Upstream {
+        ip: ip.to_string(),
+        send,
+    })
+}
+/// 串发拨号 + h2 握手（boring 拨号 ALPN 已协商 h2）。
 pub async fn dial_h2(
     pool_name: &str,
     host: &str,
@@ -73,16 +96,7 @@ pub async fn dial_h2(
     } else {
         "伪装"
     };
-    let (send, conn) = h2::client::handshake(conn_io)
-        .await
-        .map_err(|e| format!("h2 握手失败: {e}"))?;
-    tokio::spawn(async move {
-        let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
-    });
-    (log)(&format!(
-        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手)"
-    ));
-    Ok(H2Upstream { ip, send })
+    h2_from_dialed(host, conn_io, &ip, form, log).await
 }
 /// 在自管 h2 连接上发一次请求：请求头从 out 重建, 体按 replay 注入
 /// （SendStream 发送, 不阻塞连接复用）。响应体 RecvStream 转 BoxBody,
