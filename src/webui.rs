@@ -181,7 +181,7 @@ fn pac_script() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "// Viaduct 分流 PAC —— 由工作台按开关动态生成, 勿手改\n\
+        "// GitPort GitHub 分流 PAC —— 由工作台按开关动态生成, 勿手改\n\
 function FindProxyForURL(url, host) {{\n\
   if (fpMatch((host + '').toLowerCase())) return '{proxy}; DIRECT';\n\
   return 'DIRECT';\n\
@@ -210,8 +210,7 @@ async fn proxy_pac() -> Response {
 }
 
 #[derive(Serialize)]
-// 键名与 Go 版 /api/status 一致(camelCase)：前端 index.html/app.js 是 Go 原样
-// 复制，读 s.domainCount —— Rust 曾输出 domain_count(snake) 导致前端显示 undefined。
+// 键名 camelCase：前端读 s.domainCount —— 曾输出 domain_count(snake) 导致前端显示 undefined。
 #[serde(rename_all = "camelCase")]
 struct StatusResp {
     version: String,
@@ -328,7 +327,7 @@ async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBod
 }
 
 #[derive(Serialize)]
-// 键名与 Go 版 /api/settings 一致(camelCase)：前端读 s.closeToTray / s.githubPAC。
+// 键名 camelCase：前端读 s.closeToTray / s.githubPAC。
 #[serde(rename_all = "camelCase")]
 struct SettingsResp {
     autostart: bool,

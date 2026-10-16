@@ -4,8 +4,6 @@
 //!   （Fastly 边缘真名 / 主站与 auth 伪装），证书按目标 host 校验（解耦见
 //!   pool/dial.rs）。每请求经串发表新拨号（fresh 语义）。
 //! - 镜像腿：标准 TLS + h1 直拨，无表无阶梯。
-//!
-//! Go 版 http2.Transport + DialTLSContext 语义一致：连接层完全自定义。
 use crate::pool::{self, dial::Dialed, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;

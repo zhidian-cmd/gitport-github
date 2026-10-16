@@ -443,7 +443,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         dirty: false,
     };
     // 遍历已知池（而非文件里的键）：文件缺池/被旧 exe 误清时用种子补齐，
-    // 防"串发表为空"（Go 0f02257 拆 api 池后的自愈语义）。文件为准，不做
+    // 防"串发表为空"。文件为准，不做
     // 种子归属剔除；种子结构变更时删 plans.json 重建（2026-10-13 决定）。
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
@@ -894,7 +894,7 @@ mod tests {
 
     fn tmpdir() -> PathBuf {
         let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("gkl_test_{}_{n}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("gitport_test_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

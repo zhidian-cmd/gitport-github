@@ -4,7 +4,7 @@
 //! + BoringSSL 默认套件序 = Chrome 同款指纹（JA3/JA4 不再像库实现）。
 //! 选型：Rust 生态无 utls 绑定（rquest 全 yanked、wreq 无法解耦"拨号 IP"与
 //! "SNI"——本项目生命线），故用 boring（cloudflare/boring 4.22）自建三形态
-//! 握手，语义同 Go 版 DialOne。
+//! 握手。
 
 use crate::config::CONNECT_TIMEOUT_SECS;
 use boring::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
@@ -94,8 +94,8 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg)
 }
 
-/// 系统根证书（X509 列表，进程内一次加载）。等价 Go 的 x509.SystemCertPool 与
-/// rustls 版 system_roots。单条解析失败跳过不放大（一颗坏证书不再废掉整池）；
+/// 系统根证书（X509 列表，进程内一次加载）。
+/// 单条解析失败跳过不放大（一颗坏证书不再废掉整池）；
 /// 全部失败返回 None（调用方回退 set_default_verify_paths）。
 fn system_root_certs() -> Option<&'static [X509]> {
     static CERTS: std::sync::OnceLock<Option<Vec<X509>>> = std::sync::OnceLock::new();
@@ -185,7 +185,7 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
 }
 
 /// 对已建立的 TCP 连接按形态完成 BoringSSL 握手（Chrome 指纹）。
-/// 末尾强制断言协商出 h2（对照 Go dialOne 的 ALPN 检查）。
+/// 末尾强制断言协商出 h2。
 pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
     let ssl = client_ssl(host, mode, None)?;
     let tls = tokio::time::timeout(
@@ -269,7 +269,7 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
 }
 
 /// 系统根证书（rustls 版，供 certgen 测试的 rustls 客户端验证 MITM 证书）。
-/// 加载失败时退回空池（连接会因证书校验失败而快速失败，与 Go 版一致）。
+/// 加载失败时退回空池（连接会因证书校验失败而快速失败）。
 #[cfg(test)]
 pub fn system_roots() -> Arc<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
@@ -283,7 +283,7 @@ pub fn system_roots() -> Arc<rustls::RootCertStore> {
     Arc::new(roots)
 }
 
-/// 供 mitm 上游构造 http 请求时使用（host-only 解析用，等价 Go net.SplitHostPort）。
+/// 供 mitm 上游构造 http 请求时使用（host-only 解析）。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,7 +343,7 @@ mod tests {
     fn acceptor_for(chain_pem: &str, key_pem: &str) -> SslAcceptor {
         let dir = std::env::temp_dir();
         let chain_path = dir.join(format!(
-            "gh_link_test_chain_{}_{}.pem",
+            "gitport_test_chain_{}_{}.pem",
             std::process::id(),
             tmp_seq()
         ));

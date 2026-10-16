@@ -109,14 +109,14 @@ pub fn tls_config_of(a: &Arc<Authority>) -> Arc<rustls::ServerConfig> {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    // schannel(curl/git, Windows) 的会话恢复票据与 Go 服务端互操作会报 bad record MAC，
+    // schannel(curl/git, Windows) 的会话恢复票据与本服务端互操作会报 bad record MAC，
     // 禁用票据/PSK 恢复：每次全新握手，换取稳定。
     cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     Arc::new(cfg)
 }
 
-/// 加载 dir 下 ca.crt/ca.key；不存在则生成（CN=Viaduct Root，10 年）。
-/// 优先兼容 Go 版遗留 CA（PEM: CERTIFICATE + EC PRIVATE KEY）。
+/// 加载 dir 下 ca.crt/ca.key；不存在则生成（CN=GitPort Root，10 年）。
+/// 兼容 SEC1 旧格式 CA（PEM: CERTIFICATE + EC PRIVATE KEY）。
 pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
@@ -131,7 +131,7 @@ pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
 fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| e.to_string())?;
     let key_pem = std::fs::read_to_string(key_path).map_err(|e| e.to_string())?;
-    // 新 Rust CA = PKCS#8("PRIVATE KEY")；Go 遗留 = SEC1("EC PRIVATE KEY") → 转 PKCS#8
+    // 本程序 CA = PKCS#8("PRIVATE KEY")；旧格式 = SEC1("EC PRIVATE KEY") → 转 PKCS#8
     let ca_key = KeyPair::from_pem(&key_pem)
         .or_else(|_| {
             sec1_to_pkcs8(&key_pem).and_then(|der| {
@@ -160,7 +160,7 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     }))
 }
 
-/// SEC1 "EC PRIVATE KEY" PEM → PKCS#8 DER（兼容 Go 版 ca.key）。
+/// SEC1 "EC PRIVATE KEY" PEM → PKCS#8 DER（兼容旧格式 ca.key）。
 /// PKCS#8 包装：PrivateKeyInfo { version=0, algorithm=ecPublicKey(P-256),
 /// privateKey=OCTET STRING(SEC1) }。DER 结构固定，手工 TLV 编码。
 fn sec1_to_pkcs8(pem: &str) -> Result<Vec<u8>, String> {
@@ -230,10 +230,10 @@ fn generate() -> Result<Arc<Authority>, String> {
     let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "Viaduct Root");
+        .push(rcgen::DnType::CommonName, "GitPort Root");
     params
         .distinguished_name
-        .push(rcgen::DnType::OrganizationName, "viaduct");
+        .push(rcgen::DnType::OrganizationName, "gitport-github");
     params.not_before = now - time::Duration::hours(1);
     params.not_after = now + time::Duration::days(3650); // 10 年
     params.key_usages = vec![
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn ca_generate_and_leaf() {
-        let dir = std::env::temp_dir().join(format!("gkl_cert_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitport_cert_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = load_or_generate(&dir).unwrap();
         assert!(!a.cert_der.is_empty());
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn sec1_conversion() {
-        // 用 rcgen 生成 P-256 密钥 → 手工构造 SEC1 PEM 模拟 Go 版 → 转换回 PKCS#8 可读
+        // 用 rcgen 生成 P-256 密钥 → PKCS#8 DER 往返解析一致
         let kp = KeyPair::generate().unwrap();
         let pkcs8 = kp.serialize_der();
         let kp2 = KeyPair::from_pkcs8_der_and_sign_algo(
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn tls_config_ok() {
-        let dir = std::env::temp_dir().join(format!("gkl_tls_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitport_tls_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = load_or_generate(&dir).unwrap();
         let _cfg = tls_config_of(&a);
@@ -323,7 +323,7 @@ mod tests {
     // 集成：本地起 TLS 服务 + rustls 客户端握手，验证按 SNI 出证书
     #[tokio::test(flavor = "multi_thread")]
     async fn mitm_handshake_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("gkl_hs_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = load_or_generate(&dir).unwrap();
         let cfg = tls_config_of(&a);

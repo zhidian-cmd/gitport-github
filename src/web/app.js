@@ -1,4 +1,4 @@
-/* Viaduct 工作台前端: 状态轮询 + 连通性探针 + 日志增量 + 规则/池/设置管理。
+/* GitPort GitHub 工作台前端: 状态轮询 + 连通性探针 + 日志增量 + 规则/池/设置管理。
    所有开关一律由状态对象 S 驱动, 不解析按钮文字(双击/慢响应下会串状态)。 */
 const $ = id => document.getElementById(id);
 let logSeq = 0;

@@ -1,4 +1,4 @@
-# Viaduct —— GitHub 加速器 · 跨站加速代理
+# GitPort GitHub —— GitHub 加速器 · 跨站加速代理
 
 **中国大陆访问 GitHub 的本地加速器 —— 免插件、免服务器、后台仅 12MB。**
 clone、push、Release 下载、raw 文件、头像、网页浏览全场景加速，其余网站流量完全不受影响。
@@ -17,7 +17,7 @@ clone、push、Release 下载、raw 文件、头像、网页浏览全场景加�
 
 | 方案 | 免插件 | 免服务器/账号 | clone/push | 后台占用 | 只碰 GitHub |
 |---|---|---|---|---|---|
-| **Viaduct** | ✅ PAC 一键 | ✅ | ✅ | ~12MB | ✅ |
+| **GitPort GitHub** | ✅ PAC 一键 | ✅ | ✅ | ~12MB | ✅ |
 | 改 hosts | ✅ | ✅ | 部分 | — | ✅ 但 IP 失效即瘫 |
 | gh-proxy 网页镜像 | — | 靠第三方 | ✗ | — | — |
 | Watt Toolkit | ✅ | ✅ | 部分 | 较高 | ✅（多站点） |
@@ -25,7 +25,7 @@ clone、push、Release 下载、raw 文件、头像、网页浏览全场景加�
 
 ## 快速上手（3 步）
 
-1. 双击 `viaduct.exe`（或 `.\viaduct.exe -tray` 驻留托盘）
+1. 双击 `gitport-github.exe`（或 `.\gitport-github.exe -tray` 驻留托盘）
 2. 首次启动在 exe 同目录生成：`ca.crt`/`ca.key`（MITM 证书）、`plans.json`（IP 表）、`settings.json`（开关）
 3. 浏览器直接用；或开「GitHub 分流接管」开关（写系统 PAC，免插件）
 
@@ -79,8 +79,7 @@ MITM 开着但本地根证书未装/浏览器未重启。WebUI 开关自动 cert
 <details>
 <summary>和别的代理/工具端口冲突？</summary>
 
-默认占 7810（代理）+ 7811（WebUI）。用 `.\viaduct.exe -port 7812 -webui 7813` 换端口；
-与旧版 free_proxy.exe 的互斥锁各自独立，不会互踩。
+默认占 7810（代理）+ 7811（WebUI）。用 `.\gitport-github.exe -port 7812 -webui 7813` 换端口即可。
 </details>
 
 <details>
@@ -133,7 +132,7 @@ flowchart TD
     F -->|"否"| G["直连串发<br/>.133 真名SNI, 其余伪装<br/>一圈全灭 → 熔断120s + 回落镜像链"]
     D -->|"主站 / api / auth 主机"| H["直连串发 + gh_defuse<br/>拦截页垫底换IP, 试到全表"]
     D -->|"objects-origin.* 上传域"| Z2["例外: 纯透传, 不过 MITM 不过镜像<br/>(经镜像会弄坏上传)"]
-    E --> R["写回浏览器: 剥 hop-by-hop 头<br/>注入 X-FP-Route / X-FP-Upstream 诊断头"]
+    E --> R["写回浏览器: 剥 hop-by-hop 头<br/>注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
     E2 --> R
     G --> R
     S --> R
@@ -307,10 +306,10 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 ### 命令行参数
 
 ```powershell
-.\viaduct.exe            # 默认：桌面壳 + 托盘
-.\viaduct.exe -headless  # 无窗口：只跑代理 + 管理页面
-.\viaduct.exe -tray      # 开机自启用：直接驻留托盘
-.\viaduct.exe -port 7812 -webui 7813   # 与其他实例共存时换端口
+.\gitport-github.exe            # 默认：桌面壳 + 托盘
+.\gitport-github.exe -headless  # 无窗口：只跑代理 + 管理页面
+.\gitport-github.exe -tray      # 开机自启用：直接驻留托盘
+.\gitport-github.exe -port 7812 -webui 7813   # 与其他实例共存时换端口
 ```
 
 ### plans.json 手改指南
@@ -376,7 +375,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 ## 构建与验证
 
 ```powershell
-cargo build --release   # 产物 target\release\viaduct.exe（连同 assets\icon.ico 即为 dist）
+cargo build --release   # 产物 target\release\gitport-github.exe（连同 assets\icon.ico 即为 dist）
 cargo test              # TLS 握手探针、迁移归一、轮换 no-op 等行为契约
 ```
 

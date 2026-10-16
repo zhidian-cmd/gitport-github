@@ -2,7 +2,7 @@
 //! 不生成 ACL —— 文件缺省继承所在目录 ACL，同机其他账户/进程可读。
 //! ca.key（MITM 根私钥）/settings.json 属敏感本地数据，落盘后收紧为
 //! 仅当前用户与 SYSTEM：根私钥一旦可读，同机进程即可伪造用户已信任的
-//! "Viaduct Root" 叶子证书对用户实施中间人。
+//! "GitPort Root" 叶子证书对用户实施中间人。
 
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};

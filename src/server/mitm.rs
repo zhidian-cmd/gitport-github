@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 // 镜像腿响应头预算：8s 内必须出响应头，头一到即解除，体不限。
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(8);
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
-// Go 0f02257：ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
+// ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
 // 条件只有"拿到正常页"或"串发全灭"。
 /// release 附件与源码包路径（/releases/download、/archive）一律走镜像；
 /// git 智能协议路径不在此列 —— 镜像不认，必须走 core 池直连（伪装 SNI）。
@@ -112,7 +112,7 @@ pub async fn handle_connect_mitm(
     }
 }
 // ---------- MITM HTTP 处理 ----------
-/// 记录本次实际使用的上游边缘 IP，响应头暴露(X-FP-Upstream 排障)。
+/// 记录本次实际使用的上游边缘 IP，响应头暴露(X-GitPort-Upstream 排障)。
 #[derive(Default, Clone)]
 struct UpstreamInfo {
     ip: Arc<Mutex<String>>,
@@ -131,7 +131,7 @@ async fn mitm_http(
 ) -> axum::response::Response<BoxBody> {
     // host 优先取 URI authority（h2 :authority / 代理形式绝对 URL）；
     // CONNECT 隧道内的 h1 请求是 origin-form（GET /），URI 无 host ——
-    // 回退 Host 头（Go 版 r.Host 同源语义，2026-10-13 实测隧道内 502 根因）。
+    // 回退 Host 头（2026-10-13 实测隧道内 502 根因）。
     let host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
@@ -505,7 +505,7 @@ async fn try_cached(
 }
 /// 直连串发 = 完整请求逐个试：响应头到手 = 成功连（该 IP 置顶）；超时/
 /// 黑洞 = 垫底换下一个；上限 24 防病态；POST 等非简单方法不重发。
-/// fresh 语义对照 Go 1f8bf6c：每 attempt 新拨号（坏 IP 连接不缓存），
+/// fresh 语义：每 attempt 新拨号（坏 IP 连接不缓存），
 /// 垫底后下一 attempt 必然换 IP —— "垫底换 IP"真实生效。
 async fn get_direct(
     log: &LogFn,
@@ -662,7 +662,7 @@ async fn gh_defuse(
     let name = pool::pool_for(host);
     let is_simple = true;
     let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
-    // Go 0f02257 升级(用户裁定)：不冷静、试到全表 —— 检测出 Whoa 就换 IP 试到底，
+    // 不冷静、试到全表(用户裁定) —— 检测出 Whoa 就换 IP 试到底，
     // 串发表每个候选都要试过才算数。终止条件只有两个：重试拿到正常页(交付)、
     // 或串发给不出新连接(全灭 → retry 报错，交回最后响应)。中间任一个候选返回
     // 正常页即交付成功，绝不无谓冷静。
@@ -691,7 +691,7 @@ async fn gh_defuse(
                                                // 白烧一次完整往返, 搜索/进仓库全部变慢)
         upstream::drop_h2(host, &ip);
         // 2026-10-14 起直连腿每请求新拨号(fresh), 无共享连接池可丢 ——
-        // 垫底后下一 attempt 的 serial_dial 必然跳过该 IP(Go 1f8bf6c 语义)
+        // 垫底后下一 attempt 的 serial_dial 必然跳过该 IP
         tried += 1;
         (log)(&format!(
             "[MITM] {host} 边缘 {ip} 返回风控拦截页, 垫底换 IP 重试({tried})"
@@ -702,7 +702,7 @@ async fn gh_defuse(
         };
     }
 }
-/// 把上游响应写回浏览器：剔除 hop-by-hop 头，注入 X-FP-Route / X-FP-Upstream
+/// 把上游响应写回浏览器：剔除 hop-by-hop 头，注入 X-GitPort-Route / X-GitPort-Upstream
 /// 诊断头；嗅探读出的前缀字节拼回响应体前端。
 fn write_upstream(
     resp: hyper::Response<BoxBody>,
@@ -715,13 +715,13 @@ fn write_upstream(
     if !route.is_empty() {
         parts
             .headers
-            .insert("x-fp-route", HeaderValue::from_str(route).unwrap());
+            .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
     }
     let ip = info.get();
     if !ip.is_empty() {
         parts
             .headers
-            .insert("x-fp-upstream", HeaderValue::from_str(&ip).unwrap());
+            .insert("x-gitport-upstream", HeaderValue::from_str(&ip).unwrap());
     }
     let prefix = parts
         .extensions

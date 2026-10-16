@@ -80,7 +80,7 @@ fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> 
         .map_err(|e| e.to_string())?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Viaduct")
+        .with_tooltip("GitPort GitHub")
         .with_icon(load_icon())
         .build()
         .map_err(|e| e.to_string())?;
@@ -90,7 +90,7 @@ fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true(调用方直接退出)。
 /// mutex 的 HANDLE 必须存活到进程退出（Windows 关闭最后一个 handle 即销毁
 /// mutex），而 windows crate 的 HANDLE 带 Drop —— 故存 static 锚住（字段
-/// 故意永不读，进程退出由 OS 清理），等价 Go 版 runtime.KeepAlive(mu)。
+/// 故意永不读，进程退出由 OS 清理）。
 /// 否则二次启动放行、双实例抢 7810（2026-10-13 实测）。
 #[allow(dead_code)]
 struct SingleMutexHandle(windows::Win32::Foundation::HANDLE);
@@ -103,7 +103,7 @@ pub fn already_running() -> bool {
     use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
-    let r = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\viaduct")) };
+    let r = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\gitport-github")) };
     match r {
         Ok(h) => {
             *SINGLE_MUTEX.lock().unwrap() = Some(SingleMutexHandle(h));
@@ -111,8 +111,8 @@ pub fn already_running() -> bool {
         }
         Err(err) => {
             if err.code() == windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) {
-                let text = windows::core::w!("Viaduct 已在运行(请看系统托盘)。");
-                let title = windows::core::w!("Viaduct");
+                let text = windows::core::w!("GitPort GitHub 已在运行(请看系统托盘)。");
+                let title = windows::core::w!("GitPort GitHub");
                 unsafe {
                     let _ = MessageBoxW(
                         None,
@@ -148,7 +148,7 @@ fn create_window(
         return true;
     }
     let window = match WindowBuilder::new()
-        .with_title("Viaduct")
+        .with_title("GitPort GitHub")
         .with_inner_size(tao::dpi::LogicalSize::new(WIN_W, WIN_H))
         .build(elwt)
     {

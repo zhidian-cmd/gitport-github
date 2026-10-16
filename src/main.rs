@@ -1,8 +1,8 @@
-// Viaduct —— 多站点加速代理工作台(Rust 版, 前身 FreeProxy/github_link 串发版)。
+// GitPort GitHub —— 多站点加速代理工作台。
 // 桌面框架: tao 原生窗口 + wry(WebView2 渲染 WebUI) + tray-icon 系统托盘。
 // 代理 127.0.0.1:7810 + WebUI http://127.0.0.1:7811(窗口加载该地址, 无 WebView2 时回退浏览器)。
 // 启动参数: -tray 直接驻留托盘不开窗(开机自启用), -headless 只跑代理+WebUI,
-// -port N 覆盖代理端口, -webui N 覆盖 WebUI 端口(与 Go 版共存时避开 7810/7811)。
+// -port N 覆盖代理端口, -webui N 覆盖 WebUI 端口(与其他实例共存时避开 7810/7811)。
 // Windows 子系统: release 双击运行无控制台黑框(日志走文件+WebUI 环形缓冲,
 // 崩溃取证走 crash.log); headless 仍可用命令行重定向观察 stdout。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -47,7 +47,7 @@ fn run() {
     logger::set_crash_path(&exe_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
-    // 兜底（对照 Go 0f02257）：run 任何正常返回路径（含窗口循环 return / headless
+    // 兜底：run 任何正常返回路径（含窗口循环 return / headless
     // 信号）都再还原一次系统代理。on_quit 已先清，此处幂等无害；端口无关：任何
     // 127.0.0.1 的 /proxy.pac 残留（含崩溃/被杀遗留）都会被清掉。
     // 注意：panic/abort 不走本 defer，但崩溃后下次启动 heal_stale_proxy 兜底。
@@ -56,7 +56,7 @@ fn run() {
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "-headless");
     let tray_mode = args.iter().any(|a| a == "-tray");
-    // 端口覆盖：仅命令行显式给才改默认（与 Go 版共存测试时避开 7810/7811）
+    // 端口覆盖：仅命令行显式给才改默认（避开其他实例占用的默认端口）
     if let Some(p) = arg_value(&args, "-port") {
         config::set_proxy_port(p);
     }

@@ -1,14 +1,14 @@
 [package]
-name = "viaduct"
+name = "gitport-github"
 version = "0.1.0"
 edition = "2021"
-description = "多站点加速代理工作台 —— 串发表驱动的本地加速代理（前身 github_link / FreeProxy）"
+description = "GitHub 加速器 —— 串发表驱动的本地加速代理"
 license = "Apache-2.0"
 # 建仓后取消注释并填实际地址:
-# repository = "https://github.com/<account>/viaduct"
+# repository = "https://github.com/<account>/gitport-github"
 
 [[bin]]
-name = "viaduct"
+name = "gitport-github"
 path = "src/main.rs"
 
 [dependencies]

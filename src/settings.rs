@@ -8,9 +8,7 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE: &str = "Viaduct";
-/// 更名前的旧自启动键：写/删新键时顺手清掉，防双自启残留。
-const RUN_VALUE_LEGACY: &str = "ProxyWorkbench";
+const RUN_VALUE: &str = "gitport-github";
 const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 struct SettingsState {
@@ -22,7 +20,6 @@ struct SettingsState {
     // our_pac 本程序当前写入的 PAC 地址(持久化到 settings.json)：清理/自愈时
     // 用来精确判定"AutoConfigURL 是不是我们设的"，避免把用户自己的配置或我们的
     // 旧残留误判。端口无关兜底见 is_our_pac 的 localhost 正则。
-    // 对照 Go 0f02257「代理接管(PAC)清理强化」。
     our_pac: Mutex<String>,
 }
 
@@ -86,7 +83,7 @@ fn get_auto_config_url(key: &RegKey) -> String {
 
 /// 本程序设置的 PAC 兜底形态：仅本程序在 127.0.0.1 提供 /proxy.pac，端口无关
 /// —— 覆盖端口曾变化/旧版残留等场景，让清理与自愈不依赖精确端口匹配。
-/// 严格等价 Go 0f02257 的 localhostPACRE：`^https?://127\.0\.0\.1:\d+/proxy\.pac$`。
+/// 等价正则 `^https?://127\.0\.0\.1:\d+/proxy\.pac$`。
 fn is_our_pac_like(cur: &str) -> bool {
     let cur = cur.trim();
     let Some(rest) = cur
@@ -100,7 +97,7 @@ fn is_our_pac_like(cur: &str) -> bool {
     };
     let hostport = &rest[..idx];
     let Some((host, port)) = hostport.rsplit_once(':') else {
-        return false; // 必须带端口（Go regex :\d+）
+        return false; // 必须带端口
     };
     if host != "127.0.0.1" {
         return false;
@@ -112,7 +109,7 @@ fn is_our_pac_like(cur: &str) -> bool {
 }
 
 /// 给定 AutoConfigURL 是否本程序设置：精确匹配持久化的 our_pac，或兜底匹配
-/// 127.0.0.1 的 /proxy.pac 形态。空串返回 false。对照 Go 0f02257 isOurPAC。
+/// 127.0.0.1 的 /proxy.pac 形态。空串返回 false。
 pub fn is_our_pac(cur: &str) -> bool {
     if cur.trim().is_empty() {
         return false;
@@ -125,7 +122,7 @@ pub fn is_our_pac(cur: &str) -> bool {
 }
 
 /// 广播代理设置变更，让 Edge/Chrome 等立即生效（免重启浏览器）。
-/// 与 Go 版一致：LazyDLL 动态加载 wininet.dll（不依赖静态链接）。
+/// 动态加载 wininet.dll（不依赖静态链接）。
 fn refresh_wininet() {
     use windows::core::{s, w};
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -160,7 +157,7 @@ fn refresh_wininet() {
 }
 
 /// 按开关状态接管/还原系统代理（幂等，代理运行中调用）。
-/// 对照 Go 0f02257：只备份用户自己的配置（旧残留若也是我们设的，不当成
+/// 只备份用户自己的配置（旧残留若也是我们设的，不当成
 /// "用户原配置"备份 —— 否则污染 proxyBackup 导致自愈时把死端口 PAC 当原
 /// 配置还原而非删除，直观表现为"pac 越积越多 / 退出还生效"）。
 pub fn ensure_system_proxy() {
@@ -187,7 +184,7 @@ pub fn ensure_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// RAII 兜底（对照 Go 0f02257 的 `defer settings.RemoveSystemProxy()`）：
+/// RAII 兜底：
 /// main 正常返回路径（窗口循环 return / headless）都经过本 guard 的 drop 再
 /// 还原一次系统代理；幂等无害。panic/abort 不走 drop，崩溃后由下次启动的
 /// heal_stale_proxy 兜底。
@@ -277,10 +274,8 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 // ---------- settings.json ----------
 
 #[derive(Serialize, Deserialize)]
-// 字段名与 Go 版 settings.json 完全一致(camelCase)：用户机器上可能留有
-// Go 版写出的 settings.json(closeToTray/mitm/winRect/githubPAC/proxyBackup/ourPAC)，
-// 移植版必须能读——之前漏 rename 导致 Go 遗留文件 serde 反序列化失败、
-// 静默回退全部默认值(MITM 开关失效, 2026-10-13 实测)。
+// 字段名(camelCase)即 settings.json 的既有落盘格式，不可改：漏 rename 会让
+// 已有文件 serde 反序列化失败、静默回退全部默认值(MITM 开关失效, 2026-10-13 实测)。
 #[serde(rename_all = "camelCase")]
 struct SettingsFile {
     close_to_tray: bool,
@@ -292,10 +287,10 @@ struct SettingsFile {
     groups: std::collections::HashMap<String, bool>, // 旧版键（多开关时代），读出后并入，写盘不再产出
     #[serde(default)]
     proxy_backup: String,
-    // 键名与 Go 版一致：Go save 显式写 "ourPAC"(PAC 全大写, 非 camelCase 的 ourPac)，
-    // 缺 rename 会写出 ourPac → Go 版读不到(双向兼容破坏)
+    // 键名显式写 "ourPAC"(PAC 全大写, 非 camelCase 的 ourPac)：既有落盘即此形，
+    // 缺 rename 会写出 ourPac → 已有文件读不到
     #[serde(default, rename = "ourPAC")]
-    our_pac: String, // 对照 Go 0f02257：持久化"我们当前写入的 PAC"用于端口无关自识别
+    our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
 }
 
 /// 从 exe 同目录 settings.json 恢复设置，程序启动时调用一次。
@@ -411,7 +406,6 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     } else {
         let _ = key.delete_value(RUN_VALUE);
     }
-    let _ = key.delete_value(RUN_VALUE_LEGACY); // 旧键名残留清理(更名前版本)
     Ok(())
 }
 
@@ -437,8 +431,7 @@ mod tests {
         assert_eq!(parse_exe_path("   "), None);
     }
 
-    // 对照 Go 0f02257 settings_windows_test.go TestIsOurPAC：端口无关自识别。
-    // 本程序写出的 PAC 形态（任意端口）都算"我们的"；用户自己的配置不算。
+    // 端口无关自识别：本程序写出的 PAC 形态（任意端口）都算"我们的"；用户自己的配置不算。
     #[test]
     fn is_our_pac_port_agnostic() {
         // 精确匹配持久化的 ourPAC 形态
@@ -454,6 +447,6 @@ mod tests {
         assert!(!is_our_pac_like(""));
         assert!(!is_our_pac_like("socks5://127.0.0.1:7811/proxy.pac"));
         assert!(!is_our_pac_like("http://127.0.0.1:78a1/proxy.pac")); // 端口非数字
-        assert!(!is_our_pac_like("http://127.0.0.1:7811/proxy.pac?x=1")); // 严格等 Go regex
+        assert!(!is_our_pac_like("http://127.0.0.1:7811/proxy.pac?x=1"));
     }
 }

@@ -1014,6 +1014,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitport-github"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "boring",
+ "bytes",
+ "embed-resource",
+ "futures-util",
+ "h2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tao",
+ "time",
+ "tokio",
+ "tokio-boring",
+ "tokio-rustls",
+ "tokio-util",
+ "tower-service",
+ "tray-icon",
+ "windows",
+ "winreg",
+ "wry",
+]
+
+[[package]]
 name = "glib"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3155,41 +3190,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "viaduct"
-version = "0.1.0"
-dependencies = [
- "axum",
- "boring",
- "bytes",
- "embed-resource",
- "futures-util",
- "h2",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "image",
- "rcgen",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "tao",
- "time",
- "tokio",
- "tokio-boring",
- "tokio-rustls",
- "tokio-util",
- "tower-service",
- "tray-icon",
- "windows",
- "winreg",
- "wry",
-]
 
 [[package]]
 name = "vswhom"
