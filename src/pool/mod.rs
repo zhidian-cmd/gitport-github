@@ -1,15 +1,12 @@
 //! 串发拨号：plans.json 是唯一权威，纯粹按表重试。
 //!
 //! - 元素 {ip, sni}; sni 形态按 IP 族定(见 shape_for_ip)，SNI 与校验名解耦
-//! - 排序: 成功(ok)该 IP 置顶, 失败(拨号错/零回包/拦截页)垫底
+//! - 排序: 成功(ok)置顶, 失败(拨号错/零回包/拦截页)垫底; 同 IP 重复置顶是
+//!   no-op 不写盘不打日志 —— 否则每个成功响应都重写 plans.json
 //! - 全灭: 冷却 30s 快速失败, 不自动拉源 —— 表内容只靠手改维护
 //! - 仅顺序真变更才写盘(2s 内原子写回); 文件可随时手改(改完重启生效)
-//!   —— 同 IP 重复置顶是 no-op, 不写不打日志: 否则每个成功响应都重写
-//!   plans.json, 表现为"没流量文件也在不断轮换"
-//!
-//! 覆盖: core/api/edge 三池(均直连)。edge 为混合池(auth 主机 + Fastly 静态
-//! 边缘: .133 内容域真名 / .153 .io 与 .154 .assets 伪装抗 SNI 阻断)，条目按
-//! host 族对口选择(entry_serves)。codeload 与 releases 大文件仍全镜像无表
+//! - 覆盖 core/api/edge 三池(均直连)。edge 混合池按 host 族对口选择
+//!   (entry_serves)；codeload 与 releases 大文件仍全镜像无表
 //! —— 见 config::GROUPS 与 server/mitm.rs。
 
 pub mod dial;
@@ -230,16 +227,12 @@ pub fn serial_pool(name: &str) -> bool {
     SERIAL_POOLS.contains(&name)
 }
 
-/// IP → 默认 SNI 形态。Fastly 边缘（185.199.108-111 段）对任意 SNI 都返
-/// 本边缘主证书（2026-10-14 实测，推翻"按 SNI 路由证书"旧结论）：
-/// - .133 内容域边缘：伪装 SNI 会被边缘挂起（握手 OK 但 HTTP 0 回包），
-///   只能真名；其主证书 SAN 覆盖 *.github.com/*.github.io/*.githubusercontent.com
-/// - .153(.io)/.154/.215(.assets, 2026-10 GitHub 迁移的新代边缘)：伪装 SNI
-///   HTTP 正常 —— ClientHello 不暴露 github 域名，GFW 无法按 SNI 阻断
-///   （raw 真名被 RST 即前车之鉴），主证书 SAN 恰好覆盖各自域族，按真 host 校验照常通过
-/// 其余（GitHub 主站边缘，含 auth 主机）伪装 —— 任意 SNI 返覆盖真名的证书。
-/// 用于种子展开与旧表空/legacy 值归一；表内显式写法优先（Fastly 三段除外，
-/// 见 serial_load —— 形态由边缘行为决定，显式写法对它们无意义）。
+/// IP → 默认 SNI 形态（2026-10-14 实测：Fastly 边缘对任意 SNI 都返本边缘
+/// 主证书，推翻"按 SNI 路由证书"旧结论）。.133 伪装会被边缘挂起（握手 OK
+/// 但零回包）只能真名；.153/.154/.215（assets 新代边缘）伪装可正常 HTTP 且
+/// 抗 SNI 阻断（raw 真名被 RST 即前车之鉴）；主站/auth 边缘伪装。
+/// 用于种子展开与旧表空/legacy 值归一；表内显式写法优先（Fastly 段除外
+/// —— 形态由边缘行为决定，显式写法无意义）。
 fn shape_for_ip(ip: &str) -> &'static str {
     if fastly_last_octet(ip) == Some("133") {
         dial::MODE_SNI
@@ -278,13 +271,10 @@ fn host_family(host: &str) -> &'static str {
     }
 }
 
-/// 条目是否服务该 host：
-/// - Fastly 各族 host 只认对应末段的条目（形态跟随条目：.133 真名、
-///   .153/.215/.154 伪装，均为该边缘实测可用形态；assets 族 2026-10 起
-///   GitHub 迁至 .215 新边缘，.154 旧边缘保留兼容）
-/// - 其余 host（主站/auth）只认非 Fastly 段的伪装条目
-/// 不对口的条目跳过（不试也不垫底）——否则每类请求都会把另一类 IP
-/// 试败垫底，排序永远 ping-pong。
+/// 条目是否服务该 host：Fastly 各族只认对应末段（.133 真名 / .153、.154、
+/// .215 伪装；assets 族 2026-10 起认新边缘 .215，.154 保留兼容），其余
+/// host（主站/auth）只认非 Fastly 伪装条目。不对口跳过（不试不垫底）——
+/// 否则各类请求互相试败垫底，池序永远乒乓。
 fn entry_serves(host: &str, p: &SerialPlan) -> bool {
     match host_family(host) {
         "content" => fastly_last_octet(&p.ip) == Some("133"),
@@ -452,12 +442,9 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         mirrors: HashMap::new(),
         dirty: false,
     };
-    // 遍历已知池（而非文件里的键）：文件缺失某池/被旧版二进制误清时，用种子补齐，
-    // 避免该池请求落到"串发表为空"。仅当文件里该池确有条目时才以文件为准。
-    // (对照 Go 0f02257：拆出 api 池后必须如此 —— 旧 exe 不识 api 池会把它从
-    // plans.json 写掉；新 exe 启动应自愈而非让 api.github.com 请求全灭。)
-    // 注：不做"种子归属剔除"——种子只管首次生成，文件即权威（用户手改有效）；
-    // 种子结构变更时旧文件残留由开发期手动删 plans.json 重建解决（2026-10-13 决定）。
+    // 遍历已知池（而非文件里的键）：文件缺池/被旧 exe 误清时用种子补齐，
+    // 防"串发表为空"（Go 0f02257 拆 api 池后的自愈语义）。文件为准，不做
+    // 种子归属剔除；种子结构变更时删 plans.json 重建（2026-10-13 决定）。
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
@@ -653,12 +640,11 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
     }
 }
 
-/// 单串发：按表一个一个试，一个失败连下一个（失败条目垫底），绕表一圈
-/// 全灭 → 冷却 30s 报错。置顶只由数据层 ok（serial_note）认证 —— 拨号成功
-/// 不算"成功"。tls_handshake=false 时只做裸 TCP 拨号（透传 CONNECT 隧道）。
+/// 单串发：按表逐个试，失败条目垫底换下一个，绕表一圈全灭 → 冷却 30s
+/// 报错。置顶只由数据层 ok（serial_note）认证 —— 拨号成功不算成功。
+/// tls_handshake=false 时只做裸 TCP 拨号（透传 CONNECT 隧道）。ctx 到期只
+/// 掐正在试的那条：没试完 ≠ 失败（不沉底）≠ 全灭（不冷却）。
 /// 返回 (连接, 所用 IP, 所用形态)。混合池按 host 选形态（host_shape）。
-/// 请求 ctx 到期只掐断正在试的那一条：没试完不算失败（不沉底），
-/// 没试完更不算全灭（不冷却）。
 pub async fn serial_dial(
     pool_name: &str,
     host: &str,

@@ -1,21 +1,10 @@
 //! 握手执行器：串发表每个 (ip, sni 形态) 的实际拨号。
-//! 2026-10-14 起流量形态恒为伪装（fake:x，如 baidu.com）；real 仅存留
-//! 于诊断与测试（nosni 形态已随生产不可达删除, 旧表值由 serial_load 归一）。
-//!
-//! Go 版用 refraction-networking/utls 模拟 Chrome TLS 指纹；Rust 生态的
-//! rquest（0x676e67/rquest）在 crates.io 上 152 个版本全部 yanked、仓库已改名
-//! netty（纯协议客户端，无指纹能力），wreq 同为其 URL 级高层客户端，无法把
-//! "拨号目标 IP"与"SNI"解耦（本项目生命线：对指定 IP 拨号但 SNI 用伪装域名/
-//! 无 SNI，证书按目标 host 校验），故采用 boring（cloudflare/boring 4.22）——
-//! BoringSSL 的 Rust 绑定，Chrome 同款 TLS 实现——自建三形态握手，语义与 Go 版
-//! DialOne 完全一致：
-//! - fake:x: SNI=x（伪装），证书按 host 校验（流量主形态）
-//! - real:   SNI=host，证书按 host 校验（诊断）
-//! SNI 与校验名解耦：SSL_set_tlsext_host_name（SslRef::set_hostname）只改 SNI
-//! 扩展；X509_VERIFY_PARAM_set1_host（verify param 的 set_host）只改校验名。
-//! 开启 GREASE（SSL_CTX_set_grease_enabled，Chrome 指纹标志）与 ALPN h2,http/1.1，
-//! BoringSSL 默认密码套件/扩展顺序即 Chrome 同款 —— 指纹不再被风控按 JA3/JA4
-//! 识别为库实现。
+//! 2026-10-14 起流量恒为伪装（fake:x）。SNI 与校验名解耦：set_hostname 只改
+//! SNI 扩展，verify param 的 set_host 只改校验名；GREASE + ALPN h2,http/1.1
+//! + BoringSSL 默认套件序 = Chrome 同款指纹（JA3/JA4 不再像库实现）。
+//! 选型：Rust 生态无 utls 绑定（rquest 全 yanked、wreq 无法解耦"拨号 IP"与
+//! "SNI"——本项目生命线），故用 boring（cloudflare/boring 4.22）自建三形态
+//! 握手，语义同 Go 版 DialOne。
 
 use crate::config::CONNECT_TIMEOUT_SECS;
 use boring::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
@@ -123,11 +112,9 @@ fn system_root_certs() -> Option<&'static [X509]> {
     .as_deref()
 }
 
-/// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）。
-/// - Sni：SNI=host，校验名=host
-/// - Fake(name)：SNI=name，校验名=host（先按 host 建，再覆盖 SNI 扩展）
-/// ca_pem 为注入的信任锚 PEM（测试用，内存解析零临时文件）；真实路径传
-/// None → 系统根（进程内一次解析，X509StoreBuilder 内存注入，无磁盘 I/O）。
+/// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）：Sni=真名，
+/// Fake(name)=伪装，证书一律按 host 校验。ca_pem 为测试用内存信任锚
+/// （X509StoreBuilder 注入，零临时文件），真实路径 None → 系统根。
 /// 开启 GREASE + ALPN h2,http/1.1（Chrome 指纹 + 上游必须 h2）。
 fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
     let mut ctx_b = SslContextBuilder::new(SslMethod::tls())
@@ -312,14 +299,10 @@ mod tests {
         TMP_SEQ.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// boring 官方测试证书目录（BoringSSL 自带，链/根/密钥齐全）。
-    /// 用官方材料而非 rcgen 自签链：官方材料能被 boring 客户端完整信任，
-    /// rcgen 生成的链在 boring 的 X509 链构建下不被认（self-signed/unknown_ca，
-    /// 已逐一实证：issued()=Ok、check_host=Ok 仍被 TLS 拒绝）——测试目标是
-    /// 验证三形态 ClientHello 与证书按 host 校验，官方材料即真实自签链。
-    /// 位置不写死：编译过 boring 后材料在 CARGO_HOME 注册表下自动出现
-    /// （registry/src/*/boring-*/test），也可用 BORING_TEST_DIR 显式指定；
-    /// 找不到 = 相关测试跳过（材料不随仓库分发）。
+    /// 用 BoringSSL 官方测试证书而非 rcgen 自签：rcgen 链在 boring 的 X509
+    /// 链构建下不被认（issued/check_host 均 Ok 仍被拒，已逐一实证），官方
+    /// 材料即真实自签链。位置随 CARGO_HOME 注册表自动出现（或 BORING_TEST_DIR
+    /// 指定）；找不到 = 相关测试跳过（材料不随仓库分发）。
     const OFFICIAL_HOST: &str = "foobar.com";
 
     fn boring_test_dir() -> Option<std::path::PathBuf> {

@@ -1,14 +1,11 @@
 //! MITM 路径：池内域名本地终结 TLS 后按 plans.json 串发连上游
-//! (boring Chrome 指纹 + 伪装 SNI，每请求新拨号)，风控拦截页(403 restricted/
-//! 400 Whoa)本地识别(ghDefuse)，该 IP 垫底换下一个重试，浏览器无感。
-//! 分流策略：
-//! - core/api/edge 池：直连（boring Chrome 指纹腿；edge 混合池内按 IP 族
-//!   分形态与域族：.133 内容域真名 SNI，.153/.154 与主站边缘伪装 SNI）
-//! - githubusercontent 内容域（avatars/camo/gist/raw）：直连优先（实测 1s 内
-//!   200；镜像链全灭 502 是头像不显示的根源），失败回落镜像串行链
+//! (boring Chrome 指纹 + 伪装 SNI)，风控拦截页(403 restricted/400 Whoa)
+//! 本地识别(ghDefuse)，该 IP 垫底换下一个重试。分流：
+//! - core/api/edge：直连（edge 混合池内按 IP 族分形态，见 pool::shape_for_ip）
+//! - githubusercontent 内容域（avatars/camo/gist/raw）：直连优先（1s 内 200），
+//!   失败回落镜像串行链
 //! - codeload / objects / release-assets / github.com 的 releases/download、
-//!   archive 路径：镜像 only，按 plans.json mirrors 板块的链序串行取用
-//!   （禁并发竞速，2026-10-15 裁定），链全灭 502
+//!   archive 路径：镜像 only（禁并发竞速，2026-10-15 裁定），链全灭 502
 use super::upstream::{self, mitm_h1_client, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
@@ -24,11 +21,9 @@ use tokio_util::sync::CancellationToken;
 // 镜像腿响应头预算：8s 内必须出响应头，头一到即解除，体不限。
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(8);
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
-// Go 0f02257：ghDefuse 不再设"连续 N 个 Whoa"冷静阈值（用户裁定：不冷静、试到
-// 全表），故无 GH_DEFUSE_STREAK_COOLDOWN / 尝试上限 —— 终止条件只有"重试拿到
-// 正常页"或"串发给不出新连接(全灭)"。
-/// release 附件与源码包路径（github.com 站点上的下载 URL）：
-/// /:owner/:repo/releases/download/... 与 /:owner/:repo/archive/... 一律走镜像。
+// Go 0f02257：ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
+// 条件只有"拿到正常页"或"串发全灭"。
+/// release 附件与源码包路径（/releases/download、/archive）一律走镜像；
 /// git 智能协议路径不在此列 —— 镜像不认，必须走 core 池直连（伪装 SNI）。
 fn is_release_asset_path(host: &str, path: &str) -> bool {
     if host != "github.com" {
@@ -508,12 +503,10 @@ async fn try_cached(
         }
     }
 }
-/// 直连串发测试 = 完整 HTTP 请求逐个试：每个候选发真请求，响应头到手 = 成功
-/// 连(该 IP 置顶)；超时/黑洞 = 垫底自动换下一个；循环上限 24 防病态；
-/// POST 等非简单方法不重发(只试一次)。
-/// 语义对照 Go 1f8bf6c：每次 attempt 都新建上游 client（无池化复用），
-/// 等价 Go 的 getDirect(fresh=true)/mitmH2Fresh —— 坏 IP 连接不缓存，
-/// 垫底后下一 attempt 必然新拨号并跳过垫底 IP（"垫底换 IP"真实生效）。
+/// 直连串发 = 完整请求逐个试：响应头到手 = 成功连（该 IP 置顶）；超时/
+/// 黑洞 = 垫底换下一个；上限 24 防病态；POST 等非简单方法不重发。
+/// fresh 语义对照 Go 1f8bf6c：每 attempt 新拨号（坏 IP 连接不缓存），
+/// 垫底后下一 attempt 必然换 IP —— "垫底换 IP"真实生效。
 async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -540,12 +533,10 @@ async fn get_direct(
     {
         return r;
     }
-    // per-host 拨号单飞：并发请求同时未命中缓存时，只放一个进串发拨号，
-    // 其余在 host 锁上排队 —— 首拨成功入槽后，队列里的请求全部放单飞、
-    // 锁外并发走复用（一波页面 27 并发各自拨号的握手风暴 → 一拨全用）。
-    // 教训（2026-10-16 实测）：锁只能罩"拨号等待"，缓存命中后的请求必须
-    // 放到锁外发 —— 原实现持锁直到响应头返回，冷启动单页 129 个并发请求
-    // 逐个排队、各占 ~250ms（一个 RTT），正是 34s FCP / 布局跳动的真凶。
+    // per-host 拨号单飞：并发未命中缓存时只放一个进串发拨号，其余排队；
+    // 首拨入槽后排队者立即放锁、锁外并发复用。锁只罩"拨号等待"不罩发送
+    // —— 2026-10-16 实测：持锁到响应返回会把 129 个并发压成逐个 RTT 串行
+    // （34s FCP / 布局跳动的真凶）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
     // 拿到锁后重查熔断：排队期间排在前面的请求可能已把该 host 拨到熔断
@@ -846,11 +837,9 @@ async fn dns_direct_fetch(
     ))
 }
 // ---------- 镜像串行链：按链逐个用，禁并发竞速 ----------
-/// 镜像串行链：按 plans.json mirrors 板块的链序逐个取用（链头=校准出的
-/// 最快），一个失败/被拒再试下一个，链全灭才报错。
-/// 2026-10-15 用户裁定废除并发竞速：公共镜像不该被同一资源的 N 路并发
-/// 探测同时捶（头像一波 16 请求 × 分片竞速 ≈ 80 路并发把镜像打爆全灭，
-/// 正是头像不显示的推手）。链序由内置默认(实测 TTFB) + UI 校准维护。
+/// 镜像串行链：按链序逐个取用，失败/被拒换下一个，链全灭才报错。
+/// 2026-10-15 裁定废除并发竞速：N 路并发探测会打爆公共镜像（头像全灭
+/// 的推手）。链序 = 内置默认（实测 TTFB）+ UI 校准。
 async fn chain_fetch(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,

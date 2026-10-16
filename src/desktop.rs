@@ -1,8 +1,7 @@
 //! 桌面框架 —— tao 原生窗口 + wry(WebView2 渲染 WebUI) + tray-icon 系统托盘。
-//! 对应 Go 版 webview_go + energye/systray 的语义：
-//! - ✕ 且开"关闭到托盘" → 释放整个 WebView2 收进托盘(点击托盘重建; 托盘态
-//!   无 Chromium 进程, 占用≈headless)
-//! - 窗口被外部销毁(WebView2 运行时事件) → 自愈重建(代理保持运行)
+//! - ✕ 且开"关闭到托盘" → 释放整个 WebView2 收进托盘（点击托盘重建；
+//!   托盘态无 Chromium 进程，占用 ≈ headless）
+//! - 窗口被外部销毁（WebView2 运行时事件） → 自愈重建（代理保持运行）
 //! - 托盘左键/菜单「显示工作台」→ 有窗则显示聚焦，无窗则按需创建
 //! - 窗口矩形退出时记忆、启动时恢复；无记录则居中偏下
 //! - 单实例 mutex + 二次启动弹提示
@@ -89,17 +88,12 @@ fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> 
 }
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true(调用方直接退出)。
-/// 单实例 mutex 的 handle 必须持有到进程退出：Windows 在最后一个 handle
-/// 关闭时销毁 mutex。windows crate 的 HANDLE 带 Drop(自动 CloseHandle)，
-/// 若随函数返回即被关闭，mutex 会立刻消失 —— 二次启动照样放行，多实例
-/// 竞争端口（2026-10-13 实测：双击二次启动导致 7810 绑定失败）。Go 版
-/// runtime.KeepAlive(mu) 是同一目的。持有在 static，进程退出由 OS 清理。
-/// 该 handle 仅作"mutex 存活的锚"：只写一次、绝不被其它线程使用或关闭，
-/// 进程退出由 OS 统一清理 —— 跨线程持有是安全的。字段故意永不读。
+/// mutex 的 HANDLE 必须存活到进程退出（Windows 关闭最后一个 handle 即销毁
+/// mutex），而 windows crate 的 HANDLE 带 Drop —— 故存 static 锚住（字段
+/// 故意永不读，进程退出由 OS 清理），等价 Go 版 runtime.KeepAlive(mu)。
+/// 否则二次启动放行、双实例抢 7810（2026-10-13 实测）。
 #[allow(dead_code)]
 struct SingleMutexHandle(windows::Win32::Foundation::HANDLE);
-// 该 handle 仅作"mutex 存活的锚"：只写一次、绝不被其它线程使用或关闭，
-// 进程退出由 OS 统一清理 —— 跨线程持有是安全的。
 unsafe impl Send for SingleMutexHandle {}
 unsafe impl Sync for SingleMutexHandle {}
 
@@ -329,12 +323,9 @@ pub fn run(args: DesktopArgs) -> ! {
             }
             Event::UserEvent(AppEvent::RequestQuit) => do_quit(control_flow),
             Event::LoopDestroyed => {
-                // 系统关机/注销(WM_ENDSESSION wParam!=0)或退出流程结束: 还原系统
-                // 代理(避免关机残留指向死端口的 PAC 断用户网)。tao 0.34.8
-                // event_loop.rs:2384 只有 wParam=TRUE 才发 LoopDestroyed, 取消关机
-                // (wParam=0)到不了这儿 —— 不误清(代理仍在跑)。等价 Go 0f02257
-                // desktop_windows.go 的 WM_ENDSESSION 分支; 与 do_quit 幂等合并
-                // (quitting 防重入, save_window_rect 收尾一次)。
+                // 系统关机/注销(WM_ENDSESSION wParam!=0)：还原系统代理, 防残留
+                // PAC 指向死端口断网。tao 只在 wParam=TRUE 时发 LoopDestroyed
+                // —— 取消关机不会到这, 不误清。与 do_quit 幂等合并(quitting 防重入)。
                 if !quitting.swap(true, Ordering::SeqCst) {
                     save_window_rect(&slot);
                     (on_quit)();

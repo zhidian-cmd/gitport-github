@@ -1,15 +1,11 @@
-//! 上游 HTTP 客户端。
+//! 上游 HTTP 客户端。两条腿：
+//! - 池内直连腿：boring Chrome 指纹（GREASE + Chrome 套件/扩展序 + ALPN
+//!   h2,http/1.1；Rust 无 utls 绑定，warpsock 腿已拆除）。SNI 按 IP 族定
+//!   （Fastly 边缘真名 / 主站与 auth 伪装），证书按目标 host 校验（解耦见
+//!   pool/dial.rs）。每请求经串发表新拨号（fresh 语义）。
+//! - 镜像腿：标准 TLS + h1 直拨，无表无阶梯。
 //!
-//! 分两条腿：
-//! - 池内域名直连腿（core/api/edge）：boring Chrome 指纹 —— GREASE +
-//!   Chrome 默认密码套件/扩展顺序 + ALPN h2,http/1.1（等价 utls HelloChrome
-//!   的 Rust 落地；Rust 生态无 utls 绑定，warpsock 腿已拆除）。
-//!   SNI 按 IP 族定：Fastly 边缘真名，主站边缘含 auth 主机伪装（baidu.com），
-//!   证书按目标 host 校验（SNI 与校验名解耦，见 pool/dial.rs）。每请求经串发表
-//!   新拨号（fresh 语义，坏连接复用不可能发生）。
-//! - 镜像腿（fastly/codeload/release）：标准 TLS + h1 直拨，无表无阶梯。
-//!
-//! Go 版用 http2.Transport + DialTLSContext 语义一致：连接层完全自定义。
+//! Go 版 http2.Transport + DialTLSContext 语义一致：连接层完全自定义。
 use crate::pool::{self, dial::Dialed, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
@@ -27,11 +23,10 @@ use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
 // ---------- 自管 h2 连接：拨号、握手、多路复用 ----------
-/// 每 host 一条自管 h2 连接。不用 hyper-util legacy 池：它对"响应体还在
-/// 流式转发"的连接不回池，页面连续取资源时每秒再拨一条（实测新拨与复用
-/// 各半）。自管后 h2 的 SendRequest 可 Clone 且请求体流与连接复用解耦 ——
-/// 一条连接承载该 host 全部并发请求（浏览器同款语义），新拨号只在连接
-/// 死亡时发生。只有"完整请求成功过"的连接才入槽（fresh 语义保持）。
+/// 每 host 一条自管 h2 连接（不用 hyper-util legacy 池：响应体还在转发的
+/// 连接不回池，页面连续取资源时每秒再拨一条——实测新拨与复用各半）。
+/// SendRequest 可 Clone，一条连接承载该 host 全部并发请求；只有"完整请求
+/// 成功过"的连接才入槽（fresh 语义保持）。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
@@ -67,12 +62,9 @@ pub async fn h2_from_dialed(
     form: &str,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    // 流控窗口（2026-10-16 实测）：h2 默认流级/连接级窗口都是 65535B。一条
-    // h2 连接上几十个并发资源流共享这 64KB 连接窗口，每 ~64KB 就要等一次
-    // WINDOW_UPDATE 往返（边缘 RTT ~240ms）——单页 129 个资源被串行成 ~34s
-    // FCP（实测每请求恰好慢 ~240ms），是"进仓库文件列表先在正中间再跳位"
-    // 的最后一层元凶（.215 边缘迁移修复之后的遗留问题）。放大窗口让多流
-    // 真正并行。
+    // h2 默认流级/连接级窗口都是 64KB，单页 129 个并发资源流共享连接窗口
+    // 会被压成按 RTT 逐个串行（实测 FCP 34s）——放大为流 1MB/连接 4MB
+    // 让多流真并行（2026-10-16）。
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
@@ -191,10 +183,9 @@ pub async fn h2_stream_head(
 }
 /// 流式直通·请求体泵：客户端体帧 → SendStream，按对端授予的发送窗口分片
 /// 发送（reserve_capacity/poll_capacity 背压，单次 send_data 严禁超窗口）。
-/// 响应头先到时调用方已把响应交付客户端 —— 泵的失败仅记日志，绝不覆盖真实
-/// 业务响应（响应优先语义）。客户端体读取出错（中断）时不补 EOS 直接弃流：
-/// 上游按 RST 丢弃截断体 —— git pack 尾部带校验和，截断包必须被服务端拒绝，
-/// 若补 EOS 反而会让上游把截断包当完整包处理。
+/// 响应头先到时泵失败只记日志，绝不覆盖已交付的响应（响应优先）。
+/// 客户端体读取出错时不补 EOS 直接弃流 —— git pack 尾带校验和，截断包必须
+/// 被服务端 RST 拒绝，补 EOS 会被当完整包处理。
 pub fn h2_spawn_pump(mut send: h2::SendStream<Bytes>, mut body: BoxBody, log: LogFn) {
     tokio::spawn(async move {
         let mut sent: u64 = 0;

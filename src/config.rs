@@ -62,12 +62,10 @@ pub const GROUPS: &[Group] = &[
         patterns: &["api.github.com"],
     },
     Group {
-        // 直连混合池 edge：auth 主机（OAuth/回调，凭据不能外泄第三方镜像）
-        // + Fastly 静态边缘（CSS/JS、github.io、githubusercontent 内容域）。
-        // avatars/camo/gist 直连 1s 内 200，镜像竞速则全灭 502（头像风暴还会
-        // 打爆公共镜像）；raw 真名 SNI 被 GFW RST，直连失败由 mitm 回落镜像。
-        // 条目 SNI 形态按 IP 族自动定（见 pool::shape_for_ip），serial_dial
-        // 按 host 族选条目（IP 末段 133/153/154 对应域族），不对口不试不垫底。
+        // 直连混合池 edge：auth 主机（凭据不外泄镜像）+ Fastly 静态/内容边缘。
+        // avatars/camo/gist 直连 1s 内 200，镜像竞速则全灭 502（头像风暴还
+        // 会打爆公共镜像）；raw 真名 SNI 被 GFW RST，直连失败由 mitm 回落镜像。
+        // 条目按 host 族对口选择（entry_serves），不对口不试不垫底。
         name: "edge",
         patterns: &[
             "githubapp.com",
