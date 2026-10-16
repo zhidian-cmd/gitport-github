@@ -623,6 +623,11 @@ async fn chain_fetch(
     if chain.is_empty() {
         return Err(format!("{host} 无镜像链"));
     }
+    // 全灭熔断：刚整链失败过(60s 内)直接快速失败, 不再逐家重烧 —— 多图
+    // 仓库在全灭窗口里每张图都重烧一遍链, spinner 会转几分钟
+    if pool::mirror_breaker_open(host) {
+        return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
+    }
     let orig_url = format!(
         "https://{host}{}",
         out.uri()
@@ -651,6 +656,7 @@ async fn chain_fetch(
                     i + 1,
                     len = chain.len(),
                 ));
+                pool::mirror_breaker_clear(host); // 链是活的: 清全灭熔断
                 return Ok(resp);
             }
             Err(e) => {
@@ -658,6 +664,7 @@ async fn chain_fetch(
             }
         }
     }
+    pool::mirror_breaker_set(host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
     Err(format!("{host} 镜像链全灭({} 个)", chain.len()))
 }
 /// 重建请求：头/方法/URI 复制 + 体按 replay 注入（Request<BoxBody> 不可

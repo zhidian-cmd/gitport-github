@@ -854,6 +854,44 @@ pub fn content_direct_fail(host: &str) {
     g.insert(host.to_string(), Instant::now() + Duration::from_secs(120));
 }
 
+// ---------- 镜像链全灭熔断 ----------
+
+/// 镜像链全灭熔断：链全灭一次后 60s 内同 host 的后续请求快速失败 —— 否则
+/// README 塞二三十张图的仓库在全灭期间每张图都串行烧完整条链(11 家 × 失败
+/// 延迟), 页面 spinner 转几分钟(2026-10-16 实锤: dev-sidecar 20+ 张 raw 图
+/// 撞上直连+镜像双全灭窗口)。成功取回即清除; 60s 后放行一次真实探测。
+static MIRROR_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::OnceLock::new();
+
+/// 镜像链是否处于全灭熔断期。
+pub fn mirror_breaker_open(host: &str) -> bool {
+    let g = MIRROR_BREAKER
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    g.get(host)
+        .map(|until| Instant::now() < *until)
+        .unwrap_or(false)
+}
+
+/// 镜像链全灭：熔断该 host 60s。
+pub fn mirror_breaker_set(host: &str) {
+    let mut g = MIRROR_BREAKER
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    g.insert(host.to_string(), Instant::now() + Duration::from_secs(60));
+}
+
+/// 镜像链取回成功：清除该 host 熔断。
+pub fn mirror_breaker_clear(host: &str) {
+    let mut g = MIRROR_BREAKER
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    g.remove(host);
+}
+
 /// 域名 → 所属池名（config 唯一路由真相，"" = 非池域名）。
 pub use crate::config::pool_for;
 
