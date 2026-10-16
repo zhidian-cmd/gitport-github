@@ -38,3 +38,4 @@ diag*.txt
 .sessions/
 
 .workbuddy/
+.zread

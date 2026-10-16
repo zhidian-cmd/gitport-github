@@ -62,6 +62,15 @@ pub const GROUPS: &[Group] = &[
         patterns: &["api.github.com"],
     },
     Group {
+        // uploads.github.com 专用上传源站（alambic：release 附件上传管线，
+        // CNAME 本名 alambic-origin.githubusercontent.com → 20.205.243.161，
+        // 单租户：除自己两个名字外一律拒绝）。被 core 的 "*.github.com"
+        // 通配符收走会用网页边缘承接上传，只会得到 301/403，上传必挂
+        // （2026-10-16 IP 级实测：core 全池无一 IP 服务上传）—— 精确拆池对口。
+        name: "uploads",
+        patterns: &["uploads.github.com"],
+    },
+    Group {
         // 直连混合池 edge：auth 主机（凭据不外泄镜像）+ Fastly 静态/内容边缘。
         // avatars/camo/gist 直连 1s 内 200，镜像竞速则全灭 502（头像风暴还
         // 会打爆公共镜像）；raw 真名 SNI 被 GFW RST，直连失败由 mitm 回落镜像。
@@ -151,7 +160,9 @@ mod tests {
         // api 池精确匹配优先于 core 的 "*.github.com"
         assert_eq!(pool_for("api.github.com"), "api");
         assert_eq!(pool_for("api.github.com.cn"), ""); // 不误伤非 api.github.com 后缀
-                                                       // 精确 pattern 优先：codeload 不能落 core
+        // uploads 上传源站拆池：精确 pattern 首轮全等命中，不落 core 通配符
+        assert_eq!(pool_for("uploads.github.com"), "uploads");
+        // 精确 pattern 优先：codeload 不能落 core
         assert_eq!(pool_for("codeload.github.com"), "codeload");
         // 文件内容域 → edge 直连（avatars/camo/gist 实测直连 1s 内 200；
         // 镜像竞速全灭 502 是头像不显示的根源）+ 失败回落镜像在 mitm 侧

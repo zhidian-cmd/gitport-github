@@ -5,8 +5,9 @@
 //!   no-op 不写盘不打日志 —— 否则每个成功响应都重写 plans.json
 //! - 全灭: 冷却 30s 快速失败, 不自动拉源 —— 表内容只靠手改维护
 //! - 仅顺序真变更才写盘(2s 内原子写回); 文件可随时手改(改完重启生效)
-//! - 覆盖 core/api/edge 三池(均直连)。edge 混合池按 host 族对口选择
-//!   (entry_serves)；codeload 与 releases 大文件仍全镜像无表
+//! - 覆盖 core/api/edge/uploads 四池(均直连)。edge 混合池按 host 族对口选择
+//!   (entry_serves)；uploads 为 uploads.github.com 专用上传源站小池；
+//!   codeload 与 releases 大文件仍全镜像无表
 //! —— 见 config::GROUPS 与 server/mitm.rs。
 
 pub mod dial;
@@ -32,9 +33,10 @@ pub struct SerialPlan {
 }
 
 /// 串发覆盖的直连池：core（站点）/ api（api.github.com）/ edge（auth 主机 +
-/// Fastly 静态边缘，均不外泄镜像/镜像不路由）。codeload 与 releases 大文件
-/// 全镜像、无表。此常量同时决定落盘/UI 顺序（两者恒一致，不设第二份）。
-pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
+/// Fastly 静态边缘，均不外泄镜像/镜像不路由）/ uploads（uploads.github.com
+/// 专用上传源站）。codeload 与 releases 大文件全镜像、无表。此常量同时决定
+/// 落盘/UI 顺序（两者恒一致，不设第二份）。
+pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge", "uploads"];
 
 /// 内置种子：首次运行（无 plans.json）时展开成初始表。
 const SEEDS_JSON: &str = include_str!("seeds.json");
@@ -1002,7 +1004,7 @@ mod tests {
         // fastly/codeload 全镜像不直连: 不再是串发池
         assert!(!serial_pool("fastly"));
         assert!(!serial_pool("codeload"));
-        for p in ["core", "api", "edge"] {
+        for p in ["core", "api", "edge", "uploads"] {
             assert!(serial_pool(p), "{p} 应为串发池");
         }
     }
