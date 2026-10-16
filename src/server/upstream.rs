@@ -67,7 +67,17 @@ pub async fn h2_from_dialed(
     form: &str,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    let (send, conn) = h2::client::handshake(conn_io)
+    // 流控窗口（2026-10-16 实测）：h2 默认流级/连接级窗口都是 65535B。一条
+    // h2 连接上几十个并发资源流共享这 64KB 连接窗口，每 ~64KB 就要等一次
+    // WINDOW_UPDATE 往返（边缘 RTT ~240ms）——单页 129 个资源被串行成 ~34s
+    // FCP（实测每请求恰好慢 ~240ms），是"进仓库文件列表先在正中间再跳位"
+    // 的最后一层元凶（.215 边缘迁移修复之后的遗留问题）。放大窗口让多流
+    // 真正并行。
+    let mut cb = h2::client::Builder::new();
+    cb.initial_window_size(1024 * 1024) // 流级 1MB
+        .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
+    let (send, conn) = cb
+        .handshake(conn_io)
         .await
         .map_err(|e| format!("h2 握手失败: {e}"))?;
     tokio::spawn(async move {
