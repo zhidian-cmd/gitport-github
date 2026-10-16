@@ -385,9 +385,10 @@ async fn stream_passthrough(
         (log)(&format!("[流式] {host}{path} 两条连接腿均失败, 放弃"));
         return plain_502();
     };
-    if let Some(b) = body.take() {
-        upstream::h2_spawn_pump(send, b, log.clone());
-    }
+    // 接住泵句柄：响应头失败/超时路径必须 abort，否则泵滞留不回收
+    let pump = body
+        .take()
+        .map(|b| upstream::h2_spawn_pump(send, b, log.clone()));
     let timed = tokio::time::timeout(
         std::time::Duration::from_secs(upstream::STREAM_HEAD_BUDGET_SECS),
         upstream::h2_recv_response(fut),
@@ -406,10 +407,16 @@ async fn stream_passthrough(
             write_upstream(resp, "stream", &info)
         }
         Ok(Err(e)) => {
+            if let Some(h) = &pump {
+                h.abort();
+            }
             (log)(&format!("[流式] {host}{path} 上游响应失败: {e}"));
             plain_502()
         }
         Err(_) => {
+            if let Some(h) = &pump {
+                h.abort();
+            }
             (log)(&format!(
                 "[流式] {host}{path} 响应头预算({}s)超时",
                 upstream::STREAM_HEAD_BUDGET_SECS

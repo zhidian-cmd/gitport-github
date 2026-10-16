@@ -31,6 +31,10 @@ const UPLOADS_VERIFY_NAME: &str = "alambic-origin.githubusercontent.com";
 /// (*.githubusercontent.com，SAN 不含 uploads.github.com)，按目标 host 验收
 /// 必败；改按其 CNAME 本名验收（公网 CA 真证书，抗中间人能力不减）。
 /// 真名腿(SNI=uploads)服务器按 SNI 出专用证书，仍按 host 验收，不覆盖。
+/// 安全权衡（知情记录，2026-10-17 复审）：此腿验收名不再等于用户所访名，
+/// 证书接受集从"覆盖 uploads"放宽为"覆盖本名"——两名为 GitHub 同控，
+/// 公信 CA 获取难度同级，实质 MITM 门槛近似。仅此一处容忍降级，其他 host
+/// 一律按目标 host 验收。
 pub fn verify_name<'a>(host: &'a str, mode: &str) -> &'a str {
     if mode.starts_with(MODE_FAKE_PFX) && host == "uploads.github.com" {
         UPLOADS_VERIFY_NAME

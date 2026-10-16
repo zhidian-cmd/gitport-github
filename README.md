@@ -52,6 +52,7 @@ clone、push、Release 下载、raw 文件、头像、网页浏览全场景加�
 | 完全无门槛 | 开 MITM 需装本地根证书 | WebUI 一键 certutil 安装；不装也能用（纯透传） |
 | 加速所有网站 | 只路由 GitHub 系域名 | Google / YouTube 等请用通用代理 |
 | 私库 release 附件走镜像 | 镜像链剥凭据（防 Cookie 外泄，设计如此） | 公库无感；私库附件等直连恢复 |
+| 上传路径按"本名"验收 TLS | uploads.github.com 伪装 SNI 时按其 CNAME 本名 `alambic-origin.githubusercontent.com` 验收（源站对未知 SNI 只吐默认证书，按所访名验收必败） | 两名同为 GitHub 控制，公信 CA 获取难度同级；仅此一处容忍，其余 host 一律按所访名验收（dial.rs `verify_name`） |
 
 ## 常见问题
 
@@ -370,7 +371,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 ## WebUI 功能（127.0.0.1:7811）
 
 - 概览：运行状态、代理地址、连通徽标、最近日志
-- IP 池：四池条目一览（顺序即优先级，表头即正在用）
+- IP 池：三池条目一览（顺序即优先级，表头即正在用）；uploads 上传源站池由内部管理，不在 UI 呈现，出问题看日志
 - 设置：开机自启、关窗到托盘（✕ = 释放整个 WebView2，托盘态只剩代理核心约 12MB ≈ headless；点托盘图标随时重开工作台）、GitHub 分流接管（PAC）、MITM 开关（自动 certutil 装根，装完重启浏览器一次）
 - 镜像链校准：约 30~90 秒，期间可正常上网
 

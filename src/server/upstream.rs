@@ -184,7 +184,14 @@ pub async fn h2_stream_head(
 /// 响应头先到时泵失败只记日志，绝不覆盖已交付的响应（响应优先）。
 /// 客户端体读取出错时不补 EOS 直接弃流 —— git pack 尾带校验和，截断包必须
 /// 被服务端 RST 拒绝，补 EOS 会被当完整包处理。
-pub fn h2_spawn_pump(mut send: h2::SendStream<Bytes>, mut body: BoxBody, log: LogFn) {
+/// 返回 JoinHandle 供调用方在失败路径 abort —— 句柄丢弃的话，"上游停发
+/// 窗口 + 客户端挂连接不关"的组合会让泵滞留在 poll_capacity 上，任务/连接
+/// 不回收（2026-10-17 复审裁定）。
+pub fn h2_spawn_pump(
+    mut send: h2::SendStream<Bytes>,
+    mut body: BoxBody,
+    log: LogFn,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sent: u64 = 0;
         loop {
@@ -227,7 +234,7 @@ pub fn h2_spawn_pump(mut send: h2::SendStream<Bytes>, mut body: BoxBody, log: Lo
         }
         let _ = send.send_data(Bytes::new(), true); // 干净收尾: EOS
         (log)(&format!("[上游] 请求体泵完成: {sent}B"));
-    });
+    })
 }
 /// 每 host 拨号单飞闸：并发请求同时缓存未命中时，只有一个真正进串发拨号，
 /// 其余排队等待 —— 首拨成功入槽后，队列里的请求全部直走复用路径。
