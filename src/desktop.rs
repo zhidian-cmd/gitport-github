@@ -10,7 +10,6 @@ use crate::pool::LogFn;
 use crate::settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
@@ -264,30 +263,42 @@ pub fn run(args: DesktopArgs) -> ! {
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
     let mut _tray = build_tray(show_item, quit_item).ok();
+    // 托盘事件 → 全事件驱动：两个线程各自阻塞收（crossbeam recv 无事件即
+    // 内核级睡眠，零周期唤醒）。原 80ms recv_timeout 轮询 = 12.5 次/秒无谓
+    // 唤醒，违背托盘态"几乎零活动"（2026-10-17 裁定）。
     {
         let proxy = proxy.clone();
         std::thread::spawn(move || {
-            let menu_rx = MenuEvent::receiver();
+            // 左键单击 = 显示工作台
             let tray_rx = TrayIconEvent::receiver();
-            loop {
-                match tray_rx.recv_timeout(Duration::from_millis(80)) {
-                    Ok(ev) => {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            ..
-                        } = ev
-                        {
-                            let _ = proxy.send_event(AppEvent::ShowWindow);
-                        }
+            while let Ok(ev) = tray_rx.recv() {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    ..
+                } = ev
+                {
+                    if proxy.send_event(AppEvent::ShowWindow).is_err() {
+                        break; // 事件循环已退出：进程行将结束
                     }
-                    Err(_) => {}
                 }
-                if let Ok(ev) = menu_rx.try_recv() {
-                    if *ev.id() == show_id {
-                        let _ = proxy.send_event(AppEvent::ShowWindow);
-                    } else if *ev.id() == quit_id {
-                        let _ = proxy.send_event(AppEvent::RequestQuit);
-                    }
+            }
+        });
+    }
+    {
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            // 菜单：显示工作台 / 退出
+            let menu_rx = MenuEvent::receiver();
+            while let Ok(ev) = menu_rx.recv() {
+                let ev = if *ev.id() == show_id {
+                    AppEvent::ShowWindow
+                } else if *ev.id() == quit_id {
+                    AppEvent::RequestQuit
+                } else {
+                    continue;
+                };
+                if proxy.send_event(ev).is_err() {
+                    break;
                 }
             }
         });

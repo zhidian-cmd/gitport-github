@@ -554,13 +554,23 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     write_plans_file(&path, &snap, &chains);
 }
 
-/// 顺序变更 2s 内写回实体文件（后台 ticker）。
+/// 顺序变更 2s 内写回实体文件（变更驱动 + 去抖）。
 /// 必须在 tokio runtime 构建后调用（main 用 rt.spawn 挂起）。
+/// 纯事件驱动：无变更时任务睡在 Notify 上，进程零周期唤醒（托盘态
+/// "几乎无活动"裁定的一部分）—— 原 2s interval ticker 无变更也醒。
+static PERSIST_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// dirty 置位后调用：踢醒落盘任务。无等待者时存许可证，语义安全。
+fn kick_persist() {
+    PERSIST_KICK.notify_one();
+}
+
 pub fn start_persist(rt: &tokio::runtime::Runtime) {
     rt.spawn(async move {
-        let mut iv = tokio::time::interval(Duration::from_secs(2));
         loop {
-            iv.tick().await;
+            PERSIST_KICK.notified().await;
+            // 2s 去抖：合并一串快速变更（页面加载时表头连续翻飞）为一次写盘
+            tokio::time::sleep(Duration::from_secs(2)).await;
             let dirty = {
                 let mut g = SERIAL.lock().unwrap();
                 let dirty = g.as_ref().map(|t| t.dirty).unwrap_or(false);
@@ -631,6 +641,8 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
     let new_head = new_plans.first().map(|p| p.ip.clone());
     *pool_plans = new_plans;
     tab.dirty = true;
+    drop(g); // 先放锁再踢醒: 被唤醒的落盘任务要抢同一把锁
+    kick_persist();
     if old_head != new_head {
         if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
             log(&format!(
@@ -791,6 +803,8 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     }
     tab.mirrors.insert(host.to_string(), vc);
     tab.dirty = true;
+    drop(g); // 先放锁再踢醒: 被唤醒的落盘任务要抢同一把锁
+    kick_persist();
     if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
         log(&format!("[镜像] {host} 链序更新({why})"));
     }
