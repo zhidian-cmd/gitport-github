@@ -99,50 +99,110 @@ MITM 开着但本地根证书未装/浏览器未重启。WebUI 开关自动 cert
 
 ## 工作原理
 
-### 总架构
+### 请求全流程（一张图）
+
+从浏览器点开仓库到字节回到屏幕的完整链路：PAC 分流 → 代理入口 → 明文分流 → 上游拨号 → 失败兜底 → 回传压缩，外加旁路组件。
 
 ```mermaid
-flowchart LR
-    B["浏览器 / git / 命令行"] -->|"PAC: 只有 GitHub 系域名走代理"| P["本机代理 127.0.0.1:7810"]
-    B -->|"其余网站"| NET["直连互联网, 与本程序无关"]
-    P -.管理页面.-> W["WebUI 127.0.0.1:7811<br/>状态/日志/开关/镜像校准"]
-    P --> D{"分流: host 是池内域名<br/>且 MITM 开着?"}
-    D -->|"是"| M["MITM 本地终结 TLS<br/>用本地 CA 现签证书, 解出明文"]
-    D -->|"否"| T["CONNECT 纯透传<br/>串发裸 TCP 或系统 DNS, 双向搬字节"]
-    M --> U1["直连串发腿<br/>boring 伪装SNI → GitHub 真实 IP"]
-    M --> U2["镜像串行链<br/>gh-proxy 系前缀代理"]
-    M --> U3["系统 DNS 直连"]
-    T --> U3
-    U1 --> G["GitHub 边缘<br/>140.82.x / 20.x / 185.199.x"]
-    U2 --> GH["镜像站"]
-    U3 --> ANY["任意站点"]
+flowchart TB
+    %% ===== ① 客户端 =====
+    subgraph L1["① 客户端"]
+        B["浏览器"]
+        G["git / curl / CLI"]
+    end
+
+    %% ===== ② PAC =====
+    subgraph L2["② 系统代理接管（PAC，可在 WebUI 关闭）"]
+        P1{"域名判定"}
+        WL["直连白名单：不入池、不过代理<br/>objects-origin · uploads.github.com · viewscreen"]
+        PX["PROXY 127.0.0.1:7810"]
+        OD["其余站点：直连"]
+    end
+    B --> P1
+    G --> P1
+    P1 -->|"白名单"| WL
+    P1 -->|"池内域名（core / api / edge 三池）"| PX
+    P1 -->|"其他"| OD
+
+    %% ===== ③ 代理入口 =====
+    subgraph L3["③ 本地代理 127.0.0.1:7810"]
+        C1["CONNECT / 明请求"]
+        M1{"MITM 开启 且 域名在池?"}
+        PASS["纯透传 CONNECT<br/>裸 TCP 双向搬字节"]
+        MITM["MITM<br/>本地终结 TLS → 明文请求"]
+    end
+    PX --> C1
+    C1 --> M1
+    M1 -->|"否（白名单 / 非池）"| PASS
+    M1 -->|"是"| MITM
+    PASS --> SD["系统 DNS 直拨<br/>上传 PUT 与 mermaid 渲染走这里"]
+
+    %% ===== ④ 明文分流 =====
+    subgraph L4["④ 明文分流"]
+        Q{"路径判定"}
+        S1["流式直通<br/>git 智能协议 / 声明体积超 1MB"]
+        S2["大文件：镜像 only<br/>codeload · objects · release-assets · archive"]
+        S3["内容域直连<br/>avatars · raw · camo · gist · media"]
+        S4["主站 / api / auth"]
+    end
+    MITM --> Q
+    Q --> S1
+    Q --> S2
+    Q --> S3
+    Q --> S4
+
+    %% ===== ⑤ 上游拨号 =====
+    subgraph L5["⑤ 上游拨号（所有直连腿共用）"]
+        D1["串发：三池一个 IP 一个试<br/>core 35 个主站边缘 · api · edge"]
+        T1["boring Chrome TLS 指纹<br/>主站族 = 伪装 SNI · Fastly .133 = 真名 SNI"]
+        H1["h2 多路复用 + 复用优先<br/>活跃窗口每 30s PING 保活（静默 5 分钟停）"]
+    end
+    S1 --> D1
+    S3 --> D1
+    S4 --> D1
+    D1 --> T1
+    T1 --> H1
+
+    %% ===== ⑥ 兜底链 =====
+    subgraph L6["⑥ 失败兜底（逐级尝试，绝不并发）"]
+        GH["直连成功：数据到手"]
+        GD["gh_defuse<br/>拦截页 → 该 IP 垫底，换下一个"]
+        MK["镜像链（串行逐家）<br/>大文件全链 · 内容域限长前 5 家 · 单家 5s"]
+        BRK["整链全灭 → 熔断 60s<br/>窗口内同域毫秒级失败"]
+        DNSL["系统 DNS 直连腿（仅 GET / HEAD）"]
+        E502["502 提示页<br/>GET 导航每 8s 自动刷新"]
+    end
+    H1 --> GH
+    S2 --> MK
+    S3 -.->|"直连全灭"| MK
+    S4 -.->|"命中拦截页"| GD
+    GD -.->|"全表全灭"| DNSL
+    MK -->|"成功"| GH
+    MK -->|"全灭"| BRK
+    BRK --> DNSL
+    DNSL -->|"失败"| E502
+
+    %% ===== ⑦ 回传与旁路 =====
+    subgraph L7["⑦ 回传与旁路组件"]
+        R1["回传压缩：github.com / api 强制 gzip 取上游<br/>解压嗅探前 4KB 判拦截页 · 原始压缩帧原样转发<br/>其余域名放行浏览器 br / zstd"]
+        R2["响应注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
+        CA["本地 CA（certgen）→ Windows 证书库"]
+        WUI["WebUI 7811<br/>状态 · 日志 · 池序 · 镜像校准 · 开关"]
+        PLAN["plans.json（池序 + 镜像链）<br/>2s 去抖落盘，可手改"]
+        TRAY["托盘 + WebView2 桌面壳（-tray / -headless）"]
+        LOG["日志环形 2000 条 + 崩溃捕获"]
+    end
+    GH --> R1
+    R1 --> R2
+    R2 --> B
+    MITM -.->|"按需现签叶子证书"| CA
+    WUI --> PLAN
+    WUI --> LOG
+    TRAY --> WUI
+    WUI -.->|"校准重排镜像链"| PLAN
 ```
 
-### 一次请求的完整旅程
-
-```mermaid
-flowchart TD
-    A["浏览器请求"] --> B{"池内域名 且 MITM 开?"}
-    B -->|"否"| Z1["CONNECT 透传: 裸 TCP 串发或系统 DNS<br/>8s 首字节看门狗, 结束后按流量记账置顶/垫底"]
-    B -->|"是"| C["本地终结 TLS, 拿到明文请求"]
-    C --> D{"路径判定"}
-    D -->|"git push 等智能协议 POST<br/>或声明体积超 1MB 的请求"| S["流式直通: 请求体不进内存<br/>边收边泵给上游(h2 背压分片)<br/>响应头一到立即交付, 不再 502"]
-    D -->|"大文件域: codeload / objects / release-assets"| E["镜像 only: 按链逐个试<br/>全灭 = 熔断 60s + 502, 不回落直连"]
-    D -->|"github.com 的 /archive 或 /releases/download"| E
-    D -->|"githubusercontent 内容域<br/>avatars / raw / gist / camo"| F{"直连熔断中? 120s 内"}
-    F -->|"是"| E2["直接走镜像链, 不烧直连"]
-    F -->|"否"| G["直连串发<br/>.133 真名SNI, 其余伪装<br/>一圈全灭 → 熔断120s + 回落镜像链"]
-    D -->|"主站 / api / auth 主机"| H["直连串发 + gh_defuse<br/>拦截页垫底换IP, 试到全表"]
-    D -->|"直连白名单域: 上传×2 + mermaid 渲染"| Z2["直连白名单: 不入池不过代理<br/>(上传: 仅 GLB/源站本尊服务; mermaid: 真名 SNI 被掐, 直连有 DoH/ECH)"]
-    E --> R["写回浏览器: 剥 hop-by-hop 头<br/>注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
-    E2 --> R
-    G --> R
-    S --> R
-    H -->|"池表+镜像全灭"| Z3["末路兜底(仅 GET/HEAD):<br/>按系统 DNS 解析的当前 IP 真名直拨<br/>—— GitHub 迁边缘 IP 时自愈"]
-    H --> R
-    Z3 --> R
-    R --> X["彻底失败且是 GET 导航 →<br/>502 提示页, 每 8s 自动刷新"]
-```
+> 拨号的记账细则（成功置顶 / 失败垫底 / 全灭熔断）见下节「串发拨号与 IP 轮换」；白名单判据见「直连白名单」。
 
 ### 直连白名单：有些域名不归代理管
 
@@ -260,25 +320,7 @@ CSS/JS 与 github.io 不过镜像（实测全 404），归 edge 直连池。
 
 **与直连串发同一哲学：一家失败再试下一家，绝不并发。** 内容域小文件（头像/图片/gist/media）
 只试链上**前 5 家**（每家 5s 预算）——把一张坏图标的最坏等待从"11 家逐家超时"收窄；
-大文件走全链（逐家拉，不并发，避免多份大流量）。
-
-```mermaid
-flowchart TD
-    A["需要镜像取回"] --> B["读该 host 的链<br/>= plans.json 的 mirrors 板块"]
-    B --> C{"链空?"}
-    C -->|"是"| ERR["报错 → 502"]
-    C -->|"否"| D["取链位 i 的镜像<br/>内容域小文件最多试前 5 家<br/>(大文件走全链)"]
-    D --> E["拼 URL: 镜像域名 + / + 原始完整URL<br/>剥 Cookie / Authorization / Referer<br/>(凭据不外泄镜像)"]
-    E --> F{"5s 内出响应头?"}
-    F -->|"否"| H["记失败, i+1"]
-    F -->|"是"| G{"状态 >= 300<br/>或返回 html?"}
-    G -->|"是 (甩锅/假站/拒绝)"| H
-    G -->|"否"| OK["成功: 响应体不限时"]
-    H --> I{"链用完?"}
-    I -->|"否"| D
-    I -->|"是"| BRK["镜像熔断 60s: 期间同域请求<br/>毫秒级快速失败(不再逐家烧链)<br/>成功取回或到期即恢复"]
-    BRK --> ERR
-```
+大文件走全链（逐家拉，不并发，避免多份大流量）。流程见上图「⑥ 失败兜底」。
 
 **链序从哪来**：内置默认序（8 host × 11 镜像实测 TTFB 排好）→ UI「校准」按钮半自动重排 → 手改 `plans.json`。
 校准 = 对每条链串行实测 TTFB（host 之间并行，链内严格串行，全程约 30~90 秒），按成绩升序重排，
