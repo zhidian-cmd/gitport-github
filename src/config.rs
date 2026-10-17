@@ -41,8 +41,10 @@ pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 /// 流量拨号闸门：限真实流量拨号的总并发 —— 没有它，打开一个页面
 /// 30 并发请求会把自己打爆（实测踩过）。
 pub const DIAL_GATE_SIZE: usize = 48;
-/// 环形日志条数（供 WebUI 增量拉取）。
-pub const LOG_BUFFER_SIZE: usize = 500;
+/// 环形日志条数（供 WebUI 增量拉取，协议按 seq 增量、对容量无感知）。
+/// 2000 = 浏览高峰约十分钟的追溯窗口：500 条在活跃浏览时几分钟即被冲掉，
+/// 排障时"几分钟前的失败"查无实据（2026-10-17 复审裁定扩容）。
+pub const LOG_BUFFER_SIZE: usize = 2000;
 /// 域名分组：命中规则的流量按该池的 plans.json 串发表拨号。
 /// IP 名单不在此处 —— plans.json 是唯一权威（首次运行由 pool/seeds.json 初始化）。
 pub struct Group {

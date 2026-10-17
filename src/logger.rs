@@ -1,6 +1,7 @@
 //! 环形日志：带自增序号供 WebUI 增量拉取；崩溃取证（唯一落盘的日志）。
 
 use crate::config::LOG_BUFFER_SIZE;
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,7 +22,9 @@ pub struct Logger {
 
 struct LoggerInner {
     seq: u64,
-    buf: Vec<Entry>,
+    /// VecDeque：满员淘汰是 O(1) pop_front —— Vec::remove(0) 是整段搬移，
+    /// 容量扩到 2000 后每行日志白挪 48KB，不可忍。
+    buf: VecDeque<Entry>,
     echo_stdout: bool,
 }
 
@@ -36,7 +39,7 @@ impl Logger {
         Logger {
             inner: std::sync::Arc::new(Mutex::new(LoggerInner {
                 seq: 0,
-                buf: Vec::with_capacity(LOG_BUFFER_SIZE),
+                buf: VecDeque::with_capacity(LOG_BUFFER_SIZE),
                 echo_stdout,
             })),
         }
@@ -52,10 +55,10 @@ impl Logger {
             let mut g = self.inner.lock().unwrap();
             g.seq += 1;
             if g.buf.len() >= LOG_BUFFER_SIZE {
-                g.buf.remove(0);
+                g.buf.pop_front();
             }
             let seq = g.seq;
-            g.buf.push(Entry {
+            g.buf.push_back(Entry {
                 seq,
                 line: line.clone(),
             });
