@@ -674,6 +674,7 @@ async fn gh_defuse(
     // 或串发给不出新连接(全灭 → retry 报错，交回最后响应)。中间任一个候选返回
     // 正常页即交付成功，绝不无谓冷静。
     let mut tried = 0; // 已垫底重试候选数(仅日志)
+    let mut seen = std::collections::HashSet::new(); // 本轮已试 IP
     loop {
         if !is_gh_block_page(&mut resp).await {
             return Ok(resp);
@@ -700,6 +701,15 @@ async fn gh_defuse(
         // 2026-10-14 起直连腿每请求新拨号(fresh), 无共享连接池可丢 ——
         // 垫底后下一 attempt 的 serial_dial 必然跳过该 IP
         tried += 1;
+        // 整表轮换完一圈(同 IP 再现) = 全员拦截页: 再转只会重复, 交回 GitHub
+        // 真实拦截响应终止。垫底+拔连接必须发生在终止判定之前 —— 否则交付时
+        // 坏连接仍挂在复用缓存, 下个请求乒乓(2026-10-17 复审补充)
+        if !seen.insert(ip.clone()) {
+            (log)(&format!(
+                "[MITM] {host} 全部可用边缘均返回拦截页({tried}), 交付真实响应"
+            ));
+            return Ok(resp);
+        }
         (log)(&format!(
             "[MITM] {host} 边缘 {ip} 返回风控拦截页, 垫底换 IP 重试({tried})"
         ));

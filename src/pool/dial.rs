@@ -135,21 +135,11 @@ fn system_root_certs() -> Option<&'static [X509]> {
     .as_deref()
 }
 
-/// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）：Sni=真名，
-/// Fake(name)=伪装，证书一律按 host 校验。ca_pem 为测试用内存信任锚
-/// （X509StoreBuilder 注入，零临时文件），真实路径 None → 系统根。
-/// 开启 GREASE + ALPN h2,http/1.1（Chrome 指纹 + 上游必须 h2）。
-fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
+/// 构建 SslContext（信任锚由调用方给：None = 走系统默认路径）。ctx 与 host
+/// 无关 —— SNI/校验名都建在每次的 Ssl 对象上，因此生产可全局复用。
+fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::SslContext> {
     let mut ctx_b = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io_err(format!("BoringSSL 上下文初始化失败: {e}")))?;
-    // 信任锚：测试注入 PEM 优先，否则系统根；两者皆空 → set_default_verify_paths
-    let roots = match ca_pem {
-        Some(pem) => Some(
-            X509::stack_from_pem(pem.as_bytes())
-                .map_err(|e| io_err(format!("CA PEM 解析失败: {e}")))?,
-        ),
-        None => system_root_certs().map(<[X509]>::to_vec),
-    };
     match roots {
         Some(certs) => {
             let mut sb = boring::x509::store::X509StoreBuilder::new()
@@ -172,8 +162,38 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
     ctx_b
         .set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
-    let ctx = ctx_b.build();
-    let mut ssl = Ssl::new(&ctx).map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?;
+    Ok(ctx_b.build())
+}
+
+/// 生产路径全局 SslContext 单例：每次拨号重建 store(塞 100-300 张根证书)
+/// 纯属白烧 —— 冷启动一波并发拨号每个都重建一遍(2026-10-17 复审裁定)。
+/// 测试注入 ca_pem 的信任锚各套各的, 保持临时构建不进缓存不互扰。
+fn default_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
+    static CTX: std::sync::OnceLock<boring::ssl::SslContext> = std::sync::OnceLock::new();
+    if let Some(ctx) = CTX.get() {
+        return Ok(ctx);
+    }
+    let built = build_ssl_context(system_root_certs().map(<[X509]>::to_vec))?;
+    // 并发首拨: 后来者自建一份后丢弃(OnceLock 只收第一份), 结果等价
+    let _ = CTX.set(built);
+    Ok(CTX.get().expect("上下文刚已写入"))
+}
+
+/// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）：Sni=真名，
+/// Fake(name)=伪装，证书一律按 host 校验。ca_pem 为测试用内存信任锚
+/// （临时构建不进缓存），真实路径 None → 系统根全局单例。
+/// 开启 GREASE + ALPN h2,http/1.1（Chrome 指纹 + 上游必须 h2）。
+fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
+    let mut ssl = match ca_pem {
+        None => Ssl::new(default_ssl_context()?)
+            .map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?,
+        Some(pem) => {
+            let certs = X509::stack_from_pem(pem.as_bytes())
+                .map_err(|e| io_err(format!("CA PEM 解析失败: {e}")))?;
+            let ctx = build_ssl_context(Some(certs))?;
+            Ssl::new(&ctx).map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?
+        }
+    };
 
     match mode {
         MODE_SNI => {

@@ -9,10 +9,20 @@ use std::sync::Mutex;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-/// 本地时间戳（time 单一时间库；多线程下 local-offset 偶发失败回退 UTC）。
+/// 本地时区偏移（进程内缓存一次）：now_local 每次调用都重新探测，多线程下
+/// 偶发失败会回退 UTC —— 时间戳在 +08:00 和 UTC 之间跳跃。缓存后省掉每次
+/// 系统调用，时间戳恒定本地时区(2026-10-17 复审)。
+static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
+
+/// 本地时间戳：缓存偏移 + now_utc 换算（time 单一时间库）。
 fn now_str(fd: &[time::format_description::FormatItem<'static>]) -> String {
-    let dt = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    dt.format(fd).unwrap_or_else(|_| "00:00:00".to_string())
+    let offset = *LOCAL_OFFSET.get_or_init(|| {
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
+    });
+    OffsetDateTime::now_utc()
+        .to_offset(offset)
+        .format(fd)
+        .unwrap_or_else(|_| "00:00:00".to_string())
 }
 
 #[derive(Clone)]

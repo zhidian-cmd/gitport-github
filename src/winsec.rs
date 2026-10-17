@@ -16,6 +16,19 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+/// 句柄 RAII：本函数有 8 个错误早退路径, 手动 CloseHandle 放尾部会全部漏掉
+/// (2026-10-17 复审)。守卫兜底, 无效句柄不关。
+struct AutoCloseHandle(windows::Win32::Foundation::HANDLE);
+impl Drop for AutoCloseHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 /// 用受保护 DACL 覆盖继承权限：仅 SYSTEM 与当前用户保留完全控制，
 /// 其他账户（含同机普通用户）一律剥离。失败返回错误（文件本身已写入成功，
 /// 调用方按 best-effort 处理，不影响主流程）。
@@ -30,6 +43,7 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("OpenProcessToken 失败: {e}"))?;
     }
+    let _token = AutoCloseHandle(token); // 此后任何早退路径都自动释放
     // TOKEN_USER 缓冲（SID 大小可变，用固定缓冲 + GetTokenInformation 查询）
     let mut buf = vec![0u8; 512];
     let mut size = 0u32;
@@ -120,9 +134,6 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
     }
     if err.0 != 0 {
         return Err(format!("SetNamedSecurityInfoW 失败: {}", err.0));
-    }
-    unsafe {
-        let _ = CloseHandle(token);
     }
     Ok(())
 }
