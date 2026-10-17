@@ -35,6 +35,12 @@ pub const HEAD_TIMEOUT_SECS: u64 = 30;
 /// 单候选拨号超时（TCP 与 TLS 握手共用）：3s 给 SYN 丢包一次重传机会，
 /// 黑洞型死 IP 不许拖住整轮串发。
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// 活跃窗口内 h2 保活：探测间隔（秒）。日志实测上游 h2 连接在空闲
+/// 50-65s 时被边缘回收，30s 探测可稳定续命。
+pub const KEEPALIVE_PROBE_SECS: u64 = 30;
+/// 保活活跃窗口（秒）：最近一次请求后窗口内的探测，静默超窗即停（回零唤醒）。
+pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
 /// CONNECT 隧道首字节看门狗：客户端已发 ClientHello 而上游 0 回包
 /// （TCP 活着但被黑洞）时，代理先于浏览器 15~30s 超时判死 + 垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
@@ -106,9 +112,16 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
 /// - uploads.github.com（API 式上传源站 alambic → 20.205.243.161）：当前网页
 ///   流程不用它；直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
 ///   （原专用池 + 验收名覆盖为一处降级，已随之删除）。
+/// - viewscreen.githubusercontent.com（mermaid 服务端渲染）：走代理是真名 SNI
+///   拨 .133 内容边缘，被 GFW 间歇掐断（新建连接 3s 超时 × 多候选、无镜像
+///   兜底）→ 图表等得久；浏览器直连有 DoH+ECH 加密 SNI，实测"一进仓库就出图"。
 /// vhost→边缘的映射只有 GitHub 的 DNS 知道，交给系统解析永远命中正确族，
 /// 代码里不再保留这份会腐化的知识。
-pub const DIRECT_HOSTS: &[&str] = &["objects-origin.githubusercontent.com", "uploads.github.com"];
+pub const DIRECT_HOSTS: &[&str] = &[
+    "objects-origin.githubusercontent.com",
+    "uploads.github.com",
+    "viewscreen.githubusercontent.com",
+];
 
 /// host 是否在直连白名单。
 pub fn is_direct(host: &str) -> bool {
@@ -184,6 +197,9 @@ mod tests {
         // uploads.github.com(API 式上传源站)同在白名单: 原上游专用池已撤销
         assert!(is_direct("uploads.github.com"));
         assert_eq!(pool_for("uploads.github.com"), "");
+        // viewscreen(mermaid 渲染): 代理腿真名 SNI 被间歇掐, 直连走浏览器 DoH/ECH
+        assert!(is_direct("viewscreen.githubusercontent.com"));
+        assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
         // 精确 pattern 优先：codeload 不能落 core
         assert_eq!(pool_for("codeload.github.com"), "codeload");
         // 文件内容域 → edge 直连（avatars/camo/gist 实测直连 1s 内 200；

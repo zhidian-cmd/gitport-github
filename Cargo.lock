@@ -1021,6 +1021,7 @@ dependencies = [
  "boring",
  "bytes",
  "embed-resource",
+ "flate2",
  "futures-util",
  "h2",
  "http",

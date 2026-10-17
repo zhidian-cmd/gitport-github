@@ -29,12 +29,84 @@ pub type Incoming = hyper::body::Incoming;
 pub struct H2Upstream {
     pub ip: String,
     send: SendRequest<Bytes>,
+    /// h2 PING 句柄（保活用）：连接建立时取出，活跃窗口内发 PING 帧防边缘
+    /// 按空闲回收（约 50-60s）导致跨导航冷启动（1.3s 握手）。None = 取不到
+    /// （理论上不会），保活跳过该连接。
+    ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
 static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, H2Upstream>>> =
     std::sync::OnceLock::new();
 fn conn_pool() -> &'static Mutex<HashMap<String, H2Upstream>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+// ---------- 活跃窗口内 h2 保活（跨导航复用，2026-10-17） ----------
+/// 最近一次代理请求时间（unix 秒）。0 = 从未有请求（任务纯睡）。
+static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 唤醒保活任务（每次请求踢一下；无请求时任务睡在它上面，零周期唤醒）。
+static ACTIVITY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 记录一次代理请求：开着保活窗口计时并踢醒任务。
+pub fn note_activity() {
+    LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    ACTIVITY_KICK.notify_one();
+}
+
+/// 启动活跃窗口保活任务（须在 runtime 构建后调用）。
+/// 语义：有请求 → 每 PROBE 秒对 core host 的缓存 h2 连接发 PING；静默超过
+/// WINDOW 秒 → 回睡眠。**空闲零唤醒不变**：无请求 = 无定时器, 进程纯睡。
+pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
+    rt.spawn(async move {
+        loop {
+            ACTIVITY_KICK.notified().await; // 空闲: 纯睡, 零周期唤醒
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    crate::config::KEEPALIVE_PROBE_SECS,
+                ))
+                .await;
+                let idle = now_secs()
+                    .saturating_sub(LAST_ACTIVITY.load(std::sync::atomic::Ordering::Relaxed));
+                if idle > crate::config::KEEPALIVE_WINDOW_SECS {
+                    break; // 静默超窗: 停保活, 回 Notify 睡眠
+                }
+                keepalive_pass().await;
+            }
+        }
+    });
+}
+
+/// 一轮保活：对所有**已缓存**的连接发 PING（不主动建新连接——只续命真实
+/// 请求建立过的连接，符合"不预建通道"约束）。覆盖 core(页面骨架) + api +
+/// edge(头像/图片/样式)：2026-10-17 实测只保 core 时，avatars 冷启 741ms、
+/// camo 1823ms、assets 753ms，跨导航后图片/样式明显晚到。
+/// 失败即清槽（下次请求重新拨，等价无保活行为）。
+async fn keepalive_pass() {
+    let conns: Vec<(String, H2Upstream)> = {
+        let g = conn_pool().lock().unwrap();
+        g.iter().map(|(h, u)| (h.clone(), u.clone())).collect()
+    };
+    for (host, up) in conns {
+        let Some(pp) = up.ping.clone() else { continue };
+        let mut guard = pp.lock().await;
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            guard.ping(h2::Ping::opaque()),
+        )
+        .await;
+        if !matches!(r, Ok(Ok(_))) {
+            drop(guard);
+            drop_h2(&host, &up.ip); // 对端无答/连接已死: 清槽
+        }
+    }
+}
+
 /// 取 host 的复用连接。命中 = 上次完整成功的那条链路。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
     conn_pool().lock().unwrap().get(host).cloned()
@@ -66,10 +138,14 @@ pub async fn h2_from_dialed(
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
-    let (send, conn) = cb
+    let (send, mut conn) = cb
         .handshake(conn_io)
         .await
         .map_err(|e| format!("h2 握手失败: {e}"))?;
+    // PING 句柄必须在驱动前取出（只能取一次）；连接驱动 spawn 后句柄仍可发帧
+    let ping = conn
+        .ping_pong()
+        .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
     tokio::spawn(async move {
         let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
     });
@@ -79,6 +155,7 @@ pub async fn h2_from_dialed(
     Ok(H2Upstream {
         ip: ip.to_string(),
         send,
+        ping,
     })
 }
 /// 串发拨号 + h2 握手（boring 拨号 ALPN 已协商 h2）。
@@ -279,8 +356,8 @@ pub fn mitm_h1_client() -> LegacyClient<MirrorConnector, BoxBody> {
 /// 请求预算：一次上游请求的总预算。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 重写上游请求：绝对 URL 化 + 剥代理头；accept-encoding 仅嗅探型 host
-/// （github.com/api）剥离，其余放行压缩（见函数内注释）。返回 (host, 请求)。
+/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host（github.com/api）强制
+/// gzip 上游压缩（2026-10-17），其余 host 放行浏览器原生压缩。
 pub fn upstream_request(
     req: &hyper::Request<Incoming>,
     host: &str,
@@ -295,11 +372,12 @@ pub fn upstream_request(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
-    // accept-encoding 策略（2026-10-15）：gh_defuse 要读明文 HTML 头 4KB 判拦截页，
-    // 只有 github.com / api.github.com 强制身份编码（HTML 文档 300~400KB，代价可忍）；
-    // 其余 host（assets/内容域/avatars 等从不嗅探响应体）放行浏览器原生压缩。
-    // 此前全量裸传是"进仓库慢"主因 —— 实测仓库页 327KB→gzip 44.5KB（7.3x），
-    // 31 个 CSS 合计 3.34MB→507KB（6.6x），129 个 JS 同理。
+    // accept-encoding 策略（2026-10-17）：gh_defuse 要读拦截页明文，过去对
+    // github.com/api 强制身份编码 —— 但大页面裸传是"大仓库进页面慢"主因
+    // （实测仓库页 327KB → 44.5KB，7.3x）。现在改为强制 gzip：嗅探在
+    // mitm::is_gh_block_page 里做"边收边解压判前 4KB"，已消费的原始压缩帧
+    // 原样转发给浏览器，不重压缩。其余 host（assets/内容域/avatars，从不
+    // 嗅探响应体）继续放行浏览器原生压缩（br/zstd 由浏览器自己协商）。
     let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();
@@ -310,6 +388,11 @@ pub fn upstream_request(
             continue;
         }
         out = out.header(k, v);
+    }
+    if sniffed {
+        // 只认 gzip：代理侧只需一个解压器（flate2），br/zstd 解压要额外依赖。
+        // gzip 已拿回 ~5-6 倍压缩比，足够。
+        out = out.header("accept-encoding", "gzip");
     }
     let body =
         BoxBody::new(http_body_util::Empty::<bytes::Bytes>::new().map_err(|never| match never {}));

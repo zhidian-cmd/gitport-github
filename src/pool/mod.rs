@@ -1035,14 +1035,14 @@ mod tests {
     }
 
     #[test]
-    fn upload_hosts_never_pooled() {
-        // 上传域名全部直连白名单(2026-10-17):
-        // objects-origin 只由 GLB 族(140.82.11x.21/.22)服务, 主站边缘对其
-        // 301 无 CORS → 跨域预检失败、上传必败; uploads.github.com 为 API 式
-        // 上传源站, 直连等价 gh CLI 的已知可用路径。两者都不入池、不过代理。
+    fn direct_hosts_never_pooled() {
+        // 直连白名单(2026-10-17):
+        // objects-origin/uploads.github.com 为上传链路(只由 GLB/源站本尊服务)
+        // viewscreen 为 mermaid 渲染(代理腿真名 SNI 被间歇掐, 直连有 DoH/ECH)
         for host in [
             "objects-origin.githubusercontent.com",
             "uploads.github.com",
+            "viewscreen.githubusercontent.com",
         ] {
             assert!(crate::config::is_direct(host), "{host} 应在直连白名单");
             assert_eq!(crate::config::pool_for(host), "", "{host} 不应归任何池");

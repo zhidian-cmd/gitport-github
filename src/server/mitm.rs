@@ -19,7 +19,18 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 // ---------- 常量与镜像 ----------
 // 镜像腿响应头预算：8s 内必须出响应头，头一到即解除，体不限。
-const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(8);
+const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// 内容域镜像链限长（2026-10-17 用户要求）：仍然串行逐家试，只是最多前 5
+/// 家、每家 5s 超时——把一张坏图标的最坏等待从"11 家 × 各自超时"(实测 16s)
+/// 压到 25s 上限内的大概率更早出局。大文件保链全量（各家串行, 不并发）。
+const MIRROR_CHAIN_CAP: usize = 5;
+
+/// 内容域小文件（头像/图片/gist/media）的镜像链限长；大文件与 github.com
+/// 归档/release 返回 None = 用全链。
+/// 注意：**镜像链仍是串行**（与直连 IP 串发同一哲学：一家失败再下一家）。
+fn mirror_chain_cap(host: &str) -> Option<usize> {
+    (host != "github.com" && !is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
+}
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 // ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
 // 条件只有"拿到正常页"或"串发全灭"。
@@ -437,8 +448,11 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-/// 嗅探响应体前 4KB 判定 GitHub 风控拦截页(HTML + 标志串)。
-/// 读出的字节原样保留(PeekPrefix)，最终写回客户端，不影响响应体完整性。
+/// 嗅探响应体头部判定 GitHub 风控拦截页(HTML + 标志串)。
+/// 2026-10-17 起 github.com/api 强制上游 gzip(大页面裸传是"大仓库进页面慢"
+/// 主因, 实测仓库页 327KB → 44.5KB): 嗅探改为**边收边解压**判前 4KB 明文,
+/// 已消费的**原始压缩帧**原样保留(PeekRaw), 写回时拼到最前 —— 浏览器收到的
+/// 字节流与上游完全一致(解压由浏览器负责), 不重压缩、不改 content-length。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     let ct = resp
         .headers()
@@ -449,34 +463,71 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     if !ct.contains("text/html") {
         return false;
     }
+    let enc = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // 只认 gzip(上游请求由我们强制) 与 identity; 其他编码放弃嗅探(透明转发,
+    // 宁可不判也不误杀)
+    if !enc.is_empty() && enc != "identity" && enc != "gzip" {
+        return false;
+    }
+    let gz = enc == "gzip";
+    let mut raw: Vec<Bytes> = Vec::new();
+    let mut comp: Vec<u8> = Vec::new();
+    let mut plain: Vec<u8> = Vec::new();
     let body = resp.body_mut();
-    let mut head = Vec::new();
-    // 帧式读取：一次可能读入 >4096(单帧 16KB 整帧消费)，多读的字节一并保留，
-    // 判定只看前 4096 —— 响应体完整性不受影响
-    while head.len() < 4096 {
+    // 帧式读取: 单帧 16KB, 解压后远超 4KB, 一般 1-2 帧即够。上限 8 帧 /
+    // 128KB 压缩数据, 防异常响应拖住嗅探; 多读的字节原样保留, 不影响完整性。
+    while plain.len() < 4096 && raw.len() < 8 {
         match http_body_util::BodyExt::frame(body).await {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
-                    head.extend_from_slice(&data);
+                    if gz {
+                        comp.extend_from_slice(&data);
+                        plain = gunzip_partial(&comp, 8192);
+                    } else {
+                        plain.extend_from_slice(&data);
+                    }
+                    raw.push(data);
+                    if gz && comp.len() > 128 * 1024 {
+                        break;
+                    }
                 }
             }
             _ => break,
         }
     }
-    if head.is_empty() {
+    if raw.is_empty() {
         return false;
     }
-    resp.extensions_mut().insert(PeekPrefix(head.clone()));
-    let chunk = String::from_utf8_lossy(&head).to_lowercase();
+    resp.extensions_mut().insert(PeekRaw(raw));
+    if plain.is_empty() {
+        return false;
+    }
+    let chunk = String::from_utf8_lossy(&plain[..plain.len().min(4096)]).to_lowercase();
     // "bad request" 串太宽(任何 400 页正文都可能含) —— 必须叠加状态码=400
     // 才判风控(2026-10-17 安全审计 F-005), 否则正常 400 会触发整池轮换
     chunk.contains("has been restricted")
         || chunk.contains("whoa there")
         || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
 }
-/// 嗅探/探测读出的字节：最终写回时拼到响应体前端。
+
+/// 解压已收到的 gzip 前缀(可能被截断): 尾部"数据不足"错误忽略, 返回已解出部分。
+fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let _ = flate2::read::GzDecoder::new(data)
+        .take(max as u64)
+        .read_to_end(&mut out);
+    out
+}
+/// 嗅探/探测已消费的原始帧：最终写回时拼到响应体前端。
 #[derive(Clone)]
-struct PeekPrefix(Vec<u8>);
+struct PeekRaw(Vec<Bytes>);
 /// 复用缓存 h2 连接发一次请求。Some(Ok)=成功可直接交付；Some(Err)=POST 等
 /// 非简单方法复用失效不重发，直接报错；None=缓存未命中或连接已死，落回串发。
 async fn try_cached(
@@ -764,13 +815,13 @@ fn write_upstream(
     }
     let prefix = parts
         .extensions
-        .remove::<PeekPrefix>()
+        .remove::<PeekRaw>()
         .map(|p| p.0)
         .unwrap_or_default();
     let out_body = if prefix.is_empty() {
         body // BoxBody 错误已是 io::Error，无需再映射
     } else {
-        upstream::prepend_body(vec![Bytes::from(prefix)], body)
+        upstream::prepend_body(prefix, body)
     };
     axum::response::Response::from_parts(parts, out_body)
 }
@@ -912,7 +963,9 @@ async fn chain_fetch(
             .unwrap_or_default()
     );
     let path = path_of(out.uri());
-    for (i, m) in chain.iter().enumerate() {
+    // 内容域小文件限长前 5 家（串行逐家, 2026-10-17 用户要求）; 大文件全链。
+    let limit = mirror_chain_cap(host).unwrap_or(chain.len()).min(chain.len());
+    for (i, m) in chain.iter().take(limit).enumerate() {
         let req = match mirror_request(out, m, &orig_url) {
             Ok(r) => r,
             Err(e) => {
@@ -941,7 +994,7 @@ async fn chain_fetch(
         }
     }
     pool::mirror_breaker_set(host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
-    Err(format!("{host} 镜像链全灭({} 个)", chain.len()))
+    Err(format!("{host} 镜像链全灭({limit} 个)"))
 }
 /// 重建请求：头/方法/URI 复制 + 体按 replay 注入（Request<BoxBody> 不可
 /// Clone，换 IP/换候选重发时每 attempt 重建一份）。
@@ -1250,6 +1303,81 @@ async fn mitm_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 镜像链限长范围（2026-10-17 用户要求）：内容域小文件限长前 5 家（仍串行），
+    /// 大文件与 github.com 归档/release 用全链。
+    #[test]
+    fn mirror_chain_cap_scope() {
+        for h in [
+            "raw.githubusercontent.com",
+            "camo.githubusercontent.com",
+            "avatars.githubusercontent.com",
+            "user-images.githubusercontent.com",
+            "media.githubusercontent.com",
+            "gist.githubusercontent.com",
+        ] {
+            assert_eq!(mirror_chain_cap(h), Some(5), "{h} 应限长 5 家");
+        }
+        for h in [
+            "codeload.github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "github.com",
+        ] {
+            assert_eq!(mirror_chain_cap(h), None, "{h} 应用全链");
+        }
+    }
+    /// gzip 嗅探(2026-10-17): 拦截页必须在"解压后的前 4KB"被判出, 且已消费的
+    /// 原始压缩帧必须是压缩流的真前缀 —— 写回时拼回不破坏字节流(浏览器自行解压)。
+    #[tokio::test]
+    async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
+        use std::io::Write;
+        fn gzip(data: &[u8]) -> Vec<u8> {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        }
+        let mut html = b"<!doctype html><html><body><h1>".to_vec();
+        html.extend_from_slice(&vec![b'a'; 2000]);
+        html.extend_from_slice(b"</h1><p>Whoa there, pardner!</p></body></html>");
+        let compressed = gzip(&html);
+        let body = BoxBody::new(
+            http_body_util::Full::new(Bytes::from(compressed.clone()))
+                .map_err(std::io::Error::other),
+        );
+        let (parts, _) = hyper::Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .header("content-encoding", "gzip")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let mut resp = hyper::Response::from_parts(parts, body);
+        assert!(is_gh_block_page(&mut resp).await, "gzip 压缩的拦截页应被判定");
+        let raw = resp
+            .extensions()
+            .get::<PeekRaw>()
+            .expect("必须保留原始压缩帧")
+            .0
+            .clone();
+        let joined: Vec<u8> = raw.iter().flat_map(|b| b.to_vec()).collect();
+        assert!(!joined.is_empty());
+        assert!(
+            compressed.starts_with(&joined),
+            "写回前缀必须是原始压缩流的真前缀"
+        );
+        // 正常页不误判
+        let normal = gzip(b"<!doctype html><html><body>hello</body></html>");
+        let body2 = BoxBody::new(
+            http_body_util::Full::new(Bytes::from(normal)).map_err(std::io::Error::other),
+        );
+        let (parts2, _) = hyper::Response::builder()
+            .header("content-type", "text/html")
+            .header("content-encoding", "gzip")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let mut resp2 = hyper::Response::from_parts(parts2, body2);
+        assert!(!is_gh_block_page(&mut resp2).await);
+    }
     /// 锁住镜像候选池契约：全部 https、互不重复、全部来自统一 MIRRORS 池
     /// （gh-proxy 系；dh-proxy 无对应服务，域名是本常量数组可改）。
     #[test]

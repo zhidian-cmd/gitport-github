@@ -133,7 +133,7 @@ flowchart TD
     F -->|"是"| E2["直接走镜像链, 不烧直连"]
     F -->|"否"| G["直连串发<br/>.133 真名SNI, 其余伪装<br/>一圈全灭 → 熔断120s + 回落镜像链"]
     D -->|"主站 / api / auth 主机"| H["直连串发 + gh_defuse<br/>拦截页垫底换IP, 试到全表"]
-    D -->|"objects-origin / uploads.github.com 上传域"| Z2["直连白名单: 不入池不过代理<br/>(仅 GLB 族/源站本尊服务, 代理边缘对其 301 会弄死上传)"]
+    D -->|"直连白名单域: 上传×2 + mermaid 渲染"| Z2["直连白名单: 不入池不过代理<br/>(上传: 仅 GLB/源站本尊服务; mermaid: 真名 SNI 被掐, 直连有 DoH/ECH)"]
     E --> R["写回浏览器: 剥 hop-by-hop 头<br/>注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
     E2 --> R
     G --> R
@@ -146,14 +146,34 @@ flowchart TD
 
 ### 直连白名单：有些域名不归代理管
 
-两个上传域名被排除在代理之外，PAC 直接返回 `DIRECT`，浏览器用自己的解析直连，代理完全不参与：
+三个域名被排除在代理之外，PAC 直接返回 `DIRECT`，浏览器用自己的解析直连，代理完全不参与：
 
 - **objects-origin.githubusercontent.com**（网页上传 Release 的落点）：该 vhost **只由 GitHub 的 GLB 族**
   （140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且不带 CORS 头——浏览器的跨域预检会直接失败，
   文件一个字节都发不出去
 - **uploads.github.com**（API 式上传源站 alambic）：直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
+- **viewscreen.githubusercontent.com**（mermaid 服务端渲染）：走代理要用**真名 SNI** 拨 Fastly 内容边缘，
+  被间歇掐断且无镜像兜底（图表要等）；浏览器直连有 **DoH + ECH 加密 SNI**，实测一进仓库即出图
 
 与其在表里猜"哪个 IP 服务它"，不如把这份知识还给 DNS。
+
+**进白名单的硬前提（判据）**：任何域名想直连，先查两件事——① 系统 DNS 有没有被污染；② 真名 SNI 会不会被 GFW 重置。
+经验规律：
+
+- 解析到**主站 GLB / 源站家族**的域名（objects-origin、viewscreen → 140.82.11x.21/.22；uploads.github.com → alambic .161）
+  → 无 DNS 污染、无 SNI 重置，**可直连**
+- 落在 **Fastly 内容边缘 .133** 的域名（raw / camo / avatars）→ 真名 SNI 被 RST（实测 `TLS 握手失败:
+  远程主机强迫关闭了一个现有的连接 (10054)`）→ **必须走代理**，直连必挂
+
+2026-10-17 实测对照：
+
+| 域名 | 系统 DNS | 真名 SNI | 结论 |
+|---|---|---|---|
+| objects-origin | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
+| viewscreen（mermaid） | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
+| uploads.github.com | 无污染（→ alambic .161） | 无阻断 | 直连 ✅ |
+| raw | 无污染（→ 185.199.110.133） | **被 RST** | 走代理 |
+| camo | 无污染（同一 IP） | 间歇黑洞 | 走代理 |
 
 判定原则：**vhost → 边缘的映射只有 GitHub 的 DNS 知道；代理只接管"表能可靠覆盖"的域名**
 （主站 / API / Fastly 三族），其余交给系统 DNS。这条原则也解释了为什么"越多的 IP 假设"反而越脆弱。
@@ -217,27 +237,39 @@ flowchart TD
 首拨成功入槽后，排队者**立即放锁、锁外并发复用**（拨号锁只罩拨号等待，不罩请求发送——持锁到发送
 会把单页 129 个并发资源压成逐个 RTT 串行，实测曾致首屏绘制 34 秒）。
 
+**活跃窗口内保活（2026-10-17）**：上游 h2 连接会被边缘按空闲回收（实测 50-65 秒），跨页面导航时
+就变成"重新握手 1.3 秒"——表现为进入新页面的轻微换页感。对策：有请求后每 30 秒对**所有已缓存的
+连接**（主站 / API / 头像图片样式族）发一个 h2 PING 帧（不发 HTTP 请求、不触风控、对端 ACK 即验活），
+只续命真实请求建立过的连接、绝不预建新通道；静默 5 分钟后自动停——连续浏览时页面导航走缓存连接
+（~300ms 首包，头像/图片同理），**空闲时没有任何定时器，进程照常纯睡**。
+
 ### 压缩传输
 
-上游请求的 `accept-encoding` 仅对 `github.com` / `api.github.com` 剥除（gh_defuse 拦截页嗅探要读
-明文 HTML 头 4KB），其余域名一律放行浏览器原生 br/gzip——GitHub 页面的 HTML/CSS/JS 全程压缩传输
-（实测单页资源裸传 3.7MB → 压缩后约 550KB），配合上游 h2 流控窗口（流 1MB / 连接 4MB）与并发复用，
-这是"进仓库快"的完整链路。
+上游请求的 `accept-encoding`：`github.com` / `api.github.com` **强制 `gzip`**（2026-10-17 起），
+其余域名一律放行浏览器原生 br/zstd——GitHub 页面的 HTML/CSS/JS 全程压缩传输
+（实测仓库页 327KB → 44.5KB、单页资源合计 3.7MB → 约 550KB）。
+gh_defuse 的拦截页嗅探不受影响：代理侧**边收边解压判前 4KB 明文**，已消费的**原始压缩帧原样转发**
+给浏览器（不重压缩、不改 content-length，解压由浏览器负责）。配合上游 h2 流控窗口
+（流 1MB / 连接 4MB）与并发复用，这是"进仓库快"的完整链路——大仓库的大文档同样走 5-7 倍压缩。
 
-### 镜像串行链
+### 镜像链（串行逐家；内容域限长前 5 家）
 
 镜像链覆盖 9 个 host：8 个内容域（raw / gist / avatars / user-images / codeload / objects / release-assets / media）
 加 github.com（专供 `/archive` 与 `/releases/download` 路径）。
 CSS/JS 与 github.io 不过镜像（实测全 404），归 edge 直连池。
+
+**与直连串发同一哲学：一家失败再试下一家，绝不并发。** 内容域小文件（头像/图片/gist/media）
+只试链上**前 5 家**（每家 5s 预算）——把一张坏图标的最坏等待从"11 家逐家超时"收窄；
+大文件走全链（逐家拉，不并发，避免多份大流量）。
 
 ```mermaid
 flowchart TD
     A["需要镜像取回"] --> B["读该 host 的链<br/>= plans.json 的 mirrors 板块"]
     B --> C{"链空?"}
     C -->|"是"| ERR["报错 → 502"]
-    C -->|"否"| D["取链位 i 的镜像"]
+    C -->|"否"| D["取链位 i 的镜像<br/>内容域小文件最多试前 5 家<br/>(大文件走全链)"]
     D --> E["拼 URL: 镜像域名 + / + 原始完整URL<br/>剥 Cookie / Authorization / Referer<br/>(凭据不外泄镜像)"]
-    E --> F{"8s 内出响应头?"}
+    E --> F{"5s 内出响应头?"}
     F -->|"否"| H["记失败, i+1"]
     F -->|"是"| G{"状态 >= 300<br/>或返回 html?"}
     G -->|"是 (甩锅/假站/拒绝)"| H
@@ -376,6 +408,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 | github.com 及其余子域 | core 池直连串发（伪装 SNI）+ gh_defuse |
 | api.github.com | api 池直连串发（API 专用边缘，与网站 IP 互斥） |
 | uploads.github.com | **直连白名单**（API 式上传源站；不入池、不过代理，DNS 直达 alambic .161——等价 gh CLI 可用路径；原专用池与验收名覆盖已随之删除。网页上传 Release 实际走 objects-origin） |
+| viewscreen.githubusercontent.com | **直连白名单**（mermaid 服务端渲染；代理腿真名 SNI 被间歇掐且无镜像兜底，直连走浏览器 DoH/ECH 加密 SNI——2026-10-17 实测直连即出图） |
 | githubapp.com（授权）、githubassets、github.io | edge 池直连串发 |
 | avatars/camo/gist/raw 等内容域 | edge 直连优先 → 熔断后镜像链 |
 | codeload / objects / release-assets | 镜像 only |

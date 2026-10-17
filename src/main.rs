@@ -88,6 +88,8 @@ fn run() {
 
     // 串发表顺序变更 2s 内落盘（需 runtime 就绪）
     pool::start_persist(&rt);
+    // 活跃窗口内上游 h2 保活（跨导航复用；空闲零唤醒不变）
+    server::upstream::start_keepalive(&rt);
 
     // 启动代理
     let srv = Arc::new(server::ProxyServer {

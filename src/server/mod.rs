@@ -103,6 +103,8 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
 impl ProxyServer {
     async fn handle(&self, mut client: TcpStream) -> std::io::Result<()> {
         let _ = client.set_nodelay(true);
+        // 活跃窗口计时: 有请求时保持上游 h2 连接保活(跨导航复用), 静默即停
+        upstream::note_activity();
         let head = read_head(&mut client).await?;
         let Some(idx) = find_crlf(&head) else {
             return Ok(());
