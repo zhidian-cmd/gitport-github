@@ -99,13 +99,16 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
 }
 
 /// 直连白名单：不归任何池、也不经代理的域名（"信任 DNS"清单）。
-/// objects-origin（release 附件上传落点）：该 vhost 只由 GLB 族
-/// (140.82.11x.21/.22, x-github-backend: Kubernetes) 服务；主站网页边缘对它
-/// 一律 301 到 github.com 且无 CORS 头 → 浏览器跨域预检直接失败、文件字节
-/// 一个都发不出去（2026-10-17 逐 IP 实测：core 池 21/35 是 301 边缘）。
-/// vhost→边缘的映射只有 GitHub 的 DNS 知道，交给系统解析（→ glb-*.github.com）
-/// 永远命中正确族，代码里不再保留这份会腐化的知识。
-pub const DIRECT_HOSTS: &[&str] = &["objects-origin.githubusercontent.com"];
+/// - objects-origin（网页上传 Release 落点）：该 vhost 只由 GLB 族
+///   (140.82.11x.21/.22, x-github-backend: Kubernetes) 服务；主站网页边缘对它
+///   一律 301 到 github.com 且无 CORS 头 → 浏览器跨域预检直接失败、文件字节
+///   一个都发不出去（2026-10-17 逐 IP 实测：core 池 21/35 是 301 边缘）。
+/// - uploads.github.com（API 式上传源站 alambic → 20.205.243.161）：当前网页
+///   流程不用它；直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
+///   （原专用池 + 验收名覆盖为一处降级，已随之删除）。
+/// vhost→边缘的映射只有 GitHub 的 DNS 知道，交给系统解析永远命中正确族，
+/// 代码里不再保留这份会腐化的知识。
+pub const DIRECT_HOSTS: &[&str] = &["objects-origin.githubusercontent.com", "uploads.github.com"];
 
 /// host 是否在直连白名单。
 pub fn is_direct(host: &str) -> bool {
@@ -175,13 +178,12 @@ mod tests {
         // api 池精确匹配优先于 core 的 "*.github.com"
         assert_eq!(pool_for("api.github.com"), "api");
         assert_eq!(pool_for("api.github.com.cn"), ""); // 不误伤非 api.github.com 后缀
-        // uploads.github.com 2026-10-17 起非池化: 当前网页上传流程不经它,
-        // 被 core 的 *.github.com 通配符接住即可(与主站边缘同池)
-        assert_eq!(pool_for("uploads.github.com"), "core");
-        // objects-origin（release 附件上传落点）: 直连白名单 —— 不入池不过代理。
-        // 该 vhost 只有 GLB 族服务（其余边缘 301 无 CORS → 跨域预检失败、上传必败）
+        // 上传域名全部直连白名单: 不入池不过代理(2026-10-17)
         assert!(is_direct("objects-origin.githubusercontent.com"));
         assert_eq!(pool_for("objects-origin.githubusercontent.com"), "");
+        // uploads.github.com(API 式上传源站)同在白名单: 原上游专用池已撤销
+        assert!(is_direct("uploads.github.com"));
+        assert_eq!(pool_for("uploads.github.com"), "");
         // 精确 pattern 优先：codeload 不能落 core
         assert_eq!(pool_for("codeload.github.com"), "codeload");
         // 文件内容域 → edge 直连（avatars/camo/gist 实测直连 1s 内 200；

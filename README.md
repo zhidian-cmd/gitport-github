@@ -54,7 +54,6 @@ clone、push、网页上传、Release 下载、raw 文件、头像、网页浏�
 | 私库 release 附件走镜像 | 镜像链剥凭据 + 拒绝带签名查询串的请求（防 Cookie/token 外泄，2026-10-17 审计加固） | 公库无感；私库附件 signed URL 镜像腿拒收，等直连恢复 |
 | 内容域新建连接偶发被掐 | GFW 对 Fastly 内容边缘（.133/.154/.215，真名 SNI）的间歇性阻断：新建 TCP 黑洞、已建连接复用正常（表现为 raw 图/头像/图表"忽快忽死"） | DNS 兜底腿 + 镜像链自动接管；窗口过去后自动恢复直连（2026-10-17 实测记录） |
 | MITM 下用 schannel 系 CLI 工具 | 本地叶子证书无 OCSP/CRL 吊销信息（certgen.rs `ocsp: None`），Windows 系统 TLS 栈吊销检查硬失败（CRYPT_E_NO_REVOCATION_CHECK）：`curl.exe` 直接拒绝握手，git 走默认 schannel 后端同样失败 | `curl --ssl-no-revoke`；`git config --global http.schannelCheckRevoke false`（或 git 换 openssl 后端）；浏览器吊销检查是软失败，网页使用无感。根治需本地 CRL/OCSP 端点，暂以客户端配置绕过 |
-| 上传路径按"本名"验收 TLS | uploads.github.com 伪装 SNI 时按其 CNAME 本名 `alambic-origin.githubusercontent.com` 验收（源站对未知 SNI 只吐默认证书，按所访名验收必败） | 两名同为 GitHub 控制，公信 CA 获取难度同级；仅此一处容忍，其余 host 一律按所访名验收（dial.rs `verify_name`） |
 
 ## 常见问题
 
@@ -134,7 +133,7 @@ flowchart TD
     F -->|"是"| E2["直接走镜像链, 不烧直连"]
     F -->|"否"| G["直连串发<br/>.133 真名SNI, 其余伪装<br/>一圈全灭 → 熔断120s + 回落镜像链"]
     D -->|"主站 / api / auth 主机"| H["直连串发 + gh_defuse<br/>拦截页垫底换IP, 试到全表"]
-    D -->|"objects-origin.* 上传域"| Z2["直连白名单: 不入池不过代理<br/>(仅 GLB 族服务, 代理边缘对其 301 会弄死上传)"]
+    D -->|"objects-origin / uploads.github.com 上传域"| Z2["直连白名单: 不入池不过代理<br/>(仅 GLB 族/源站本尊服务, 代理边缘对其 301 会弄死上传)"]
     E --> R["写回浏览器: 剥 hop-by-hop 头<br/>注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
     E2 --> R
     G --> R
@@ -147,12 +146,14 @@ flowchart TD
 
 ### 直连白名单：有些域名不归代理管
 
-`objects-origin.githubusercontent.com`（网页上传 Release 附件的落点）是唯一被排除在代理之外的 GitHub 域名。
-这个 vhost **只由 GitHub 的 GLB 族**（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且不带 CORS 头——
-浏览器的跨域预检会直接失败，文件一个字节都发不出去。
+两个上传域名被排除在代理之外，PAC 直接返回 `DIRECT`，浏览器用自己的解析直连，代理完全不参与：
 
-与其在表里猜"哪个 IP 服务它"，不如把这份知识还给 DNS：PAC 对这个域名直接返回 `DIRECT`，
-浏览器用自己的解析直连 GLB，代理完全不参与。
+- **objects-origin.githubusercontent.com**（网页上传 Release 的落点）：该 vhost **只由 GitHub 的 GLB 族**
+  （140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且不带 CORS 头——浏览器的跨域预检会直接失败，
+  文件一个字节都发不出去
+- **uploads.github.com**（API 式上传源站 alambic）：直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
+
+与其在表里猜"哪个 IP 服务它"，不如把这份知识还给 DNS。
 
 判定原则：**vhost → 边缘的映射只有 GitHub 的 DNS 知道；代理只接管"表能可靠覆盖"的域名**
 （主站 / API / Fastly 三族），其余交给系统 DNS。这条原则也解释了为什么"越多的 IP 假设"反而越脆弱。
@@ -357,7 +358,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 | `140.82.x.3` / `.4` | 主站边缘 | github.com 网页 | 伪装 |
 | `140.82.x.5` / `.6` | API 专用边缘 | api.github.com（与网站 IP 互斥） | 伪装 |
 | `140.82.x.29` / `.30` | 授权边缘 | githubapp.com 登录/OAuth 回调 | 伪装 |
-| `20.205.243.161` | 上传源站（alambic，单租户） | uploads.github.com（部分上传类型；**网页上传 Release 走直连白名单，不经此 IP**） | 伪装（验收名覆盖为其 CNAME 本名） |
+| `20.205.243.161` | 上传源站（alambic，单租户） | uploads.github.com（API 式上传；**网页上传 Release 走 objects-origin 直连白名单，不经此 IP**） | —（直连白名单，代理不拨它） |
 | `20.x.x.x`（Azure 段）、`4.237.x`、`172.182.x` 等杂段 | 主站边缘备选 | github.com 网页 | 伪装 |
 | `185.199.x.133` | Fastly 内容边缘 | avatars / raw / gist / camo 等 githubusercontent 族 | **真名**（伪装会被该边缘挂起） |
 | `185.199.x.215` | Fastly 静态边缘（**新**，2026-10 起 assets 已迁至此） | githubassets 的 CSS/JS | 伪装 |
@@ -374,7 +375,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 |---|---|
 | github.com 及其余子域 | core 池直连串发（伪装 SNI）+ gh_defuse |
 | api.github.com | api 池直连串发（API 专用边缘，与网站 IP 互斥） |
-| uploads.github.com | core 池（2026-10-17 起 uploads 池撤销，被 `*.github.com` 通配符接住；当前网页上传流程不经它，系统 DNS 直连兜底） |
+| uploads.github.com | **直连白名单**（API 式上传源站；不入池、不过代理，DNS 直达 alambic .161——等价 gh CLI 可用路径；原专用池与验收名覆盖已随之删除。网页上传 Release 实际走 objects-origin） |
 | githubapp.com（授权）、githubassets、github.io | edge 池直连串发 |
 | avatars/camo/gist/raw 等内容域 | edge 直连优先 → 熔断后镜像链 |
 | codeload / objects / release-assets | 镜像 only |
@@ -385,7 +386,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 ## WebUI 功能（127.0.0.1:7811）
 
 - 概览：运行状态、代理地址、连通徽标、最近日志
-- IP 池：三池条目一览（顺序即优先级，表头即正在用）；objects-origin 上传路径是直连白名单（不入池、不上 UI，日志不会出现它的隧道记录，属正常）
+- IP 池：三池条目一览（顺序即优先级，表头即正在用）；objects-origin 与 uploads.github.com 是直连白名单（不入池、不上 UI，日志不会出现它们的隧道记录，属正常）
 - 设置：开机自启、关窗到托盘（✕ = 释放整个 WebView2，托盘态只剩代理核心约 12MB ≈ headless；点托盘图标随时重开工作台）、GitHub 分流接管（PAC）、MITM 开关（自动 certutil 装根，装完重启浏览器一次）
 - 镜像链校准：约 30~90 秒，期间可正常上网
 

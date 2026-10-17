@@ -40,3 +40,4 @@ diag*.txt
 .workbuddy/
 .zread
 deliverables
+/dist/*.exe.old*

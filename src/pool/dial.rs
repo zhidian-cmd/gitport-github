@@ -2,8 +2,8 @@
 //! 2026-10-14 起流量恒为伪装（fake:x）。SNI 与校验名解耦：set_hostname 只改
 //! SNI 扩展，verify param 的 set_host 只改校验名；GREASE + ALPN h2,http/1.1
 //! + BoringSSL 默认套件序 = Chrome 同款指纹（JA3/JA4 不再像库实现）。
-//! 唯一验收名覆盖：uploads.github.com 伪装腿按其 CNAME 本名验收（verify_name
-//! —— 上传源站对未知 SNI 吐默认证书 *.githubusercontent.com，SAN 无 uploads）。
+//! 校验名恒为目标 host（无任何覆盖）——上传域名已全部走直连白名单
+//! （config::DIRECT_HOSTS），不再进入本拨号层（2026-10-17）。
 //! 选型：Rust 生态无 utls 绑定（rquest 全 yanked、wreq 无法解耦"拨号 IP"与
 //! "SNI"——本项目生命线），故用 boring（cloudflare/boring 4.22）自建三形态
 //! 握手。
@@ -21,27 +21,6 @@ use tokio::net::TcpStream;
 /// 握手形态标识（拨号层内部用）。
 pub const MODE_SNI: &str = "sni"; // BoringSSL 真 SNI
 pub const MODE_FAKE_PFX: &str = "fake:"; // 表内裸域名(如 baidu.com)经 plan_mode 加上, 证书按 host 校验
-
-/// uploads.github.com 的 CNAME 本名：专用上传源站（alambic）伪装 SNI 时吐的
-/// 默认证书即 *.githubusercontent.com 族，验收名对准本名才能通过。
-const UPLOADS_VERIFY_NAME: &str = "alambic-origin.githubusercontent.com";
-
-/// 验收名（校验名）：恒为目标 host，唯一例外是伪装腿的 uploads.github.com
-/// —— 上传源站 TLS 层不按 SNI 拒绝路由，对未知 SNI 吐默认证书
-/// (*.githubusercontent.com，SAN 不含 uploads.github.com)，按目标 host 验收
-/// 必败；改按其 CNAME 本名验收（公网 CA 真证书，抗中间人能力不减）。
-/// 真名腿(SNI=uploads)服务器按 SNI 出专用证书，仍按 host 验收，不覆盖。
-/// 安全权衡（知情记录，2026-10-17 复审）：此腿验收名不再等于用户所访名，
-/// 证书接受集从"覆盖 uploads"放宽为"覆盖本名"——两名为 GitHub 同控，
-/// 公信 CA 获取难度同级，实质 MITM 门槛近似。仅此一处容忍降级，其他 host
-/// 一律按目标 host 验收。
-pub fn verify_name<'a>(host: &'a str, mode: &str) -> &'a str {
-    if mode.starts_with(MODE_FAKE_PFX) && host == "uploads.github.com" {
-        UPLOADS_VERIFY_NAME
-    } else {
-        host
-    }
-}
 
 /// BoringSSL(Tokio) TLS 流类型。
 pub type BoringTls = tokio_boring::SslStream<TcpStream>;
@@ -212,18 +191,16 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
             return Err(io_err(format!("未知握手形态 {other:?}")));
         }
     }
-    // 校验名恒为目标 host（与 SNI 解耦；IP 形式走 set_ip），伪装腿的唯一
-    // 覆盖见 verify_name。对照 boring 官方 setup_verify_hostname：
-    // NO_PARTIAL_WILDCARDS + set_host/set_ip。
+    // 校验名恒为目标 host（与 SNI 解耦；IP 形式走 set_ip），无任何覆盖。
+    // 对照 boring 官方 setup_verify_hostname：NO_PARTIAL_WILDCARDS + set_host/set_ip。
     let param = ssl.param_mut();
     param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
-    let vname = verify_name(host, mode);
-    match vname.parse::<std::net::IpAddr>() {
+    match host.parse::<std::net::IpAddr>() {
         Ok(ip) => param
             .set_ip(ip)
             .map_err(|e| io_err(format!("校验 IP 设置失败: {e}")))?,
         Err(_) => param
-            .set_host(vname)
+            .set_host(host)
             .map_err(|e| io_err(format!("校验名设置失败: {e}")))?,
     }
     Ok(ssl)
@@ -506,23 +483,6 @@ mod tests {
         assert!(obs.grease);
     }
 
-    #[test]
-    fn verify_name_overrides_only_uploads_fake() {
-        // 伪装腿访问 uploads：验收名覆盖为其 CNAME 本名（默认证书 SAN 内）
-        assert_eq!(
-            verify_name("uploads.github.com", "fake:baidu.com"),
-            "alambic-origin.githubusercontent.com"
-        );
-        // 真名腿不覆盖：服务器按 SNI 出 uploads 专用证书，按 host 验收即过
-        assert_eq!(
-            verify_name("uploads.github.com", MODE_SNI),
-            "uploads.github.com"
-        );
-        // 其他 host 伪装腿不覆盖（网页边缘默认证书恰好覆盖 *.github.com 族）
-        assert_eq!(verify_name("github.com", "fake:baidu.com"), "github.com");
-        assert_eq!(verify_name("api.github.com", "fake:baidu.com"), "api.github.com");
-    }
-
     #[tokio::test]
     #[ignore = "真实网络直连 GitHub，仅诊断用，非 CI 稳定项"]
     async fn real_network_boring_dial_probe() {
@@ -550,37 +510,6 @@ mod tests {
                 }
                 Ok(Err(e)) => eprintln!("[{mode}] {ip} 失败: {e}"),
                 Err(_) => eprintln!("[{mode}] {ip} 超时"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "真实网络直连上传源站，仅诊断用，非 CI 稳定项"]
-    async fn real_network_uploads_verify_probe() {
-        // 上传源站 20.205.243.161（alambic）双向对照：
-        // 伪装腿（SNI=baidu.com + 验收名覆盖本名）应握手成功 —— 线上形态；
-        // 真名腿（SNI=uploads.github.com，按 host 验收）应握手成功 —— 对照组。
-        // 任一失败 = 源站性格/证书变化，先查 verify_name 与 .161 是否仍有效。
-        for (label, mode) in [("伪装+覆盖", "fake:baidu.com"), ("真名对照", MODE_SNI)] {
-            match tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                let tcp = TcpStream::connect(("20.205.243.161", 443))
-                    .await
-                    .map_err(|e| format!("TCP 连接失败: {e}"))?;
-                let ssl =
-                    client_ssl("uploads.github.com", mode, None).map_err(|e| format!("client_ssl: {e}"))?;
-                tokio_boring::SslStreamBuilder::new(ssl, tcp)
-                    .connect()
-                    .await
-                    .map_err(|e| format!("TLS 握手失败: {e}"))
-            })
-            .await
-            {
-                Ok(Ok(tls)) => eprintln!(
-                    "[{label}] uploads.github.com <- 20.205.243.161 拨号成功 h2={:?}",
-                    tls.ssl().selected_alpn_protocol()
-                ),
-                Ok(Err(e)) => eprintln!("[{label}] 失败: {e}"),
-                Err(_) => eprintln!("[{label}] 超时"),
             }
         }
     }
