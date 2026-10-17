@@ -52,6 +52,7 @@ clone、push、Release 下载、raw 文件、头像、网页浏览全场景加�
 | 完全无门槛 | 开 MITM 需装本地根证书 | WebUI 一键 certutil 安装；不装也能用（纯透传） |
 | 加速所有网站 | 只路由 GitHub 系域名 | Google / YouTube 等请用通用代理 |
 | 私库 release 附件走镜像 | 镜像链剥凭据（防 Cookie 外泄，设计如此） | 公库无感；私库附件等直连恢复 |
+| MITM 下用 schannel 系 CLI 工具 | 本地叶子证书无 OCSP/CRL 吊销信息（certgen.rs `ocsp: None`），Windows 系统 TLS 栈吊销检查硬失败（CRYPT_E_NO_REVOCATION_CHECK）：`curl.exe` 直接拒绝握手，git 走默认 schannel 后端同样失败 | `curl --ssl-no-revoke`；`git config --global http.schannelCheckRevoke false`（或 git 换 openssl 后端）；浏览器吊销检查是软失败，网页使用无感。根治需本地 CRL/OCSP 端点，暂以客户端配置绕过 |
 | 上传路径按"本名"验收 TLS | uploads.github.com 伪装 SNI 时按其 CNAME 本名 `alambic-origin.githubusercontent.com` 验收（源站对未知 SNI 只吐默认证书，按所访名验收必败） | 两名同为 GitHub 控制，公信 CA 获取难度同级；仅此一处容忍，其余 host 一律按所访名验收（dial.rs `verify_name`） |
 
 ## 常见问题
