@@ -73,7 +73,7 @@ fn run() {
     };
     // 串发核心: plans.json 唯一权威, 随使用演化(首次运行由内嵌种子初始化)
     pool::serial_load(&exe_dir, Some(log_fn.clone()));
-    let ca = certgen::load_or_generate(&exe_dir).ok();
+    let ca = certgen::load_or_generate(&exe_dir, Some(&log_fn)).ok();
     if ca.is_none() {
         log_fn("CA 初始化失败, MITM 不可用");
     }

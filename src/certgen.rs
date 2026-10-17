@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
+use crate::pool::LogFn;
+
 /// 本地 CA。
 pub struct Authority {
     cert_pem: String, // CA 证书 PEM（Issuer 重建/导出用）
@@ -117,10 +119,20 @@ pub fn tls_config_of(a: &Arc<Authority>) -> Arc<rustls::ServerConfig> {
 
 /// 加载 dir 下 ca.crt/ca.key；不存在则生成（CN=GitPort Root，10 年）。
 /// 兼容 SEC1 旧格式 CA（PEM: CERTIFICATE + EC PRIVATE KEY）。
-pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
+/// load 分支重申 key 的 ACL：ACL 若只在首次生成时收紧，旧版遗留/外部复制
+/// 进来的 key 会保持目录继承权限 —— 同机他账户可读根私钥即可伪造叶子证书
+/// 对用户 MITM（2026-10-17 安全审计 F-004）。重申失败不阻断 MITM，但写
+/// 日志必须可见。
+pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
     if let Ok(a) = load(&cert_path, &key_path) {
+        let key_str = key_path.to_string_lossy().into_owned();
+        if let Err(e) = crate::winsec::restrict_to_current_user(&key_str) {
+            if let Some(l) = log {
+                l(&format!("[安全] ca.key ACL 重申失败: {e}"));
+            }
+        }
         return Ok(a);
     }
     let a = generate()?;
@@ -290,7 +302,7 @@ mod tests {
     fn ca_generate_and_leaf() {
         let dir = std::env::temp_dir().join(format!("gitport_cert_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let a = load_or_generate(&dir).unwrap();
+        let a = load_or_generate(&dir, None).unwrap();
         assert!(!a.cert_der.is_empty());
         let leaf = a.leaf("github.com").unwrap();
         assert_eq!(leaf.cert.len(), 2, "叶子应附带 CA 链");
@@ -316,7 +328,7 @@ mod tests {
     fn tls_config_ok() {
         let dir = std::env::temp_dir().join(format!("gitport_tls_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let a = load_or_generate(&dir).unwrap();
+        let a = load_or_generate(&dir, None).unwrap();
         let _cfg = tls_config_of(&a);
     }
 
@@ -325,7 +337,7 @@ mod tests {
     async fn mitm_handshake_roundtrip() {
         let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let a = load_or_generate(&dir).unwrap();
+        let a = load_or_generate(&dir, None).unwrap();
         let cfg = tls_config_of(&a);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

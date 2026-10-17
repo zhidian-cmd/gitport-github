@@ -82,13 +82,14 @@ async function refreshStatus() {
   $('sPoolCount').textContent = total;
   $('sPoolCount').style.color = total ? 'var(--green)' : '';
   $('navPools').textContent = total;
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   $('poolCards').innerHTML = poolOrder.map(name => {
     const items = sp[name] || [];
     const shown = items.slice(0, 9);
     const chips = shown.length
       ? '<div class="chips">' + shown.map(p =>
-          '<span class="chip"><span>' + p.ip + '</span><span class="ms">' +
-          (p.sni || '自动') + '</span></span>'
+          '<span class="chip"><span>' + esc(p.ip) + '</span><span class="ms">' +
+          esc(p.sni || '自动') + '</span></span>'
         ).join('') + (items.length > 9 ? '<div class="hint" style="margin:4px 0 0">…其余 ' + (items.length - 9) + ' 条按序候补</div>' : '') + '</div>'
       : '<div class="pool-empty">表空: 手动往 plans.json 加候选(改完重启生效)</div>';
     return '<div class="panel pool-card">' +

@@ -46,15 +46,14 @@ fn is_big_file_host(host: &str) -> bool {
         || host == "objects.githubusercontent.com"
         || host == "release-assets.githubusercontent.com"
 }
-/// 池内域名本地终结 TLS。objects-origin 是上传链路，经 MITM/镜像会弄坏上传，保持纯透传。
+/// 池内域名本地终结 TLS。直连白名单域名（objects-origin 等）pool_for 返回空
+/// → 上面 is_empty 分支已豁免；把它们改回池属契约变更，由
+/// pool::tests::objects_origin_never_pooled 拦，不设运行时护栏。
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
     }
-    if pool::pool_for(host).is_empty() {
-        return false;
-    }
-    !host.starts_with("objects-origin.")
+    !pool::pool_for(host).is_empty()
 }
 // ---------- 单连接 MITM 服务 ----------
 /// 回 200 后把连接升级为 TLS 服务端，按 ALPN 选择 h2/h1 服务，可承载多条请求。
@@ -430,6 +429,14 @@ fn path_of(uri: &http::Uri) -> String {
         .map(|p| p.as_str().to_string())
         .unwrap_or_default()
 }
+/// HTML 实体转义（&<>"'），错误页插值用。
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
 /// 嗅探响应体前 4KB 判定 GitHub 风控拦截页(HTML + 标志串)。
 /// 读出的字节原样保留(PeekPrefix)，最终写回客户端，不影响响应体完整性。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
@@ -461,9 +468,11 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     }
     resp.extensions_mut().insert(PeekPrefix(head.clone()));
     let chunk = String::from_utf8_lossy(&head).to_lowercase();
+    // "bad request" 串太宽(任何 400 页正文都可能含) —— 必须叠加状态码=400
+    // 才判风控(2026-10-17 安全审计 F-005), 否则正常 400 会触发整池轮换
     chunk.contains("has been restricted")
         || chunk.contains("whoa there")
-        || chunk.contains("bad request")
+        || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
 }
 /// 嗅探/探测读出的字节：最终写回时拼到响应体前端。
 #[derive(Clone)]
@@ -659,6 +668,13 @@ async fn get_direct(
     Err("直连串发全灭(完整请求逐个试完)".to_string())
 }
 
+/// gh_defuse 终止决策（纯函数，仅为可测性抽出）：同 IP 再现 = 整表已轮完
+/// 一圈，全员拦截页 → 终止交付真实响应。调用方必须已完成垫底 + drop_h2
+/// （顺序不可换：终止交付时坏连接不能留在复用缓存）。
+fn defuse_full_cycle(seen: &mut std::collections::HashSet<String>, ip: &str) -> bool {
+    !seen.insert(ip.to_string())
+}
+
 async fn gh_defuse(
     log: &LogFn,
     host: &str,
@@ -675,6 +691,7 @@ async fn gh_defuse(
     // 正常页即交付成功，绝不无谓冷静。
     let mut tried = 0; // 已垫底重试候选数(仅日志)
     let mut seen = std::collections::HashSet::new(); // 本轮已试 IP
+    let mut empty_ip_retries = 0u8; // 归属缺失分支的重试上限
     loop {
         if !is_gh_block_page(&mut resp).await {
             return Ok(resp);
@@ -685,7 +702,12 @@ async fn gh_defuse(
         }
         if ip.is_empty() {
             // 复用连接上的拦截页(理论可达：本次没拨号)：直接重试(连接不复用，
-            // 重试必有归属)
+            // 重试必有归属)。归属缺失时 seen 无法追踪 —— 计数上限钉死该
+            // 理论路径(2026-10-17 代码审查: 防未来改动使其真可达时死循环)
+            empty_ip_retries += 1;
+            if empty_ip_retries > 3 {
+                return Ok(resp);
+            }
             resp = match get_direct(log, out, host, info, is_simple, body).await {
                 Ok(r) => r,
                 Err(e) => return Err(e),
@@ -704,7 +726,7 @@ async fn gh_defuse(
         // 整表轮换完一圈(同 IP 再现) = 全员拦截页: 再转只会重复, 交回 GitHub
         // 真实拦截响应终止。垫底+拔连接必须发生在终止判定之前 —— 否则交付时
         // 坏连接仍挂在复用缓存, 下个请求乒乓(2026-10-17 复审补充)
-        if !seen.insert(ip.clone()) {
+        if defuse_full_cycle(&mut seen, &ip) {
             (log)(&format!(
                 "[MITM] {host} 全部可用边缘均返回拦截页({tried}), 交付真实响应"
             ));
@@ -761,6 +783,9 @@ fn mitm_unavailable(
         return plain_502();
     }
     let ui_port = config::webui_port();
+    // host 来自 CONNECT 目标/Host 头, 进 HTML 前转义(2026-10-17 安全审计
+    // F-007: 浏览器路径不可注入, 纯纵深)
+    let host = html_escape(host);
     let html = format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
 <meta http-equiv=\"refresh\" content=\"8\"><title>{host} 暂时不可用</title>\
@@ -870,6 +895,14 @@ async fn chain_fetch(
     // 仓库在全灭窗口里每张图都重烧一遍链, spinner 会转几分钟
     if pool::mirror_breaker_open(host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
+    }
+    // 凭据查询串拒绝走镜像(2026-10-17 安全审计 F-001)：签名凭据
+    // (token/X-Amz-*/sig 类)等价 bearer, 剥头清单管不到它 —— 私库附件
+    // signed URL 交给第三方镜像即外泄。此类请求镜像本也取不回, 直接拒。
+    if let Some(q) = out.uri().query() {
+        if has_credential_query(q) {
+            return Err(format!("{host} 查询串含凭据参数, 拒绝镜像(防外泄)"));
+        }
     }
     let orig_url = format!(
         "https://{host}{}",
@@ -983,6 +1016,22 @@ async fn mirror_do(
         std::io::Error::other,
     ));
     Ok(hyper::Response::from_parts(parts, body))
+}
+/// 镜像腿凭据查询串检测：参数名命中凭据形态即拒（大小写不敏感）。
+/// 前缀匹配覆盖 AWS SigV4 全家（x-amz-*），精确名覆盖 gh-proxy 系常见形态。
+fn has_credential_query(query: &str) -> bool {
+    query.split('&').any(|kv| {
+        let name = kv.split('=').next().unwrap_or("").to_lowercase();
+        name == "token"
+            || name == "sig"
+            || name == "signature"
+            || name == "jwt"
+            || name == "auth"
+            || name == "access_token"
+            || name == "session_token"
+            || name == "awsaccesskeyid"
+            || name.starts_with("x-amz-")
+    })
 }
 /// 校准模板：每 host 一个内置稳定 URL，校准时经各镜像拉它测 TTFB。
 /// 选型原则：十年不腐 —— octocat 官方 gist/头像、torvalds/linux 的
@@ -1235,6 +1284,18 @@ mod tests {
                 "{h} 缺校准模板"
             );
         }
+    }
+    /// gh_defuse 终止决策契约：首见 IP 继续, 同 IP 再现(整表轮完一圈)终止。
+    #[test]
+    fn defuse_full_cycle_pins_contract() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(!defuse_full_cycle(&mut seen, "1.2.3.4"), "首见 = 继续");
+        assert!(!defuse_full_cycle(&mut seen, "5.6.7.8"), "另一 IP = 继续");
+        assert!(
+            defuse_full_cycle(&mut seen, "1.2.3.4"),
+            "同 IP 再现 = 整表轮完, 终止"
+        );
+        assert!(defuse_full_cycle(&mut seen, "1.2.3.4"), "重复终止保持终止");
     }
     /// release/archive 路径判定：只拦下载，不拦 git 智能协议与页面。
     #[test]

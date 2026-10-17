@@ -134,6 +134,15 @@ async fn index() -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    // 纵深防御(2026-10-17 安全审计 F-003)：connect-src 锁 self 断外传数据。
+    // script/style 需 unsafe-inline：index 内联脚本 + onclick 事件属性
+    // （注入源已在 pool 层做 sni 格式校验收口, 这里是第二道）
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+        ),
+    );
     headers.insert(
         "content-type",
         HeaderValue::from_static("text/html; charset=utf-8"),
@@ -164,7 +173,9 @@ async fn app_js() -> Response {
 }
 
 /// 分流 PAC 脚本(系统代理接管)：开启时池内全部域名 → PROXY 127.0.0.1:port，
-/// 其余 DIRECT。JScript 是 ES3：后缀判断手写 lastIndexOf。
+/// 其余 DIRECT。直连白名单(config::DIRECT_HOSTS)显式短路 DIRECT —— 必须在
+/// 后缀匹配之前判定，否则会被 *.githubusercontent.com 通配符吞掉
+/// (objects-origin 上传链路, 2026-10-17)。JScript 是 ES3：后缀判断手写 lastIndexOf。
 fn pac_script() -> String {
     let mut domains: Vec<&str> = Vec::new();
     if settings::github_pac() {
@@ -180,10 +191,19 @@ fn pac_script() -> String {
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
         .join(",");
+    // 直连白名单单一真相: 从 config::DIRECT_HOSTS 生成, 不写第二份字面量
+    let direct_list = config::DIRECT_HOSTS
+        .iter()
+        .map(|d| format!("'{d}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "// GitPort GitHub 分流 PAC —— 由工作台按开关动态生成, 勿手改\n\
 function FindProxyForURL(url, host) {{\n\
-  if (fpMatch((host + '').toLowerCase())) return '{proxy}; DIRECT';\n\
+  var h = (host + '').toLowerCase();\n\
+  var dl = [{direct_list}];\n\
+  for (var i = 0; i < dl.length; i++) {{ if (h === dl[i]) return 'DIRECT'; }}\n\
+  if (fpMatch(h)) return '{proxy}; DIRECT';\n\
   return 'DIRECT';\n\
 }}\n\
 function fpMatch(h) {{\n\

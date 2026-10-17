@@ -5,8 +5,8 @@
 //!   no-op 不写盘不打日志 —— 否则每个成功响应都重写 plans.json
 //! - 全灭: 冷却 30s 快速失败, 不自动拉源 —— 表内容只靠手改维护
 //! - 仅顺序真变更才写盘(2s 内原子写回); 文件可随时手改(改完重启生效)
-//! - 覆盖 core/api/edge/uploads 四池(均直连)。edge 混合池按 host 族对口选择
-//!   (entry_serves)；uploads 为 uploads.github.com 专用上传源站小池；
+//! - 覆盖 core/api/edge 三池(均直连)。edge 混合池按 host 族对口选择
+//!   (entry_serves)；uploads.github.com 与 objects-origin 已非池化(直连兜底)；
 //!   codeload 与 releases 大文件仍全镜像无表
 //! —— 见 config::GROUPS 与 server/mitm.rs。
 
@@ -32,11 +32,12 @@ pub struct SerialPlan {
     pub sni: String,
 }
 
-/// 串发覆盖的直连池：core（站点）/ api（api.github.com）/ edge（auth 主机 +
-/// Fastly 静态边缘，均不外泄镜像/镜像不路由）/ uploads（uploads.github.com
-/// 专用上传源站）。codeload 与 releases 大文件全镜像、无表。此常量同时决定
-/// 落盘/UI 顺序（两者恒一致，不设第二份）。
-pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge", "uploads"];
+/// 串发覆盖的直连池：core（站点）/ api（api.github.com）/
+/// edge（auth 主机 + Fastly 静态边缘，均不外泄镜像/镜像不路由）。codeload 与
+/// releases 大文件全镜像、无表。此常量同时决定落盘/UI 顺序（两者恒一致）。
+/// uploads.github.com 与 objects-origin（上传链路）2026-10-17 起非池化，
+/// 系统 DNS 直连兜底（objects-origin 走 config::DIRECT_HOSTS，连代理都不进）。
+pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
 /// 内置种子：首次运行（无 plans.json）时展开成初始表。
 const SEEDS_JSON: &str = include_str!("seeds.json");
@@ -277,6 +278,7 @@ fn host_family(host: &str) -> &'static str {
 /// .215 伪装；assets 族 2026-10 起认新边缘 .215，.154 保留兼容），其余
 /// host（主站/auth）只认非 Fastly 伪装条目。不对口跳过（不试不垫底）——
 /// 否则各类请求互相试败垫底，池序永远乒乓。
+/// 注：objects-origin 是直连白名单（config::DIRECT_HOSTS），不经任何池。
 fn entry_serves(host: &str, p: &SerialPlan) -> bool {
     match host_family(host) {
         "content" => fastly_last_octet(&p.ip) == Some("133"),
@@ -424,17 +426,22 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
     *SERIAL_LOG.lock().unwrap() = log.clone();
     let path = plans_path();
-    let loaded: PlansFile = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|b| serde_json::from_str::<PlansFile>(&b).ok())
-    {
-        Some(f) => f,
-        // 无文件 -> 空 pools: 下面每池的"缺失即种子补齐"分支与有文件路径同源
-        None => PlansFile {
-            pools: HashMap::new(),
-            mirrors: HashMap::new(),
-        },
-    };
+    let raw = std::fs::read_to_string(&path).ok();
+    let parsed = raw.as_deref().and_then(|b| serde_json::from_str::<PlansFile>(b).ok());
+    if let (Some(_raw), None) = (&raw, &parsed) {
+        // 有文件但解析失败(2026-10-17 安全审计 F-006)：不许静默覆丢用户
+        // 手排表 —— 先备份原文件, 再走种子重建, 日志留痕
+        let bak = path.with_extension("json.bak");
+        if std::fs::copy(&path, &bak).is_ok() {
+            if let Some(l) = log.as_ref() {
+                l("[串发] plans.json 解析失败, 原文件已备份为 plans.json.bak, 本次按种子重建");
+            }
+        }
+    }
+    let loaded: PlansFile = parsed.unwrap_or_else(|| PlansFile {
+        pools: HashMap::new(),
+        mirrors: HashMap::new(),
+    });
     let plans_map = loaded.pools;
     let loaded_chains = loaded.mirrors;
 
@@ -465,7 +472,21 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 match p.sni.trim() {
                     "" | "real" | "nosni" => shape_for_ip(&p.ip).to_string(),
                     dial::MODE_SNI => dial::MODE_SNI.to_string(),
-                    s => s.trim_start_matches(dial::MODE_FAKE_PFX).to_string(),
+                    s => {
+                        // 表层格式校验(2026-10-17 安全审计 F-003): sni 会进
+                        // WebUI 与 ClientHello, 只认域名形态字符 —— plans.json
+                        // 手改内容不得携带标记进前端
+                        let bare = s.trim_start_matches(dial::MODE_FAKE_PFX);
+                        if !bare.is_empty()
+                            && bare
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                        {
+                            bare.to_string()
+                        } else {
+                            shape_for_ip(&p.ip).to_string()
+                        }
+                    }
                 }
             };
             plans.push(SerialPlan { ip: p.ip, sni });
@@ -1014,13 +1035,28 @@ mod tests {
     }
 
     #[test]
+    fn objects_origin_never_pooled() {
+        // objects-origin 只由 GLB 族(140.82.11x.21/.22)服务, 主站边缘对其
+        // 301 无 CORS → 跨域预检失败、上传必败(2026-10-17 逐 IP 实测)。
+        // 故走直连白名单: 不入池、不过代理, 让系统 DNS 永远命中 GLB。
+        assert!(crate::config::is_direct("objects-origin.githubusercontent.com"));
+        assert_eq!(
+            crate::config::pool_for("objects-origin.githubusercontent.com"),
+            ""
+        );
+    }
+
+    #[test]
     fn fastly_pools_no_longer_serial() {
         // fastly/codeload 全镜像不直连: 不再是串发池
         assert!(!serial_pool("fastly"));
         assert!(!serial_pool("codeload"));
-        for p in ["core", "api", "edge", "uploads"] {
+        for p in ["core", "api", "edge"] {
             assert!(serial_pool(p), "{p} 应为串发池");
         }
+        // uploads 池 2026-10-17 撤销: 当前网页上传流程不经 uploads.github.com
+        // (objects-origin 已归 core), 非池化走系统直连
+        assert!(!serial_pool("uploads"));
     }
 
     #[test]
@@ -1213,6 +1249,41 @@ mod tests {
         assert_eq!(back["edge"][0].sni, dial::MODE_SNI);
         // 落盘只含 SERIAL_POOLS 三池 + mirrors
         assert!(!b.contains("fastly") && !b.contains("codeload"));
+    }
+
+    #[test]
+    fn notify_persist_writes_on_change_and_skips_noop() {
+        // 变更驱动落盘(42b7923): 真变更 → 去抖 2s 内写盘; no-op → 不写盘。
+        // 静默失败形态的回归钉(2026-10-17 QA): kick/dirty 任一环回归都无报错,
+        // 用户感知滞后到下次重启表序复原才爆发 —— 此测试就是防它
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tmpdir();
+        serial_load(&dir, None);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        start_persist(&rt);
+        let head_before = {
+            let g = SERIAL.lock().unwrap();
+            g.as_ref().unwrap().pools.get("core").unwrap()[0].ip.clone()
+        };
+        let target = {
+            let g = SERIAL.lock().unwrap();
+            g.as_ref().unwrap().pools.get("core").unwrap()[2].ip.clone()
+        };
+        assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
+        serial_note("core", &target, "ok");
+        rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+        assert_eq!(
+            SERIAL.lock().unwrap().as_ref().unwrap().pools.get("core").unwrap()[0].ip,
+            target,
+            "置顶应已生效"
+        );
+        let file1 = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+        assert!(file1.contains(&target), "变更应落盘");
+        // no-op: 表头再置顶 = 顺序不变 → 不置 dirty → 不写盘
+        let snap_before = plans_snapshot();
+        serial_note("core", &target, "ok");
+        rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+        assert_eq!(plans_snapshot(), snap_before, "no-op 不应触发写盘");
     }
 
     #[test]
