@@ -760,10 +760,14 @@ pub async fn serial_dial(
         // 一条都没试（全被形态过滤）：不是全灭，不冷却，快速失败
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
-    // 绕表一圈全灭（每条都真试过）：冷却 30s。githubusercontent 内容域例外
-    // —— 它有镜像竞速兜底（mitm 侧回落），且全灭多为 GFW 按域干扰（raw 真
-    // 名被 RST）而非 IP 死；冷却只会把同池其他内容域（avatars 等）连坐 30s。
-    if !host.ends_with("githubusercontent.com") {
+    // 绕表一圈全灭（每条都真试过）：冷却 30s。**只有"确实有镜像兜底"的
+    // 内容域**才豁免（2026-10-18 修正）：原判据对所有 *.githubusercontent.com
+    // 一刀切豁免，但 camo 根本不在镜像链里（镜像对 camo 一律 301，实测），
+    // 豁免只会让每张徽章全额重烧整表——12 张 shields.io 徽章的仓库页转圈
+    // 两分钟（日志：22 候选全灭 12s + DNS 腿 3s，×十几张）。
+    // 冷却的池级副作用可接受：内容域直连快速失败 → 立刻落到镜像（更快）。
+    let has_mirror = !mirror_chain(host).is_empty();
+    if !has_mirror {
         let mut g = SERIAL.lock().unwrap();
         g.as_mut().unwrap().cool.insert(
             pool_name.to_string(),
@@ -771,10 +775,10 @@ pub async fn serial_dial(
         );
     }
     if let Some(log) = log {
-        let tail = if host.ends_with("githubusercontent.com") {
-            "内容域不冷却(有镜像竞速兜底)"
+        let tail = if has_mirror {
+            "内容域不冷却(有镜像兜底)"
         } else {
-            "冷却 30s; 表内容请手改 plans.json"
+            "无镜像兜底, 冷却 30s 快速失败"
         };
         log(&format!(
             "[串发] {} 全灭({} 候选, 累计 {:?}), {tail}",

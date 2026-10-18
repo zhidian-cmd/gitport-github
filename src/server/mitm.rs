@@ -1080,8 +1080,12 @@ async fn mirror_do(
     // 镜像须直出内容：3xx=甩锅回 GitHub(用户侧被墙，浏览器跟随即断)，
     // HTML=假站/停车场页面，>=400=镜像侧拒绝。实测(2026-10-14 沙箱)11 候选
     // 无一带 3xx，护栏常驻防镜像来日改配。
+    // **304 例外**（2026-10-18 实测修复）：浏览器缓存热了会带 If-None-Match，
+    // 镜像如实回 304 Not Modified——这是合法响应，必须原样回给浏览器；
+    // 曾把它当甩锅 → 每家镜像都 304 → 整链全灭 → 熔断 → 封锁窗口内头像/
+    // 图片集体死亡（日志实锤：v4 秒回 304 被判失败）。
     let st = resp.status().as_u16();
-    if st >= 300 || ct.contains("text/html") {
+    if (st >= 300 && st != 304) || ct.contains("text/html") {
         return Err(format!("{mirror} 状态 {st}"));
     }
     // hyper Incoming → BoxBody（镜像腿统一响应类型）
