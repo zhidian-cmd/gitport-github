@@ -215,7 +215,7 @@ flowchart TB
   文件一个字节都发不出去
 - **uploads.github.com**（API 式上传源站 alambic）：直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
 - **viewscreen.githubusercontent.com**（mermaid 服务端渲染）：走代理要用**真名 SNI** 拨 Fastly 内容边缘，
-  被间歇掐断且无镜像兜底（图表要等）；浏览器直连有 **DoH + ECH 加密 SNI**，实测一进仓库即出图
+  被间歇掐断且无镜像兜底（图表要等）；浏览器直连该域**时通时断**，实测一进仓库即出图（2026-10-17，窗口期；GitHub **不发布 HTTPS RR / ECH**，不存在"加密 SNI"一说，见已知边界勘误）
 
 与其在表里猜"哪个 IP 服务它"，不如把这份知识还给 DNS。
 
@@ -464,7 +464,7 @@ GB 级也不堆积（实测 28MB 泵送期间代理常驻内存仅 +3MB）。
 | github.com 及其余子域 | core 池直连串发（伪装 SNI）+ gh_defuse |
 | api.github.com | api 池直连串发（API 专用边缘，与网站 IP 互斥） |
 | uploads.github.com | **直连白名单**（API 式上传源站；不入池、不过代理，DNS 直达 alambic .161——等价 gh CLI 可用路径；原专用池与验收名覆盖已随之删除。网页上传 Release 实际走 objects-origin） |
-| viewscreen.githubusercontent.com | **直连白名单**（mermaid 服务端渲染；代理腿真名 SNI 被间歇掐且无镜像兜底，直连走浏览器 DoH/ECH 加密 SNI——2026-10-17 实测直连即出图） |
+| viewscreen.githubusercontent.com | **直连白名单**（mermaid 服务端渲染；代理腿真名 SNI 被间歇掐且无镜像兜底；浏览器直连时通时断，2026-10-17 实测直连即出图——窗口期表现，**非 ECH**：github.com/viewscreen 均无 HTTPS RR） |
 | githubapp.com（授权）、githubassets、github.io | edge 池直连串发 |
 | avatars/camo/gist/raw 等内容域 | edge 直连优先 → 熔断后镜像链 |
 | codeload / objects / release-assets | 镜像 only |

@@ -740,13 +740,24 @@ pub async fn serial_dial(
                 if ctx.is_cancelled() {
                     break; // 请求预算到期：这条没试完，不算失败；没试完 ≠ 全灭，不冷却
                 }
-                // 拨号失败垫底：内容域豁免 —— GFW 对 raw 真名 SNI 的 RST 发生在
-                // TLS 握手(dial 层)，会把健康的 .133(avatars 同 IP)连坐垫底，
-                // 池序被按域干扰刷着轮换(2026-10-15 实锤)
-                if !host.ends_with("githubusercontent.com") {
+                // 失败分层沉底（2026-10-18 实测修正）：
+                // · TCP 层失败（拨号超时/拒绝/重置）= 该 IP 对谁都达不通，与域无关，
+                //   内容域也必须沉底 —— 实测 108/109/111.133 TCP 全超时，旧规则
+                //   豁免沉底导致每轮都先撞 9 秒死 IP 才落镜像（页面 10-12s）。
+                // · TLS 层失败（raw 真名被 RST）才保留内容域豁免 —— 那是按域干扰，
+                //   沉底会连坐健康的 .133(avatars 同 IP)（2026-10-15 实锤）。
+                let msg = e.to_string();
+                let tcp_level = msg.starts_with("TCP")
+                    || matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    );
+                if !host.ends_with("githubusercontent.com") || tcp_level {
                     let target = p.clone();
-                    serial_move(pool_name, |q| *q == target, false, "拨号失败");
-                    // 真失败垫底(单条)
+                    let why = if tcp_level { "IP 不可达" } else { "拨号失败" };
+                    serial_move(pool_name, |q| *q == target, false, why);
                 }
                 continue;
             }
