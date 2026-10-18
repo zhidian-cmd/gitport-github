@@ -83,7 +83,18 @@ pub async fn handle_connect_mitm(
         .alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-    (srv.log)(&format!("[MITM] {host} 隧道已解密, 按域名路由转发"));
+    // ALPN 落点必记：2026-10-19 下载排查发现 23 条
+    // "connection closed before message completed" 只可能来自 h1 服务端
+    // （hyper h2 无 IncompleteMessage 映射）——不记 ALPN 就无从判断
+    // 客户端当时用的是哪条协议。
+    let alpn_name = match alpn.as_slice() {
+        b"h2" => "h2",
+        b"http/1.1" => "http/1.1",
+        _ => "none",
+    };
+    (srv.log)(&format!(
+        "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
+    ));
     // axum 0.8 的 Handler 只接受 axum::extract::Request，而本层必须保留原始
     // Incoming body（重放/嗅探），故不用 axum Router，直接 hyper service_fn。
     let log = srv.log.clone();
@@ -225,6 +236,7 @@ async fn mitm_http(
         )
     {
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
+            let resp = counted_mirror(resp, &host, &path, &log);
             return write_upstream(resp, "mirror", &info);
         }
         (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
@@ -240,6 +252,7 @@ async fn mitm_http(
             match pool::route::fallback_for(&name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
+                        let r = counted_mirror(r, &host, &path, &log);
                         return write_upstream(r, "mirror", &info);
                     }
                     (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
@@ -794,6 +807,100 @@ async fn gh_defuse(
         };
     }
 }
+/// 交付计数体：包住大响应的体，统计实际推给客户端的字节数。
+/// 推完记"交付完成"；连接被提前关（Drop 时未推完）记"推了 N/总 M 后
+/// 连接终止" —— 2026-10-19 DevSidecar 下载排查的盲区：日志只有
+/// `connection closed before message completed`（hyper h1 服务端
+/// IncompleteMessage = 客户端在响应体未推完时关连接），分不清是
+/// 我们没发够还是客户端自己关的。计数体让下次一眼可判。
+struct CountingBody {
+    inner: BoxBody,
+    sent: u64,
+    total: Option<u64>,
+    done: bool,
+    log: LogFn,
+    tag: String,
+}
+impl CountingBody {
+    fn new(inner: BoxBody, total: Option<u64>, log: LogFn, tag: String) -> Self {
+        Self {
+            inner,
+            sent: 0,
+            total,
+            done: false,
+            log,
+            tag,
+        }
+    }
+    fn summary(&self) -> String {
+        match self.total {
+            Some(t) => format!("{}B/{}B", self.sent, t),
+            None => format!("{}B", self.sent),
+        }
+    }
+}
+impl hyper::body::Body for CountingBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(d) = frame.data_ref() {
+                    this.sent += d.len() as u64;
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => {
+                this.done = true;
+                (this.log)(&format!("[交付] {} 推完({})", this.tag, this.summary()));
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+impl Drop for CountingBody {
+    fn drop(&mut self) {
+        if !self.done {
+            (self.log)(&format!(
+                "[交付] {} 推了({})后连接终止(客户端关闭或响应被弃)",
+                self.tag,
+                self.summary()
+            ));
+        }
+    }
+}
+/// 镜像大响应（>1MB）包交付计数体；小响应不包（免噪音）。
+/// 只罩镜像腿：直连腿的字节账由 `[隧道] ↑↓` 覆盖，镜像腿此前没有任何
+/// 交付记录。
+fn counted_mirror(
+    resp: hyper::Response<BoxBody>,
+    host: &str,
+    path: &str,
+    log: &LogFn,
+) -> hyper::Response<BoxBody> {
+    let total = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if total.map_or(true, |t| t <= 1024 * 1024) {
+        return resp;
+    }
+    let (parts, body) = resp.into_parts();
+    let body = BoxBody::new(CountingBody::new(
+        body,
+        total,
+        log.clone(),
+        format!("{host}{path}"),
+    ));
+    hyper::Response::from_parts(parts, body)
+}
 /// 把上游响应写回浏览器：剔除 hop-by-hop 头，注入 X-GitPort-Route / X-GitPort-Upstream
 /// 诊断头；嗅探读出的前缀字节拼回响应体前端。
 fn write_upstream(
@@ -970,6 +1077,21 @@ async fn chain_fetch(
         (log)(&format!(
             "[镜像] {host}{path} 归属链 {chain_host}（不用 {host} 自己的链）"
         ));
+    }
+    // 客户端请求形态（2026-10-19 排查盲区）：镜像链此前只记归属链与
+    // via，看不到浏览器到底要的是全量、Range 段还是缓存重验证 ——
+    // 23 条 "connection closed" 无法归因。Range / 条件头出现即记。
+    let range = out.headers().get("range").and_then(|v| v.to_str().ok());
+    let cond = out
+        .headers()
+        .get("if-none-match")
+        .or_else(|| out.headers().get("if-modified-since"))
+        .and_then(|v| v.to_str().ok());
+    if let Some(r) = range {
+        (log)(&format!("[镜像] {host}{path} 客户端 Range: {r}"));
+    }
+    if let Some(c) = cond {
+        (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
     let chain = pool::mirror_chain(chain_host);
     if chain.is_empty() {
@@ -1744,5 +1866,47 @@ mod tests {
         // GET/HEAD 永不流式（无体）
         assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
         assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
+    }
+
+    /// 交付计数体（2026-10-19）：推完记"推完"，未推完被弃记"推了 N/总 M
+    /// 后连接终止" —— 下载连接被提前关时，区分"我们没发够"与"客户端
+    /// 自己关了"的唯一交付凭据。
+    #[tokio::test]
+    async fn counting_body_logs_completion_and_truncation() {
+        use hyper::body::Body;
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let l = logs.clone();
+        let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
+        let two_chunks = || {
+            BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+                vec![
+                    Ok(hyper::body::Frame::data(Bytes::from_static(b"01234"))),
+                    Ok(hyper::body::Frame::data(Bytes::from_static(b"56789"))),
+                ],
+            )))
+        };
+        // 推完路径：collect 走完全部两帧 → "推完(10B/10B)"
+        let counted = CountingBody::new(two_chunks(), Some(10), log.clone(), "t/full".into());
+        let out = http_body_util::BodyExt::collect(counted).await.unwrap();
+        assert_eq!(out.to_bytes().len(), 10);
+        // 截断路径：只取第一帧就弃（连接被关时 hyper 正是这样丢体）
+        let mut counted = CountingBody::new(two_chunks(), Some(10), log.clone(), "t/part".into());
+        let f = std::future::poll_fn(|cx| std::pin::Pin::new(&mut counted).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.into_data().unwrap().len(), 5);
+        drop(counted);
+        let lines = logs.lock().unwrap();
+        assert!(
+            lines.iter().any(|s| s.contains("t/full 推完(10B/10B)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("t/part 推了(5B/10B)后连接终止")),
+            "{lines:?}"
+        );
     }
 }
