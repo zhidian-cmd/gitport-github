@@ -122,12 +122,17 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .btn.sm{padding:4px 12px;font-size:12px}
 
 /* ---------- 概览 ---------- */
-.hero-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:16px;margin-bottom:16px}
-@media (max-width:980px){.hero-grid{grid-template-columns:1fr}}
-.hero-addr{margin-bottom:0;display:flex;flex-direction:column}
-.addr-row{display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap}
-.addr{font-family:var(--mono);font-size:27px;font-weight:600;letter-spacing:-.01em;color:var(--txt)}
+/* 曾为两列 grid（1.25fr 1fr）但只剩一个子卡片 → 右侧永远空半页，改全宽单卡（2026-10-18） */
+.hero-addr{display:flex;flex-direction:column}
+.addr-row{display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap;cursor:pointer}
+.addr{font-family:var(--mono);font-size:27px;font-weight:600;letter-spacing:-.01em;color:var(--txt);transition:color .15s}
+.addr-row:hover .addr{color:var(--green)}
 .hero-addr .hint{margin-top:auto;padding-top:10px}
+
+/* 校准报告：与卡片同规范的框，不再是裸文字 */
+#calResult{margin-top:10px;white-space:pre-wrap;display:none;max-height:280px;overflow:auto;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:12px 14px;
+  font:12px var(--mono);color:var(--mid);line-height:1.7}
 
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}
 @media (max-width:980px){.grid3{grid-template-columns:1fr}}

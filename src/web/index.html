@@ -100,14 +100,12 @@
     <div class="views">
       <!-- 概览 -->
       <section id="view-overview" class="view active">
-        <div class="hero-grid">
-          <div class="panel hero-addr">
-            <span class="label">代理地址</span>
-            <div class="addr-row">
-              <code class="addr" id="addr">127.0.0.1:7810</code>
-            </div>
-            <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
+        <div class="panel hero-addr">
+          <span class="label">代理地址</span>
+          <div class="addr-row" onclick="copyText(document.getElementById('addr').textContent)" title="点击复制">
+            <code class="addr" id="addr">127.0.0.1:7810</code>
           </div>
+          <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
         </div>
 
         <div class="grid3">
@@ -175,7 +173,7 @@
           <div class="feature-info">
             <h2>镜像链校准</h2>
             <p class="hint" style="margin-top:5px">按实测速度重排镜像顺序链，均为后台任务（关窗进托盘也会跑完，结果见「运行日志」）。<br>• <strong>大文件链</strong>：5MB 下载竞速，流量约 30-50MB<br>• <strong>图片链</strong>：响应头测速，约 1 分钟</p>
-            <pre id="calResult" class="hint" style="margin-top:8px;white-space:pre-wrap;display:none;max-height:260px;overflow:auto"></pre>
+            <pre id="calResult"></pre>
           </div>
           <div class="cal-actions">
             <button class="btn primary" id="calBigBtn">校准大文件链（下载测速）</button>
