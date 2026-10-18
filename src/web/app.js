@@ -1,6 +1,19 @@
 /* GitPort GitHub 工作台前端: 状态轮询 + 连通性探针 + 日志增量 + 规则/池/设置管理。
    所有开关一律由状态对象 S 驱动, 不解析按钮文字(双击/慢响应下会串状态)。 */
 const $ = id => document.getElementById(id);
+
+/* toast 提示（2026-10-18 补：函数定义此前丢失，所有 toast 调用抛
+   ReferenceError——copyText 的 try/catch 把它静默吞掉，校准/MITM 路径上
+   则暴露为"TypeError: toast is not a function"） */
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
 let logSeq = 0;
 let S = { running: false, mitm: false, port: 7810 };
 
