@@ -47,7 +47,7 @@ clone、push、网页上传、Release 下载、raw 文件、头像、网页浏�
 | 做不到 | 原因 | 应对 |
 |---|---|---|
 | 支持 macOS / Linux | 桌面框架是 Windows 专属 | macOS 用户推荐 Watt Toolkit / Clash Verge |
-| 大文件上传快 | 伪装 SNI 链路上行带宽物理受限（实测 ~115KB/s 级） | 流式直通保证不 502 不堆积；中断后 git 整体重传 |
+| 大文件上传快 | 伪装 SNI 链路上行为**每流限速**（2026-10-18 实测：单流 ~119KB/s；3 流并发聚合 1.52MB/s，每流还更快）——但 git push 的 pack 与 release 单附件都是**单流协议**（GitHub 无分片上传 API），聚合容量无法利用 | 多附件同时传即享并发（本就支持，无全局闸门）；大文件优先走 release 附件上传（uploads.github.com 真名直拨单流实测 1.30MB/s，比 push 快 11 倍）；中断后 git 整体重传 |
 | 一劳永逸 | GitHub 边缘 IP 会迁移 | 种子补缺 + 系统 DNS 兜底腿自动自愈，极端情况手改 `plans.json` |
 | 完全无门槛 | 开 MITM 需装本地根证书 | WebUI 一键 certutil 安装；不装也能用（纯透传） |
 | 加速所有网站 | 只路由 GitHub 系域名 | Google / YouTube 等请用通用代理 |

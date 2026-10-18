@@ -391,8 +391,9 @@ pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
 /// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host（github.com/api）强制
 /// gzip 上游压缩（2026-10-17），其余 host 放行浏览器原生压缩。
-pub fn upstream_request(
-    req: &hyper::Request<Incoming>,
+/// 泛型 B：只读头/方法/URI，不触体——测试可用任意体类型构造。
+pub fn upstream_request<B>(
+    req: &hyper::Request<B>,
     host: &str,
 ) -> Result<(hyper::Request<BoxBody>, String), String> {
     let method = req.method().clone();
@@ -423,9 +424,21 @@ pub fn upstream_request(
         out = out.header(k, v);
     }
     if sniffed {
-        // 只认 gzip：代理侧只需一个解压器（flate2），br/zstd 解压要额外依赖。
-        // gzip 已拿回 ~5-6 倍压缩比，足够。
-        out = out.header("accept-encoding", "gzip");
+        // 只在客户端声明接受 gzip 时才强制上游 gzip —— 22365f7 曾无条件强制，
+        // 让 curl / git 等未发 accept-encoding 的客户端拿到 gzip 响应解不了码
+        //（2026-10-18 上行实测时暴露的回归）。客户端没声明 → 上游回身份编码，
+        // 行为与"剥掉 accept-encoding"的旧策略等价。
+        let accepts_gzip = req
+            .headers()
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase().contains("gzip"))
+            .unwrap_or(false);
+        if accepts_gzip {
+            // 只认 gzip：代理侧只需一个解压器（flate2），br/zstd 解压要额外依赖。
+            // gzip 已拿回 ~5-6 倍压缩比，足够。
+            out = out.header("accept-encoding", "gzip");
+        }
     }
     let body =
         BoxBody::new(http_body_util::Empty::<bytes::Bytes>::new().map_err(|never| match never {}));
@@ -443,4 +456,48 @@ pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
     )
     .chain(tail_stream.map(|r| r.map(hyper::body::Frame::data)));
     BoxBody::new(http_body_util::StreamBody::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 强制 gzip 的门控（2026-10-18 回归修复）：客户端声明接受 gzip → 上游
+    /// 请求带 accept-encoding: gzip；客户端未声明（curl/git）→ 上游不带
+    /// accept-encoding（身份编码），无解压能力的客户端不再收到 gzip。
+    #[test]
+    fn forced_gzip_gated_on_client_accept() {
+        let req = hyper::Request::builder()
+            .uri("https://github.com/a")
+            .header("accept-encoding", "gzip, deflate, br")
+            .body(())
+            .unwrap();
+        let (out, _) = upstream_request(&req, "github.com").unwrap();
+        assert_eq!(
+            out.headers().get("accept-encoding").unwrap(),
+            "gzip",
+            "声明过 gzip 的客户端应被强制 gzip"
+        );
+
+        let req2 = hyper::Request::builder()
+            .uri("https://github.com/a")
+            .body(())
+            .unwrap();
+        let (out2, _) = upstream_request(&req2, "github.com").unwrap();
+        assert!(
+            out2.headers().get("accept-encoding").is_none(),
+            "未声明的客户端应回身份编码"
+        );
+
+        // 内容域（非嗅探 host）：不添加 accept-encoding，放行浏览器原生协商
+        let req3 = hyper::Request::builder()
+            .uri("https://raw.githubusercontent.com/a")
+            .body(())
+            .unwrap();
+        let (out3, _) = upstream_request(&req3, "raw.githubusercontent.com").unwrap();
+        assert!(
+            out3.headers().get("accept-encoding").is_none(),
+            "非嗅探 host 不添加"
+        );
+    }
 }
