@@ -57,6 +57,8 @@ pub fn is_big_file_host(host: &str) -> bool {
 
 /// release 附件与源码包路径（/releases/download、/archive）一律走镜像；
 /// git 智能协议路径不在此列 —— 镜像不认，必须走 core 池直连（伪装 SNI）。
+/// /releases/latest/download/<asset> 稳定链形态同归镜像（2026-10-19 补）：
+/// 漏了它会落 core 池直连，与 /releases/download/<tag>/ 语义相同。
 fn is_release_asset_path(host: &str, path: &str) -> bool {
     if host != "github.com" {
         return false;
@@ -64,12 +66,35 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [_owner, _repo, kind, ..] if *kind == "releases" => {
-            // releases/download/...（releases 页面本身不拦，只拦下载）
-            segs.len() >= 4 && segs[3] == "download"
+            // releases/download/<tag>/<asset>（releases 页面本身不拦，只拦下载）
+            // releases/latest/download/<asset>（稳定链，段 3 = latest）
+            (segs.len() >= 4 && segs[3] == "download")
+                || (segs.len() >= 5 && segs[3] == "latest" && segs[4] == "download")
         }
         [_owner, _repo, kind, ..] if *kind == "archive" => true,
         _ => false,
     }
+}
+
+/// 镜像链归属 host：请求 host → 实际内容 host 的**专属链**。
+/// github.com 的 releases/download 302 落 release-assets、archive 302 落
+/// codeload —— 镜像跟随 302 时"用谁的链"在本函数定，与请求 host 解耦：
+/// release 附件必须用 release-assets 专属链（实测 3838KB/s 的 gh-proxy 系
+/// 在头部），不能用 github.com 链（头部 ghproxy.net 实测慢且中断——
+/// 2026-10-19 DevSidecar 下载重试风暴的根因）。大文件域自身即链 host。
+pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
+    if is_big_file_host(host) {
+        return host;
+    }
+    if is_release_asset_path(host, path) {
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        return if matches!(segs.get(2), Some(&"archive")) {
+            "codeload.github.com"
+        } else {
+            "release-assets.githubusercontent.com"
+        };
+    }
+    host
 }
 
 /// 总路由：host → 处置。唯一真相（取代四处散落的判定）。
@@ -512,9 +537,50 @@ mod tests {
         assert!(!(f.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
     }
 
+    /// 镜像链归属：release 附件/archive 走专属链，不用请求 host 自己的链。
+    /// 2026-10-19 DevSidecar 下载根因：github.com 链头部 ghproxy.net 慢且
+    /// 中断，而 release-assets 链头部是实测 3838KB/s 的 gh-proxy 系。
     #[test]
-    fn retired_ips_snapshot() {
-        for ip in [
+    fn mirror_chain_host_dedicated() {
+        // release 附件 → release-assets 专属链
+        assert_eq!(
+            mirror_chain_host("github.com", "/o/r/releases/download/v1/f.exe"),
+            "release-assets.githubusercontent.com"
+        );
+        assert_eq!(
+            mirror_chain_host("github.com", "/o/r/releases/latest/download/f.exe"),
+            "release-assets.githubusercontent.com"
+        );
+        // 源码包 → codeload 专属链
+        assert_eq!(
+            mirror_chain_host("github.com", "/o/r/archive/refs/tags/v1.tar.gz"),
+            "codeload.github.com"
+        );
+        // 大文件域自身即链 host（含直接命中 signed URL 的私库附件）
+        assert_eq!(
+            mirror_chain_host(
+                "release-assets.githubusercontent.com",
+                "/x?sig=abc"
+            ),
+            "release-assets.githubusercontent.com"
+        );
+        assert_eq!(
+            mirror_chain_host("codeload.github.com", "/o/r/tar.gz/x"),
+            "codeload.github.com"
+        );
+        // 非 release 路径：链 = 请求 host 自己
+        assert_eq!(mirror_chain_host("raw.githubusercontent.com", "/o/r/f"), "raw.githubusercontent.com");
+        assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
+        assert_eq!(mirror_chain_host("github.com", "/o/r/releases"), "github.com");
+        // 总路由同步：latest/download 也是 Mirror（曾是直连漏洞）
+        assert_eq!(
+            master_route("github.com", "GET", "/o/r/releases/latest/download/f.exe"),
+            Route::Mirror
+        );
+    }
+
+    #[test]
+    fn retired_ips_snapshot() {        for ip in [
             "140.82.115.3",
             "140.82.120.4",
             "140.82.117.3",

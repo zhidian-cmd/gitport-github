@@ -944,15 +944,6 @@ async fn chain_fetch(
     out: &hyper::Request<BoxBody>,
     host: &str,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let chain = pool::mirror_chain(host);
-    if chain.is_empty() {
-        return Err(format!("{host} 无镜像链"));
-    }
-    // 全灭熔断：刚整链失败过(60s 内)直接快速失败, 不再逐家重烧 —— 多图
-    // 仓库在全灭窗口里每张图都重烧一遍链, spinner 会转几分钟
-    if pool::mirror_breaker_open(host) {
-        return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
-    }
     // 凭据查询串拒绝走镜像(2026-10-17 安全审计 F-001)：签名凭据
     // (token/X-Amz-*/sig 类)等价 bearer, 剥头清单管不到它 —— 私库附件
     // signed URL 交给第三方镜像即外泄。此类请求镜像本也取不回, 直接拒。
@@ -969,8 +960,30 @@ async fn chain_fetch(
             .unwrap_or_default()
     );
     let path = path_of(out.uri());
+    // 镜像链归属：release 附件/源码包走**专属链**（release-assets/codeload），
+    // 不用请求 host 自己的链 —— 2026-10-19 DevSidecar 下载根因：github.com
+    // 链头部 ghproxy.net 慢且中断（重试风暴），而 release-assets 链头部是
+    // 实测 3838KB/s 的 gh-proxy 系。URL 仍用原 host 构造（镜像自己跟随
+    // 302 落点），熔断/限长/链序全部按归属 host。
+    let chain_host = pool::route::mirror_chain_host(host, &path);
+    if chain_host != host {
+        (log)(&format!(
+            "[镜像] {host}{path} 归属链 {chain_host}（不用 {host} 自己的链）"
+        ));
+    }
+    let chain = pool::mirror_chain(chain_host);
+    if chain.is_empty() {
+        return Err(format!("{host} 无镜像链({chain_host})"));
+    }
+    // 全灭熔断：刚整链失败过(60s 内)直接快速失败, 不再逐家重烧 —— 多图
+    // 仓库在全灭窗口里每张图都重烧一遍链, spinner 会转几分钟
+    if pool::mirror_breaker_open(chain_host) {
+        return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
+    }
     // 内容域小文件限长前 5 家（串行逐家, 2026-10-17 用户要求）; 大文件全链。
-    let limit = mirror_chain_cap(host).unwrap_or(chain.len()).min(chain.len());
+    let limit = mirror_chain_cap(chain_host)
+        .unwrap_or(chain.len())
+        .min(chain.len());
     for (i, m) in chain.iter().take(limit).enumerate() {
         let req = match mirror_request(out, m, &orig_url) {
             Ok(r) => r,
@@ -991,9 +1004,9 @@ async fn chain_fetch(
                     "[镜像] {host}{path} via {m} (链位 {}/{len}{skipped}, 头 {ms}ms)",
                     i + 1,
                     len = chain.len(),
-                    ms = t0.elapsed().as_millis(),
+                    ms = t0.elapsed().as_millis()
                 ));
-                pool::mirror_breaker_clear(host); // 链是活的: 清全灭熔断
+                pool::mirror_breaker_clear(chain_host); // 链是活的: 清全灭熔断
                 return Ok(resp);
             }
             Err(e) => {
@@ -1004,8 +1017,8 @@ async fn chain_fetch(
             }
         }
     }
-    pool::mirror_breaker_set(host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
-    Err(format!("{host} 镜像链全灭({limit} 个)"))
+    pool::mirror_breaker_set(chain_host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
+    Err(format!("{host} 镜像链全灭({chain_host} 链 {limit} 个)"))
 }
 /// 重建请求：头/方法/URI 复制 + 体按 replay 注入（Request<BoxBody> 不可
 /// Clone，换 IP/换候选重发时每 attempt 重建一份）。
@@ -1666,6 +1679,11 @@ mod tests {
         assert!(mirror(
             "github.com",
             "/cli/cli/releases/download/v2.0.0/gh_2.0.0_windows_amd64.zip"
+        ));
+        // /releases/latest/download/ 稳定链形态（2026-10-19 补：曾漏，落 core 直连）
+        assert!(mirror(
+            "github.com",
+            "/docmirror/dev-sidecar/releases/latest/download/DevSidecar.exe"
         ));
         // releases 列表页本身不拦（只是页面）
         assert!(not_mirror("github.com", "/torvalds/linux/releases"));
