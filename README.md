@@ -26,8 +26,8 @@ clone、push、网页上传、Release 下载、raw 文件、头像、网页浏�
 ## 快速上手（3 步）
 
 1. 双击 `gitport-github.exe`（或 `.\gitport-github.exe -tray` 驻留托盘）
-2. 首次启动在 exe 同目录生成：`ca.crt`/`ca.key`（MITM 证书）、`plans.json`（IP 表）、`settings.json`（开关）
-3. 浏览器直接用；或开「GitHub 分流接管」开关（写系统 PAC，免插件）
+2. 首次启动在 exe 同目录自动生成：`ca.crt`/`ca.key`（MITM 证书）、`plans.json`（IP 表）、`settings.json`（开关）——**所有开关默认全关**，逐项自己打开
+3. 打开工作台：先开「GitHub 分流接管」（写系统 PAC）→ 需要内容域直连/流式直通再开「MITM」（一键 certutil 装证书根）
 
 不开 MITM 也能用（纯透传加速）；开了 MITM 解锁内容域直连与流式直通，证书根由 WebUI 一键 certutil 安装。
 系统代理接管在退出/关机时自动还原；崩溃强杀后的残留由下次启动自愈。

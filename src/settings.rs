@@ -30,7 +30,10 @@ fn state() -> &'static SettingsState {
     SETTINGS.get_or_init(|| SettingsState {
         close_to_tray: std::sync::atomic::AtomicBool::new(false),
         mitm: std::sync::atomic::AtomicBool::new(false),
-        github_pac: std::sync::atomic::AtomicBool::new(true), // 缺省开：开箱即用免插件
+        // 首启全关（2026-10-18 用户裁定）：MITM / 分流接管 / 关窗到托盘 /
+        // 开机自启全部默认关，让首次使用者逐项自己打开——settings.json 由
+        // 第一次改动（含窗口矩形落地）自动生成
+        github_pac: std::sync::atomic::AtomicBool::new(false),
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         our_pac: Mutex::new(String::new()),
