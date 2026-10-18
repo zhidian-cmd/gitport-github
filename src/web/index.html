@@ -185,10 +185,13 @@
         <div class="feature-card">
           <div class="feature-info">
             <h2>镜像链校准</h2>
-            <p class="hint" style="margin-top:5px">为 raw / gist / avatars / codeload 等 8 类有镜像的资源各维护一条镜像使用顺序链(串行取用, 不并发竞速)。点击校准会用内置的稳定模板文件逐个实测各镜像当前速度, 按实测快慢自动重排各资源的链序并保存。全程约 30~90 秒, 期间可正常上网</p>
+            <p class="hint" style="margin-top:5px">为有镜像的资源各维护一条镜像使用顺序链（串行取用，绝不并发）。两种校准都是<strong>后台任务</strong>：点击后即可关闭窗口进托盘，任务继续跑完，新链序自动保存，过程与报告见「运行日志」页。<br>• <strong>大文件链</strong>（github.com / codeload / objects / release-assets）：5MB 真实下载竞速，四链串行、链内 11 家并发，一轮流量约 30-50MB，测的是<strong>下载吞吐</strong><br>• <strong>图片链</strong>（raw / gist / avatars / user-images / media）：响应头测速，约 1 分钟——图片小，首包时间就是主要成本</p>
             <pre id="calResult" class="hint" style="margin-top:8px;white-space:pre-wrap;display:none;max-height:260px;overflow:auto"></pre>
           </div>
-          <button class="btn primary" id="calBtn">校准</button>
+          <div>
+            <button class="btn primary" id="calBigBtn" style="margin-bottom:8px">校准大文件链（下载测速）</button><br>
+            <button class="btn" id="calImgBtn">校准图片链（响应头）</button>
+          </div>
         </div>
       </section>
 

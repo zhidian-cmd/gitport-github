@@ -151,25 +151,23 @@ $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked
 /* ---------- 镜像链校准 ---------- */
 // 半自动: 点击 -> 后端按内置模板对每条镜像链串行实测 TTFB -> 按成绩重排
 // 各资源链序并写盘 -> 返回人读报告。全程约 30~90s, 期间按钮禁用。
-$('calBtn').onclick = async () => {
-  const btn = $('calBtn'), box = $('calResult');
+async function runCal(mode, btn, label) {
+  const box = $('calResult');
   btn.disabled = true;
-  const old = btn.textContent;
-  btn.textContent = '校准中…';
   box.style.display = 'block';
-  box.textContent = '正在逐个实测各镜像速度(每资源串行, 约 30~90 秒)…';
   try {
-    const r = await fetch('/api/calibrate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const r = await fetch('/api/calibrate?mode=' + mode, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
     const text = await r.text();
-    box.textContent = text.trim() || '校准完成(无结果)';
-    toast('镜像链校准完成, 新顺序已保存');
+    box.textContent = text;
+    toast(label + '校准已在后台开始');
     refreshLogs();
   } catch (e) {
-    box.textContent = '校准失败: ' + e;
+    box.textContent = '校准启动失败: ' + e;
   }
-  btn.disabled = false;
-  btn.textContent = old;
-};
+  btn.disabled = false; // 校准已后台化，按钮立即恢复（防重入在服务端）
+}
+$('calBigBtn').onclick = () => runCal('throughput', $('calBigBtn'), '大文件链');
+$('calImgBtn').onclick = () => runCal('ttfb', $('calImgBtn'), '图片链');
 
 /* ---------- 启动 ---------- */
 route(); refreshStatus(); refreshLogs(); refreshSettings();

@@ -328,9 +328,13 @@ pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
-/// 镜像腿：标准 TLS + h1 直拨（非池域名），无表无阶梯。
+/// 镜像腿：标准 TLS + 直拨（非池域名），无表无阶梯。
+/// ALPN 是 h2,http/1.1：镜像（多为 Cloudflare 前置）常协商 h2，一条连接可
+/// 复用多个请求（图片突发/多 Range），h1 镜像退回串行复用。
 #[derive(Clone)]
-pub struct MirrorConnector;
+pub struct MirrorConnector {
+    log: LogFn,
+}
 impl Service<Uri> for MirrorConnector {
     type Response = TokioIo<Dialed>;
     type Error = std::io::Error;
@@ -340,18 +344,47 @@ impl Service<Uri> for MirrorConnector {
     }
     fn call(&mut self, uri: Uri) -> Self::Future {
         let host = uri.host().unwrap_or("").to_lowercase();
+        let log = self.log.clone();
         Box::pin(async move {
+            let t0 = std::time::Instant::now();
             let tls = pool::dial::dial_tls_simple(&host).await?;
+            let alpn = tls.ssl().selected_alpn_protocol().unwrap_or_default();
+            // 只在真正新建 TLS 时出现 —— 复用命中的请求没有这行, 天然无噪音
+            (log)(&format!(
+                "[镜像拨号] {host} TLS {}ms alpn={}",
+                t0.elapsed().as_millis(),
+                String::from_utf8_lossy(alpn)
+            ));
             Ok(TokioIo::new(Dialed::Tls(tls)))
         })
     }
 }
-/// 构建镜像腿 h1 客户端。
-pub fn mitm_h1_client() -> LegacyClient<MirrorConnector, BoxBody> {
-    let connector = MirrorConnector;
-    LegacyClient::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(connector)
+/// 镜像腿每镜像的空闲连接上限。0 = 关闭连接池（回滚开关，退回"每次新拨"）。
+const MIRROR_POOL_MAX_IDLE: usize = 4;
+/// 空闲连接保留时长；必须配 pool_timer 才生效（见 mirror_client）。
+const MIRROR_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+static MIRROR_CLIENT: std::sync::OnceLock<LegacyClient<MirrorConnector, BoxBody>> =
+    std::sync::OnceLock::new();
+
+/// 镜像腿共享客户端（进程内单例，2026-10-18）。
+/// 此前每请求新建 client 且 `pool_max_idle_per_host(0)`，17 张图/多次 Range
+/// 各自重付一次 DNS+TCP+TLS；共享后每镜像只拨 1-4 次。
+/// 边界：h2 下响应头到手连接即回池（并发小请求可复用）；**单流大文件吞吐
+/// 不变**——大文件的速度杠杆是链序置顶（pool::MIRROR_PINS）。
+/// 首次调用者的 log 被永久持有；各调用点传的都是同一 Logger 的克隆，无差别。
+pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxBody> {
+    MIRROR_CLIENT.get_or_init(|| {
+        let mut b = LegacyClient::builder(TokioExecutor::new());
+        b.pool_max_idle_per_host(MIRROR_POOL_MAX_IDLE)
+            .pool_idle_timeout(MIRROR_POOL_IDLE)
+            // 没有 timer 时 pool_idle_timeout 完全不生效（hyper-util 内部
+            // 只在 timer 存在时 spawn 空闲回收任务）
+            .pool_timer(hyper_util::rt::TokioTimer::new())
+            // 复用了已死连接且请求尚未写出 → 自动重发（镜像请求体恒空，安全）
+            .retry_canceled_requests(true);
+        b.build(MirrorConnector { log: log.clone() })
+    })
 }
 /// 请求预算：一次上游请求的总预算。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);

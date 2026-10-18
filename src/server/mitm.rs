@@ -6,7 +6,7 @@
 //!   失败回落镜像串行链
 //! - codeload / objects / release-assets / github.com 的 releases/download、
 //!   archive 路径：镜像 only（禁并发竞速，2026-10-15 裁定），链全灭 502
-use super::upstream::{self, mitm_h1_client, BoxBody, Incoming, REQUEST_BUDGET};
+use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
 use crate::pool::{self, dial::Dialed, LogFn};
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 // ---------- 常量与镜像 ----------
-// 镜像腿响应头预算：8s 内必须出响应头，头一到即解除，体不限。
+// 镜像腿响应头预算：5s 内必须出响应头，头一到即解除，体不限。
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// 内容域镜像链限长（2026-10-17 用户要求）：仍然串行逐家试，只是最多前 5
 /// 家、每家 5s 超时——把一张坏图标的最坏等待从"11 家 × 各自超时"(实测 16s)
@@ -973,7 +973,8 @@ async fn chain_fetch(
                 continue;
             }
         };
-        match mirror_do(req, m).await {
+        let t0 = Instant::now();
+        match mirror_do(req, m, log).await {
             Ok(resp) => {
                 let skipped = if i == 0 {
                     String::new()
@@ -981,15 +982,19 @@ async fn chain_fetch(
                     format!(", 跳过前 {i} 个")
                 };
                 (log)(&format!(
-                    "[镜像] {host}{path} via {m} (链位 {}/{len}{skipped})",
+                    "[镜像] {host}{path} via {m} (链位 {}/{len}{skipped}, 头 {ms}ms)",
                     i + 1,
                     len = chain.len(),
+                    ms = t0.elapsed().as_millis(),
                 ));
                 pool::mirror_breaker_clear(host); // 链是活的: 清全灭熔断
                 return Ok(resp);
             }
             Err(e) => {
-                (log)(&format!("[镜像] {host} {m} 失败({e}), 链内下一个"));
+                (log)(&format!(
+                    "[镜像] {host} {m} 失败({e}, {}ms), 链内下一个",
+                    t0.elapsed().as_millis()
+                ));
             }
         }
     }
@@ -1027,7 +1032,21 @@ fn mirror_request(
     let mut builder = hyper::Request::builder().method(out.method()).uri(url);
     for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
-        if low == "cookie" || low == "authorization" || low == "host" || low == "referer" {
+        // 身份头不外泄镜像；hop-by-hop 头必须剥净 —— 启用连接池后
+        // `Connection: close` 会让每次请求都新建连接，复用形同虚设
+        if matches!(
+            low.as_str(),
+            "cookie"
+                | "authorization"
+                | "host"
+                | "referer"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+        ) {
             continue;
         }
         builder = builder.header(k, v);
@@ -1036,13 +1055,16 @@ fn mirror_request(
         BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|e| std::io::Error::other(e)));
     builder.body(body).map_err(|e| e.to_string())
 }
-/// 镜像腿单发：有头预算(8s 内必须出响应头，头一到即解除，体不限) +
+/// 镜像腿单发：有头预算(5s 内必须出响应头，头一到即解除，体不限) +
 /// 假页拒判(≥400 或 text/html = 镜像自身的 SPA 页，不算成绩)。
+/// 2026-10-18 起走共享连接池（upstream::mirror_client）：图片突发/多 Range
+/// 不再各自重付 DNS+TCP+TLS；hop-by-hop 头已在 mirror_request 剥净。
 async fn mirror_do(
     req: hyper::Request<BoxBody>,
     mirror: &str,
+    log: &LogFn,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let client = mitm_h1_client();
+    let client = upstream::mirror_client(log);
     let timed = tokio::time::timeout(MIRROR_HEAD_TIMEOUT, client.request(req));
     let resp = match timed.await {
         Ok(Ok(r)) => r,
@@ -1128,9 +1150,48 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
         "https://media.githubusercontent.com/media/torvalds/linux/master/README",
     ),
 ];
-/// 单镜像校准测速：拉模板 URL，响应头达标（<300 且非 HTML）即有效成绩。
-/// 拒判口径与 mirror_do 一致 —— 3xx=甩锅、HTML=假站、>=400=拒绝路由。
-async fn calibrate_one(mirror: &str, tmpl: &str) -> Result<u16, String> {
+// ---------- 校准（2026-10-18 重设计：两种模式，host 间严格串行） ----------
+/// 校准模式：
+/// - **Throughput**：大文件四链（github.com / codeload / objects / release-assets），
+///   每链 11 家**并发**竞速真实下载——窗口 12s / 每家上限 5MB，按窗口内实收
+///   字节数排名，字节读完即弃不落盘。TTFB 快 ≠ 下载快，大文件必须按吞吐排
+/// - **Ttfb**：内容域五链（raw / gist / avatars / user-images / media），逐家
+///   实测响应头时间——图片小，TTFB 就是主要成本
+///
+/// 铁律（2026-10-18 用户裁定）：**host 之间严格串行**。同一镜像服务多条链，
+/// 跨链并发校准会让同一镜像被多路同时打，测出的数字互相污染。
+/// 与 10-15"废除并发竞速"裁定的关系：那次废的是**常规流量路径**上的竞速；
+/// 本处的并发只存在于**手动低频校准**（一次 30-50MB 流量），目的是测量。
+pub enum CalibMode {
+    Throughput,
+    Ttfb,
+}
+
+/// 校准重入闸（校准后台化后，防 UI 连点/双开）。
+static CALIB_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 尝试占用校准闸：false = 已有校准在跑。
+pub fn try_begin_calibrate() -> bool {
+    !CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 释放校准闸（后台任务结束时调用）。
+pub fn end_calibrate() {
+    CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 吞吐测速参数：固定窗口 12s、每家上限 5MB。窗口从发起请求起算——
+/// 握手/回源都算在里面，镜像快慢一体呈现；字节读完即弃，不落盘。
+const CALIB_THROUGHPUT_WINDOW: Duration = Duration::from_secs(12);
+const CALIB_THROUGHPUT_CAP: u64 = 5 * 1024 * 1024;
+
+/// 吞吐测速（Throughput 模式单镜）：固定窗口内统计真实下载字节数。
+/// 到 5MB 上限或 EOF 提前结束，按实际字节计。拒判口径与 mirror_do 一致。
+async fn throughput_probe(
+    mirror: &str,
+    tmpl: &str,
+    log: &LogFn,
+) -> Result<(u64, u128), String> {
     let uri: http::Uri = format!("{mirror}/{tmpl}")
         .parse()
         .map_err(|e| format!("URL 解析失败: {e}"))?;
@@ -1143,7 +1204,103 @@ async fn calibrate_one(mirror: &str, tmpl: &str) -> Result<u16, String> {
             http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
         ))
         .map_err(|e| e.to_string())?;
-    let client = mitm_h1_client();
+    let client = upstream::mirror_client(log);
+    let start = tokio::time::Instant::now();
+    let deadline = start + CALIB_THROUGHPUT_WINDOW;
+    let resp = match tokio::time::timeout_at(deadline, client.request(req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("窗口内未见响应头".to_string()),
+    };
+    let st = resp.status().as_u16();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if st >= 300 || ct.contains("text/html") {
+        return Err(format!("{mirror} 状态 {st}"));
+    }
+    let mut body = resp.into_body();
+    let mut n: u64 = 0;
+    loop {
+        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remain.is_zero() || n >= CALIB_THROUGHPUT_CAP {
+            break;
+        }
+        match tokio::time::timeout(remain, http_body_util::BodyExt::frame(&mut body)).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(d) = frame.into_data() {
+                    n += d.len() as u64;
+                }
+            }
+            _ => break, // EOF / 上游错 / 窗口到
+        }
+    }
+    let ms = start.elapsed().as_millis();
+    Ok((n, ms))
+}
+
+/// 吞吐竞速（单 host 内 11 家并发，固定窗口同钟测速）：
+/// 全员同窗口起跑，字节数即排名——先到 5MB 的自然是冠军，
+/// 被窗口掐掉的慢镜像按已收字节排后（截断时刻的进度就是吞吐快照）。
+/// 返回 (镜像, 字节数) 已按字节降序；失败条目为负的耗时，自然沉底。
+async fn throughput_race(
+    host: &str,
+    chain: &[String],
+    tmpl: &str,
+    log: &LogFn,
+) -> Vec<(String, i64)> {
+    let host = host.to_string();
+    let mut joins = tokio::task::JoinSet::new();
+    for m in chain {
+        let m = m.clone();
+        let tmpl = tmpl.to_string();
+        let host = host.clone();
+        let log = log.clone();
+        joins.spawn(async move {
+            let r = throughput_probe(&m, &tmpl, &log).await;
+            match &r {
+                Ok((bytes, ms)) => {
+                    (log)(&format!(
+                        "[校准] {host} {m} 吞吐 {}KB ({ms}ms 内)",
+                        bytes / 1024
+                    ));
+                }
+                Err(e) => {
+                    (log)(&format!("[校准] {host} {m} 失败({e})"));
+                }
+            }
+            (m, r.map(|(b, _)| b as i64).unwrap_or(-1))
+        });
+    }
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    while let Some(r) = joins.join_next().await {
+        if let Ok(row) = r {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1)); // 字节数降序，失败(负)沉底
+    rows
+}
+
+/// 单镜像校准测速（TTFB 模式）：拉模板 URL，响应头达标（<300 且非 HTML）即有效成绩。
+/// 拒判口径与 mirror_do 一致 —— 3xx=甩锅、HTML=假站、>=400=拒绝路由。
+async fn calibrate_one(mirror: &str, tmpl: &str, log: &LogFn) -> Result<u16, String> {
+    let uri: http::Uri = format!("{mirror}/{tmpl}")
+        .parse()
+        .map_err(|e| format!("URL 解析失败: {e}"))?;
+    let req = hyper::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("user-agent", "Mozilla/5.0")
+        .header("accept", "*/*")
+        .body(BoxBody::new(
+            http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
+        ))
+        .map_err(|e| e.to_string())?;
+    let client = upstream::mirror_client(log);
     let timed = tokio::time::timeout(MIRROR_HEAD_TIMEOUT, client.request(req)).await;
     match timed {
         Ok(Ok(r)) => {
@@ -1164,65 +1321,59 @@ async fn calibrate_one(mirror: &str, tmpl: &str) -> Result<u16, String> {
         Err(_) => Err("响应头预算超时".to_string()),
     }
 }
-/// 镜像链校准（UI"校准"按钮后端）：对每条链串行实测 TTFB（host 之间并行
-/// —— 校准是维护操作，不是流量路径；链内严格串行），按成绩升序重排
-/// （失败条目按原相对序排尾），写回 plans.json mirrors 板块。
-/// 返回人读报告供 UI 展示。
-pub async fn calibrate_chains(log: &LogFn) -> String {
+/// 镜像链校准（UI 两个校准按钮的后端，**后台任务**）：host 之间严格串行，
+/// 链内按模式分流——Throughput = 11 家并发竞速真实下载，Ttfb = 逐家实测
+/// 响应头。结果经 set_mirror_chain 写回 plans.json 并返回人读报告（报告
+/// 由调用方写进日志页——校准已后台化，HTTP 响应不再等待它）。
+pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     let chains = pool::mirror_chains_snapshot();
-    let mut joins = tokio::task::JoinSet::new();
+    let mut report = String::new();
+    // 铁律：host 之间严格串行（同一镜像服务多条链，跨链并发互相污染测量）
     for (host, chain) in chains {
+        let big = is_big_file_host(&host);
+        let eligible = match mode {
+            CalibMode::Throughput => big,
+            CalibMode::Ttfb => !big,
+        };
+        if !eligible {
+            continue;
+        }
         let Some((_, tmpl)) = CALIBRATE_TEMPLATES.iter().find(|(h, _)| *h == host) else {
             continue;
         };
-        let tmpl = tmpl.to_string();
-        let log = log.clone();
-        joins.spawn(async move {
-            // rows: (镜像, ms) —— 失败 ms 为负，排序自然沉底
-            let mut rows: Vec<(String, i64)> = Vec::new();
-            for m in &chain {
-                let t0 = Instant::now();
-                let res = calibrate_one(m, &tmpl).await;
-                let ms = t0.elapsed().as_millis() as i64;
-                match res {
-                    Ok(st) => {
-                        log(&format!("[校准] {host} {m} {ms}ms {st}"));
-                        rows.push((m.clone(), ms));
-                    }
-                    Err(e) => {
-                        log(&format!("[校准] {host} {m} 失败({e})"));
-                        rows.push((m.clone(), -ms));
+        let rows = match mode {
+            CalibMode::Throughput => throughput_race(&host, &chain, tmpl, log).await,
+            CalibMode::Ttfb => {
+                let mut rows: Vec<(String, i64)> = Vec::new();
+                for m in &chain {
+                    let t0 = Instant::now();
+                    let res = calibrate_one(m, tmpl, log).await;
+                    let ms = t0.elapsed().as_millis() as i64;
+                    match res {
+                        Ok(st) => {
+                            (log)(&format!("[校准] {host} {m} {ms}ms {st}"));
+                            rows.push((m.clone(), ms));
+                        }
+                        Err(e) => {
+                            (log)(&format!("[校准] {host} {m} 失败({e})"));
+                            rows.push((m.clone(), -ms));
+                        }
                     }
                 }
+                rows.sort_by_key(|(_, ms)| -*ms); // TTFB：小者优；失败(负)沉底
+                rows
             }
-            (host, rows)
-        });
-    }
-    let mut report = String::new();
-    while let Some(res) = joins.join_next().await {
-        let Ok((host, rows)) = res else { continue };
-        let mut ok: Vec<(String, i64)> = rows.iter().filter(|(_, ms)| *ms > 0).cloned().collect();
-        ok.sort_by_key(|(_, ms)| *ms);
-        let dead: Vec<String> = rows
+        };
+        let new_chain: Vec<String> = rows.iter().map(|(m, _)| m.clone()).collect();
+        let summary: Vec<String> = rows
             .iter()
-            .filter(|(_, ms)| *ms <= 0)
-            .map(|(m, _)| m.clone())
-            .collect();
-        let new_chain: Vec<String> = ok
-            .iter()
-            .map(|(m, _)| m.clone())
-            .chain(dead.iter().cloned())
-            .collect();
-        let summary: Vec<String> = new_chain
-            .iter()
-            .map(|m| {
-                let ms = rows
-                    .iter()
-                    .find(|(mm, _)| mm == m)
-                    .map(|(_, ms)| *ms)
-                    .unwrap_or(0);
-                if ms > 0 {
-                    format!("{}({}ms)", m.trim_start_matches("https://"), ms)
+            .map(|(m, v)| {
+                if *v > 0 {
+                    let human = match mode {
+                        CalibMode::Throughput => format!("{}KB", v / 1024),
+                        CalibMode::Ttfb => format!("{}ms", v),
+                    };
+                    format!("{}({})", m.trim_start_matches("https://"), human)
                 } else {
                     format!("{}(失败)", m.trim_start_matches("https://"))
                 }
@@ -1325,6 +1476,54 @@ mod tests {
         ] {
             assert_eq!(mirror_chain_cap(h), None, "{h} 应用全链");
         }
+    }
+    /// 镜像请求剥头（2026-10-18）：身份头不外泄 + hop-by-hop 剥净（启用
+    /// 连接池后 `Connection: close` 会让复用形同虚设）；业务头必须保留。
+    #[test]
+    fn mirror_request_strips_identity_and_hop_by_hop() {
+        let out = hyper::Request::builder()
+            .method(Method::GET)
+            .uri("https://raw.githubusercontent.com/a/b")
+            .header("cookie", "logged_in=yes")
+            .header("authorization", "Bearer tok")
+            .header("connection", "close")
+            .header("keep-alive", "timeout=5")
+            .header("upgrade", "websocket")
+            .header("te", "trailers")
+            .header("range", "bytes=0-1023")
+            .header("accept-encoding", "gzip")
+            .header("user-agent", "UA/1.0")
+            .body(BoxBody::new(
+                http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
+            ))
+            .unwrap();
+        let req = mirror_request(
+            &out,
+            "https://gh-proxy.com",
+            "https://raw.githubusercontent.com/a/b",
+        )
+        .unwrap();
+        let h = req.headers();
+        for gone in [
+            "cookie",
+            "authorization",
+            "host",
+            "referer",
+            "connection",
+            "keep-alive",
+            "upgrade",
+            "te",
+        ] {
+            assert!(h.get(gone).is_none(), "{gone} 应被剥除");
+        }
+        assert_eq!(h.get("range").unwrap(), "bytes=0-1023", "业务头必须保留");
+        assert_eq!(h.get("accept-encoding").unwrap(), "gzip");
+        assert_eq!(h.get("user-agent").unwrap(), "UA/1.0");
+        let uri = req.uri().to_string();
+        assert!(
+            uri.starts_with("https://gh-proxy.com/https://raw.githubusercontent.com/"),
+            "拼 URL 形态: {uri}"
+        );
     }
     /// gzip 嗅探(2026-10-17): 拦截页必须在"解压后的前 4KB"被判出, 且已消费的
     /// 原始压缩帧必须是压缩流的真前缀 —— 写回时拼回不破坏字节流(浏览器自行解压)。

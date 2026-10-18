@@ -283,18 +283,49 @@ async fn api_mirrors() -> Response {
 /// 镜像链校准（UI"校准"按钮）：串行实测每链 TTFB 后按成绩重排并写盘。
 /// 最坏耗时 ≈ 链长 × 头预算(8s)（host 间已并行），约 30~90s —— 前端显示
 /// "校准中"并等待本响应。
-async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
+async fn api_calibrate(
+    State(st): State<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let logs = st.logs.clone();
     let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
-    let report = crate::server::mitm::calibrate_chains(&log).await;
+    // 防重入：校准已后台化，同一时刻只允许一个任务
+    if !crate::server::mitm::try_begin_calibrate() {
+        return (
+            [
+                ("content-type", "text/plain; charset=utf-8"),
+                ("cache-control", "no-store"),
+            ],
+            "校准已在后台进行中，请等当前校准结束（进度见运行日志页）".to_string(),
+        )
+            .into_response();
+    }
+    let mode = match q.get("mode").map(|s| s.as_str()) {
+        Some("ttfb") => crate::server::mitm::CalibMode::Ttfb,
+        _ => crate::server::mitm::CalibMode::Throughput,
+    };
+    let mode_name = match mode {
+        crate::server::mitm::CalibMode::Throughput => "大文件链(下载测速)",
+        crate::server::mitm::CalibMode::Ttfb => "图片链(响应头测速)",
+    };
+    // 后台化：HTTP 立即返回，任务挂在 runtime 上——关窗进托盘校准继续，
+    // 结果经 set_mirror_chain 落盘、报告写进日志页
+    tokio::spawn(async move {
+        let report = crate::server::mitm::calibrate_chains(&log, mode).await;
+        (log)(&format!("[校准] 完成\n{report}"));
+        crate::server::mitm::end_calibrate();
+    });
     (
         [
             ("content-type", "text/plain; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        report,
+        format!(
+            "{mode_name}校准已在后台开始：进度与结果见「运行日志」页，完成后新链序自动保存。\
+             关闭窗口进托盘不影响任务。"
+        ),
     )
-        .into_response()
+    .into_response()
 }
 
 #[derive(Deserialize)]
