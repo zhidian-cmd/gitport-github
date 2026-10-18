@@ -132,18 +132,13 @@ body{
 @media (max-width:980px){.grid3{grid-template-columns:1fr}}
 .statcard{display:flex;flex-direction:column;gap:7px;background:var(--panel);
           border:1px solid var(--line);border-radius:12px;padding:17px 19px;
-          text-decoration:none;color:var(--txt);transition:border-color .15s,background .15s}
-.statcard:hover{border-color:var(--line-strong);background:var(--panel-2)}
+          color:var(--txt)}
 .statcard .value{font-size:18px;font-weight:600}
 .statcard .meta{font:12px var(--mono);color:var(--faint)}
 .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
 .badge{font-size:11.5px;padding:3.5px 9px;border-radius:999px;
        background:var(--panel-2);border:1px solid var(--line-strong);color:var(--faint)}
 .badge.on{background:var(--green-soft);border-color:var(--green-line);color:var(--green)}
-
-.log-mini{background:#0a0d13;border:1px solid #171d27;border-radius:9px;padding:13px 15px;
-          font:12px var(--mono);color:#7d92a8;line-height:1.75;white-space:pre-wrap;
-          max-height:150px;overflow:hidden}
 
 /* ---------- IP 池 ---------- */
 .pool-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}

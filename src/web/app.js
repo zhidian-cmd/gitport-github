@@ -110,7 +110,6 @@ async function refreshLogs() {
     box.textContent += lines.join('\n') + '\n';
     while (box.textContent.split('\n').length > 400) box.textContent = box.textContent.split('\n').slice(1).join('\n');
     if ($('autoScroll').checked && atBottom) box.scrollTop = box.scrollHeight;
-    $('logsMini').textContent = lines.slice(-6).join('\n');
   }
   logSeq = d.latest;
 }
