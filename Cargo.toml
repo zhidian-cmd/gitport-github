@@ -12,7 +12,7 @@ name = "gitport-github"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["net", "time", "io-util", "sync", "rt", "rt-multi-thread", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2"
@@ -20,7 +20,7 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 h2 = "0.4"
 flate2 = "1"
@@ -31,7 +31,7 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 axum = { version = "0.8", features = ["json"] }
-rcgen = { version = "0.14", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] } # Issuer::from_ca_cert_der 需要（2026-10-18 审计误删后构建报错，已恢复）
 time = { version = "0.3", features = ["macros", "local-offset"] }
 winreg = "0.56"
 windows = { version = "0.61", features = [

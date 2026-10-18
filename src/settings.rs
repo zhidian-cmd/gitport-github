@@ -287,8 +287,6 @@ struct SettingsFile {
     #[serde(rename = "githubPAC", skip_serializing_if = "Option::is_none")]
     github_pac: Option<bool>,
     #[serde(default)]
-    groups: std::collections::HashMap<String, bool>, // 旧版键（多开关时代），读出后并入，写盘不再产出
-    #[serde(default)]
     proxy_backup: String,
     // 键名显式写 "ourPAC"(PAC 全大写, 非 camelCase 的 ourPac)：既有落盘即此形，
     // 缺 rename 会写出 ourPac → 已有文件读不到
@@ -320,11 +318,6 @@ pub fn load() {
         state()
             .github_pac
             .store(on, std::sync::atomic::Ordering::Relaxed);
-    } else if let Some(on) = v.groups.get("github") {
-        // 旧 settings.json 的一次性迁移
-        state()
-            .github_pac
-            .store(*on, std::sync::atomic::Ordering::Relaxed);
     }
     heal_stale_proxy();
 }
@@ -336,7 +329,6 @@ fn save() -> Result<(), String> {
         mitm: s.mitm.load(std::sync::atomic::Ordering::Relaxed),
         win_rect: *s.win_rect.lock().unwrap(),
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
-        groups: std::collections::HashMap::new(),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         our_pac: s.our_pac.lock().unwrap().clone(),
     };

@@ -105,8 +105,12 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/settings/githubPAC",
             axum::routing::post(api_github_pac),
         )
+        .route("/api/show", axum::routing::post(api_show))
         .route("/api/mirrors", axum::routing::get(api_mirrors))
-        .route("/api/calibrate", axum::routing::post(api_calibrate))
+        .route(
+            "/api/calibrate",
+            axum::routing::get(api_calib_status).post(api_calibrate),
+        )
         .with_state(app.clone())
         .layer(axum::middleware::from_fn(local_guard));
     let port = config::webui_port();
@@ -311,8 +315,10 @@ async fn api_calibrate(
     // 后台化：HTTP 立即返回，任务挂在 runtime 上——关窗进托盘校准继续，
     // 结果经 set_mirror_chain 落盘、报告写进日志页
     tokio::spawn(async move {
+        crate::server::mitm::set_calibrate_report(None);
         let report = crate::server::mitm::calibrate_chains(&log, mode).await;
         (log)(&format!("[校准] 完成\n{report}"));
+        crate::server::mitm::set_calibrate_report(Some(report));
         crate::server::mitm::end_calibrate();
     });
     (
@@ -393,6 +399,23 @@ async fn api_settings() -> Response {
         close_to_tray: settings::close_to_tray(),
         github_pac: settings::github_pac(),
     })
+}
+
+/// 校准状态（UI 轮询）：running + 最近一次报告。
+async fn api_calib_status() -> Response {
+    write_json(&serde_json::json!({
+        "running": crate::server::mitm::calibrate_running(),
+        "report": crate::server::mitm::last_calibrate_report(),
+    }))
+}
+
+/// 二次启动唤起：把托盘里的工作台叫出来（窗口已释放则重建）。
+async fn api_show() -> Response {
+    if crate::desktop::show_via_proxy() {
+        write_json(&serde_json::json!({"ok": true}))
+    } else {
+        write_json(&serde_json::json!({"ok": false, "error": "无窗口(headless 或事件循环未就绪)"}))
+    }
 }
 
 async fn api_autostart(axum::Json(body): axum::Json<OnBody>) -> Response {

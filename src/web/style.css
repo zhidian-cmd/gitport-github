@@ -38,6 +38,9 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 ::selection{background:rgba(63,185,80,.28)}
+/* 极淡噪点纹理：削弱大面积纯色面板的"反光感"（静态层，零 JS 开销） */
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;opacity:.022;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='0.6'/></svg>")}
 :focus-visible{outline:2px solid var(--green-line);outline-offset:2px;border-radius:6px}
 
 *::-webkit-scrollbar{width:10px;height:10px}
@@ -77,12 +80,12 @@ body{
 /* ---------- 主区 ---------- */
 .main{display:flex;flex-direction:column;min-width:0;min-height:0;
       background:radial-gradient(1100px 280px at 72% -100px,rgba(63,185,80,.05),transparent 60%),var(--bg)}
-.topbar{min-height:68px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;
-        padding:0 28px;border-bottom:1px solid var(--line)}
+.topbar{min-height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;
+        padding:0 14px;border-bottom:1px solid var(--line)}
 .topbar h1{font-size:15.5px;font-weight:600}
 .top-sub{font-size:12px;color:var(--faint);margin-top:3px}
 
-.views{flex:1;overflow-y:auto;padding:24px 28px 32px;min-height:0}
+.views{flex:1;overflow-y:auto;padding:12px 14px 16px;min-height:0}
 .view{display:none}
 .view.active{display:block;animation:rise .22s ease}
 @keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -95,10 +98,7 @@ body{
 /* ---------- 通用件 ---------- */
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;
        padding:20px;margin-bottom:16px}
-.panel.grow{flex:1;display:flex;flex-direction:column;min-height:0;margin-bottom:0}
 .panel h2{font-size:13.5px;font-weight:600;color:var(--txt)}
-.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}
-.panel-head:last-child{margin-bottom:0}
 
 .hint{font-size:12.5px;color:var(--faint);line-height:1.7;margin-top:6px}
 .label{font-size:12px;color:var(--sub)}
@@ -107,6 +107,7 @@ body{
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
 .head-row{margin-top:0}
 .view-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+#view-logs .view-toolbar{margin-bottom:4px} /* 日志页：工具栏贴紧日志框，多让出显示空间 */
 .view-toolbar .hint{margin:0}
 
 .btn{border:1px solid var(--line-strong);background:var(--panel-2);border-radius:8px;
@@ -161,6 +162,9 @@ body{
 .feature-info{flex:1;min-width:0}
 .feature-info p{font-size:12.5px;color:var(--faint);line-height:1.75;margin-top:7px}
 .feature-card .btn{flex-shrink:0;min-width:96px}
+/* 校准双按钮：等宽、上下对齐、同为绿色 */
+.cal-actions{display:flex;flex-direction:column;gap:8px;min-width:236px}
+.cal-actions .btn{width:100%}
 
 .set-row{display:flex;align-items:center;gap:20px;padding:6px 0}
 .set-row + .set-row{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}
@@ -179,8 +183,13 @@ body{
 
 /* ---------- 日志 ---------- */
 #logsBox{background:#0a0d13;border:1px solid #171d27;color:#7d92a8;border-radius:9px;
-         padding:13px 15px;font:12px var(--mono);white-space:pre-wrap;overflow-y:auto;
-         min-height:140px;line-height:1.75}
+         padding:13px 15px;font:12px var(--mono);overflow-y:auto;overflow-x:hidden;
+         min-height:140px;line-height:1.75;white-space:normal}
+/* 每行独立块：长 URL 强制断行——此前整段 pre-wrap 遇长串不折行，尾部被裁掉（2026-10-18 修） */
+#logsBox .lg{white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere}
+#logsBox .lg.err{color:#c9837c}   /* 柔化红：低饱和，长行不刺眼 */
+#logsBox .lg.warn{color:#c2a35e}  /* 柔化黄：降级/冷却类 */
+#logsBox .lg.ok{color:#7fbf98}    /* 柔化绿：成功路径 */
 #view-logs #logsBox{flex:1;min-height:0}
 .check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);cursor:pointer}
 .check input{accent-color:var(--green)}

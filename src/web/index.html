@@ -133,9 +133,6 @@
 
       <!-- IP 池 -->
       <section id="view-pools" class="view">
-        <div class="view-toolbar">
-          <p class="hint">串发模式: plans.json 是唯一 IP 来源 —— 按表逐个试连, 一个失败连下一个; 通的置顶失败的垫底, 全灭冷却 30 秒。候选不够直接手改 plans.json(改完重启生效)</p>
-        </div>
         <div id="poolCards" class="pool-grid"></div>
       </section>
 
@@ -145,24 +142,24 @@
           <div class="set-row">
             <div class="set-info">
               <h2>开机自启动</h2>
-              <p>登录 Windows 后自动运行并启动代理服务, 直接驻留系统托盘(不弹窗口)</p>
+              <p>登录 Windows 后自动启动，驻留托盘</p>
             </div>
             <label class="switch"><input type="checkbox" id="swAutostart"><span class="track"></span></label>
           </div>
           <div class="set-row">
             <div class="set-info">
               <h2>关闭窗口时缩到系统托盘</h2>
-              <p>开启后点 ✕ 只是隐藏窗口, 代理继续在后台运行; 托盘左键显示工作台, 右键退出</p>
+              <p>点 ✕ 只隐藏窗口，代理继续运行；托盘左键显示、右键退出</p>
             </div>
             <label class="switch"><input type="checkbox" id="swTray"><span class="track"></span></label>
           </div>
         </div>
         <div class="panel">
-          <p class="hint" style="margin:0 0 6px">分流接管 = 免插件的可选项: 开关开启且代理运行中时, 本程序以 PAC 脚本接管系统代理, 只有对应站点经本代理加速, 其余流量不受影响; 全部关闭时不碰系统代理, 用插件/手动接入照常可用。代理停止时自动还原接管前的系统代理。</p>
+          <p class="hint" style="margin:0 0 6px">开启且代理运行时，以 PAC 接管系统代理：仅 GitHub 系走本代理，其余直连；退出或停代理时自动还原。</p>
           <div class="set-row">
             <div class="set-info">
               <h2>GitHub 分流接管</h2>
-              <p>开启后 GitHub 系站点自动经本代理, 无需浏览器插件</p>
+              <p>GitHub 系站点自动走本代理，无需插件</p>
             </div>
             <label class="switch"><input type="checkbox" id="swGh" checked><span class="track"></span></label>
           </div>
@@ -170,36 +167,35 @@
         <div class="feature-card">
           <div class="feature-info">
             <h2>MITM 模式</h2>
-            <p class="hint" style="margin-top:5px">伪装 SNI / 无 SNI 形态与拦截页化解仅在开启时生效, 作用与流程图见 README「MITM 模式」章节</p>
+            <p class="hint" style="margin-top:5px">启用伪装 SNI、拦截页化解与流式直通；首次开启需安装本地证书</p>
           </div>
           <button class="btn primary" id="mitmBtn">开启</button>
         </div>
         <div class="feature-card">
           <div class="feature-info">
             <h2>镜像链校准</h2>
-            <p class="hint" style="margin-top:5px">为有镜像的资源各维护一条镜像使用顺序链（串行取用，绝不并发）。两种校准都是<strong>后台任务</strong>：点击后即可关闭窗口进托盘，任务继续跑完，新链序自动保存，过程与报告见「运行日志」页。<br>• <strong>大文件链</strong>（github.com / codeload / objects / release-assets）：5MB 真实下载竞速，四链串行、链内 11 家并发，一轮流量约 30-50MB，测的是<strong>下载吞吐</strong><br>• <strong>图片链</strong>（raw / gist / avatars / user-images / media）：响应头测速，约 1 分钟——图片小，首包时间就是主要成本</p>
+            <p class="hint" style="margin-top:5px">按实测速度重排镜像顺序链，均为后台任务（关窗进托盘也会跑完，结果见「运行日志」）。<br>• <strong>大文件链</strong>：5MB 下载竞速，流量约 30-50MB<br>• <strong>图片链</strong>：响应头测速，约 1 分钟</p>
             <pre id="calResult" class="hint" style="margin-top:8px;white-space:pre-wrap;display:none;max-height:260px;overflow:auto"></pre>
           </div>
-          <div>
-            <button class="btn primary" id="calBigBtn" style="margin-bottom:8px">校准大文件链（下载测速）</button><br>
-            <button class="btn" id="calImgBtn">校准图片链（响应头）</button>
+          <div class="cal-actions">
+            <button class="btn primary" id="calBigBtn">校准大文件链（下载测速）</button>
+            <button class="btn primary" id="calImgBtn">校准图片链（响应头）</button>
           </div>
         </div>
       </section>
 
       <!-- 运行日志 -->
       <section id="view-logs" class="view">
-        <div class="panel grow">
-          <div class="panel-head">
-            <h2>运行日志</h2>
-            <div class="row head-row">
-              <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
-              <button class="btn sm" onclick="copyText(document.getElementById('logsBox').textContent)">复制全部</button>
-              <button class="btn sm" onclick="document.getElementById('logsBox').textContent=''">清空</button>
-            </div>
+        <!-- 2026-10-18：去掉外层 panel —— 页面标题已有“运行日志”，再套一个同名
+             外框 + 内层日志框是三层框套框。工具栏单列一行，日志框直接填满。 -->
+        <div class="view-toolbar">
+          <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+          <div class="row head-row">
+            <button class="btn sm" onclick="copyText(document.getElementById('logsBox').textContent)">复制全部</button>
+            <button class="btn sm" onclick="document.getElementById('logsBox').textContent=''">清空</button>
           </div>
-          <div id="logsBox"></div>
         </div>
+        <div id="logsBox"></div>
       </section>
     </div>
   </main>

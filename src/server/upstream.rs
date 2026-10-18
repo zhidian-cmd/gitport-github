@@ -179,6 +179,17 @@ pub async fn dial_h2(
 /// 响应头, 2GB@1MB/s ≈ 35 分钟 —— 给足 30 分钟。黑洞上游（收包不应答）由
 /// 客户端侧超时/中止兜底。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
+
+/// hop-by-hop 头（RFC 7230 §6.1）：转发前必须剥掉。
+/// 2026-10-18 审计合并：mirror_request 与 h2_request_head 曾各抄一份名单，
+/// 改一处漏两处就会出"连接不复用/畸形请求"类怪 bug —— 单点维护。
+pub fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name,
+        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" | "te"
+    )
+}
+
 /// 从 out 重建 h2 请求头：剥 h1 hop-by-hop 头 —— 浏览器/git 在隧道内可能
 /// 以 http/1.1 发请求, h1 遗留头转发给 h2 会被判 malformed（RFC 7540
 /// §8.1.2.2）。
@@ -188,10 +199,7 @@ fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, 
         .uri(out.uri());
     for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
-        if matches!(
-            low.as_str(),
-            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" | "te"
-        ) {
+        if is_hop_by_hop(&low) {
             continue;
         }
         builder = builder.header(k, v);

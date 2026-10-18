@@ -35,7 +35,12 @@ fn main() {
 
 fn run() {
     if desktop::already_running() {
-        return; // 单实例: 二次启动只弹提示
+        // 单实例：二次启动不新开托盘，而是让已在运行的那个把工作台唤起来；
+        // 唤起失败（旧版本实例/headless/端口不通）才退回提示框。
+        if !desktop::signal_show(config::webui_port()) {
+            desktop::notify_already_running();
+        }
+        return;
     }
     // 工作目录切到 exe 目录：开机自启/快捷方式的 cwd 不可靠，
     // 而 ca.crt / settings.json / plans.json 都按相对路径读写

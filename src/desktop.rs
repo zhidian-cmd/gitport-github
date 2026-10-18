@@ -98,34 +98,80 @@ unsafe impl Sync for SingleMutexHandle {}
 
 static SINGLE_MUTEX: Mutex<Option<SingleMutexHandle>> = Mutex::new(None);
 
+/// 事件循环代理（WebUI 的 /api/show 用它把托盘里的窗口唤起来）。
+static EVENT_PROXY: std::sync::OnceLock<tao::event_loop::EventLoopProxy<AppEvent>> =
+    std::sync::OnceLock::new();
+
+/// 触发"显示工作台"（二次启动经 /api/show 调用）。headless 无事件循环 → false。
+pub fn show_via_proxy() -> bool {
+    EVENT_PROXY
+        .get()
+        .map(|p| p.send_event(AppEvent::ShowWindow).is_ok())
+        .unwrap_or(false)
+}
+
 pub fn already_running() -> bool {
-    use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    // 关键：CreateMutexW 在"互斥量已存在"时**返回成功句柄**，只在 LastError 里
+    // 报 ERROR_ALREADY_EXISTS —— 原实现只判 Err，永远判不出"已在运行"，
+    // 于是二次启动完整跑起来、托盘多一个图标（2026-10-18 实测）。
     let r = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\gitport-github")) };
     match r {
         Ok(h) => {
-            *SINGLE_MUTEX.lock().unwrap() = Some(SingleMutexHandle(h));
-            false
-        }
-        Err(err) => {
-            if err.code() == windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) {
-                let text = windows::core::w!("GitPort GitHub 已在运行(请看系统托盘)。");
-                let title = windows::core::w!("GitPort GitHub");
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
                 unsafe {
-                    let _ = MessageBoxW(
-                        None,
-                        text,
-                        title,
-                        windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(0x30),
-                    ); // MB_ICONWARNING
+                    let _ = CloseHandle(h);
                 }
                 true
             } else {
-                false // mutex 创建失败: 放行, 后面靠端口绑定报错兜底
+                *SINGLE_MUTEX.lock().unwrap() = Some(SingleMutexHandle(h));
+                false
             }
         }
+        Err(_) => false, // mutex 创建失败: 放行, 靠端口绑定报错兜底
     }
+}
+
+/// 二次启动的兜底提示（唤起失败时用，例如旧版本实例没有 /api/show）。
+pub fn notify_already_running() {
+    use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let text = windows::core::w!("GitPort GitHub 已在运行(请看系统托盘)。");
+    let title = windows::core::w!("GitPort GitHub");
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            text,
+            title,
+            windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(0x30),
+        );
+    }
+}
+
+/// 请求**已在运行的实例**把托盘里的工作台唤起来（二次启动时调用）。
+/// 走它常驻的 WebUI：POST /api/show → 事件循环 ShowWindow（窗口已释放则重建）。
+/// 返回 false = 没唤起（旧版本实例 / headless / 端口不通），调用方走提示兜底。
+pub fn signal_show(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let addr = match format!("127.0.0.1:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let mut s = match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1200)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+    let req = format!(
+        "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let n = s.read(&mut buf).unwrap_or(0);
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    resp.contains("\"ok\":true")
 }
 
 /// 窗口与 WebView 的联合句柄（事件循环闭包内共享）。
@@ -220,7 +266,10 @@ fn save_window_rect(slot: &Mutex<WinSlot>) {
     let g = slot.lock().unwrap();
     let Some(w) = &g.win else { return };
     let Ok(pos) = w.outer_position() else { return };
-    let size = w.outer_size();
+    // 尺寸存 **inner_size**（客户区）：恢复时 builder 用的就是 with_inner_size。
+    // 曾存 outer_size（含标题栏/边框），每次重开都被当成客户区再加一遍装饰 ——
+    // 窗口一轮比一轮大，系统为保在屏内又挪位置 → “位置偏、大小变”（2026-10-18 修）。
+    let size = w.inner_size();
     let (wpx, hpx) = (size.width as i32, size.height as i32);
     if wpx < 400 || hpx < 300 {
         return; // 异常矩形(窗口已销毁等)不保存
@@ -262,6 +311,7 @@ pub fn run(args: DesktopArgs) -> ! {
 
     let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let _ = EVENT_PROXY.set(proxy.clone());
     let slot = Arc::new(Mutex::new(WinSlot {
         win: None,
         wv: None,

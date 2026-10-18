@@ -113,6 +113,16 @@ async function refreshStatus() {
 }
 
 /* ---------- 日志增量 ---------- */
+/* 日志行着色：按关键字分级（纯前端，零额外请求） */
+function logTone(l) {
+  // 顺序即优先级：降级类（冷却/垫底/拦截）先判黄 —— 这些行常同时含“超时/失败”，
+  // 若红先判，黄色永远走不到（2026-10-18 实测：用户只看到红绿）。
+  if (/冷却|垫底|降权|拦截|假页|退化|注入/.test(l)) return 'warn';
+  if (/失败|错误|全灭|超时|拒绝|状态 [45]\d\d/.test(l)) return 'err';
+  if (/via |握手|复用连接|新连接|已解密|成功|已保存/.test(l)) return 'ok';
+  return '';
+}
+
 async function refreshLogs() {
   let d;
   try { d = await (await fetch('/api/logs?after=' + logSeq)).json(); } catch (e) { return; }
@@ -120,8 +130,15 @@ async function refreshLogs() {
     const lines = d.logs.map(x => x[1]);
     const box = $('logsBox');
     const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
-    box.textContent += lines.join('\n') + '\n';
-    while (box.textContent.split('\n').length > 400) box.textContent = box.textContent.split('\n').slice(1).join('\n');
+    const frag = document.createDocumentFragment();
+    for (const l of lines) {
+      const row = document.createElement('div');
+      row.className = 'lg ' + logTone(l);
+      row.textContent = l;
+      frag.appendChild(row);
+    }
+    box.appendChild(frag);
+    while (box.childElementCount > 400) box.removeChild(box.firstChild);
     if ($('autoScroll').checked && atBottom) box.scrollTop = box.scrollHeight;
   }
   logSeq = d.latest;
@@ -173,6 +190,17 @@ async function runCal(mode, btn, label) {
     box.textContent = text;
     toast(label + '校准已在后台开始');
     refreshLogs();
+    // 后台任务完成前轮询状态；完成后把排序结果（各镜像实测值）回显出来
+    const timer = setInterval(async () => {
+      try {
+        const st = await (await fetch('/api/calibrate')).json();
+        if (st.running) { box.textContent = label + '校准中…（进度见「运行日志」页）'; return; }
+        clearInterval(timer);
+        box.textContent = st.report || label + '校准完成（无可校准的链）';
+        toast(label + '校准完成');
+        refreshLogs();
+      } catch (e) { /* 网络抖动继续轮询 */ }
+    }, 1500);
   } catch (e) {
     box.textContent = '校准启动失败: ' + e;
   }

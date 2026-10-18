@@ -1034,19 +1034,9 @@ fn mirror_request(
         let low = k.as_str().to_lowercase();
         // 身份头不外泄镜像；hop-by-hop 头必须剥净 —— 启用连接池后
         // `Connection: close` 会让每次请求都新建连接，复用形同虚设
-        if matches!(
-            low.as_str(),
-            "cookie"
-                | "authorization"
-                | "host"
-                | "referer"
-                | "connection"
-                | "keep-alive"
-                | "proxy-connection"
-                | "transfer-encoding"
-                | "upgrade"
-                | "te"
-        ) {
+        if upstream::is_hop_by_hop(&low)
+            || matches!(low.as_str(), "cookie" | "authorization" | "host" | "referer")
+        {
             continue;
         }
         builder = builder.header(k, v);
@@ -1173,6 +1163,30 @@ pub enum CalibMode {
 
 /// 校准重入闸（校准后台化后，防 UI 连点/双开）。
 static CALIB_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 最近一次校准的人读报告（后台任务结束时写入；UI 轮询 GET /api/calibrate 取回展示）。
+static CALIB_REPORT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 校准是否在跑（UI 轮询用）。
+pub fn calibrate_running() -> bool {
+    CALIB_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 取最近一次校准报告（无则空串）。
+pub fn last_calibrate_report() -> String {
+    CALIB_REPORT
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// 写入/清空最近校准报告（webui 的后台任务调用）。
+pub fn set_calibrate_report(r: Option<String>) {
+    if let Ok(mut g) = CALIB_REPORT.lock() {
+        *g = r;
+    }
+}
 
 /// 尝试占用校准闸：false = 已有校准在跑。
 pub fn try_begin_calibrate() -> bool {
