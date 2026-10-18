@@ -146,9 +146,39 @@ fn create_window(
     if g.win.is_some() {
         return true;
     }
+    // 唯一标准：settings.json 的 winRect（2026-10-18 用户裁定）。
+    // 窗口按它 **出生即在位**（builder 直接定位）——不再"先按默认尺寸出现在
+    // 系统位置，建完 WebView 再跳"，那个跳就是用户看到的闪跳。
+    // 没有记录（首次/异常小）就按主屏居中偏下现算一个并**立刻写回**：
+    // settings.json 从此就是窗口状态的唯一来源，之后每次启动都按它建窗。
+    let (sw, sh) = elwt
+        .primary_monitor()
+        .map(|m| {
+            let s = m.size();
+            (s.width as i32, s.height as i32)
+        })
+        .unwrap_or((1920, 1080));
+    let default_rect = || {
+        let x = ((sw as f64 - WIN_W) / 2.0).max(0.0) as i32;
+        let y = ((sh as f64 - WIN_H) / 2.0 + WIN_DY).max(0.0) as i32;
+        (x, y, WIN_W as i32, WIN_H as i32)
+    };
+    let (l, t, w, h) = match settings::window_rect() {
+        Some((l, t, w, h))
+            if l < sw && t < sh && l + w > 0 && t + h > 0 =>
+        {
+            (l, t, w, h)
+        }
+        // 记录缺失，或矩形完全落在当前主屏外（拔了显示器等）→ 退回默认居中
+        _ => default_rect(),
+    };
+    if settings::window_rect() != Some((l, t, w, h)) {
+        let _ = settings::set_window_rect(l, t, w, h);
+    }
     let window = match WindowBuilder::new()
         .with_title("GitPort GitHub")
-        .with_inner_size(tao::dpi::LogicalSize::new(WIN_W, WIN_H))
+        .with_inner_size(tao::dpi::PhysicalSize::new(w, h))
+        .with_position(tao::dpi::PhysicalPosition::new(l, t))
         .build(elwt)
     {
         Ok(w) => w,
@@ -172,36 +202,16 @@ fn create_window(
         Ok(wv) => {
             g.win = Some(window);
             g.wv = Some(wv);
-            // 恢复上次退出时的窗口状态，无记录则居中偏下
-            if let Some((l, t, w, h)) = settings::window_rect() {
-                set_window_rect(&g.win.as_ref().unwrap(), l, t, w, h);
-            } else {
-                place_window(&g.win.as_ref().unwrap(), WIN_W, WIN_H, WIN_DY);
-            }
+            // OS 可能对位置做了屏幕钳制：把"实际矩形"立刻写回一次，
+            // settings.json 恒等于窗口真实现状（此后收起/退出时再存）
+            drop(g);
+            save_window_rect(slot);
             true
         }
         Err(_) => {
-            log("WebView2 不可用, 工作台暂由系统浏览器提供");
+            (log)("WebView2 不可用, 工作台暂由系统浏览器提供");
             false
         }
-    }
-}
-
-/// 移动窗口到指定位置与尺寸。
-fn set_window_rect(window: &Window, l: i32, t: i32, w: i32, h: i32) {
-    let _ = window.set_outer_position(tao::dpi::PhysicalPosition::new(l, t));
-    let _ = window.set_inner_size(tao::dpi::PhysicalSize::new(w, h));
-}
-
-/// 把窗口摆到屏幕 (水平居中, 垂直居中+dy)。
-fn place_window(window: &Window, w: f64, h: f64, dy: f64) {
-    if let Some(m) = window.current_monitor() {
-        let area = m.size();
-        let sw = area.width as f64;
-        let sh = area.height as f64;
-        let x = ((sw - w) / 2.0).max(0.0) as i32;
-        let y = ((sh - h) / 2.0 + dy).max(0.0) as i32;
-        let _ = window.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
     }
 }
 
