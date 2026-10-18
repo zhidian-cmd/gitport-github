@@ -227,6 +227,24 @@ pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
     POOL_ROUTES.iter().find(|pr| pr.pool == pool)
 }
 
+/// 串发族筛选：池内按 host 选族。未显式列族的 host 归**末族**兜底
+/// （edge = auth，旧 entry_serves "_" 语义）—— 与 `family_for` 的族名
+/// 判定必须一致：找不到族就完全不过滤会把 Fastly IP 也试败沉底
+/// （打错边缘 Host 必拒），那是 bug 不是兼容。
+pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
+    let pr = pool_route(pool)?;
+    pr.families
+        .iter()
+        .find(|f| (f.host_of)(host))
+        .or_else(|| {
+            if pr.families.len() > 1 {
+                pr.families.last()
+            } else {
+                None
+            }
+        })
+}
+
 /// host 在该池所属族名（"" = 池无路由表）。edge 未显式列族的 host 归
 /// auth（兜底族，见 FAMILY_AUTH 注释）。
 pub fn family_for(pool: &str, host: &str) -> &'static str {
@@ -464,6 +482,34 @@ mod tests {
         assert_eq!(fallback_for("edge", "githubapp.com"), Fallback::Dns);
         assert_eq!(fallback_for("core", "github.com"), Fallback::Dns);
         assert_eq!(fallback_for("api", "api.github.com"), Fallback::Dns);
+    }
+
+    /// 串发族筛选与族名判定必须一致：serial_family 选出的族名 == family_for。
+    /// 两者漂移的后果是"日志报 content 族、实际按 auth 族筛条目"——
+    /// 排障时看到的候选数与真实试的候选数不是一批。
+    #[test]
+    fn serial_family_matches_family_for() {
+        for (pool, host) in [
+            ("core", "github.com"),
+            ("api", "api.github.com"),
+            ("edge", "raw.githubusercontent.com"),
+            ("edge", "github.githubassets.com"),
+            ("edge", "octocat.github.io"),
+            ("edge", "githubapp.com"),
+            // edge 未显式列族的 host：归 auth 末族（旧 entry_serves "_" 语义）
+            ("edge", "future.edge.host"),
+            // 无路由表的池：None / ""
+            ("codeload", "codeload.github.com"),
+        ] {
+            let picked = serial_family(pool, host).map(|f| f.name).unwrap_or("");
+            assert_eq!(picked, family_for(pool, host), "{pool}/{host} 族名漂移");
+        }
+        // 兜底族真的在筛条目：未列族 host 只试非 Fastly 伪装（Fastly IP
+        // 打错边缘 Host 必被拒，试了也是白沉底）
+        let f = serial_family("edge", "future.edge.host").unwrap();
+        assert_eq!(f.name, "auth");
+        assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
+        assert!(!(f.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
     }
 
     #[test]

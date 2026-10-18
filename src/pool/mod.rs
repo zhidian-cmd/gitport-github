@@ -690,11 +690,12 @@ pub async fn serial_dial(
     };
 
     // 族筛选（路由细分）：池内按 host 选族，只试对口条目 —— 不试也不垫底，
-    // 否则每类请求都把另一类 IP 试败沉底，共享表顺序永久 ping-pong
-    let family = route::pool_route(pool_name)
-        .and_then(|pr| pr.families.iter().find(|f| (f.host_of)(host)));
+    // 否则每类请求都把另一类 IP 试败沉底，共享表顺序永久 ping-pong。
+    // 兜底语义与 route::family_for 一致（edge 未列族 host 归 auth 末族），
+    // 由 route::serial_family 单点实现 + serial_family_matches_family_for 钉住。
+    let family = route::serial_family(pool_name, host);
     let serves = family.map(|f| f.serves);
-    let family_name = family.map(|f| f.name).unwrap_or("");
+    let family_name = route::family_for(pool_name, host);
 
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
