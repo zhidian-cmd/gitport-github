@@ -11,6 +11,7 @@
 //! —— 见 config::GROUPS 与 server/mitm.rs。
 
 pub mod dial;
+pub mod route;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -237,54 +238,10 @@ pub fn serial_pool(name: &str) -> bool {
 /// 用于种子展开与旧表空/legacy 值归一；表内显式写法优先（Fastly 段除外
 /// —— 形态由边缘行为决定，显式写法无意义）。
 fn shape_for_ip(ip: &str) -> &'static str {
-    if fastly_last_octet(ip) == Some("133") {
+    if route::fastly_last_octet(ip) == Some("133") {
         dial::MODE_SNI
     } else {
         "baidu.com"
-    }
-}
-
-/// Fastly 段 IP 的末段（108-111 段才认），非 Fastly 返回 None。
-/// 末段即域族：133=githubusercontent 内容 / 153=github.io / 154=githubassets。
-fn fastly_last_octet(ip: &str) -> Option<&str> {
-    let mut o = ip.split('.');
-    match (o.next(), o.next(), o.next(), o.next()) {
-        (Some("185"), Some("199"), Some(n), Some(last))
-            if matches!(n, "108" | "109" | "110" | "111") =>
-        {
-            Some(last)
-        }
-        _ => None,
-    }
-}
-
-/// host 的 Fastly 域族（"" = 非 Fastly 域）。
-/// 末段即域族：.133=githubusercontent 内容 / .153=github.io / .154=githubassets。
-/// 三族边缘各服务各的域，打错边缘 Host 会被对端拒绝或 404 —— 条目必须与
-/// host 域族对口。
-fn host_family(host: &str) -> &'static str {
-    if host.ends_with("githubusercontent.com") {
-        "content"
-    } else if host.ends_with("githubassets.com") {
-        "assets"
-    } else if host == "github.io" || host.ends_with(".github.io") {
-        "io"
-    } else {
-        ""
-    }
-}
-
-/// 条目是否服务该 host：Fastly 各族只认对应末段（.133 真名 / .153、.154、
-/// .215 伪装；assets 族 2026-10 起认新边缘 .215，.154 保留兼容），其余
-/// host（主站/auth）只认非 Fastly 伪装条目。不对口跳过（不试不垫底）——
-/// 否则各类请求互相试败垫底，池序永远乒乓。
-/// 注：objects-origin 是直连白名单（config::DIRECT_HOSTS），不经任何池。
-fn entry_serves(host: &str, p: &SerialPlan) -> bool {
-    match host_family(host) {
-        "content" => fastly_last_octet(&p.ip) == Some("133"),
-        "assets" => matches!(fastly_last_octet(&p.ip), Some("154") | Some("215")),
-        "io" => fastly_last_octet(&p.ip) == Some("153"),
-        _ => fastly_last_octet(&p.ip).is_none() && plan_mode(&p.sni) != plan_mode(dial::MODE_SNI),
     }
 }
 
@@ -296,7 +253,18 @@ const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
 
 struct SerialTab {
     pools: HashMap<String, Vec<SerialPlan>>,
-    cool: HashMap<String, Instant>, // 全灭冷却
+    /// 全灭冷却（2026-10-19 起按 host 记账，不再按池）：该 host 所在族全灭
+    /// 一次后 30s 内快速失败。池级冷却会让一个域的全灭毒倒同池其他族的
+    /// 健康腿（实测 camo 无镜像全灭 → 30s 内 assets/io/auth 全部快速失败
+    /// → 落 502）。有镜像兜底的 host 不冷却（内容域熔断已覆盖，见
+    /// mitm content_direct_fail）。
+    cool: HashMap<String, Instant>,
+    /// per-IP 死亡冷却（2026-10-19）：TCP 层失败 = 该 IP 对谁都不通，直接
+    /// 跳过。仅"逐个沉底"不够 —— 全失败时沉底会把顺序还原成原样，每个
+    /// 请求仍要重撞死 IP（实测 raw 11.3s）。指数退避：连续 TCP 失败
+    /// 60s → 5min → 30min（封顶）—— 10 个死 IP 每 60s 各打扰 3s 的代价
+    /// 实测把 github.com 冷请求拖到 12.4s。成功拨号即清除计数。
+    dead: HashMap<String, (Instant, u32)>,
     /// 镜像使用链：内容域 host -> 有序镜像列表（串行逐个用，禁并发竞速）。
     /// 顺序来源：内置默认(实测) / UI 校准半自动重排 / 手改。
     mirrors: HashMap<String, Vec<String>>,
@@ -448,6 +416,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     let mut tab = SerialTab {
         pools: HashMap::new(),
         cool: HashMap::new(),
+        dead: HashMap::new(),
         mirrors: HashMap::new(),
         dirty: false,
     };
@@ -458,7 +427,13 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
         for p in ps {
-            if p.ip.parse::<std::net::IpAddr>().is_err() || p.sni == "ech" {
+            // 已下线 IP（route::RETIRED_IPS，2026-10-19 TCP 实测死）：
+            // 实表里的也不再保留 —— 死 IP 每分钟打扰一次（3s/个）的代价
+            // 实测把冷请求拖到十几秒
+            if p.ip.parse::<std::net::IpAddr>().is_err()
+                || p.sni == "ech"
+                || route::is_retired(&p.ip)
+            {
                 continue;
             }
             // ech: 边缘不发布 ECH 记录, 恒失败 —— 清除旧表遗留;
@@ -466,7 +441,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             // 决定, 显式写法无意义 —— 旧表 .153/.154 的真名条目随 2026-10-14
             // "伪装抗 SNI 阻断"实测结论统一迁移); 其余条目显式写法保留,
             // 空与旧值(real/nosni)按 IP 族归一; 表内存量统一为裸域名
-            let sni = if fastly_last_octet(&p.ip).is_some() {
+            let sni = if route::fastly_last_octet(&p.ip).is_some() {
                 shape_for_ip(&p.ip).to_string()
             } else {
                 match p.sni.trim() {
@@ -495,7 +470,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         if plans.is_empty() {
             if let Some(ips) = seed_db().get(*name) {
                 for ip in ips {
-                    if ip.parse::<std::net::IpAddr>().is_err() {
+                    if ip.parse::<std::net::IpAddr>().is_err() || route::is_retired(ip) {
                         continue;
                     }
                     if plans.len() < SERIAL_MAX_PLANS {
@@ -514,6 +489,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             let mut added = 0usize;
             for ip in ips {
                 if ip.parse::<std::net::IpAddr>().is_err()
+                    || route::is_retired(ip)
                     || plans.iter().any(|p| p.ip == *ip)
                     || plans.len() >= SERIAL_MAX_PLANS
                 {
@@ -679,7 +655,8 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
 /// 报错。置顶只由数据层 ok（serial_note）认证 —— 拨号成功不算成功。
 /// tls_handshake=false 时只做裸 TCP 拨号（透传 CONNECT 隧道）。ctx 到期只
 /// 掐正在试的那条：没试完 ≠ 失败（不沉底）≠ 全灭（不冷却）。
-/// 返回 (连接, 所用 IP, 所用形态)。混合池按 host 选形态（host_shape）。
+/// 返回 (连接, 所用 IP, 所用形态)。混合池按 host 选族（route::POOL_ROUTES），
+/// 只试对口条目。
 pub async fn serial_dial(
     pool_name: &str,
     host: &str,
@@ -687,11 +664,11 @@ pub async fn serial_dial(
     tls_handshake: bool,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
-    // 全灭冷却期内快速失败
+    // 全灭冷却期内快速失败（按 host：只毒该 host 自己，不毒同池其他族）
     {
         let g = SERIAL.lock().unwrap();
         let tab = g.as_ref().unwrap();
-        if let Some(cool) = tab.cool.get(pool_name) {
+        if let Some(cool) = tab.cool.get(host) {
             if Instant::now() < *cool {
                 let remain = cool.duration_since(Instant::now()).as_secs();
                 return Err(format!("串发冷却中(全灭后约 {remain}s), 快速失败"));
@@ -712,13 +689,31 @@ pub async fn serial_dial(
         g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
+    // 族筛选（路由细分）：池内按 host 选族，只试对口条目 —— 不试也不垫底，
+    // 否则每类请求都把另一类 IP 试败沉底，共享表顺序永久 ping-pong
+    let family = route::pool_route(pool_name)
+        .and_then(|pr| pr.families.iter().find(|f| (f.host_of)(host)));
+    let serves = family.map(|f| f.serves);
+    let family_name = family.map(|f| f.name).unwrap_or("");
+
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
+    let mut eligible = 0usize; // 对口候选总数（含死亡冷却跳过的）
     for p in &snapshot {
-        // 按 host 选条目（形态 + Fastly 域族）：不对口的条目跳过 —— 不试也不垫底，
-        // 否则每类请求都把另一类 IP 试败沉底，排序永久 ping-pong
-        if !entry_serves(host, p) {
-            continue;
+        if let Some(s) = serves {
+            if !s(host, p) {
+                continue;
+            }
+        }
+        eligible += 1;
+        // per-IP 死亡冷却（指数退避）：跳过期间不打扰（见 SerialTab::dead）
+        {
+            let g = SERIAL.lock().unwrap();
+            if let Some((until, _)) = g.as_ref().and_then(|t| t.dead.get(&p.ip)) {
+                if Instant::now() < *until {
+                    continue;
+                }
+            }
         }
         tried += 1;
         let mode = plan_mode(
@@ -754,10 +749,29 @@ pub async fn serial_dial(
                             | std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::ConnectionAborted
                     );
-                if !host.ends_with("githubusercontent.com") || tcp_level {
+                if !route::is_content_host(host) || tcp_level {
                     let target = p.clone();
                     let why = if tcp_level { "IP 不可达" } else { "拨号失败" };
                     serial_move(pool_name, |q| *q == target, false, why);
+                }
+                if tcp_level {
+                    // 指数退避置位：60s → 5min → 30min（封顶）。死 IP 不是
+                    // 每分钟都值得打扰一次 —— 10 个死 IP × 3s 实测把冷请求
+                    // 拖到 12.4s（2026-10-19 github.com 首页实测）
+                    if let Ok(mut g) = SERIAL.lock() {
+                        if let Some(t) = g.as_mut() {
+                            let n = t.dead.get(&p.ip).map(|(_, n)| *n).unwrap_or(0) + 1;
+                            let secs = match n {
+                                1 => 60,
+                                2 => 300,
+                                _ => 1800,
+                            };
+                            t.dead.insert(
+                                p.ip.clone(),
+                                (Instant::now() + Duration::from_secs(secs), n),
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -768,33 +782,38 @@ pub async fn serial_dial(
         return Err("请求预算到期".to_string());
     }
     if tried == 0 {
-        // 一条都没试（全被形态过滤）：不是全灭，不冷却，快速失败
+        // 一条都没试：对口候选全在死亡冷却（不是全灭，不冷却，快速失败）
+        // 或被形态滤光（同）。两者分开报，排障时一眼可辨
+        if eligible > 0 {
+            return Err(format!(
+                "全部 {eligible} 个对口候选处于死亡冷却({pool_name}, {host})"
+            ));
+        }
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
-    // 绕表一圈全灭（每条都真试过）：冷却 30s。**只有"确实有镜像兜底"的
-    // 内容域**才豁免（2026-10-18 修正）：原判据对所有 *.githubusercontent.com
-    // 一刀切豁免，但 camo 根本不在镜像链里（镜像对 camo 一律 301，实测），
-    // 豁免只会让每张徽章全额重烧整表——12 张 shields.io 徽章的仓库页转圈
-    // 两分钟（日志：22 候选全灭 12s + DNS 腿 3s，×十几张）。
-    // 冷却的池级副作用可接受：内容域直连快速失败 → 立刻落到镜像（更快）。
+    // 绕表一圈全灭（每条都真试过）：按 host 冷却 30s。**只有"确实有镜像
+    // 兜底"的 host** 才豁免（2026-10-18 修正）：原判据对所有
+    // *.githubusercontent.com 一刀切豁免，但 camo 根本不在镜像链里（镜像对
+    // camo 一律 301，实测），豁免只会让每张徽章全额重烧整表——12 张
+    // shields.io 徽章的仓库页转圈两分钟（日志：22 候选全灭 12s + DNS 腿
+    // 3s，×十几张）。按 host 冷却（2026-10-19 修正）：原池级冷却会让
+    // camo 的全灭把 assets/io/auth 的健康腿一起毒倒 30s。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
         let mut g = SERIAL.lock().unwrap();
         g.as_mut().unwrap().cool.insert(
-            pool_name.to_string(),
+            host.to_string(),
             Instant::now() + Duration::from_secs(30),
         );
     }
     if let Some(log) = log {
         let tail = if has_mirror {
-            "内容域不冷却(有镜像兜底)"
+            "不冷却(有镜像兜底)".to_string()
         } else {
-            "无镜像兜底, 冷却 30s 快速失败"
+            "无镜像兜底, 冷却 30s 快速失败".to_string()
         };
         log(&format!(
-            "[串发] {} 全灭({} 候选, 累计 {:?}), {tail}",
-            pool_name,
-            snapshot.len(),
+            "[串发] {host} {pool_name}/{family_name} 全灭({tried}/{eligible} 候选, 累计 {:?}), {tail}",
             last_err.as_deref().unwrap_or("未知")
         ));
     }
@@ -804,6 +823,13 @@ pub async fn serial_dial(
 /// 数据层回写真实结果并修正排序。kind: ok / 其他一切（noreply 零回包/block 错误页/…）。
 /// 通的信号（ok）该 IP 整体置顶；死的信号垫底 —— IP 级移位。
 pub fn serial_note(pool_name: &str, ip: &str, kind: &str) {
+    if kind == "ok" {
+        if let Ok(mut g) = SERIAL.lock() {
+            if let Some(t) = g.as_mut() {
+                t.dead.remove(ip);
+            }
+        }
+    }
     serial_move(pool_name, |p| p.ip == ip, kind == "ok", kind);
 }
 
@@ -987,66 +1013,10 @@ mod tests {
         for ip in ["140.82.112.29", "20.205.243.167"] {
             assert_eq!(shape_for_ip(ip), "baidu.com", "{ip} 应取伪装");
         }
-        // host 期望形态由条目形态决定（.133 真名 / .153/.154 伪装，host_shape 已废）
-        // 域族 → 条目末段对口：.133/.153/.154 各服务各的域，打错边缘必拒
-        let mk = |ip: &str, sni: &str| SerialPlan {
-            ip: ip.into(),
-            sni: sni.into(),
-        };
-        assert!(entry_serves(
-            "avatars.githubusercontent.com",
-            &mk("185.199.108.133", dial::MODE_SNI)
-        ));
-        assert!(!entry_serves(
-            "avatars.githubusercontent.com",
-            &mk("185.199.108.154", "baidu.com")
-        ));
-        assert!(!entry_serves(
-            "avatars.githubusercontent.com",
-            &mk("140.82.112.29", "baidu.com")
-        ));
-        assert!(entry_serves(
-            "github.githubassets.com",
-            &mk("185.199.108.154", "baidu.com")
-        ));
-        assert!(!entry_serves(
-            "github.githubassets.com",
-            &mk("185.199.108.133", dial::MODE_SNI)
-        ));
-        assert!(entry_serves(
-            "octocat.github.io",
-            &mk("185.199.108.153", "baidu.com")
-        ));
-        // .153 真名条目同样服务(形态跟随条目, 真名亦可用, 仅不抗 SNI 阻断;
-        // 表内形态已由 serial_load 按族强制归一)
-        assert!(entry_serves(
-            "octocat.github.io",
-            &mk("185.199.108.153", dial::MODE_SNI)
-        ));
-        // .215 新代 assets 边缘(2026-10 GitHub 迁移): 伪装, 只服务 assets 族
+        // .215 新代 assets 边缘(2026-10 GitHub 迁移): 伪装
         assert_eq!(shape_for_ip("185.199.108.215"), "baidu.com");
-        assert!(entry_serves(
-            "github.githubassets.com",
-            &mk("185.199.108.215", "baidu.com")
-        ));
-        assert!(!entry_serves(
-            "avatars.githubusercontent.com",
-            &mk("185.199.110.215", "baidu.com")
-        ));
-        // 非 Fastly 族 host 只认非 Fastly 段的伪装条目
-        assert!(entry_serves(
-            "githubapp.com",
-            &mk("140.82.112.29", "baidu.com")
-        ));
-        assert!(entry_serves("github.com", &mk("140.82.112.3", "baidu.com")));
-        assert!(!entry_serves(
-            "github.com",
-            &mk("185.199.108.133", dial::MODE_SNI)
-        ));
-        assert!(!entry_serves(
-            "api.github.com",
-            &mk("140.82.112.29", dial::MODE_SNI)
-        ));
+        // 域族 → 条目末段对口的 serves 判据已移入 route.rs（family_entry_serves
+        // 测试），此处不再重复；shape_for_ip 只定形态
     }
 
     #[test]
@@ -1148,7 +1118,7 @@ mod tests {
         assert!(
             edge_ps
                 .iter()
-                .any(|p| fastly_last_octet(&p.ip) == Some("133") && p.sni == dial::MODE_SNI),
+                .any(|p| route::fastly_last_octet(&p.ip) == Some("133") && p.sni == dial::MODE_SNI),
             "种子补缺应追加 .133 真名内容域条目: {edge_ps:?}"
         );
         // ghapp/assets 旧键不再是池: 落盘只剩 core/api/edge
@@ -1190,9 +1160,15 @@ mod tests {
             seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
             "补缺应打一行日志"
         );
-        // 落盘含补齐条目
+        // 落盘含补齐条目（.133 内容域仅 110.133 存活，108/109/111 已退役）
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-        assert!(b.contains("185.199.108.133"), "补缺应落盘: {b}");
+        assert!(b.contains("185.199.110.133"), "补缺应落盘: {b}");
+        assert!(
+            !b.contains("185.199.108.133")
+                && !b.contains("185.199.109.133")
+                && !b.contains("185.199.111.133"),
+            "退役死 IP 不应补缺落盘: {b}"
+        );
     }
 
     #[test]

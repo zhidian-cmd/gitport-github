@@ -53,6 +53,10 @@ pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;
 /// 域名分组：命中规则的流量按该池的 plans.json 串发表拨号。
 /// IP 名单不在此处 —— plans.json 是唯一权威（首次运行由 pool/seeds.json 初始化）。
+/// 组即串发池（core/api/edge，见 pool::SERIAL_POOLS）—— codeload 2026-10-19
+/// 撤组：它是"纯镜像域"不是池，GET/HEAD 由总路由 pool::route::master_route
+/// 判 Mirror only，其他方法落 core 通配（主站边缘服务 codeload 子域），
+/// 不再有"串发表为空(codeload)"的空转噪音。
 pub struct Group {
     pub name: &'static str,
     pub patterns: &'static [&'static str],
@@ -75,7 +79,7 @@ pub const GROUPS: &[Group] = &[
         // 直连混合池 edge：auth 主机（凭据不外泄镜像）+ Fastly 静态/内容边缘。
         // avatars/camo/gist 直连 1s 内 200，镜像竞速则全灭 502（头像风暴还
         // 会打爆公共镜像）；raw 真名 SNI 被 GFW RST，直连失败由 mitm 回落镜像。
-        // 条目按 host 族对口选择（entry_serves），不对口不试不垫底。
+        // 条目按 host 族对口选择（route::POOL_ROUTES），不对口不试不垫底。
         name: "edge",
         patterns: &[
             "githubapp.com",
@@ -85,11 +89,6 @@ pub const GROUPS: &[Group] = &[
             "*.github.io",
             "*.githubusercontent.com",
         ],
-    },
-    Group {
-        // 纯镜像池（codeload 源码包）：同 fastly，不直连无表。
-        name: "codeload",
-        patterns: &["codeload.github.com"],
     },
 ];
 
@@ -114,7 +113,8 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
 ///   （原专用池 + 验收名覆盖为一处降级，已随之删除）。
 /// - viewscreen.githubusercontent.com（mermaid 服务端渲染）：走代理是真名 SNI
 ///   拨 .133 内容边缘，被 GFW 间歇掐断（新建连接 3s 超时 × 多候选、无镜像
-///   兜底）→ 图表等得久；浏览器直连有 DoH+ECH 加密 SNI，实测"一进仓库就出图"。
+///   兜底）→ 图表等得久；浏览器直连该域时通时断（窗口期），实测"一进仓库
+///   就出图"——**非 ECH**：github.com/viewscreen 均无 HTTPS RR（2026-10-18 实测）。
 /// vhost→边缘的映射只有 GitHub 的 DNS 知道，交给系统解析永远命中正确族，
 /// 代码里不再保留这份会腐化的知识。
 pub const DIRECT_HOSTS: &[&str] = &[
@@ -129,8 +129,9 @@ pub fn is_direct(host: &str) -> bool {
 }
 
 /// 域名 -> 所属池名（唯一路由真相，"" = 非池域名）。
-/// 精确 pattern 优先于通配符 —— 否则 codeload.github.com 会被先遍历到的
-/// core 组 "*.github.com" 抢走。
+/// 精确 pattern 优先于通配符 —— api.github.com 必须精确命中 api 组，
+/// 否则会被先遍历到的 core 组 "*.github.com" 抢走。
+/// 总路由（含直连白名单/镜像 only 分流）见 pool::route::master_route。
 pub fn pool_for(host: &str) -> &'static str {
     // 白名单必须先于两次 GROUPS 遍历：只删 pattern 不够 —— objects-origin
     // 会落到 edge 的 *.githubusercontent.com 通配符（Fastly 500 Domain
@@ -200,8 +201,9 @@ mod tests {
         // viewscreen(mermaid 渲染): 代理腿真名 SNI 被间歇掐, 直连走浏览器 DoH/ECH
         assert!(is_direct("viewscreen.githubusercontent.com"));
         assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
-        // 精确 pattern 优先：codeload 不能落 core
-        assert_eq!(pool_for("codeload.github.com"), "codeload");
+        // codeload 2026-10-19 撤组：大文件 GET/HEAD 由总路由判 Mirror only，
+        // 其他方法落 core 通配（主站边缘服务该子域）——不再有空池噪音
+        assert_eq!(pool_for("codeload.github.com"), "core");
         // 文件内容域 → edge 直连（avatars/camo/gist 实测直连 1s 内 200；
         // 镜像竞速全灭 502 是头像不显示的根源）+ 失败回落镜像在 mitm 侧
         assert_eq!(pool_for("raw.githubusercontent.com"), "edge");

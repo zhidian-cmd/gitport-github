@@ -1,7 +1,8 @@
 //! MITM 路径：池内域名本地终结 TLS 后按 plans.json 串发连上游
 //! (boring Chrome 指纹 + 伪装 SNI)，风控拦截页(403 restricted/400 Whoa)
-//! 本地识别(ghDefuse)，该 IP 垫底换下一个重试。分流：
-//! - core/api/edge：直连（edge 混合池内按 IP 族分形态，见 pool::shape_for_ip）
+//! 本地识别(ghDefuse)，该 IP 垫底换下一个重试。分流总表见
+//! pool::route::master_route（唯一真相）：
+//! - core/api/edge：直连（edge 混合池内按 host 选族，见 route::POOL_ROUTES）
 //! - githubusercontent 内容域（avatars/camo/gist/raw）：直连优先（1s 内 200），
 //!   失败回落镜像串行链
 //! - codeload / objects / release-assets / github.com 的 releases/download、
@@ -23,40 +24,22 @@ const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// 内容域镜像链限长（2026-10-17 用户要求）：仍然串行逐家试，只是最多前 5
 /// 家、每家 5s 超时——把一张坏图标的最坏等待从"11 家 × 各自超时"(实测 16s)
 /// 压到 25s 上限内的大概率更早出局。大文件保链全量（各家串行, 不并发）。
+/// 内容域（.133 真名腿）的 h2 响应头预算：比通用 8s 短 —— 该腿被 GFW
+/// 按域黑洞时等满 8s 才换镜像（实测 raw 每 120s 白烧 10s+）。健康边缘
+/// 响应头 <1s（直连成功实测 ~1s，镜像腿 0.65-1.1s），4s 够真流量、又把
+/// 黑洞探测砍半。预算只罩到响应头（h2_send → h2_recv_response），体不限。
+const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4);
 const MIRROR_CHAIN_CAP: usize = 5;
 
 /// 内容域小文件（头像/图片/gist/media）的镜像链限长；大文件与 github.com
 /// 归档/release 返回 None = 用全链。
 /// 注意：**镜像链仍是串行**（与直连 IP 串发同一哲学：一家失败再下一家）。
 fn mirror_chain_cap(host: &str) -> Option<usize> {
-    (host != "github.com" && !is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
+    (host != "github.com" && !pool::route::is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
 }
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 // ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
 // 条件只有"拿到正常页"或"串发全灭"。
-/// release 附件与源码包路径（/releases/download、/archive）一律走镜像；
-/// git 智能协议路径不在此列 —— 镜像不认，必须走 core 池直连（伪装 SNI）。
-fn is_release_asset_path(host: &str, path: &str) -> bool {
-    if host != "github.com" {
-        return false;
-    }
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.as_slice() {
-        [_owner, _repo, kind, ..] if *kind == "releases" => {
-            // releases/download/... （releases 页面本身不拦，只拦下载）
-            segs.len() >= 4 && segs[3] == "download"
-        }
-        [_owner, _repo, kind, ..] if *kind == "archive" => true,
-        _ => false,
-    }
-}
-/// 大文件下载域(整域镜像)：codeload=源码包；objects/release-assets=release
-/// 附件 302 的落点(新旧两代域名)。
-fn is_big_file_host(host: &str) -> bool {
-    host == "codeload.github.com"
-        || host == "objects.githubusercontent.com"
-        || host == "release-assets.githubusercontent.com"
-}
 /// 池内域名本地终结 TLS。直连白名单域名（objects-origin 等）pool_for 返回空
 /// → 上面 is_empty 分支已豁免；把它们改回池属契约变更，由
 /// pool::tests::objects_origin_never_pooled 拦，不设运行时护栏。
@@ -230,32 +213,43 @@ async fn mitm_http(
         }),
         None => out,
     };
-    // 镜像 only 域（不直连）：codeload / objects / release-assets 大文件域、
-    // github.com 的 releases/download 与 archive 路径（git 智能协议路径除外）。
+    // 镜像 only 判定走总路由 pool::route::master_route（唯一真相）：
+    // codeload / objects / release-assets 大文件域、github.com 的
+    // releases/download 与 archive 路径 → Route::Mirror（GET/HEAD）。
     // 镜像链全灭 → 直接 502，不回落直连。
     // githubusercontent 内容域不在此列 —— 直连优先（1s 内 200），失败回落镜像链。
-    if is_simple && (is_big_file_host(&host) || is_release_asset_path(&host, &path)) {
+    if is_simple
+        && matches!(
+            pool::route::master_route(&host, req.method().as_str(), &path),
+            pool::route::Route::Mirror
+        )
+    {
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
             return write_upstream(resp, "mirror", &info);
         }
         (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
         return mitm_unavailable(&req, &host);
     }
+    let name = pool::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
-            // 内容域直连优先、失败回落镜像链：直连是 avatars/camo/gist
-            // 的常态路径；raw 真名 SNI 被 GFW 黑洞（快速失败），兜底走链。
-            if host.ends_with("githubusercontent.com") && is_simple {
-                if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
-                    return write_upstream(r, "mirror", &info);
+            // 直连失败后的兜底策略同样收拢到 route::fallback_for(pool, host)：
+            // edge 内容族（.133 真名）有镜像链 → MirrorDns：先镜像链，再系统
+            // DNS 直连腿；其余族 Dns：镜像链不可用（或非简单请求），只走 DNS 腿。
+            match pool::route::fallback_for(&name, &host) {
+                pool::route::Fallback::MirrorDns if is_simple => {
+                    if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
+                        return write_upstream(r, "mirror", &info);
+                    }
+                    (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
                 }
-                (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
-            } else {
-                (log)(&format!(
-                    "[MITM] {host}{} 上游失败: {e}",
-                    path_of(req.uri())
-                ));
+                _ => {
+                    (log)(&format!(
+                        "[MITM] {host}{} 上游失败: {e}",
+                        path_of(req.uri())
+                    ));
+                }
             }
             // 末路兜底: 系统 DNS 直连腿 —— 池表 IP 漂移(GitHub 边缘迁移,
             // 如 2026-10 assets .154→.215)时按系统解析自愈。仅 GET/HEAD。
@@ -544,10 +538,14 @@ async fn try_cached(
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
     let up = upstream::cached_h2(host)?;
     let attempt_req = build_request(out, body);
-    let timed = tokio::time::timeout(
-        REQUEST_BUDGET,
-        upstream::h2_send(&up, &attempt_req, body),
-    );
+    // 内容域专用预算 4s（vs 通用 8s）：.133 真名腿被 GFW 黑洞时快速失败，
+    // 省下的 4s 直接让给镜像链 —— 实测黑洞请求必然烧满预算，罩更久纯浪费
+    let budget = if is_content {
+        CONTENT_REQUEST_BUDGET
+    } else {
+        REQUEST_BUDGET
+    };
+    let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
     match timed.await {
         Ok(Ok(resp)) => {
             info.set(&up.ip);
@@ -585,7 +583,8 @@ async fn get_direct(
     let name = pool::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
-    let is_content = host.ends_with("githubusercontent.com");
+    // 内容域判据收拢到 route::is_content_host（*.githubusercontent.com 末段 .133 族）
+    let is_content = pool::route::is_content_host(host);
     // 内容域直连熔断：GFW 按域黑洞期间每个请求烧满预算才回落 —— 熔断中
     // 直接放弃直连（调用方立即回落镜像链），不再逐条试
     if name == "edge" && is_content && pool::content_direct_open(host) {
@@ -649,10 +648,13 @@ async fn get_direct(
             }
         };
         let attempt_req = build_request(out, body);
-        let timed = tokio::time::timeout(
-            REQUEST_BUDGET,
-            upstream::h2_send(&up, &attempt_req, body),
-        );
+        // 内容域（真名 SNI 走 .133）黑洞必烧满预算 —— 同 get_direct 砍到 4s
+        let budget = if is_content {
+            CONTENT_REQUEST_BUDGET
+        } else {
+            REQUEST_BUDGET
+        };
+        let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
         match timed.await {
             Ok(Ok(resp)) => {
                 info.set(&up.ip);
@@ -904,10 +906,14 @@ async fn dns_direct_fetch(
             }
         };
         let attempt_req = build_request(out, body);
-        let timed = tokio::time::timeout(
-            REQUEST_BUDGET,
-            upstream::h2_send(&up, &attempt_req, body),
-        );
+        // 内容域专用预算 4s：.133 真名腿被 GFW 黑洞时快速失败回落镜像链，
+        // 不拖满 8s —— 预算只罩到响应头，体不限
+        let budget = if pool::route::is_content_host(host) {
+            CONTENT_REQUEST_BUDGET
+        } else {
+            REQUEST_BUDGET
+        };
+        let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
         match timed.await {
             Ok(Ok(resp)) => {
                 info.set(&ip);
@@ -1348,7 +1354,7 @@ pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     let mut report = String::new();
     // 铁律：host 之间严格串行（同一镜像服务多条链，跨链并发互相污染测量）
     for (host, chain) in chains {
-        let big = is_big_file_host(&host);
+        let big = pool::route::is_big_file_host(&host);
         let eligible = match mode {
             CalibMode::Throughput => big,
             CalibMode::Ttfb => !big,
@@ -1642,44 +1648,40 @@ mod tests {
         );
         assert!(defuse_full_cycle(&mut seen, "1.2.3.4"), "重复终止保持终止");
     }
-    /// release/archive 路径判定：只拦下载，不拦 git 智能协议与页面。
+    /// release/archive 路径判定（已收拢 route.rs）：只拦下载，不拦 git 智能
+    /// 协议与页面。判定入口是总路由 master_route → Route::Mirror。
     #[test]
     fn release_asset_path_gate() {
-        assert!(is_release_asset_path(
+        use pool::route::{master_route, Route};
+        let mirror = |host: &str, path: &str| {
+            matches!(master_route(host, "GET", path), Route::Mirror)
+        };
+        let not_mirror = |host: &str, path: &str| {
+            !matches!(master_route(host, "GET", path), Route::Mirror)
+        };
+        assert!(mirror(
             "github.com",
             "/torvalds/linux/archive/refs/tags/v6.6.tar.gz"
         ));
-        assert!(is_release_asset_path(
+        assert!(mirror(
             "github.com",
             "/cli/cli/releases/download/v2.0.0/gh_2.0.0_windows_amd64.zip"
         ));
         // releases 列表页本身不拦（只是页面）
-        assert!(!is_release_asset_path(
-            "github.com",
-            "/torvalds/linux/releases"
-        ));
-        assert!(!is_release_asset_path(
-            "github.com",
-            "/torvalds/linux/releases/tag/v6.6"
-        ));
+        assert!(not_mirror("github.com", "/torvalds/linux/releases"));
+        assert!(not_mirror("github.com", "/torvalds/linux/releases/tag/v6.6"));
         // git 智能协议不拦：必须走 core 池直连
-        assert!(!is_release_asset_path(
+        assert!(not_mirror(
             "github.com",
             "/torvalds/linux/info/refs?service=git-upload-pack"
         ));
-        assert!(!is_release_asset_path(
-            "github.com",
-            "/torvalds/linux/git-upload-pack"
-        ));
-        // 只判 github.com
-        assert!(!is_release_asset_path(
+        assert!(not_mirror("github.com", "/torvalds/linux/git-upload-pack"));
+        // 只判 github.com 的路径；codeload 走 host 判定（大文件域整体镜像）
+        assert!(not_mirror(
             "api.github.com",
             "/repos/x/y/releases/assets/1"
         ));
-        assert!(!is_release_asset_path(
-            "codeload.github.com",
-            "/x/y/legacy.tar.gz"
-        ));
+        assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
     }
 
     /// 流式直通判定契约（2026-10-16 方案一）：git 智能协议 POST 与声明
