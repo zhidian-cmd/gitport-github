@@ -337,6 +337,50 @@ struct OnBody {
     on: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_host_and_origin_gate() {
+        assert!(local_host("127.0.0.1:7811"));
+        assert!(local_host("LOCALHOST:7811"));
+        assert!(!local_host("evil.com"));
+        assert!(!local_host("127.0.0.2:7811"));
+        let port = config::webui_port();
+        assert!(local_origin(&format!("http://127.0.0.1:{port}")));
+        assert!(local_origin(&format!("http://localhost:{port}/")));
+        assert!(!local_origin(&format!("http://127.0.0.1:{port}@evil.com")));
+        assert!(!local_origin("http://evil.com"));
+        assert!(!local_origin(""));
+    }
+
+    #[test]
+    fn same_site_write_rules() {
+        let mut h = HeaderMap::new();
+        assert!(
+            same_site_write(&h),
+            "无 Origin/Referer = curl/git 等本机工具放行"
+        );
+        let base = format!("http://127.0.0.1:{}", config::webui_port());
+        h.insert(
+            "origin",
+            HeaderValue::from_str(&base).unwrap(),
+        );
+        assert!(same_site_write(&h));
+        h.insert("origin", HeaderValue::from_static("http://evil.com"));
+        assert!(!same_site_write(&h));
+        h.remove("origin");
+        h.insert(
+            "referer",
+            HeaderValue::from_str(&format!("{base}/x")).unwrap(),
+        );
+        assert!(same_site_write(&h));
+        h.insert("referer", HeaderValue::from_static("http://evil.com/x"));
+        assert!(!same_site_write(&h));
+    }
+}
+
 async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBody>) -> Response {
     if body.on {
         if st.ca.is_none() {

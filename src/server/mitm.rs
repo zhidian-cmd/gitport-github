@@ -1507,6 +1507,28 @@ mod tests {
         }
     }
     #[test]
+    fn credential_query_detection() {
+        for q in [
+            "token=abc",
+            "sig=1",
+            "signature=1",
+            "jwt=1",
+            "auth=1",
+            "access_token=x",
+            "session_token=1",
+            "AWSAccessKeyId=k",
+            "X-Amz-Signature=abc",
+            "x-amz-credential=1",
+            "a=1&access_token=x",
+        ] {
+            assert!(has_credential_query(q), "{q} 应判含凭据");
+        }
+        for q in ["", "foo=token", "page=2&q=tokenize", "tokens=1"] {
+            assert!(!has_credential_query(q), "{q} 不该误判（名字才参与，值不算）");
+        }
+    }
+
+    #[test]
     fn release_asset_path_gate() {
         use pool::route::{master_route, Route};
         let mirror = |host: &str, path: &str| {

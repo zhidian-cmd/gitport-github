@@ -735,6 +735,27 @@ mod tests {
     }
 
     #[test]
+    fn breakers_open_set_clear_by_host() {
+        let raw = "raw.githubusercontent.com";
+        let camo = "camo.githubusercontent.com";
+        assert!(!content_direct_open(raw));
+        content_direct_fail(raw);
+        assert!(content_direct_open(raw));
+        assert!(
+            !content_direct_open(camo),
+            "熔断按 host 记账，不得串到同池其他域"
+        );
+        content_direct_ok(raw);
+        assert!(!content_direct_open(raw));
+
+        assert!(!mirror_breaker_open(camo));
+        mirror_breaker_set(camo);
+        assert!(mirror_breaker_open(camo));
+        mirror_breaker_clear(camo);
+        assert!(!mirror_breaker_open(camo));
+    }
+
+    #[test]
     fn plan_mode_semantics() {
         assert_eq!(plan_mode(""), "fake:", "空串须由调用方兜底");
         assert_eq!(

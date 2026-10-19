@@ -397,4 +397,16 @@ mod tests {
         assert_eq!(host_only("[::1]:443"), "[::1]");
         assert_eq!(host_only("github.com"), "github.com");
     }
+
+    #[test]
+    fn split_target_parses_and_defaults() {
+        assert_eq!(split_target("github.com:443", 443), ("github.com".into(), 443));
+        assert_eq!(split_target("github.com", 80), ("github.com".into(), 80));
+        assert_eq!(split_target("[::1]:8443", 443), ("[::1]".into(), 8443));
+        assert_eq!(split_target("[::1]", 443), ("[::1]".into(), 443));
+        assert_eq!(
+            split_target("github.com:notaport", 80),
+            ("github.com:notaport".into(), 80)
+        );
+    }
 }
