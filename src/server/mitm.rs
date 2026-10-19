@@ -236,7 +236,7 @@ async fn mitm_http(
         )
     {
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
-            let resp = counted_mirror(resp, &host, &path, &log);
+            let resp = counted_mirror(resp, &host, &path, req.method() == &Method::HEAD, &log);
             return write_upstream(resp, "mirror", &info);
         }
         (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
@@ -252,7 +252,7 @@ async fn mitm_http(
             match pool::route::fallback_for(&name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
-                        let r = counted_mirror(r, &host, &path, &log);
+                        let r = counted_mirror(r, &host, &path, req.method() == &Method::HEAD, &log);
                         return write_upstream(r, "mirror", &info);
                     }
                     (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
@@ -876,12 +876,15 @@ impl Drop for CountingBody {
     }
 }
 /// 镜像大响应（>1MB）包交付计数体；小响应不包（免噪音）。
+/// HEAD 不包：HEAD 响应本就无体，hyper 不轮询直接弃体 —— 计数体会
+/// 误报"推了(0B/N)后连接终止"（2026-10-19 实测 rel_latest HEAD 假阳性）。
 /// 只罩镜像腿：直连腿的字节账由 `[隧道] ↑↓` 覆盖，镜像腿此前没有任何
 /// 交付记录。
 fn counted_mirror(
     resp: hyper::Response<BoxBody>,
     host: &str,
     path: &str,
+    is_head: bool,
     log: &LogFn,
 ) -> hyper::Response<BoxBody> {
     let total = resp
@@ -889,7 +892,7 @@ fn counted_mirror(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    if total.map_or(true, |t| t <= 1024 * 1024) {
+    if is_head || total.map_or(true, |t| t <= 1024 * 1024) {
         return resp;
     }
     let (parts, body) = resp.into_parts();
@@ -1908,5 +1911,39 @@ mod tests {
                 .any(|s| s.contains("t/part 推了(5B/10B)后连接终止")),
             "{lines:?}"
         );
+    }
+
+    /// HEAD 不包计数体（2026-10-19 rel_latest 实测假阳性）：HEAD 响应本就
+    /// 无体，hyper 弃体不轮询 —— 若包了会误报"推了(0B/N)后连接终止"。
+    #[test]
+    fn counted_mirror_skips_head_and_small() {
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let l = logs.clone();
+        let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
+        let big = BoxBody::new(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"))
+                .map_err(|never| match never {}),
+        );
+        let big_resp = hyper::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", "132855191")
+            .body(big)
+            .unwrap();
+        // HEAD：不包，弃体无任何交付日志
+        let r = counted_mirror(big_resp, "h", "/p", true, &log);
+        drop(r);
+        // 小响应：不包
+        let small = hyper::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", "10")
+            .body(BoxBody::new(
+                http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"))
+                    .map_err(|never| match never {}),
+            ))
+            .unwrap();
+        let r = counted_mirror(small, "h", "/p", false, &log);
+        drop(r);
+        let lines = logs.lock().unwrap();
+        assert!(lines.is_empty(), "HEAD 与小响应都不该有交付日志: {lines:?}");
     }
 }
