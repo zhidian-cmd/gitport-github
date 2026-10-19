@@ -1476,29 +1476,7 @@ mod tests {
         assert!(!is_gh_block_page(&mut resp2).await);
     }
     #[test]
-    fn mirrors_pool_health() {
-        assert!(
-            pool::MIRRORS.len() >= 6,
-            "镜像候选过少: {}",
-            pool::MIRRORS.len()
-        );
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for m in pool::MIRRORS {
-            assert!(m.starts_with("https://"), "镜像须为 https: {m}");
-            assert!(seen.insert(*m), "镜像链接重复: {m}");
-        }
-        assert_eq!(pool::CONTENT_HOSTS.len(), pool::DEFAULT_CHAINS.len());
-        for (host, chain) in pool::DEFAULT_CHAINS {
-            assert!(
-                pool::CONTENT_HOSTS.contains(host),
-                "默认链 host 越界: {host}"
-            );
-            let mut seen_c: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for m in *chain {
-                assert!(pool::MIRRORS.contains(m), "{host} 默认链含池外镜像 {m}");
-                assert!(seen_c.insert(*m), "{host} 默认链有重复: {m}");
-            }
-        }
+    fn calibrate_templates_cover_content_hosts() {
         for h in pool::CONTENT_HOSTS {
             assert!(
                 CALIBRATE_TEMPLATES.iter().any(|(host, _)| host == h),

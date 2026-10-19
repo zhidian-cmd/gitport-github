@@ -192,7 +192,7 @@ pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
     POOL_ROUTES.iter().find(|pr| pr.pool == pool)
 }
 
-/// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（与 family_for 一致，单测钉住）。
+/// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（edge 即 auth）。
 pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
     let pr = pool_route(pool)?;
     pr.families
@@ -209,18 +209,9 @@ pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
 
 /// host 在该池所属族名（"" = 池无路由表）。edge 未列族 host 归 auth 兜底族。
 pub fn family_for(pool: &str, host: &str) -> &'static str {
-    let Some(pr) = pool_route(pool) else {
-        return "";
-    };
-    for f in pr.families {
-        if (f.host_of)(host) {
-            return f.name;
-        }
-    }
-    if pr.families.len() > 1 {
-        return "auth"; // edge 兜底族
-    }
-    "all"
+    serial_family(pool, host)
+        .map(|f| f.name)
+        .unwrap_or("")
 }
 
 /// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。
@@ -413,20 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_family_matches_family_for() {
-        for (pool, host) in [
-            ("core", "github.com"),
-            ("api", "api.github.com"),
-            ("edge", "raw.githubusercontent.com"),
-            ("edge", "github.githubassets.com"),
-            ("edge", "octocat.github.io"),
-            ("edge", "githubapp.com"),
-            ("edge", "future.edge.host"),
-            ("codeload", "codeload.github.com"),
-        ] {
-            let picked = serial_family(pool, host).map(|f| f.name).unwrap_or("");
-            assert_eq!(picked, family_for(pool, host), "{pool}/{host} 族名漂移");
-        }
+    fn serial_family_edge_fallback() {
         let f = serial_family("edge", "future.edge.host").unwrap();
         assert_eq!(f.name, "auth");
         assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
