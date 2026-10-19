@@ -307,15 +307,10 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 /// 上游唯一入口：串发池域名(core/api/edge)按 plans.json 串发（按表重试）；
 /// 非串发池域名(fastly/codeload 等纯镜像池)与非池域名交系统 DNS 直接连接。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
-    if pool::serial_pool(pool::pool_for(host)) {
-        let (conn, ip, _shape) = pool::serial_dial(
-            pool::pool_for(host),
-            host,
-            CancellationToken::new(),
-            false,
-            None,
-        )
-        .await?;
+    let name = pool::pool_for(host);
+    if pool::serial_pool(name) {
+        let (conn, ip, _shape) =
+            pool::serial_dial(name, host, CancellationToken::new(), false, None).await?;
         return Ok((conn, ip));
     }
     let addr = format!("{host}:{port}");

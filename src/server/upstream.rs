@@ -334,7 +334,7 @@ pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
     host: &str,
-) -> Result<(hyper::Request<BoxBody>, String), String> {
+) -> Result<hyper::Request<BoxBody>, String> {
     let method = req.method().clone();
     let path = req
         .uri()
@@ -372,8 +372,7 @@ pub fn upstream_request<B>(
     }
     let body =
         BoxBody::new(http_body_util::Empty::<bytes::Bytes>::new().map_err(|never| match never {}));
-    let out = out.body(body).map_err(|e| e.to_string())?;
-    Ok((out, host.to_string()))
+    out.body(body).map_err(|e| e.to_string())
 }
 pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
     use futures_util::StreamExt;
@@ -398,7 +397,7 @@ mod tests {
             .header("accept-encoding", "gzip, deflate, br")
             .body(())
             .unwrap();
-        let (out, _) = upstream_request(&req, "github.com").unwrap();
+        let out = upstream_request(&req, "github.com").unwrap();
         assert_eq!(
             out.headers().get("accept-encoding").unwrap(),
             "gzip",
@@ -409,7 +408,7 @@ mod tests {
             .uri("https://github.com/a")
             .body(())
             .unwrap();
-        let (out2, _) = upstream_request(&req2, "github.com").unwrap();
+        let out2 = upstream_request(&req2, "github.com").unwrap();
         assert!(
             out2.headers().get("accept-encoding").is_none(),
             "未声明的客户端应回身份编码"
@@ -419,7 +418,7 @@ mod tests {
             .uri("https://raw.githubusercontent.com/a")
             .body(())
             .unwrap();
-        let (out3, _) = upstream_request(&req3, "raw.githubusercontent.com").unwrap();
+        let out3 = upstream_request(&req3, "raw.githubusercontent.com").unwrap();
         assert!(
             out3.headers().get("accept-encoding").is_none(),
             "非嗅探 host 不添加"

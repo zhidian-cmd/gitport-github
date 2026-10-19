@@ -52,150 +52,44 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
+/// 各链只存实测调优的头部 3 家；尾部由 serial_load 补缺按 MIRRORS 序填满，
+/// 校准（Throughput/Ttfb）会重写全序——不手写 11 家全量。
 pub const DEFAULT_CHAINS: &[(&str, &[&str])] = &[
     (
         "github.com",
-        &[
-            "https://gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://cdn.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://v4.gh-proxy.org",
-            "https://axisnow.gh-proxy.org",
-            "https://mirror.ghproxy.com",
-            "https://ghproxy.net",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://gh-proxy.org", "https://v6.gh-proxy.org", "https://cf.ghproxy.cn"],
     ),
     (
         "raw.githubusercontent.com",
-        &[
-            "https://axisnow.gh-proxy.org",
-            "https://v4.gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://gh-proxy.org",
-            "https://ghproxy.net",
-            "https://v6.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://axisnow.gh-proxy.org", "https://v4.gh-proxy.org", "https://cdn.gh-proxy.org"],
     ),
     (
         "gist.githubusercontent.com",
-        &[
-            "https://v4.gh-proxy.org",
-            "https://axisnow.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://gh-proxy.org",
-            "https://ghproxy.net",
-            "https://cdn.gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://v4.gh-proxy.org", "https://axisnow.gh-proxy.org", "https://gh-proxy.com"],
     ),
     (
         "avatars.githubusercontent.com",
-        &[
-            "https://axisnow.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://v4.gh-proxy.org",
-            "https://gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://ghproxy.net",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://axisnow.gh-proxy.org", "https://gh-proxy.com", "https://v4.gh-proxy.org"],
     ),
     (
         "user-images.githubusercontent.com",
-        &[
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://gh-proxy.com",
-            "https://gh-proxy.org",
-            "https://v4.gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://axisnow.gh-proxy.org",
-            "https://ghproxy.net",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://gh-proxy.com"],
     ),
     (
         "codeload.github.com",
-        &[
-            "https://gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://cdn.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://v4.gh-proxy.org",
-            "https://axisnow.gh-proxy.org",
-            "https://mirror.ghproxy.com",
-            "https://ghproxy.net",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://gh-proxy.org", "https://v6.gh-proxy.org", "https://cf.ghproxy.cn"],
     ),
     (
         "objects.githubusercontent.com",
-        &[
-            "https://axisnow.gh-proxy.org",
-            "https://gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://ghproxy.net",
-            "https://gh-proxy.com",
-            "https://v4.gh-proxy.org",
-            "https://mirror.ghproxy.com",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://axisnow.gh-proxy.org", "https://gh-proxy.org", "https://cdn.gh-proxy.org"],
     ),
     (
         "release-assets.githubusercontent.com",
-        &[
-            "https://gh-proxy.org",
-            "https://v4.gh-proxy.org",
-            "https://gh-proxy.com",
-            "https://axisnow.gh-proxy.org",
-            "https://ghproxy.net",
-            "https://v6.gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://gh-proxy.org", "https://v4.gh-proxy.org", "https://gh-proxy.com"],
     ),
     (
         "media.githubusercontent.com",
-        &[
-            "https://cf.ghproxy.cn",
-            "https://mirror.ghproxy.com",
-            "https://gh-proxy.com",
-            "https://gh-proxy.org",
-            "https://v4.gh-proxy.org",
-            "https://v6.gh-proxy.org",
-            "https://cdn.gh-proxy.org",
-            "https://axisnow.gh-proxy.org",
-            "https://ghproxy.net",
-            "https://ghfast.top",
-            "https://github.moeyy.xyz",
-        ],
+        &["https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://gh-proxy.com"],
     ),
 ];
 
@@ -399,21 +293,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 }
             };
             plans.push(SerialPlan { ip: p.ip, sni });
-        }
-        if plans.is_empty() {
-            if let Some(ips) = seed_db().get(*name) {
-                for ip in ips {
-                    if ip.parse::<std::net::IpAddr>().is_err() || route::is_retired(ip) {
-                        continue;
-                    }
-                    if plans.len() < SERIAL_MAX_PLANS {
-                        plans.push(SerialPlan {
-                            ip: ip.clone(),
-                            sni: shape_for_ip(&ip).to_string(),
-                        });
-                    }
-                }
-            }
         }
         if let Some(ips) = seed_db().get(*name) {
             let mut added = 0usize;
@@ -769,66 +648,67 @@ pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
 }
 
 
-/// 内容域直连熔断：被按域黑洞时每请求烧满预算，失败一次熔断 120s 走镜像，成功清除。
-static CONTENT_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
-    std::sync::OnceLock::new();
+/// 全灭熔断：set 后 ttl 内 open=true 快速失败，clear 解除；必须按 host 记账——
+/// 全局单值会让"别的域成功"反复清掉 raw 的熔断（内容域直连）/同类 host 快速失败。
+struct Breaker {
+    ttl_secs: u64,
+    map: std::sync::OnceLock<Mutex<HashMap<String, Instant>>>,
+}
+impl Breaker {
+    const fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl_secs,
+            map: std::sync::OnceLock::new(),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
+        self.map
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+    }
+    fn open(&self, host: &str) -> bool {
+        self.lock()
+            .get(host)
+            .map(|until| Instant::now() < *until)
+            .unwrap_or(false)
+    }
+    fn set(&self, host: &str) {
+        self.lock()
+            .insert(host.to_string(), Instant::now() + Duration::from_secs(self.ttl_secs));
+    }
+    fn clear(&self, host: &str) {
+        self.lock().remove(host);
+    }
+}
 
-/// 粒度必须按 host——同族域直连状态不同，全局单值会让"别的域成功"反复清掉 raw 的熔断。
+/// 内容域直连熔断：被按域黑洞时每请求烧满预算，失败一次熔断 120s 走镜像，成功清除。
+static CONTENT_BREAKER: Breaker = Breaker::new(120);
+/// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
+static MIRROR_BREAKER: Breaker = Breaker::new(60);
+
 pub fn content_direct_open(host: &str) -> bool {
-    let g = CONTENT_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.get(host)
-        .map(|until| Instant::now() < *until)
-        .unwrap_or(false)
+    CONTENT_BREAKER.open(host)
 }
 
 pub fn content_direct_ok(host: &str) {
-    let mut g = CONTENT_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.remove(host);
+    CONTENT_BREAKER.clear(host);
 }
 
 pub fn content_direct_fail(host: &str) {
-    let mut g = CONTENT_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.insert(host.to_string(), Instant::now() + Duration::from_secs(120));
+    CONTENT_BREAKER.set(host);
 }
 
-
-/// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
-static MIRROR_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
-    std::sync::OnceLock::new();
-
 pub fn mirror_breaker_open(host: &str) -> bool {
-    let g = MIRROR_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.get(host)
-        .map(|until| Instant::now() < *until)
-        .unwrap_or(false)
+    MIRROR_BREAKER.open(host)
 }
 
 pub fn mirror_breaker_set(host: &str) {
-    let mut g = MIRROR_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.insert(host.to_string(), Instant::now() + Duration::from_secs(60));
+    MIRROR_BREAKER.set(host);
 }
 
 pub fn mirror_breaker_clear(host: &str) {
-    let mut g = MIRROR_BREAKER
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    g.remove(host);
+    MIRROR_BREAKER.clear(host);
 }
 
 pub use crate::config::pool_for;
@@ -1159,7 +1039,10 @@ mod tests {
             .iter()
             .map(|m| m.to_string())
             .collect();
-        assert_eq!(media_chain, def);
+        for (i, m) in def.iter().enumerate() {
+            assert_eq!(media_chain[i], *m, "默认链头应原序保留");
+        }
+        assert_eq!(media_chain.len(), MIRRORS.len(), "补缺后应覆盖全池");
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
         assert!(b.contains("\"mirrors\""), "镜像链应落盘");

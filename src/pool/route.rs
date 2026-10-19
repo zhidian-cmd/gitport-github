@@ -222,19 +222,9 @@ pub fn family_for(pool: &str, host: &str) -> &'static str {
     "all"
 }
 
-/// host 的兜底策略（族全灭后怎么走）。
+/// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。
 pub fn fallback_for(pool: &str, host: &str) -> Fallback {
-    let name = family_for(pool, host);
-    for pr in POOL_ROUTES {
-        if pr.pool == pool {
-            for f in pr.families {
-                if f.name == name {
-                    return f.fallback;
-                }
-            }
-        }
-    }
-    Fallback::Dns
+    serial_family(pool, host).map_or(Fallback::Dns, |f| f.fallback)
 }
 
 pub fn is_content_host(host: &str) -> bool {

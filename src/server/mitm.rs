@@ -134,7 +134,7 @@ async fn mitm_http(
         return mitm_upgrade(log, req, &host).await;
     }
     let info = UpstreamInfo::default();
-    let Ok((out, _)) = upstream::upstream_request(&req, &host) else {
+    let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
     let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
@@ -566,7 +566,7 @@ async fn get_direct(
             REQUEST_BUDGET
         };
         let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
-        match timed.await {
+        let e = match timed.await {
             Ok(Ok(resp)) => {
                 info.set(&up.ip);
                 if !name.is_empty() {
@@ -583,52 +583,29 @@ async fn get_direct(
                 ));
                 return Ok(resp);
             }
-            Ok(Err(e)) => {
-                // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
-                // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
-                if !name.is_empty() && is_simple && !is_content {
-                    pool::serial_note(name, &up.ip, "noreply");
-                }
-                upstream::drop_h2(host, &up.ip);
-                (log)(&format!(
-                    "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
-                    attempt + 1
-                ));
-                if !is_simple {
-                    return Err(format!("POST 等非简单方法不重发({e})"));
-                }
-                if is_content {
-                    pool::content_direct_fail(host);
-                    return Err(format!("内容域直连全灭({e})"));
-                }
-                continue; // GET/HEAD: 换下一个候选重发完整请求
-            }
-            Err(_) => {
-                if !name.is_empty() && is_simple && !is_content {
-                    pool::serial_note(name, &up.ip, "noreply");
-                }
-                upstream::drop_h2(host, &up.ip);
-                (log)(&format!(
-                    "[MITM] {host} 上游第 {} 次尝试失败(响应预算超时), 垫底换候选",
-                    attempt + 1
-                ));
-                if !is_simple {
-                    return Err("POST 等非简单方法不重发(响应预算超时)".to_string());
-                }
-                if is_content {
-                    pool::content_direct_fail(host);
-                    return Err("内容域直连全灭(响应预算超时)".to_string());
-                }
-                continue;
-            }
+            Ok(Err(e)) => e,
+            Err(_) => "响应预算超时".to_string(),
+        };
+        // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
+        // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
+        if !name.is_empty() && is_simple && !is_content {
+            pool::serial_note(name, &up.ip, "noreply");
         }
+        upstream::drop_h2(host, &up.ip);
+        (log)(&format!(
+            "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
+            attempt + 1
+        ));
+        if !is_simple {
+            return Err(format!("POST 等非简单方法不重发({e})"));
+        }
+        if is_content {
+            pool::content_direct_fail(host);
+            return Err(format!("内容域直连全灭({e})"));
+        }
+        continue; // GET/HEAD: 换下一个候选重发完整请求
     }
     Err("直连串发全灭(完整请求逐个试完)".to_string())
-}
-
-/// 同 IP 再现 = 整表轮完，终止交付真实响应。调用方须先垫底 + drop_h2（顺序不可换）。
-fn defuse_full_cycle(seen: &mut std::collections::HashSet<String>, ip: &str) -> bool {
-    !seen.insert(ip.to_string())
 }
 
 async fn gh_defuse(
@@ -675,7 +652,7 @@ async fn gh_defuse(
         // 整表轮换完一圈(同 IP 再现) = 全员拦截页: 再转只会重复, 交回 GitHub
         // 真实拦截响应终止。垫底+拔连接必须发生在终止判定之前 —— 否则交付时
         // 坏连接仍挂在复用缓存, 下个请求乒乓(2026-10-17 复审补充)
-        if defuse_full_cycle(&mut seen, &ip) {
+        if !seen.insert(ip.to_string()) {
             (log)(&format!(
                 "[MITM] {host} 全部可用边缘均返回拦截页({tried}), 交付真实响应"
             ));
@@ -1153,6 +1130,18 @@ pub fn end_calibrate() {
 const CALIB_THROUGHPUT_WINDOW: Duration = Duration::from_secs(12);
 const CALIB_THROUGHPUT_CAP: u64 = 5 * 1024 * 1024;
 
+fn mirror_get(uri: http::Uri) -> Result<hyper::Request<BoxBody>, String> {
+    hyper::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("user-agent", "Mozilla/5.0")
+        .header("accept", "*/*")
+        .body(BoxBody::new(
+            http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
+        ))
+        .map_err(|e| e.to_string())
+}
+
 async fn throughput_probe(
     mirror: &str,
     tmpl: &str,
@@ -1161,15 +1150,7 @@ async fn throughput_probe(
     let uri: http::Uri = format!("{mirror}/{tmpl}")
         .parse()
         .map_err(|e| format!("URL 解析失败: {e}"))?;
-    let req = hyper::Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .header("user-agent", "Mozilla/5.0")
-        .header("accept", "*/*")
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-        ))
-        .map_err(|e| e.to_string())?;
+    let req = mirror_get(uri)?;
     let client = upstream::mirror_client(log);
     let start = tokio::time::Instant::now();
     let deadline = start + CALIB_THROUGHPUT_WINDOW;
@@ -1252,35 +1233,8 @@ async fn calibrate_one(mirror: &str, tmpl: &str, log: &LogFn) -> Result<u16, Str
     let uri: http::Uri = format!("{mirror}/{tmpl}")
         .parse()
         .map_err(|e| format!("URL 解析失败: {e}"))?;
-    let req = hyper::Request::builder()
-        .method(Method::GET)
-        .uri(uri)
-        .header("user-agent", "Mozilla/5.0")
-        .header("accept", "*/*")
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-        ))
-        .map_err(|e| e.to_string())?;
-    let client = upstream::mirror_client(log);
-    let timed = tokio::time::timeout(MIRROR_HEAD_TIMEOUT, client.request(req)).await;
-    match timed {
-        Ok(Ok(r)) => {
-            let st = r.status().as_u16();
-            let ct = r
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_lowercase();
-            if st >= 300 || ct.contains("text/html") {
-                Err(format!("状态 {st}"))
-            } else {
-                Ok(st)
-            }
-        }
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("响应头预算超时".to_string()),
-    }
+    let resp = mirror_do(mirror_get(uri)?, mirror, log).await?;
+    Ok(resp.status().as_u16())
 }
 pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     let chains = pool::mirror_chains_snapshot();
@@ -1551,17 +1505,6 @@ mod tests {
                 "{h} 缺校准模板"
             );
         }
-    }
-    #[test]
-    fn defuse_full_cycle_pins_contract() {
-        let mut seen = std::collections::HashSet::new();
-        assert!(!defuse_full_cycle(&mut seen, "1.2.3.4"), "首见 = 继续");
-        assert!(!defuse_full_cycle(&mut seen, "5.6.7.8"), "另一 IP = 继续");
-        assert!(
-            defuse_full_cycle(&mut seen, "1.2.3.4"),
-            "同 IP 再现 = 整表轮完, 终止"
-        );
-        assert!(defuse_full_cycle(&mut seen, "1.2.3.4"), "重复终止保持终止");
     }
     #[test]
     fn release_asset_path_gate() {

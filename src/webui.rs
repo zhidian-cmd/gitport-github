@@ -339,13 +339,12 @@ struct OnBody {
 
 async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBody>) -> Response {
     if body.on {
-        let Some(ca) = &st.ca else {
+        if st.ca.is_none() {
             return write_json(&serde_json::json!({"ok": false, "error": "CA 未初始化"}));
-        };
+        }
         if let Err(e) = crate::certgen::install_ca(&st.dir) {
             return write_json(&serde_json::json!({"ok": false, "error": e}));
         }
-        let _ = ca;
     }
     if let Err(e) = settings::set_mitm(body.on) {
         return write_json(&serde_json::json!({"ok": false, "error": e}));
