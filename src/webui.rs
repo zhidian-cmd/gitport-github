@@ -1,6 +1,4 @@
-//! 管理界面 —— axum + include_str! 内嵌前端，REST API 驱动页面。
-//! 本地管理面防护(DNS rebinding / 跨站伪造写操作)见 localGuard。
-
+//! 管理界面：axum + 内嵌前端，REST API 驱动；本地管理面防护见 localGuard。
 use crate::certgen::Authority;
 use crate::config::{self, pooled_domains};
 use crate::logger::Logger;
@@ -15,7 +13,6 @@ const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLE_CSS: &str = include_str!("web/style.css");
 const APP_JS: &str = include_str!("web/app.js");
 
-/// 应用运行时状态。
 #[derive(Clone)]
 pub struct App {
     pub logs: Arc<Logger>,
@@ -24,9 +21,7 @@ pub struct App {
     pub version: &'static str,
 }
 
-// ---------- 本地管理面防护 ----------
 
-/// Host 必须是本机(剥端口逻辑与 server::host_only 同源, 大小写不敏感)。
 fn local_host(h: &str) -> bool {
     matches!(
         crate::server::host_only(&h.to_lowercase()),
@@ -34,7 +29,6 @@ fn local_host(h: &str) -> bool {
     )
 }
 
-/// 本机工作台页面源(端口恒为 webui_port)。
 fn local_origin(o: &str) -> bool {
     let lower = o.to_lowercase();
     let o = lower.trim_end_matches('/');
@@ -61,7 +55,6 @@ fn same_site_write(headers: &HeaderMap) -> bool {
     true
 }
 
-/// 本地管理面中间件。
 async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let host = req
         .headers()
@@ -79,9 +72,7 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
     next.run(req).await
 }
 
-// ---------- 路由 ----------
 
-/// 启动管理界面(127.0.0.1:7811)。
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     let router = axum::Router::new()
         .route("/", axum::routing::get(index))
@@ -138,9 +129,7 @@ async fn index() -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    // 纵深防御(2026-10-17 安全审计 F-003)：connect-src 锁 self 断外传数据。
-    // script/style 需 unsafe-inline：index 内联脚本 + onclick 事件属性
-    // （注入源已在 pool 层做 sni 格式校验收口, 这里是第二道）
+    // CSP 锁 self 断外传数据；unsafe-inline 供内联脚本（注入源已在 pool 层收口，此处第二道）。
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
@@ -176,10 +165,7 @@ async fn app_js() -> Response {
         .into_response()
 }
 
-/// 分流 PAC 脚本(系统代理接管)：开启时池内全部域名 → PROXY 127.0.0.1:port，
-/// 其余 DIRECT。直连白名单(config::DIRECT_HOSTS)显式短路 DIRECT —— 必须在
-/// 后缀匹配之前判定，否则会被 *.githubusercontent.com 通配符吞掉
-/// (objects-origin 上传链路, 2026-10-17)。JScript 是 ES3：后缀判断手写 lastIndexOf。
+/// 分流 PAC：白名单 DIRECT 短路必须在通配符匹配之前（否则被 *.githubusercontent.com 吞掉）。
 fn pac_script() -> String {
     let mut domains: Vec<&str> = Vec::new();
     if settings::github_pac() {
@@ -195,7 +181,6 @@ fn pac_script() -> String {
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
         .join(",");
-    // 直连白名单单一真相: 从 config::DIRECT_HOSTS 生成, 不写第二份字面量
     let direct_list = config::DIRECT_HOSTS
         .iter()
         .map(|d| format!("'{d}'"))
@@ -269,7 +254,6 @@ async fn api_pools() -> Response {
     write_json(&serde_json::Value::Object(obj))
 }
 
-/// 镜像链查询（UI 校准面板展示当前链序）。
 async fn api_mirrors() -> Response {
     let chains = pool::mirror_chains_snapshot();
     let obj: serde_json::Map<String, serde_json::Value> = pool::CONTENT_HOSTS
@@ -284,14 +268,12 @@ async fn api_mirrors() -> Response {
     write_json(&serde_json::Value::Object(obj))
 }
 
-/// 镜像链校准（UI 按钮）：串行实测每链 TTFB 后重排写盘，前端等待本响应。
 async fn api_calibrate(
     State(st): State<Arc<App>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let logs = st.logs.clone();
     let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
-    // 防重入：同一时刻只允许一个校准任务
     if !crate::server::mitm::try_begin_calibrate() {
         return (
             [
@@ -310,7 +292,6 @@ async fn api_calibrate(
         crate::server::mitm::CalibMode::Throughput => "大文件链(下载测速)",
         crate::server::mitm::CalibMode::Ttfb => "图片链(响应头测速)",
     };
-    // 后台化：HTTP 立即返回，任务挂 runtime——关窗进托盘校准继续。
     tokio::spawn(async move {
         crate::server::mitm::set_calibrate_report(None);
         let report = crate::server::mitm::calibrate_chains(&log, mode).await;
@@ -398,7 +379,6 @@ async fn api_settings() -> Response {
     })
 }
 
-/// 校准状态（UI 轮询）：running + 最近一次报告。
 async fn api_calib_status() -> Response {
     write_json(&serde_json::json!({
         "running": crate::server::mitm::calibrate_running(),
@@ -406,7 +386,6 @@ async fn api_calib_status() -> Response {
     }))
 }
 
-/// 二次启动唤起：把托盘里的工作台叫出来（窗口已释放则重建）。
 async fn api_show() -> Response {
     if crate::desktop::show_via_proxy() {
         write_json(&serde_json::json!({"ok": true}))

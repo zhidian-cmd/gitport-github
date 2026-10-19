@@ -25,11 +25,8 @@ impl Drop for AutoCloseHandle {
     }
 }
 
-/// 用受保护 DACL 覆盖继承权限：仅 SYSTEM 与当前用户保留完全控制，
-/// 其他账户（含同机普通用户）一律剥离。失败返回错误（文件本身已写入成功，
-/// 调用方按 best-effort 处理，不影响主流程）。
+/// 受保护 DACL：仅 SYSTEM 与当前用户完全控制，其余剥离；失败按 best-effort 处理。
 pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
-    // 打开当前进程令牌并取用户 SID
     let mut token = Default::default();
     unsafe {
         OpenProcessToken(
@@ -40,7 +37,6 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         .map_err(|e| format!("OpenProcessToken 失败: {e}"))?;
     }
     let _token = AutoCloseHandle(token); // 此后任何早退路径都自动释放
-    // TOKEN_USER 缓冲（SID 大小可变）
     let mut buf = vec![0u8; 512];
     let mut size = 0u32;
     let first_ok = unsafe {
@@ -54,7 +50,6 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         .is_ok()
     };
     if !first_ok {
-        // 缓冲不足：按返回大小重试一次
         if size > buf.len() as u32 {
             buf.resize(size as usize, 0);
             unsafe {
@@ -74,7 +69,6 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
     let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
     let sid = user.User.Sid;
 
-    // SID → 字符串（advapi32 分配，用完 LocalFree）
     let mut sid_str = PWSTR::null();
     unsafe {
         ConvertSidToStringSidW(sid, &mut sid_str)
@@ -85,7 +79,6 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         let _ = LocalFree(Some(HLOCAL(sid_str.0 as *mut core::ffi::c_void)));
     }
 
-    // 构造保护 DACL：SYSTEM 与当前用户完全控制，其余剥离
     let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid_text})");
     let sd_h = HSTRING::from(sddl.as_str());
     let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());

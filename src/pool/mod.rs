@@ -1,8 +1,6 @@
-//! 串发拨号：plans.json 唯一权威，纯按表重试。
-//! 元素 {ip, sni}，SNI 形态按 IP 族定（shape_for_ip），SNI 与校验名解耦。
-//! ok 置顶 / 失败垫底，同 IP 重复置顶 no-op 不写盘；全灭冷却 30s 快速失败。
-//! 仅顺序真变更才写盘（2s 原子写回），文件可随时手改（重启生效）。
-//! 覆盖 core/api/edge 三池；edge 混合池按 host 族对口选择（见 route.rs）。
+//! 串发拨号：plans.json 唯一权威。ok 置顶 / 失败垫底，同 IP 重复置顶 no-op 不写盘。
+//! SNI 形态按 IP 族定（shape_for_ip），SNI 与校验名解耦；全灭冷却 30s。
+//! 仅顺序真变更才写盘（2s 原子写回）；edge 混合池按 host 族对口选择（见 route.rs）。
 
 pub mod dial;
 pub mod route;
@@ -15,10 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// 日志回调（server/main 注入）。
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 配对表单条：IP × SNI 形态，顺序即优先级。
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SerialPlan {
     pub ip: String,
@@ -26,15 +22,10 @@ pub struct SerialPlan {
     pub sni: String,
 }
 
-/// 串发池：core（站点）/ api / edge（auth + Fastly 静态边缘）。此常量决定落盘/UI 顺序。
-/// codeload 与 releases 大文件全镜像无表；uploads/objects-origin 非池化直连。
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
-/// 内置种子：首次运行（无 plans.json）时展开成初始表。
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
-/// 第三方镜像候选池（URL 前缀代理：镜像域名 + "/" + 原始完整 URL），可随时增改。
-/// 只收能真返回 GitHub 内容的前缀代理（假站由 mirror_do 拒判兜底）；CSS/JS 与 github.io 不过镜像。
 pub const MIRRORS: &[&str] = &[
     "https://mirror.ghproxy.com",
     "https://gh-proxy.com",
@@ -49,7 +40,6 @@ pub const MIRRORS: &[&str] = &[
     "https://cf.ghproxy.cn",
 ];
 
-/// 有镜像的内容域 host（CSS/JS 与 github.io 归 edge 直连池，无链）。
 pub const CONTENT_HOSTS: &[&str] = &[
     "github.com",
     "raw.githubusercontent.com",
@@ -62,7 +52,6 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 默认镜像链（实测 TTFB 序，每 host 链序不同）；校准后以 plans.json mirrors 为准。
 pub const DEFAULT_CHAINS: &[(&str, &[&str])] = &[
     (
         "github.com",
@@ -210,7 +199,6 @@ pub const DEFAULT_CHAINS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// 该池是否走串发。
 pub fn serial_pool(name: &str) -> bool {
     SERIAL_POOLS.contains(&name)
 }
@@ -239,17 +227,14 @@ struct SerialTab {
     /// per-IP 死亡冷却：TCP 层失败 = IP 对谁都不通，直接跳过。
     /// 指数退避 60s → 5min → 30min 封顶；成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
-    /// 镜像使用链：host → 有序镜像列表（串行）；来源=内置默认/UI 校准/手改。
     mirrors: HashMap<String, Vec<String>>,
     dirty: bool,
 }
 
 static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// 表头轮换日志回调：表头真变时打一行，轮换可追溯。
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// plans.json 反序列化：直连池条目 + 镜像链板块；flatten 收纳未知键。
 #[derive(serde::Deserialize)]
 struct PlansFile {
     #[serde(default)]
@@ -258,7 +243,6 @@ struct PlansFile {
     pools: HashMap<String, Vec<SerialPlan>>,
 }
 
-/// 全表快照（落盘/UI 用）。
 pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     let g = SERIAL.lock().unwrap();
     let tab = g.as_ref().unwrap();
@@ -271,7 +255,6 @@ pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     out
 }
 
-/// 手工排版序列化：每条目压成单行；池按 UI 固定顺序，末尾附镜像链板块。
 fn encode_plans(
     tab: &HashMap<String, Vec<SerialPlan>>,
     mirrors: &HashMap<String, Vec<String>>,
@@ -289,7 +272,6 @@ fn encode_plans(
                 if j > 0 {
                     b.push_str(",\n");
                 }
-                // sni 恒非空（真名/伪装）；空值条目（旧表残留）落盘省略键
                 if p.sni.is_empty() {
                     b.push_str(&format!("    {{\"ip\": {}}}", esc(&p.ip)));
                 } else {
@@ -305,7 +287,6 @@ fn encode_plans(
             b.push(']');
         }
     }
-    // 镜像链板块：host 按 CONTENT_HOSTS 固定序（可读性稳定）
     let chains: Vec<(&str, &Vec<String>)> = CONTENT_HOSTS
         .iter()
         .filter_map(|h| mirrors.get(*h).map(|c| (*h, c)))
@@ -330,7 +311,6 @@ fn esc(s: &str) -> String {
     serde_json::to_string(s).expect("字符串序列化不会失败")
 }
 
-/// 原子写 plans.json。
 fn write_plans_file(
     path: &Path,
     tab: &HashMap<String, Vec<SerialPlan>>,
@@ -356,7 +336,6 @@ fn plans_path() -> PathBuf {
     dir.join("plans.json")
 }
 
-/// 初始化：读 plans.json（无则种子展开），并启动 2s 去抖落盘。
 pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
     *SERIAL_LOG.lock().unwrap() = log.clone();
@@ -386,7 +365,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         mirrors: HashMap::new(),
         dirty: false,
     };
-    // 遍历已知池：文件缺池时用种子补齐；文件为准，不做种子归属剔除。
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
@@ -398,8 +376,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             {
                 continue;
             }
-            // ech 恒失败，清除旧表遗留；Fastly 段强制按 IP 族归一（形态由边缘行为决定）。
-            // 其余条目显式写法保留，空/旧值按 IP 族归一。
+            // ech 恒失败清除旧遗留；Fastly 段强制按 IP 族归一，其余显式写法保留。
             let sni = if route::fastly_last_octet(&p.ip).is_some() {
                 shape_for_ip(&p.ip).to_string()
             } else {
@@ -438,7 +415,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 }
             }
         }
-        // 种子补缺：新边缘 IP 追加表尾（只追加不重排）。
         if let Some(ips) = seed_db().get(*name) {
             let mut added = 0usize;
             for ip in ips {
@@ -465,7 +441,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         }
         tab.pools.insert((*name).to_string(), plans);
     }
-    // 镜像链归一：未知 host/池外镜像丢弃；缺失 host 用默认链；新镜像追加尾部。
     for (host, chain) in loaded_chains {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
             continue;
@@ -496,18 +471,15 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             }
         }
     }
-    // 先设内存态再统一重写：剥旧统计字段/补齐形态，文件与内存恒一致。
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
     write_plans_file(&path, &snap, &chains);
 }
 
-/// 顺序变更 2s 内写回（事件驱动 + 去抖）；须在 tokio runtime 构建后调用。
-/// 无变更时睡在 Notify 上，零周期唤醒。
+/// 顺序变更 2s 内写回（事件驱动 + 去抖，须在 runtime 构建后调用）；无变更零唤醒。
 static PERSIST_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// dirty 置位后调用：踢醒落盘任务。无等待者时存许可证，语义安全。
 fn kick_persist() {
     PERSIST_KICK.notify_one();
 }
@@ -516,7 +488,6 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
     rt.spawn(async move {
         loop {
             PERSIST_KICK.notified().await;
-            // 2s 去抖：合并快速变更。
             tokio::time::sleep(Duration::from_secs(2)).await;
             let dirty = {
                 let mut g = SERIAL.lock().unwrap();
@@ -547,8 +518,7 @@ pub fn plan_mode(sni: &str) -> String {
     }
 }
 
-/// 命中条目整体移位：置顶/垫底。顺序没变直接返回（no-op 不写盘不打日志）。
-/// 表头真变才打一行轮换日志。
+/// 命中条目整体移位：置顶/垫底；顺序没变 no-op，表头真变才打日志。
 fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front: bool, why: &str) {
     let mut g = SERIAL.lock().unwrap();
     let tab = g.as_mut().unwrap();
@@ -596,9 +566,8 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
     }
 }
 
-/// 单串发：按表逐个试，失败垫底换下一个，绕表一圈全灭 → 冷却 30s 报错。
-/// 置顶只由数据层 ok 认证；ctx 到期只掐正在试的那条（不沉底不冷却）。
-/// 混合池按 host 选族只试对口条目。返回 (连接, IP, 形态)。
+/// 单串发：按表逐个试，失败垫底换下一个，绕表全灭 → 冷却 30s。
+/// 置顶只由数据层 ok 认证；ctx 到期只掐当前那条；混合池只试对口条目。
 pub async fn serial_dial(
     pool_name: &str,
     host: &str,
@@ -606,7 +575,6 @@ pub async fn serial_dial(
     tls_handshake: bool,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
-    // 全灭冷却期内快速失败（按 host 记账，只毒该 host 自己）。
     {
         let g = SERIAL.lock().unwrap();
         let tab = g.as_ref().unwrap();
@@ -716,7 +684,6 @@ pub async fn serial_dial(
         return Err("请求预算到期".to_string());
     }
     if tried == 0 {
-        // 一条都没试：对口候选全在死亡冷却或被形态滤光；分开报便于排障。
         if eligible > 0 {
             return Err(format!(
                 "全部 {eligible} 个对口候选处于死亡冷却({pool_name}, {host})"
@@ -724,9 +691,8 @@ pub async fn serial_dial(
         }
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
-    // 绕表一圈全灭：按 host 冷却 30s；只有确有镜像兜底的 host 豁免
-    // （camo 不在镜像链，豁免只会让每张徽章全额重烧整表）；
-    // 按 host 而非按池（池级冷却曾把 camo 全灭毒倒 assets/io/auth）。
+    // 绕表全灭：按 host 冷却 30s，只有确有镜像兜底的 host 豁免
+    // （camo 无链，豁免会让每张徽章重烧整表；池级冷却曾毒倒同池其他族）。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
         let mut g = SERIAL.lock().unwrap();
@@ -749,7 +715,6 @@ pub async fn serial_dial(
     Err(last_err.unwrap_or_else(|| "串发全灭".to_string()))
 }
 
-/// 数据层回写：ok 置顶，其他（noreply/block）垫底，IP 级移位。
 pub fn serial_note(pool_name: &str, ip: &str, kind: &str) {
     if kind == "ok" {
         if let Ok(mut g) = SERIAL.lock() {
@@ -761,7 +726,6 @@ pub fn serial_note(pool_name: &str, ip: &str, kind: &str) {
     serial_move(pool_name, |p| p.ip == ip, kind == "ok", kind);
 }
 
-/// 内容域 host 的镜像使用链（有序，串行逐个用）。无记录返回空。
 pub fn mirror_chain(host: &str) -> Vec<String> {
     let g = SERIAL.lock().unwrap();
     g.as_ref()
@@ -772,7 +736,6 @@ pub fn mirror_chain(host: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 写回一条镜像链：未知 host 与池外镜像拒收，同链 no-op。
 pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     if !CONTENT_HOSTS.contains(&host) {
         return false;
@@ -800,16 +763,13 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     true
 }
 
-/// 全部镜像链快照（UI/落盘用）。
 pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
     let g = SERIAL.lock().unwrap();
     g.as_ref().unwrap().mirrors.clone()
 }
 
-// ---------- 内容域直连熔断 ----------
 
-/// 内容域直连熔断：直连被按域黑洞时每请求都烧满预算，失败一次熔断 120s 走镜像。
-/// 成功立即清除；120s 后给直连一次重试机会。
+/// 内容域直连熔断：被按域黑洞时每请求烧满预算，失败一次熔断 120s 走镜像，成功清除。
 static CONTENT_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
     std::sync::OnceLock::new();
 
@@ -824,7 +784,6 @@ pub fn content_direct_open(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 直连成功：清除该 host 熔断。
 pub fn content_direct_ok(host: &str) {
     let mut g = CONTENT_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -833,7 +792,6 @@ pub fn content_direct_ok(host: &str) {
     g.remove(host);
 }
 
-/// 直连失败：熔断该 host 120s。
 pub fn content_direct_fail(host: &str) {
     let mut g = CONTENT_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -842,13 +800,11 @@ pub fn content_direct_fail(host: &str) {
     g.insert(host.to_string(), Instant::now() + Duration::from_secs(120));
 }
 
-// ---------- 镜像链全灭熔断 ----------
 
 /// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
 static MIRROR_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
     std::sync::OnceLock::new();
 
-/// 镜像链是否处于全灭熔断期。
 pub fn mirror_breaker_open(host: &str) -> bool {
     let g = MIRROR_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -859,7 +815,6 @@ pub fn mirror_breaker_open(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 镜像链全灭：熔断该 host 60s。
 pub fn mirror_breaker_set(host: &str) {
     let mut g = MIRROR_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -868,7 +823,6 @@ pub fn mirror_breaker_set(host: &str) {
     g.insert(host.to_string(), Instant::now() + Duration::from_secs(60));
 }
 
-/// 镜像链取回成功：清除该 host 熔断。
 pub fn mirror_breaker_clear(host: &str) {
     let mut g = MIRROR_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -877,7 +831,6 @@ pub fn mirror_breaker_clear(host: &str) {
     g.remove(host);
 }
 
-/// 域名 → 所属池名（config 唯一路由真相，"" = 非池域名）。
 pub use crate::config::pool_for;
 
 #[cfg(test)]
@@ -903,9 +856,7 @@ mod tests {
 
     #[test]
     fn plan_mode_semantics() {
-        // plan_mode 唯一判定入口：空串返回残缺 fake:（调用方兜底）；裸域名/带前缀均伪装；MODE_SNI 直通。
         assert_eq!(plan_mode(""), "fake:", "空串须由调用方兜底");
-        // 旧表 "nosni" 由 serial_load 归一（shape_for_ip），plan_mode 不再特判
         assert_eq!(
             plan_mode("baidu.com"),
             format!("{}baidu.com", dial::MODE_FAKE_PFX)
@@ -920,23 +871,19 @@ mod tests {
 
     #[test]
     fn edge_shape_by_ip_family() {
-        // Fastly 三段：.133 伪装被挂起 → 真名；.153/.154 伪装正常 → 伪装
         assert_eq!(shape_for_ip("185.199.108.133"), dial::MODE_SNI);
         assert_eq!(shape_for_ip("185.199.111.133"), dial::MODE_SNI);
         for ip in ["185.199.108.154", "185.199.111.153"] {
             assert_eq!(shape_for_ip(ip), "baidu.com", "{ip} 应取伪装");
         }
-        // GitHub 主站边缘段 → 伪装（任意 SNI 都返覆盖真名的证书）
         for ip in ["140.82.112.29", "20.205.243.167"] {
             assert_eq!(shape_for_ip(ip), "baidu.com", "{ip} 应取伪装");
         }
-        // .215 新代 assets 边缘(2026-10 GitHub 迁移): 伪装
         assert_eq!(shape_for_ip("185.199.108.215"), "baidu.com");
     }
 
     #[test]
     fn direct_hosts_never_pooled() {
-        // 直连白名单：上传链路（GLB/源站本尊服务）+ mermaid 渲染（代理腿被间歇掐）。
         for host in [
             "objects-origin.githubusercontent.com",
             "uploads.github.com",
@@ -949,13 +896,11 @@ mod tests {
 
     #[test]
     fn fastly_pools_no_longer_serial() {
-        // fastly/codeload 全镜像不直连: 不再是串发池
         assert!(!serial_pool("fastly"));
         assert!(!serial_pool("codeload"));
         for p in ["core", "api", "edge"] {
             assert!(serial_pool(p), "{p} 应为串发池");
         }
-        // uploads 池已撤销：网页上传流程不经 uploads.github.com。
         assert!(!serial_pool("uploads"));
     }
 
@@ -987,7 +932,6 @@ mod tests {
             let tab = g.as_ref().unwrap();
             tab.pools.get("core").unwrap().clone()
         };
-        // ech/非法被滤; 旧表 real 条目按 IP 族归一为伪装; 种子补缺追加在尾部
         assert_eq!(
             ps[0],
             SerialPlan {
@@ -1002,13 +946,11 @@ mod tests {
             1 + core_seed_n,
             "补缺后 = 用户条目 + 全部种子: {ps:?}"
         );
-        // edge 混合池: Fastly 三段强制按族归一(旧表真名条目随新结论迁移)
         let edge_ps = {
             let g = SERIAL.lock().unwrap();
             let tab = g.as_ref().unwrap();
             tab.pools.get("edge").unwrap().clone()
         };
-        // 种子补缺: .133 内容域条目是新版本边缘, 用户旧表没有 → 自动追加
         assert!(edge_ps.len() >= 3, "edge 至少含旧表 3 条: {edge_ps:?}");
         assert!(
             edge_ps.contains(&SerialPlan {
@@ -1033,7 +975,6 @@ mod tests {
                 .any(|p| route::fastly_last_octet(&p.ip) == Some("133") && p.sni == dial::MODE_SNI),
             "种子补缺应追加 .133 真名内容域条目: {edge_ps:?}"
         );
-        // ghapp/assets 旧键不再是池: 落盘只剩 core/api/edge
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("成功次数") && !b.contains("分数"));
         let back: serde_json::Value = serde_json::from_str(&b).unwrap();
@@ -1047,7 +988,6 @@ mod tests {
     fn seed_topup_appends_missing_and_keeps_order() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        // 用户手排的表: 只留 1 条 ghapp(排到最前), 其余种子缺失
         std::fs::write(
             &dir.join("plans.json"),
             r#"{ "edge": [{"ip": "140.82.112.29", "sni": "baidu.com"}] }"#,
@@ -1072,7 +1012,6 @@ mod tests {
             seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
             "补缺应打一行日志"
         );
-        // 落盘含补齐条目（.133 内容域仅 110.133 存活，108/109/111 已退役）
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(b.contains("185.199.110.133"), "补缺应落盘: {b}");
         assert!(
@@ -1128,14 +1067,12 @@ mod tests {
             ],
         );
         let b = encode_plans(&tab, &mirrors);
-        // 每条目压在单行内
         for line in b.lines() {
             let t = line.trim();
             if t.starts_with("{\"ip\"") && t.matches('{').count() != 1 {
                 panic!("条目被展开成多行: {line:?}");
             }
         }
-        // 镜像链板块落盘 + 可读回
         assert!(b.contains("\"mirrors\""), "镜像链板块应落盘: {b}");
         assert!(b.contains("raw.githubusercontent.com"));
         let back_file: PlansFile = serde_json::from_str(&b).unwrap();
@@ -1153,13 +1090,11 @@ mod tests {
         assert_eq!(back["core"][0].sni, "baidu.com");
         assert_eq!(back["edge"].len(), 2);
         assert_eq!(back["edge"][0].sni, dial::MODE_SNI);
-        // 落盘只含 SERIAL_POOLS 三池 + mirrors
         assert!(!b.contains("fastly") && !b.contains("codeload"));
     }
 
     #[test]
     fn notify_persist_writes_on_change_and_skips_noop() {
-        // 变更驱动落盘：真变更 2s 内写盘，no-op 不写盘（静默失败形态的回归钉）。
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
         serial_load(&dir, None);
@@ -1183,7 +1118,6 @@ mod tests {
         );
         let file1 = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(file1.contains(&target), "变更应落盘");
-        // no-op: 表头再置顶 = 顺序不变 → 不置 dirty → 不写盘
         let snap_before = plans_snapshot();
         serial_note("core", &target, "ok");
         rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
@@ -1194,7 +1128,6 @@ mod tests {
     fn mirror_chain_load_and_topup() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        // 用户手改链：含一个池外镜像（应被丢弃）；缺 media host（应用默认链）
         std::fs::write(
             &dir.join("plans.json"),
             r#"{
@@ -1210,7 +1143,6 @@ mod tests {
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
         serial_load(&dir, Some(log));
-        // 链：池外镜像被滤，其余保留；新镜像补缺追加尾部
         let raw_chain = mirror_chain("raw.githubusercontent.com");
         assert_eq!(raw_chain[0], "https://v4.gh-proxy.org", "用户手改链头保留");
         assert!(
@@ -1218,7 +1150,6 @@ mod tests {
             "池外镜像应被丢弃: {raw_chain:?}"
         );
         assert_eq!(raw_chain.len(), MIRRORS.len(), "补缺后应覆盖全池");
-        // 未手改的 host 用默认链
         let media_chain = mirror_chain("media.githubusercontent.com");
         let def: Vec<String> = DEFAULT_CHAINS
             .iter()
@@ -1229,11 +1160,9 @@ mod tests {
             .map(|m| m.to_string())
             .collect();
         assert_eq!(media_chain, def);
-        // 未知 host 不落盘
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
         assert!(b.contains("\"mirrors\""), "镜像链应落盘");
-        // set_mirror_chain：链真变更置 dirty，同链 no-op
         let mut new_chain = raw_chain.clone();
         new_chain.reverse();
         assert!(
@@ -1264,14 +1193,12 @@ mod tests {
             g.as_ref().unwrap().pools.get("core").unwrap().clone()
         };
         let head = base[0].ip.clone();
-        // 同 IP 重复置顶：顺序没变 → 不写盘、不打日志
         serial_note("core", &head, "ok");
         {
             let g = SERIAL.lock().unwrap();
             assert!(!g.as_ref().unwrap().dirty, "顺序没变不该置 dirty");
         }
         assert_eq!(seen.lock().unwrap().len(), base_len, "顺序没变不该打日志");
-        // 换 IP 置顶：表头真变 → dirty + 一行轮换日志(带原因)
         let other = base[4].ip.clone();
         serial_note("core", &other, "ok");
         {
@@ -1302,7 +1229,6 @@ mod tests {
         };
         assert!(base.len() >= 6, "初始表过小: {}", base.len());
         let key = base[3].clone();
-        // 拨号层失败垫底（单条）
         serial_move("core", |p| *p == key, false, "test");
         let last = {
             let g = SERIAL.lock().unwrap();
@@ -1316,7 +1242,6 @@ mod tests {
                 .clone()
         };
         assert_eq!(last, key, "失败条目应在表尾");
-        // 数据层 ok 置顶（整 IP）
         let ip0 = base[0].ip.clone();
         serial_move("core", |p| p.ip == ip0, true, "ok");
         let head = {

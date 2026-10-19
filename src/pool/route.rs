@@ -1,26 +1,18 @@
-//! 路由唯一真相：master_route 总路由 + POOL_ROUTES 每池族表。
-//! 决策链：System（白名单）→ Mirror（大文件/release，仅 GET/HEAD）→ Pool{池,族} → Tunnel。
-//! 族 = host 判据 + 条目判据（IP 末段 + SNI 形态）+ 全灭兜底（Fallback）。
+//! 路由唯一真相：master_route（System→Mirror→Pool{池,族}→Tunnel）+ POOL_ROUTES 每池族表。
 //! 冷却/健康按 host 或 IP 记账不按池——池级冷却会让一个域的全灭毒倒同池其他族。
 
 use super::{plan_mode, SerialPlan};
 use crate::config;
 
-// ---------- 总路由 ----------
 
-/// 总路由判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// 直连白名单：不归任何池、不经代理。
     System,
-    /// 镜像 only：大文件域或 release 附件路径（GET/HEAD）。不试直连。
     Mirror,
-    /// 串发池 + 族名。
     Pool {
         pool: &'static str,
         family: &'static str,
     },
-    /// 非池域名：不进 MITM，CONNECT 隧道直通。
     Tunnel,
 }
 
@@ -42,8 +34,6 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [_owner, _repo, kind, ..] if *kind == "releases" => {
-            // releases/download/<tag>/<asset>（releases 页面本身不拦，只拦下载）
-            // releases/latest/download/<asset>（稳定链，段 3 = latest）
             (segs.len() >= 4 && segs[3] == "download")
                 || (segs.len() >= 5 && segs[3] == "latest" && segs[4] == "download")
         }
@@ -90,34 +80,26 @@ pub fn master_route(host: &str, method: &str, path: &str) -> Route {
     }
 }
 
-// ---------- 池内族 ----------
 
 /// 族全灭后的兜底策略；执行流在 mitm 的 get_direct 失败分支，单测钉住两端一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
-    /// 镜像链（host 有链才走）→ 系统 DNS 直连腿。
     MirrorDns,
-    /// 系统 DNS 直连腿（无镜像可走的族）。
     Dns,
 }
 
-/// 池内族路由：host 判据 + 条目判据 + 兜底策略。
 pub struct FamilyRoute {
     pub name: &'static str,
-    /// host 是否归该族（总路由分族用）。
     pub host_of: fn(&str) -> bool,
-    /// 条目是否服务该 host（串发筛选；不对口不试不垫底，防异类互相污染池序）。
     pub serves: fn(&str, &SerialPlan) -> bool,
     pub fallback: Fallback,
 }
 
-/// 每池的路由表：池 → 有序族列表。
 pub struct PoolRoute {
     pub pool: &'static str,
     pub families: &'static [FamilyRoute],
 }
 
-// --- host 判据 ---
 
 fn host_is_content(host: &str) -> bool {
     host.ends_with("githubusercontent.com")
@@ -132,7 +114,6 @@ fn host_is_auth(host: &str) -> bool {
     host == "githubapp.com" || host.ends_with(".githubapp.com")
 }
 
-// --- 条目判据 ---
 
 /// Fastly 段（185.199.108-111）IP 的末段；非 Fastly 返回 None。
 pub fn fastly_last_octet(ip: &str) -> Option<&str> {
@@ -152,7 +133,6 @@ fn serves_non_fastly(_host: &str, p: &SerialPlan) -> bool {
     fastly_last_octet(&p.ip).is_none() && plan_mode(&p.sni) != plan_mode(super::dial::MODE_SNI)
 }
 
-/// core/api 通配族：全部条目服务全部 host。
 const FAMILY_ALL: FamilyRoute = FamilyRoute {
     name: "all",
     host_of: |_| true,
@@ -192,7 +172,6 @@ const FAMILY_AUTH: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-/// 三池路由表（顺序即 UI/落盘顺序，与 `SERIAL_POOLS` 恒一致）。
 pub const POOL_ROUTES: &[PoolRoute] = &[
     PoolRoute {
         pool: "core",
@@ -208,7 +187,6 @@ pub const POOL_ROUTES: &[PoolRoute] = &[
     },
 ];
 
-/// 池路由表查找。
 pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
     POOL_ROUTES.iter().find(|pr| pr.pool == pool)
 }
@@ -259,12 +237,10 @@ pub fn fallback_for(pool: &str, host: &str) -> Fallback {
     Fallback::Dns
 }
 
-/// 是否内容域 host（edge content 族）。镜像链板块只覆盖内容域。
 pub fn is_content_host(host: &str) -> bool {
     host_is_content(host)
 }
 
-// ---------- 已下线 IP（种子与实表都不再保留） ----------
 
 /// 实测死 IP 快照；复活了就从清单删。
 pub const RETIRED_IPS: &[&str] = &[
@@ -300,12 +276,10 @@ mod tests {
         }
     }
 
-    // ---------- 总路由 ----------
 
     #[test]
     fn master_route_all_hosts() {
         use Route::*;
-        // 白名单
         assert_eq!(
             master_route("objects-origin.githubusercontent.com", "PUT", "/x"),
             System
@@ -315,7 +289,6 @@ mod tests {
             master_route("viewscreen.githubusercontent.com", "GET", "/"),
             System
         );
-        // 镜像 only：大文件域（GET/HEAD）
         assert_eq!(
             master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
             Mirror
@@ -324,7 +297,6 @@ mod tests {
             master_route("objects.githubusercontent.com", "HEAD", "/x"),
             Mirror
         );
-        // 镜像 only：github.com 附件路径
         assert_eq!(
             master_route(
                 "github.com",
@@ -334,7 +306,6 @@ mod tests {
             Mirror
         );
         assert_eq!(master_route("github.com", "GET", "/o/r/archive/x.zip"), Mirror);
-        // 同一路径非 GET 不镜像（POST 附件不存在，但语义必须钉住）
         assert_eq!(
             master_route("github.com", "POST", "/o/r/releases/download/x"),
             Pool {
@@ -342,7 +313,6 @@ mod tests {
                 family: "all"
             }
         );
-        // releases 页面本身不拦
         assert_eq!(
             master_route("github.com", "GET", "/o/r/releases"),
             Pool {
@@ -350,7 +320,6 @@ mod tests {
                 family: "all"
             }
         );
-        // 三池
         assert_eq!(
             master_route("github.com", "GET", "/"),
             Pool {
@@ -372,7 +341,6 @@ mod tests {
                 family: "all"
             }
         );
-        // 非池域名
         assert_eq!(master_route("example.com", "GET", "/"), Tunnel);
         assert_eq!(master_route("githubstatus.com", "GET", "/"), Tunnel);
     }
@@ -405,18 +373,13 @@ mod tests {
         }
     }
 
-    // ---------- 族筛选 ----------
 
     #[test]
     fn family_entry_serves() {
-        // content 只认 .133 真名
         assert!(host_is_content("avatars.githubusercontent.com"));
         assert_eq!(fastly_last_octet("185.199.110.133"), Some("133"));
-        // .154 不服务内容域（打错边缘 Host 被拒/404）
         assert_eq!(fastly_last_octet("185.199.110.154"), Some("154"));
-        // 非 Fastly 段不服务内容域
         assert!(fastly_last_octet("140.82.112.3").is_none());
-        // serves 判据逐族
         assert!((FAMILY_CONTENT.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
         assert!(!(FAMILY_CONTENT.serves)("x", &mk("185.199.110.154", "baidu.com")));
         assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.215", "baidu.com")));
@@ -427,14 +390,12 @@ mod tests {
         ));
         assert!((FAMILY_IO.serves)("x", &mk("185.199.110.153", "baidu.com")));
         assert!(!(FAMILY_IO.serves)("x", &mk("185.199.110.154", "baidu.com")));
-        // auth/all：非 Fastly 伪装
         assert!((FAMILY_AUTH.serves)("x", &mk("140.82.112.29", "baidu.com")));
         assert!(!(FAMILY_AUTH.serves)(
             "x",
             &mk("185.199.110.133", crate::pool::dial::MODE_SNI)
         ));
         assert!((FAMILY_ALL.serves)("x", &mk("140.82.112.3", "baidu.com")));
-        // Fastly 三段形态由 load 时按族强制归一（shape_for_ip），此处只验判据
     }
 
     #[test]
@@ -445,11 +406,8 @@ mod tests {
         assert_eq!(family_for("edge", "github.githubassets.com"), "assets");
         assert_eq!(family_for("edge", "octocat.github.io"), "io");
         assert_eq!(family_for("edge", "githubapp.com"), "auth");
-        // edge 兜底族：未列明的新 host 归 auth（旧 entry_serves "_" 语义）
         assert_eq!(family_for("edge", "future.edge.host"), "auth");
-        // 无路由表的池
         assert_eq!(family_for("codeload", "codeload.github.com"), "");
-        // 兜底策略：内容域先镜像后 DNS；其余直接 DNS
         assert_eq!(
             fallback_for("edge", "raw.githubusercontent.com"),
             Fallback::MirrorDns
@@ -465,7 +423,6 @@ mod tests {
         assert_eq!(fallback_for("api", "api.github.com"), Fallback::Dns);
     }
 
-    /// serial_family 选出的族名必须 == family_for（漂移则日志与实际筛的候选不一致）。
     #[test]
     fn serial_family_matches_family_for() {
         for (pool, host) in [
@@ -475,25 +432,20 @@ mod tests {
             ("edge", "github.githubassets.com"),
             ("edge", "octocat.github.io"),
             ("edge", "githubapp.com"),
-            // edge 未显式列族的 host：归 auth 末族（旧 entry_serves "_" 语义）
             ("edge", "future.edge.host"),
-            // 无路由表的池：None / ""
             ("codeload", "codeload.github.com"),
         ] {
             let picked = serial_family(pool, host).map(|f| f.name).unwrap_or("");
             assert_eq!(picked, family_for(pool, host), "{pool}/{host} 族名漂移");
         }
-        // 兜底族只试非 Fastly 伪装（Fastly IP 打错边缘 Host 必被拒）。
         let f = serial_family("edge", "future.edge.host").unwrap();
         assert_eq!(f.name, "auth");
         assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
         assert!(!(f.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
     }
 
-    /// release 附件/archive 走专属链，不用请求 host 自己的链。
     #[test]
     fn mirror_chain_host_dedicated() {
-        // release 附件 → release-assets 专属链
         assert_eq!(
             mirror_chain_host("github.com", "/o/r/releases/download/v1/f.exe"),
             "release-assets.githubusercontent.com"
@@ -502,12 +454,10 @@ mod tests {
             mirror_chain_host("github.com", "/o/r/releases/latest/download/f.exe"),
             "release-assets.githubusercontent.com"
         );
-        // 源码包 → codeload 专属链
         assert_eq!(
             mirror_chain_host("github.com", "/o/r/archive/refs/tags/v1.tar.gz"),
             "codeload.github.com"
         );
-        // 大文件域自身即链 host（含直接命中 signed URL 的私库附件）
         assert_eq!(
             mirror_chain_host(
                 "release-assets.githubusercontent.com",
@@ -519,11 +469,9 @@ mod tests {
             mirror_chain_host("codeload.github.com", "/o/r/tar.gz/x"),
             "codeload.github.com"
         );
-        // 非 release 路径：链 = 请求 host 自己
         assert_eq!(mirror_chain_host("raw.githubusercontent.com", "/o/r/f"), "raw.githubusercontent.com");
         assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
         assert_eq!(mirror_chain_host("github.com", "/o/r/releases"), "github.com");
-        // 总路由同步：latest/download 也是 Mirror（曾是直连漏洞）
         assert_eq!(
             master_route("github.com", "GET", "/o/r/releases/latest/download/f.exe"),
             Route::Mirror
@@ -540,7 +488,6 @@ mod tests {
         ] {
             assert!(is_retired(ip), "{ip} 应已下线");
         }
-        // 实测存活的必须在清单外
         for ip in [
             "140.82.116.3",
             "140.82.116.4",

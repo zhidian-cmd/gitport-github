@@ -1,6 +1,4 @@
-//! 开机自启动（注册表 Run 键）+ 关闭窗口到系统托盘 + 分流接管开关
-//! （settings.json 持久化）+ 系统代理接管（PAC）。
-
+//! 自启注册表 / 关窗到托盘 / 分流开关（settings.json 持久化）/ 系统代理 PAC 接管。
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -28,7 +26,6 @@ fn state() -> &'static SettingsState {
     SETTINGS.get_or_init(|| SettingsState {
         close_to_tray: std::sync::atomic::AtomicBool::new(false),
         mitm: std::sync::atomic::AtomicBool::new(false),
-        // 首启全关：逐项由用户自己打开。
         github_pac: std::sync::atomic::AtomicBool::new(false),
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
@@ -36,7 +33,6 @@ fn state() -> &'static SettingsState {
     })
 }
 
-/// 初始化 exe 目录（settings.json / ca.crt 读写基准），启动时调用一次。
 pub fn init_exe_dir(dir: &Path) {
     let _ = EXE_DIR.set(dir.to_path_buf());
 }
@@ -45,7 +41,6 @@ fn exe_dir() -> PathBuf {
     EXE_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("."))
 }
 
-// ---------- 分流接管开关 ----------
 
 pub fn github_pac() -> bool {
     state()
@@ -60,10 +55,8 @@ pub fn set_github_pac(on: bool) -> Result<(), String> {
     save()
 }
 
-// ---------- 系统代理接管（PAC） ----------
 // 只动 WinINET 的 AutoConfigURL：接管前备份，还原时恢复；ProxyServer/ProxyEnable 永不触碰。
 
-/// 分流 PAC 脚本地址（WebUI 提供，按开关动态生成域名表）。
 pub fn pac_url() -> String {
     format!("http://127.0.0.1:{}/proxy.pac", crate::config::webui_port())
 }
@@ -79,9 +72,7 @@ fn get_auto_config_url(key: &RegKey) -> String {
         .unwrap_or_default()
 }
 
-/// 本程序设置的 PAC 兜底形态：仅本程序在 127.0.0.1 提供 /proxy.pac，端口无关
-/// —— 覆盖端口曾变化/旧版残留等场景，让清理与自愈不依赖精确端口匹配。
-/// 等价正则 `^https?://127\.0\.0\.1:\d+/proxy\.pac$`。
+/// 端口无关：任何 127.0.0.1 的 /proxy.pac 形态都算本程序设置的。
 fn is_our_pac_like(cur: &str) -> bool {
     let cur = cur.trim();
     let Some(rest) = cur
@@ -106,8 +97,7 @@ fn is_our_pac_like(cur: &str) -> bool {
     &rest[idx..] == "/proxy.pac"
 }
 
-/// 给定 AutoConfigURL 是否本程序设置：精确匹配持久化的 our_pac，或兜底匹配
-/// 127.0.0.1 的 /proxy.pac 形态。空串返回 false。
+/// 是否本程序设置的 PAC：精确匹配 our_pac 或兜底形态。
 pub fn is_our_pac(cur: &str) -> bool {
     if cur.trim().is_empty() {
         return false;
@@ -119,8 +109,7 @@ pub fn is_our_pac(cur: &str) -> bool {
     is_our_pac_like(cur)
 }
 
-/// 广播代理设置变更，让 Edge/Chrome 等立即生效（免重启浏览器）。
-/// 动态加载 wininet.dll（不依赖静态链接）。
+/// 广播代理设置变更（动态加载 wininet.dll）。
 fn refresh_wininet() {
     use windows::core::{s, w};
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -154,8 +143,7 @@ fn refresh_wininet() {
     }
 }
 
-/// 按开关状态接管/还原系统代理（幂等）。只备份用户自己的配置——
-/// 把我们的旧残留当"用户原配置"备份会导致自愈时还原死端口 PAC。
+/// 按开关接管/还原系统代理（幂等）。只备份用户自己的配置——把我们的旧残留当原配置会让自愈还原死 PAC。
 pub fn ensure_system_proxy() {
     let Ok(key) = internet_settings_key() else {
         return;
@@ -193,8 +181,7 @@ impl Drop for ProxyGuard {
     }
 }
 
-/// 还原系统代理（代理停止时调用 —— PAC 指向已停端口只会拖垮目标站点）。
-/// 端口无关：任何 127.0.0.1 的 /proxy.pac 残留(含旧端口)都视为我们的并清理。
+/// 还原系统代理：端口无关，任何 /proxy.pac 残留都视为我们的并清理。
 pub fn remove_system_proxy() {
     let Ok(key) = internet_settings_key() else {
         return;
@@ -203,7 +190,6 @@ pub fn remove_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// 恢复备份或直接删除；随后清备份 + 广播刷新 + 存盘。
 fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
     if !backup.is_empty() && !is_our_pac(&backup) {
@@ -225,7 +211,6 @@ fn clear_if_ours(key: &RegKey, cur: &str) {
     restore_or_clear(key);
 }
 
-// ---------- 窗口/托盘/开关状态 ----------
 
 pub fn close_to_tray() -> bool {
     state()
@@ -262,7 +247,6 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
     save()
 }
 
-// ---------- settings.json ----------
 
 #[derive(Serialize, Deserialize)]
 // 字段名(camelCase)即既有落盘格式，不可改——漏 rename 会让旧文件反序列化失败静默回默认。
@@ -280,7 +264,6 @@ struct SettingsFile {
     our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
 }
 
-/// 从 exe 同目录 settings.json 恢复设置，程序启动时调用一次。
 pub fn load() {
     let path = exe_dir().join("settings.json");
     let Ok(data) = std::fs::read_to_string(&path) else {
@@ -321,7 +304,6 @@ fn save() -> Result<(), String> {
     let json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
     let p = exe_dir().join("settings.json");
     std::fs::write(&p, json).map_err(|e| e.to_string())?;
-    // settings.json 含本机配置：ACL 收紧为仅当前用户（best-effort）
     let _ = crate::winsec::restrict_to_current_user(&p.to_string_lossy());
     Ok(())
 }
@@ -338,7 +320,6 @@ fn heal_stale_proxy() {
     restore_or_clear(&key);
 }
 
-// ---------- 开机自启 ----------
 
 pub fn autostart_enabled() -> bool {
     let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_READ)
@@ -348,11 +329,9 @@ pub fn autostart_enabled() -> bool {
     let Ok(v) = key.get_value::<String, _>(RUN_VALUE) else {
         return false;
     };
-    // 值存在还要 exe 仍在 —— exe 被移动/删除后设置页如实显示未开启
     autostart_exe_exists(&v)
 }
 
-/// 解析 Run 键命令行（`"exe" args` 或裸 exe）并检查 exe 存在。
 fn parse_exe_path(cmdline: &str) -> Option<&str> {
     if let Some(rest) = cmdline.strip_prefix('"') {
         if let Some(end) = rest.find('"') {
@@ -378,7 +357,6 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
         .create_subkey(RUN_KEY)
         .map_err(|e| format!("打开 Run 键失败: {e}"))?;
     if on {
-        // -tray: 开机自启直接驻留托盘，不弹窗口
         key.set_value(RUN_VALUE, &format!("\"{}\" -tray", exe.to_string_lossy()))
             .map_err(|e| format!("写入 Run 键失败: {e}"))?;
     } else {
@@ -387,7 +365,6 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- 启动参数辅助 ----------
 
 #[cfg(test)]
 mod tests {
@@ -395,7 +372,6 @@ mod tests {
 
     #[test]
     fn autostart_cmd_parse() {
-        // 纯解析（不依赖文件系统存在性）
         assert_eq!(
             parse_exe_path(r#""C:\x\a.exe" -tray"#),
             Some("C:\\x\\a.exe")
@@ -409,14 +385,11 @@ mod tests {
         assert_eq!(parse_exe_path("   "), None);
     }
 
-    // 端口无关自识别：本程序写出的 PAC 形态（任意端口）都算"我们的"；用户自己的配置不算。
     #[test]
     fn is_our_pac_port_agnostic() {
-        // 精确匹配持久化的 ourPAC 形态
         assert!(is_our_pac_like("http://127.0.0.1:7811/proxy.pac"));
         assert!(is_our_pac_like("https://127.0.0.1:9999/proxy.pac"));
         assert!(is_our_pac_like("http://127.0.0.1:65535/proxy.pac"));
-        // 非本程序形态：绝对不算
         assert!(!is_our_pac_like("http://127.0.0.2:7811/proxy.pac"));
         assert!(!is_our_pac_like("http://127.0.0.1/proxy.pac")); // 无端口
         assert!(!is_our_pac_like("http://localhost:7811/proxy.pac")); // 非 127.0.0.1

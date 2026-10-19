@@ -12,7 +12,6 @@ use time::OffsetDateTime;
 /// 本地时区偏移（进程内缓存一次）：多线程探测偶发失败会致时间戳跳跃，缓存后恒定。
 static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
 
-/// 本地时间戳：缓存偏移 + now_utc 换算（time 单一时间库）。
 fn now_str(fd: &[time::format_description::FormatItem<'static>]) -> String {
     let offset = *LOCAL_OFFSET.get_or_init(|| {
         time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
@@ -77,7 +76,6 @@ impl Logger {
         }
     }
 
-    /// 返回 seq > after 的日志与当前最新序号。
     pub fn since(&self, after: u64) -> (Vec<(u64, String)>, u64) {
         let g = self.inner.lock().unwrap();
         let out = g
@@ -90,7 +88,6 @@ impl Logger {
     }
 }
 
-// ---------- 崩溃取证（唯一落盘的日志，只含 panic 堆栈与状态行，无浏览痕迹） ----------
 
 static CRASH: Mutex<CrashState> = Mutex::new(CrashState { path: None });
 
@@ -98,13 +95,11 @@ struct CrashState {
     path: Option<PathBuf>,
 }
 
-/// 设置崩溃日志路径（exe 目录）。
 pub fn set_crash_path(dir: &std::path::Path) {
     let mut g = CRASH.lock().unwrap();
     g.path = Some(dir.join("crash.log"));
 }
 
-/// 严重事件/panic 取证：追加写 crash.log。
 pub fn crash(msg: &str) {
     let path = {
         let g = CRASH.lock().unwrap();
@@ -124,7 +119,6 @@ pub fn crash(msg: &str) {
     }
 }
 
-/// 注册全局 panic hook：先取证落盘再恢复默认行为。
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -154,7 +148,6 @@ mod tests {
 
     #[test]
     fn ring_evicts_oldest_keeps_window() {
-        // 2000 条窗口: 灌满+5 条, 最旧 5 条被挤出
         let lg = Logger::new(false);
         for i in 0..(LOG_BUFFER_SIZE + 5) {
             lg.log(&format!("line{i}"));

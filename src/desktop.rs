@@ -1,10 +1,5 @@
-//! 桌面框架 —— tao 原生窗口 + wry(WebView2 渲染 WebUI) + tray-icon 系统托盘。
-//! - ✕ 且开"关闭到托盘" → 释放整个 WebView2 收进托盘（点击托盘重建；
-//!   托盘态无 Chromium 进程，占用 ≈ headless）
-//! - 窗口被外部销毁（WebView2 运行时事件） → 自愈重建（代理保持运行）
-//! - 托盘左键/菜单「显示工作台」→ 有窗则显示聚焦，无窗则按需创建
-//! - 窗口矩形退出时记忆、启动时恢复；无记录则居中偏下
-//! - 单实例 mutex + 二次启动弹提示
+//! 桌面框架：tao 窗口 + wry(WebView2) + 托盘。
+//! ✕ 收托盘 = 释放整个 WebView2（占用 ≈ headless）；外部销毁自愈重建；单实例 mutex；窗口矩形记忆。
 
 use crate::pool::LogFn;
 use crate::settings;
@@ -60,7 +55,6 @@ const WIN_W: f64 = 1250.0;
 const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
-/// 托盘图标（exe 同目录 asset 内嵌）。
 fn load_icon() -> Icon {
     let bytes = include_bytes!("../assets/icon.ico");
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico)
@@ -70,7 +64,6 @@ fn load_icon() -> Icon {
     Icon::from_rgba(rgba.into_raw(), w, h).expect("托盘图标初始化失败")
 }
 
-/// 构建托盘。
 fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> {
     let menu = Menu::new();
     menu.append_items(&[&show_id, &quit_id])
@@ -93,11 +86,9 @@ unsafe impl Sync for SingleMutexHandle {}
 
 static SINGLE_MUTEX: Mutex<Option<SingleMutexHandle>> = Mutex::new(None);
 
-/// 事件循环代理（WebUI 的 /api/show 用它唤起窗口）。
 static EVENT_PROXY: std::sync::OnceLock<tao::event_loop::EventLoopProxy<AppEvent>> =
     std::sync::OnceLock::new();
 
-/// 触发"显示工作台"（二次启动经 /api/show 调用）。headless 无事件循环 → false。
 pub fn show_via_proxy() -> bool {
     EVENT_PROXY
         .get()
@@ -126,7 +117,6 @@ pub fn already_running() -> bool {
     }
 }
 
-/// 二次启动的兜底提示（唤起失败时用）。
 pub fn notify_already_running() {
     use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
     let text = windows::core::w!("GitPort GitHub 已在运行(请看系统托盘)。");
@@ -141,7 +131,6 @@ pub fn notify_already_running() {
     }
 }
 
-/// 请求已运行实例唤起工作台（POST /api/show）；false = 没唤起，调用方走提示兜底。
 pub fn signal_show(port: u16) -> bool {
     use std::io::{Read, Write};
     let addr = match format!("127.0.0.1:{port}").parse() {
@@ -165,13 +154,11 @@ pub fn signal_show(port: u16) -> bool {
     resp.contains("\"ok\":true")
 }
 
-/// 窗口与 WebView 的联合句柄（事件循环闭包内共享）。
 struct WinSlot {
     win: Option<Window>,
     wv: Option<wry::WebView>,
 }
 
-/// 在事件循环线程创建窗口并导航；WebView2 不可用返回 None，调用方走浏览器兜底。
 fn create_window(
     slot: &Mutex<WinSlot>,
     elwt: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
@@ -202,7 +189,6 @@ fn create_window(
         {
             (l, t, w, h)
         }
-        // 记录缺失或矩形落在当前主屏外（拔了显示器等）→ 退回默认居中
         _ => default_rect(),
     };
     if settings::window_rect() != Some((l, t, w, h)) {
@@ -220,7 +206,6 @@ fn create_window(
     let ipc_log = log.clone();
     match wry::WebViewBuilder::new()
         .with_ipc_handler(move |req: http::Request<String>| {
-            // WebView2 剪贴板 API 默认被拒，JS 层复制经 IPC 到本机写系统剪贴板
             if let Some(text) = req.body().strip_prefix("copy:") {
                 let ok = write_clipboard(text);
                 let n = text.chars().count();
@@ -234,7 +219,6 @@ fn create_window(
         Ok(wv) => {
             g.win = Some(window);
             g.wv = Some(wv);
-            // OS 可能钳制位置：把实际矩形立刻写回，settings.json 恒等于窗口现状
             drop(g);
             save_window_rect(slot);
             true
@@ -246,7 +230,6 @@ fn create_window(
     }
 }
 
-/// 读取主窗口当前矩形并持久化(退出时调用)。
 fn save_window_rect(slot: &Mutex<WinSlot>) {
     let g = slot.lock().unwrap();
     let Some(w) = &g.win else { return };
@@ -260,7 +243,6 @@ fn save_window_rect(slot: &Mutex<WinSlot>) {
     let _ = settings::set_window_rect(pos.x, pos.y, wpx, hpx);
 }
 
-/// 显示并聚焦工作台窗口(托盘「显示工作台」)。
 fn show_window(slot: &Mutex<WinSlot>) -> bool {
     let g = slot.lock().unwrap();
     let Some(w) = &g.win else { return false };
@@ -269,14 +251,12 @@ fn show_window(slot: &Mutex<WinSlot>) -> bool {
     true
 }
 
-/// 打开系统默认浏览器。
 pub fn open_browser(url: &str) {
     let _ = std::process::Command::new("rundll32")
         .args(["url.dll,FileProtocolHandler", url])
         .spawn();
 }
 
-/// 桌面运行参数（main 装配）。
 pub struct DesktopArgs {
     pub url: String,
     pub log: LogFn,
@@ -284,7 +264,6 @@ pub struct DesktopArgs {
     pub on_quit: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// 桌面主循环(阻塞)。on_quit = 善后函数，由 main 注入；事件循环线程 = 主线程。
 pub fn run(args: DesktopArgs) -> ! {
     let url = args.url;
     let log = args.log;
@@ -299,7 +278,6 @@ pub fn run(args: DesktopArgs) -> ! {
         wv: None,
     }));
 
-    // 托盘
     let show_item = MenuItem::new("显示工作台", true, None);
     let quit_item = MenuItem::new("退出", true, None);
     let show_id = show_item.id().clone();
@@ -309,7 +287,6 @@ pub fn run(args: DesktopArgs) -> ! {
     {
         let proxy = proxy.clone();
         std::thread::spawn(move || {
-            // 左键单击 = 显示工作台
             let tray_rx = TrayIconEvent::receiver();
             while let Ok(ev) = tray_rx.recv() {
                 if let TrayIconEvent::Click {
@@ -327,7 +304,6 @@ pub fn run(args: DesktopArgs) -> ! {
     {
         let proxy = proxy.clone();
         std::thread::spawn(move || {
-            // 菜单：显示工作台 / 退出
             let menu_rx = MenuEvent::receiver();
             while let Ok(ev) = menu_rx.recv() {
                 let ev = if *ev.id() == show_id {

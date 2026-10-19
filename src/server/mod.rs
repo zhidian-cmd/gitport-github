@@ -28,13 +28,11 @@ fn set_running(v: bool) {
     RUNNING.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-// ---------- 代理启停（全局控制，main/webui 共用） ----------
 
 static PROXY_CTX: std::sync::Mutex<Option<CancellationToken>> = std::sync::Mutex::new(None);
 static PROXY_JOIN: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
-/// 同步绑定端口 + 启动服务。返回错误 = 端口被占用等真实失败。
 pub fn start_proxy_with(
     rt: &tokio::runtime::Runtime,
     srv: Arc<ProxyServer>,
@@ -52,7 +50,6 @@ pub fn start_proxy_with(
     })
 }
 
-/// 停止代理并等待端口释放（同步返回前端口已可复用）。
 pub fn stop_proxy(rt: &tokio::runtime::Runtime) {
     rt.handle().block_on(stop_proxy_async());
 }
@@ -68,7 +65,6 @@ pub async fn stop_proxy_async() {
     }
 }
 
-/// 在已绑定的 listener 上服务，ctx 取消时优雅退出。
 pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToken) {
     let _ = ln.local_addr();
     (srv.log)("代理已启动");
@@ -94,7 +90,6 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
         };
         let srv = srv.clone();
         tokio::spawn(async move {
-            // 单连接错误不致命
             let _ = srv.handle(conn).await;
         });
     }
@@ -103,7 +98,6 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
 impl ProxyServer {
     async fn handle(&self, mut client: TcpStream) -> std::io::Result<()> {
         let _ = client.set_nodelay(true);
-        // 活跃窗口计时: 保持上游 h2 保活
         upstream::note_activity();
         let head = read_head(&mut client).await?;
         let Some(idx) = find_crlf(&head) else {
@@ -122,11 +116,8 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// CONNECT 隧道（纯透传路径）：上游 TCP 拨号（串发或系统 DNS）→ 200 →
-    /// 双向转发。首字节看门狗 + 数据层结果回写串发表。
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
-        // 池内域名且 MITM 开：本地终结 TLS
         if mitm::mitm_scope(self.authority.as_ref(), &host) {
             mitm::handle_connect_mitm(self, client, &host).await;
             return;
@@ -150,7 +141,6 @@ impl ProxyServer {
         }
         (self.log)(&format!("[CONNECT] {host} via {ip} -> 200已发, 开始转发"));
 
-        // 首字节看门狗：ClientHello 被黑洞时 8s 内判死
         let (sent, recv) = bidir_copy(
             &mut client,
             &mut upstream,
@@ -163,7 +153,6 @@ impl ProxyServer {
 
         let name = pool::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
-            // 数据层结果回写串发表
             match (sent, recv) {
                 (s, r) if s > 0 && r > 0 => pool::serial_note(name, &ip, "ok"),
                 (s, r) if s > 0 && r == 0 => {
@@ -182,7 +171,6 @@ impl ProxyServer {
         }
     }
 
-    /// 明文 HTTP 转发（非 CONNECT）：重写请求头后转发上游，双向透传。
     async fn handle_http(&self, mut client: TcpStream, method: &str, target: &str, rest: &[u8]) {
         let Some(rest_target) = target.strip_prefix("http://") else {
             let _ = client
@@ -212,7 +200,6 @@ impl ProxyServer {
             }
         };
 
-        // 重写请求头：origin-form + 真实 Host，剔除 hop 头
         let head_text = String::from_utf8_lossy(rest);
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
         for l in head_text.lines() {
@@ -341,8 +328,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
 }
 
 /// 双向透传，任一方向结束即关闭两侧。返回 (a→b, b→a) 字节数。
-/// b→a 方向带首字节看门狗（可选）：第一次读到字节前设 dur 超时，
-/// 超时 = 判死（上游 TCP 活着但 ClientHello 被黑洞的假节点）。
+/// 双向透传：任一方向结束即关闭两侧；b→a 可选首字节看门狗（ClientHello 黑洞判死）。
 async fn bidir_copy<A, B>(
     a: &mut A,
     b: &mut B,
@@ -362,7 +348,6 @@ where
     (up, down)
 }
 
-/// 拷贝循环，可选首字节超时（None = 不限时）。超时/EOF/写失败即收尾。
 async fn copy_with_first_byte_timeout<R, W>(
     r: &mut R,
     w: &mut W,
@@ -411,7 +396,6 @@ where
 mod tests {
     use super::*;
 
-    /// host_only：剥端口、IPv6 字面量安全、无端口原样返回。
     #[test]
     fn host_only_strips_port() {
         assert_eq!(host_only("github.com:443"), "github.com");

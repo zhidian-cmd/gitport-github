@@ -1,6 +1,4 @@
-// GitPort GitHub -- GitHub 加速代理工作台。
-// tao 窗口 + wry(WebView2) + 托盘；代理 7810 + WebUI 7811；release 无控制台（日志走 WebUI，崩溃取证 crash.log）。
-// 启动参数：-tray 驻留托盘 / -headless 只跑代理+WebUI / -port N / -webui N。
+// 代理 7810 + WebUI 7811；-tray 驻留托盘 / -headless 无窗 / -port / -webui 换端口。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod certgen;
@@ -15,7 +13,6 @@ mod winsec;
 
 use std::sync::Arc;
 
-/// 解析 `-name value` 型启动参数。
 fn arg_value(args: &[String], name: &str) -> Option<u16> {
     args.iter()
         .position(|a| a == name)
@@ -24,14 +21,12 @@ fn arg_value(args: &[String], name: &str) -> Option<u16> {
 }
 
 fn main() {
-    // 顶层护栏：主线程(窗口线程)的 panic 取证后退出
     logger::install_panic_hook();
     logger::guard("main", || run());
 }
 
 fn run() {
     if desktop::already_running() {
-        // 单实例：二次启动唤起已有实例的工作台；唤起失败退回提示框。
         if !desktop::signal_show(config::webui_port()) {
             desktop::notify_already_running();
         }
@@ -52,7 +47,6 @@ fn run() {
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "-headless");
     let tray_mode = args.iter().any(|a| a == "-tray");
-    // 端口覆盖：仅命令行显式给才改默认（避开其他实例占用的默认端口）
     if let Some(p) = arg_value(&args, "-port") {
         config::set_proxy_port(p);
     }
@@ -67,14 +61,12 @@ fn run() {
         let l = logs.clone();
         Arc::new(move |msg: &str| l.log(msg))
     };
-    // 串发核心: plans.json 唯一权威, 随使用演化(首次运行由内嵌种子初始化)
     pool::serial_load(&exe_dir, Some(log_fn.clone()));
     let ca = certgen::load_or_generate(&exe_dir, Some(&log_fn)).ok();
     if ca.is_none() {
         log_fn("CA 初始化失败, MITM 不可用");
     }
 
-    // tokio runtime: 代理 + WebUI 常驻
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -82,12 +74,9 @@ fn run() {
             .expect("tokio runtime 创建失败"),
     );
 
-    // 串发表顺序变更 2s 内落盘（需 runtime 就绪）
     pool::start_persist(&rt);
-    // 活跃窗口内上游 h2 保活（跨导航复用；空闲零唤醒不变）
     server::upstream::start_keepalive(&rt);
 
-    // 启动代理
     let srv = Arc::new(server::ProxyServer {
         log: log_fn.clone(),
         authority: ca.clone(),
@@ -98,7 +87,6 @@ fn run() {
         settings::ensure_system_proxy(); // 分流开关接管系统代理(全关 = no-op)
     }
 
-    // WebUI 服务(护栏: panic 只断 webui 并取证, 进程活着)
     let app = Arc::new(webui::App {
         logs: logs.clone(),
         ca,
@@ -113,18 +101,14 @@ fn run() {
         });
     }
 
-    // headless: 只跑代理+WebUI, 不开窗口/托盘
     if headless {
         loop {
             std::thread::park();
         }
     }
 
-    // ---------- 桌面框架 ----------
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        // 退出第一步: 先还原系统代理
         settings::remove_system_proxy();
-        // 停代理(异步收尾)
         let rt = rt.clone();
         std::thread::spawn(move || {
             server::stop_proxy(&rt);

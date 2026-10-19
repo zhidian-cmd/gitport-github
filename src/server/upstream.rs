@@ -1,6 +1,4 @@
-//! 上游 HTTP 客户端，两条腿：
-//! - 池内直连腿：boring Chrome 指纹，SNI 按 IP 族定，证书按目标 host 校验（见 pool/dial.rs），fresh 语义。
-//! - 镜像腿：标准 TLS + h1 直拨，无表无阶梯。
+//! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
 use crate::pool::{self, dial::Dialed, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
@@ -17,14 +15,12 @@ use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
-// ---------- 自管 h2 连接：拨号、握手、多路复用 ----------
 /// 每 host 一条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
 /// SendRequest 可 Clone，一条连接承载该 host 全部并发；只有完整成功过的连接入槽。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
     send: SendRequest<Bytes>,
-    /// h2 PING 句柄（保活用）；None = 取不到，保活跳过。
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
 static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, H2Upstream>>> =
@@ -33,10 +29,7 @@ fn conn_pool() -> &'static Mutex<HashMap<String, H2Upstream>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// ---------- 活跃窗口内 h2 保活 ----------
-/// 最近一次代理请求时间（unix 秒）。0 = 从未有请求（任务纯睡）。
 static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 唤醒保活任务（每次请求踢一下；无请求时任务睡在它上面，零周期唤醒）。
 static ACTIVITY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn now_secs() -> u64 {
@@ -46,14 +39,12 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 记录一次代理请求：开着保活窗口计时并踢醒任务。
 pub fn note_activity() {
     LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
     ACTIVITY_KICK.notify_one();
 }
 
-/// 启动活跃窗口保活任务（须在 runtime 构建后调用）。
-/// 有请求 → 每 PROBE 秒对缓存 h2 连接发 PING；静默超窗回睡眠；空闲零唤醒。
+/// 启动保活任务：有请求每 PROBE 秒 PING 一次，静默超窗回睡，空闲零唤醒。
 pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
     rt.spawn(async move {
         loop {
@@ -74,7 +65,6 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
     });
 }
 
-/// 一轮保活：对所有已缓存连接发 PING（不预建新通道）；失败即清槽。
 async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
         let g = conn_pool().lock().unwrap();
@@ -95,22 +85,18 @@ async fn keepalive_pass() {
     }
 }
 
-/// 取 host 的复用连接。命中 = 上次完整成功的那条链路。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
     conn_pool().lock().unwrap().get(host).cloned()
 }
-/// 缓存成功连接（覆盖旧槽）。
 pub fn store_h2(host: &str, up: H2Upstream) {
     conn_pool().lock().unwrap().insert(host.to_string(), up);
 }
-/// 清槽（连接失效时）：仅当槽内还是该 ip 才清，防误删刚写入的新槽。
 pub fn drop_h2(host: &str, ip: &str) {
     let mut g = conn_pool().lock().unwrap();
     if g.get(host).map(|u| u.ip == ip).unwrap_or(false) {
         g.remove(host);
     }
 }
-/// 已拨连接 → h2 握手；连接驱动 future spawn 到后台直到连接结束。
 pub async fn h2_from_dialed(
     host: &str,
     conn_io: Dialed,
@@ -126,7 +112,6 @@ pub async fn h2_from_dialed(
         .handshake(conn_io)
         .await
         .map_err(|e| format!("h2 握手失败: {e}"))?;
-    // PING 句柄只能取一次，须在驱动前取出。
     let ping = conn
         .ping_pong()
         .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
@@ -142,7 +127,6 @@ pub async fn h2_from_dialed(
         ping,
     })
 }
-/// 串发拨号 + h2 握手（boring 拨号 ALPN 已协商 h2）。
 pub async fn dial_h2(
     pool_name: &str,
     host: &str,
@@ -170,7 +154,6 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// 从 out 重建 h2 请求头：剥 h1 hop-by-hop 头（h1 遗留头进 h2 判 malformed）。
 fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, String> {
     let mut builder = hyper::Request::builder()
         .method(out.method())
@@ -206,7 +189,6 @@ pub async fn h2_recv_response(
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
 }
-/// 自管 h2 连接上发一次请求：头重建，体按 replay 注入。
 pub async fn h2_send(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -226,7 +208,6 @@ pub async fn h2_send(
     }
     h2_recv_response(resp_fut).await
 }
-/// 流式直通·预泵段：头先发（EOS=false）；此段失败=连接死且体未动，可安全换新拨重试。
 pub async fn h2_stream_head(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -239,9 +220,8 @@ pub async fn h2_stream_head(
         .map_err(|e| format!("h2 发送: {e}"))?;
     Ok((resp_fut, stream))
 }
-/// 流式直通·请求体泵：按对端授予的发送窗口分片发送（单次 send_data 严禁超窗口）。
-/// 客户端体读取出错不补 EOS 直接弃流——git pack 尾带校验和，截断包必须被 RST 拒绝。
-/// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留在 poll_capacity 不回收）。
+/// 流式直通·请求体泵：按对端窗口分片发送；客户端断开时弃流不补 EOS（pack 尾带校验和）。
+/// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留不回收）。
 pub fn h2_spawn_pump(
     mut send: h2::SendStream<Bytes>,
     mut body: BoxBody,
@@ -303,7 +283,6 @@ pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
-/// 镜像腿：标准 TLS 直拨，ALPN h2,http/1.1（镜像多 Cloudflare 前置，h2 一条连接复用多请求）。
 #[derive(Clone)]
 pub struct MirrorConnector {
     log: LogFn,
@@ -322,7 +301,6 @@ impl Service<Uri> for MirrorConnector {
             let t0 = std::time::Instant::now();
             let tls = pool::dial::dial_tls_simple(&host).await?;
             let alpn = tls.ssl().selected_alpn_protocol().unwrap_or_default();
-            // 只在真正新建 TLS 时出现（复用命中无此行）。
             (log)(&format!(
                 "[镜像拨号] {host} TLS {}ms alpn={}",
                 t0.elapsed().as_millis(),
@@ -332,16 +310,13 @@ impl Service<Uri> for MirrorConnector {
         })
     }
 }
-/// 镜像腿每镜像空闲连接上限。0 = 关闭连接池（回滚开关）。
 const MIRROR_POOL_MAX_IDLE: usize = 4;
-/// 空闲连接保留时长；必须配 pool_timer 才生效。
 const MIRROR_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 static MIRROR_CLIENT: std::sync::OnceLock<LegacyClient<MirrorConnector, BoxBody>> =
     std::sync::OnceLock::new();
 
-/// 镜像腿共享客户端（进程内单例）：此前每请求新建 client，17 张图各自重付 DNS+TCP+TLS。
-/// 首次调用者的 log 被永久持有（各调用点传的都是同一 Logger 克隆）。
+/// 镜像腿共享客户端（进程内单例）；首次调用者的 log 被永久持有。
 pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxBody> {
     MIRROR_CLIENT.get_or_init(|| {
         let mut b = LegacyClient::builder(TokioExecutor::new());
@@ -349,16 +324,13 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
             .pool_idle_timeout(MIRROR_POOL_IDLE)
             // pool_idle_timeout 必须配 pool_timer 才生效（hyper-util 内部行为）。
             .pool_timer(hyper_util::rt::TokioTimer::new())
-            // 复用死连接且请求未写出 → 自动重发（镜像请求体恒空）。
             .retry_canceled_requests(true);
         b.build(MirrorConnector { log: log.clone() })
     })
 }
-/// 请求预算：一次上游请求的总预算。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host（github.com/api）强制 gzip。
-/// 泛型 B：只读头/方法/URI，不触体——测试可用任意体类型构造。
+/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制 gzip。
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
     host: &str,
@@ -395,7 +367,6 @@ pub fn upstream_request<B>(
             .map(|v| v.to_ascii_lowercase().contains("gzip"))
             .unwrap_or(false);
         if accepts_gzip {
-            // 只认 gzip：代理侧只需一个解压器。
             out = out.header("accept-encoding", "gzip");
         }
     }
@@ -404,7 +375,6 @@ pub fn upstream_request<B>(
     let out = out.body(body).map_err(|e| e.to_string())?;
     Ok((out, host.to_string()))
 }
-/// 重组带缓冲前缀的响应体流（嗅探/探测后拼接回给客户端）。
 pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
     use futures_util::StreamExt;
     let tail_stream = http_body_util::BodyExt::into_data_stream(tail);
@@ -421,7 +391,6 @@ pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
 mod tests {
     use super::*;
 
-    /// 强制 gzip 门控：客户端声明过才强制；未声明（curl/git）回身份编码。
     #[test]
     fn forced_gzip_gated_on_client_accept() {
         let req = hyper::Request::builder()
@@ -446,7 +415,6 @@ mod tests {
             "未声明的客户端应回身份编码"
         );
 
-        // 内容域（非嗅探 host）：不添加 accept-encoding，放行浏览器原生协商
         let req3 = hyper::Request::builder()
             .uri("https://raw.githubusercontent.com/a")
             .body(())

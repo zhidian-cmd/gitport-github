@@ -1,5 +1,4 @@
-//! MITM 本地证书机构 —— 生成/加载 CA，按域名即时签发叶子证书。
-//! 仅对池内/自定义域名启用 MITM；其余域名保持纯透传，不做中间人。
+//! MITM 本地证书机构：生成/加载 CA，按域名即时签发叶子证书；仅池内域名 MITM。
 
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -13,7 +12,6 @@ use time::OffsetDateTime;
 
 use crate::pool::LogFn;
 
-/// 本地 CA。
 pub struct Authority {
     cert_pem: String, // CA 证书 PEM（Issuer 重建/导出用）
     cert_der: Vec<u8>,
@@ -21,7 +19,6 @@ pub struct Authority {
     leaves: Mutex<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
-/// 由 CA 证书 DER + 私钥重建 rcgen Issuer（每次按 DER 重建，低频可接受）。
 fn issuer_of<'a>(
     cert_der: &'a [u8],
     key: &'a KeyPair,
@@ -31,7 +28,6 @@ fn issuer_of<'a>(
 }
 
 impl Authority {
-    /// 按域名签发（缓存）叶子证书，链上附带 CA。
     fn leaf(&self, host: &str) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
         {
             let leaves = self.leaves.lock().unwrap();
@@ -78,7 +74,6 @@ impl Authority {
     }
 }
 
-/// 按 SNI 出证书的解析器（rustls 服务端证书解析）。
 pub struct LeafResolver {
     pub authority: Arc<Authority>,
 }
@@ -99,8 +94,7 @@ impl rustls::server::ResolvesServerCert for LeafResolver {
     }
 }
 
-/// 服务端 TLS 配置：按 SNI 即时出证书（rustls 证书解析器）。
-/// 调用方须持有 Arc<Authority>（load_or_generate 的返回类型）。
+/// 服务端 TLS 配置：按 SNI 即时出证书。
 pub fn tls_config_of(a: &Arc<Authority>) -> Arc<rustls::ServerConfig> {
     let resolver = LeafResolver {
         authority: a.clone(),
@@ -114,8 +108,7 @@ pub fn tls_config_of(a: &Arc<Authority>) -> Arc<rustls::ServerConfig> {
     Arc::new(cfg)
 }
 
-/// 加载 dir 下 ca.crt/ca.key；不存在则生成。兼容 SEC1 旧格式。
-/// load 分支重申 key 的 ACL——同机他账户可读根私钥即可伪造叶子证书 MITM。
+/// 加载/生成 CA；load 分支重申 key 的 ACL（可读根私钥 = 可伪造叶子证书 MITM）。
 pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
@@ -136,7 +129,6 @@ pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority
 fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| e.to_string())?;
     let key_pem = std::fs::read_to_string(key_path).map_err(|e| e.to_string())?;
-    // 本程序 CA = PKCS#8；旧格式 SEC1 → 转 PKCS#8
     let ca_key = KeyPair::from_pem(&key_pem)
         .or_else(|_| {
             sec1_to_pkcs8(&key_pem).and_then(|der| {
@@ -155,7 +147,6 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
         rustls_pemfile::Item::X509Certificate(der) => der.as_ref().to_vec(),
         other => return Err(format!("ca.crt 不是 X509 证书: {other:?}")),
     };
-    // 校验 CA 私钥与证书匹配（Issuer 构造内含一致性检查，失败即返回）
     let _ = issuer_of(&cert_der, &ca_key).map_err(|e| e.to_string())?;
     Ok(Arc::new(Authority {
         cert_pem,
@@ -257,11 +248,9 @@ fn generate() -> Result<Arc<Authority>, String> {
 }
 
 impl Authority {
-    /// 写盘 PEM（证书 + PKCS#8 私钥），私钥权限收紧（调用方负责 ACL）。
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
-        // 私钥权限收紧（best-effort）
         let _ = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy());
         Ok(())
     }
@@ -296,14 +285,12 @@ mod tests {
         assert!(!a.cert_der.is_empty());
         let leaf = a.leaf("github.com").unwrap();
         assert_eq!(leaf.cert.len(), 2, "叶子应附带 CA 链");
-        // 重复签发走缓存
         let leaf2 = a.leaf("github.com").unwrap();
         assert!(std::ptr::eq(Arc::as_ptr(&leaf), Arc::as_ptr(&leaf2)) || leaf.cert == leaf2.cert);
     }
 
     #[test]
     fn sec1_conversion() {
-        // 用 rcgen 生成 P-256 密钥 → PKCS#8 DER 往返解析一致
         let kp = KeyPair::generate().unwrap();
         let pkcs8 = kp.serialize_der();
         let kp2 = KeyPair::from_pkcs8_der_and_sign_algo(
@@ -322,7 +309,6 @@ mod tests {
         let _cfg = tls_config_of(&a);
     }
 
-    // 集成：本地起 TLS 服务 + rustls 客户端握手，验证按 SNI 出证书
     #[tokio::test(flavor = "multi_thread")]
     async fn mitm_handshake_roundtrip() {
         let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
@@ -341,10 +327,8 @@ mod tests {
             let _ = tls;
         });
 
-        // 客户端按 github.com 的 SNI 握手
         let roots = crate::pool::dial::system_roots();
         let mut roots = (*roots).clone();
-        // 信任测试 CA
         roots
             .add(rustls_pki_types::CertificateDer::from(a.cert_der.clone()))
             .unwrap();
