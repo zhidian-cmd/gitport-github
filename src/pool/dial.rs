@@ -11,7 +11,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-pub const MODE_FAKE_PFX: &str = "fake:"; // 旧表伪装前缀, 加载时剥除; sni 原样透传, 证书按 host 校验
 
 pub type BoringTls = tokio_boring::SslStream<TcpStream>;
 
