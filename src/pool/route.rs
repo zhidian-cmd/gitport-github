@@ -1,7 +1,7 @@
 //! 路由唯一真相：master_route（System→Mirror→Pool{池,族}→Tunnel）+ POOL_ROUTES 每池族表。
 //! 冷却/健康按 host 或 IP 记账不按池——池级冷却会让一个域的全灭毒倒同池其他族。
 
-use super::{plan_mode, SerialPlan};
+use super::SerialPlan;
 use crate::config;
 
 
@@ -128,9 +128,9 @@ pub fn fastly_last_octet(ip: &str) -> Option<&str> {
     }
 }
 
-/// 非 Fastly 段 + 伪装形态（真名 MODE_SNI 只归 Fastly 内容族用）。
+/// 非 Fastly 段（族资格只看 IP 段；sni 是透传形态，不参与族判定）。
 fn serves_non_fastly(_host: &str, p: &SerialPlan) -> bool {
-    fastly_last_octet(&p.ip).is_none() && plan_mode(&p.sni) != plan_mode(super::dial::MODE_SNI)
+    fastly_last_octet(&p.ip).is_none()
 }
 
 const FAMILY_ALL: FamilyRoute = FamilyRoute {
@@ -140,7 +140,8 @@ const FAMILY_ALL: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-/// content：.133 真名（伪装会被该边缘挂起）；真名抗不住 GFW 按域 RST，兜底走镜像链。
+/// content：.133 伪装（2026-10-19 切换：默认证书 SAN 覆盖 *.githubusercontent.com 且实测出内容，
+/// 真名反遭 RST）；伪装若失效，应急回退 = plans.json 该条 sni 改回 "sni"（重启生效）；兜底走镜像链。
 const FAMILY_CONTENT: FamilyRoute = FamilyRoute {
     name: "content",
     host_of: host_is_content,
@@ -245,10 +246,8 @@ pub const RETIRED_IPS: &[&str] = &[
     "140.82.119.4",
     "140.82.120.3",
     "140.82.120.4",
-    // edge content：108/109/111.133（110.133 时通时断，保留作独苗）
-    "185.199.108.133",
-    "185.199.109.133",
-    "185.199.111.133",
+    // edge content：108/109/111.133 曾于 2026-10-19 判死退役，当晚复活出内容——
+    // 属日内波动假死而非真死，移出清单交串发表动态裁决（2026-10-19 晚）
 ];
 
 pub fn is_retired(ip: &str) -> bool {
@@ -370,20 +369,20 @@ mod tests {
         assert_eq!(fastly_last_octet("185.199.110.133"), Some("133"));
         assert_eq!(fastly_last_octet("185.199.110.154"), Some("154"));
         assert!(fastly_last_octet("140.82.112.3").is_none());
-        assert!((FAMILY_CONTENT.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
+        assert!((FAMILY_CONTENT.serves)("x", &mk("185.199.110.133", "baidu.com")));
         assert!(!(FAMILY_CONTENT.serves)("x", &mk("185.199.110.154", "baidu.com")));
         assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.215", "baidu.com")));
         assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.154", "baidu.com")));
         assert!(!(FAMILY_ASSETS.serves)(
             "x",
-            &mk("185.199.110.133", crate::pool::dial::MODE_SNI)
+            &mk("185.199.110.133", "baidu.com")
         ));
         assert!((FAMILY_IO.serves)("x", &mk("185.199.110.153", "baidu.com")));
         assert!(!(FAMILY_IO.serves)("x", &mk("185.199.110.154", "baidu.com")));
         assert!((FAMILY_AUTH.serves)("x", &mk("140.82.112.29", "baidu.com")));
         assert!(!(FAMILY_AUTH.serves)(
             "x",
-            &mk("185.199.110.133", crate::pool::dial::MODE_SNI)
+            &mk("185.199.110.133", "baidu.com")
         ));
         assert!((FAMILY_ALL.serves)("x", &mk("140.82.112.3", "baidu.com")));
     }
@@ -431,7 +430,7 @@ mod tests {
         let f = serial_family("edge", "future.edge.host").unwrap();
         assert_eq!(f.name, "auth");
         assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
-        assert!(!(f.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
+        assert!(!(f.serves)("x", &mk("185.199.110.133", "real")));
     }
 
     #[test]
@@ -473,8 +472,6 @@ mod tests {
             "140.82.115.3",
             "140.82.120.4",
             "140.82.117.3",
-            "185.199.108.133",
-            "185.199.111.133",
         ] {
             assert!(is_retired(ip), "{ip} 应已下线");
         }
@@ -486,6 +483,9 @@ mod tests {
             "185.199.110.154",
             "185.199.110.153",
             "140.82.112.29",
+            // 2026-10-19 晚复活，移出退役清单（日内波动假死）
+            "185.199.108.133",
+            "185.199.111.133",
         ] {
             assert!(!is_retired(ip), "{ip} 实测存活, 不应下线");
         }

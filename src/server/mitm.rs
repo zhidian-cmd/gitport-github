@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// 内容域 .133 真名腿的响应头预算：黑洞时快速失败回落镜像；只罩响应头，体不限。
+/// 内容域 .133 直连腿的响应头预算：黑洞时快速失败回落镜像；只罩响应头，体不限。
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4);
 const MIRROR_CHAIN_CAP: usize = 5;
 
@@ -845,7 +845,7 @@ async fn dns_direct_fetch(
     ));
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, pool::dial::MODE_SNI, true).await {
+        let conn = match pool::dial::dial_one(host, &ip, host, true).await {
             Ok(c) => c,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));

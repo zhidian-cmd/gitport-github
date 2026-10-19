@@ -1,5 +1,5 @@
 //! 串发拨号：plans.json 唯一权威。ok 置顶 / 失败垫底，同 IP 重复置顶 no-op 不写盘。
-//! SNI 形态按 IP 族定（shape_for_ip），SNI 与校验名解耦；全灭冷却 30s。
+//! SNI 形态文件权威（sni 必填，非法剥除），SNI 与校验名解耦；全灭冷却 30s。
 //! 仅顺序真变更才写盘（2s 原子写回）；edge 混合池按 host 族对口选择（见 route.rs）。
 
 pub mod dial;
@@ -97,17 +97,7 @@ pub fn serial_pool(name: &str) -> bool {
     SERIAL_POOLS.contains(&name)
 }
 
-/// IP → 默认 SNI 形态（Fastly 边缘对任意 SNI 返本边缘主证书）。
-/// .133 伪装被挂起只能真名；.153/.154/.215 伪装抗 SNI 阻断；主站/auth 伪装。Fastly 段强制按族归一。
-fn shape_for_ip(ip: &str) -> &'static str {
-    if route::fastly_last_octet(ip) == Some("133") {
-        dial::MODE_SNI
-    } else {
-        "baidu.com"
-    }
-}
-
-fn seed_db() -> HashMap<String, Vec<String>> {
+fn seed_db() -> HashMap<String, Vec<SerialPlan>> {
     serde_json::from_str(SEEDS_JSON).unwrap_or_default()
 }
 
@@ -270,43 +260,40 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             {
                 continue;
             }
-            // ech 恒失败清除旧遗留；Fastly 段强制按 IP 族归一，其余显式写法保留。
-            let sni = if route::fastly_last_octet(&p.ip).is_some() {
-                shape_for_ip(&p.ip).to_string()
-            } else {
-                match p.sni.trim() {
-                    "" | "real" | "nosni" => shape_for_ip(&p.ip).to_string(),
-                    dial::MODE_SNI => dial::MODE_SNI.to_string(),
-                    s => {
-                        // sni 会进 WebUI 与 ClientHello，只认域名形态字符（防注入）。
-                        let bare = s.trim_start_matches(dial::MODE_FAKE_PFX);
-                        if !bare.is_empty()
-                            && bare
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-                        {
-                            bare.to_string()
-                        } else {
-                            shape_for_ip(&p.ip).to_string()
-                        }
-                    }
+            // ech 恒失败清除旧遗留；sni 文件权威：显式写法（真名/裸域名）全段保留，
+            // sni 原样透传进握手：空串 = 无 SNI 扩展；唯一门槛是字符白名单(防注入)，非法字符该条剥除。
+            let bare = p.sni.trim().trim_start_matches(dial::MODE_FAKE_PFX);
+            if !bare.is_empty()
+                && !bare
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                if let Some(log) = log.as_ref() {
+                    log(&format!(
+                        "[串发] {} sni 含非法字符({:?}), 条目剥除",
+                        p.ip, p.sni
+                    ));
                 }
-            };
-            plans.push(SerialPlan { ip: p.ip, sni });
+                continue;
+            }
+            plans.push(SerialPlan {
+                ip: p.ip,
+                sni: bare.to_string(),
+            });
         }
         if let Some(ips) = seed_db().get(*name) {
             let mut added = 0usize;
-            for ip in ips {
-                if ip.parse::<std::net::IpAddr>().is_err()
-                    || route::is_retired(ip)
-                    || plans.iter().any(|p| p.ip == *ip)
+            for sp in ips {
+                if sp.ip.parse::<std::net::IpAddr>().is_err()
+                    || route::is_retired(&sp.ip)
+                    || plans.iter().any(|p| p.ip == sp.ip)
                     || plans.len() >= SERIAL_MAX_PLANS
                 {
                     continue;
                 }
                 plans.push(SerialPlan {
-                    ip: ip.clone(),
-                    sni: shape_for_ip(&ip).to_string(),
+                    ip: sp.ip.clone(),
+                    sni: sp.sni.clone(),
                 });
                 added += 1;
             }
@@ -383,18 +370,6 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
             }
         }
     });
-}
-
-/// sni 形态 → dial 模式：裸域名 = 伪装（兼容旧表带 fake: 前缀）；MODE_SNI = 真名。
-pub fn plan_mode(sni: &str) -> String {
-    match sni {
-        dial::MODE_SNI => dial::MODE_SNI.to_string(),
-        _ => format!(
-            "{}{}",
-            dial::MODE_FAKE_PFX,
-            sni.trim_start_matches(dial::MODE_FAKE_PFX)
-        ),
-    }
 }
 
 /// 命中条目整体移位：置顶/垫底；顺序没变 no-op，表头真变才打日志。
@@ -502,14 +477,8 @@ pub async fn serial_dial(
             }
         }
         tried += 1;
-        let mode = plan_mode(
-            p.sni
-                .trim()
-                .is_empty()
-                .then_some("baidu.com")
-                .unwrap_or(p.sni.trim()),
-        );
-        let attempt = dial::dial_one(host, &p.ip, &mode, tls_handshake);
+        let mode = p.sni.trim();
+        let attempt = dial::dial_one(host, &p.ip, mode, tls_handshake);
         let result = tokio::select! {
             _ = ctx.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "请求预算到期")),
             r = attempt => r,
@@ -756,34 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_semantics() {
-        assert_eq!(plan_mode(""), "fake:", "空串须由调用方兜底");
-        assert_eq!(
-            plan_mode("baidu.com"),
-            format!("{}baidu.com", dial::MODE_FAKE_PFX)
-        );
-        assert_eq!(
-            plan_mode("fake:baidu.com"),
-            plan_mode("baidu.com"),
-            "旧表带前缀写法行为一致"
-        );
-        assert_eq!(plan_mode(dial::MODE_SNI), dial::MODE_SNI);
-    }
-
-    #[test]
-    fn edge_shape_by_ip_family() {
-        assert_eq!(shape_for_ip("185.199.108.133"), dial::MODE_SNI);
-        assert_eq!(shape_for_ip("185.199.111.133"), dial::MODE_SNI);
-        for ip in ["185.199.108.154", "185.199.111.153"] {
-            assert_eq!(shape_for_ip(ip), "baidu.com", "{ip} 应取伪装");
-        }
-        for ip in ["140.82.112.29", "20.205.243.167"] {
-            assert_eq!(shape_for_ip(ip), "baidu.com", "{ip} 应取伪装");
-        }
-        assert_eq!(shape_for_ip("185.199.108.215"), "baidu.com");
-    }
-
-    #[test]
     fn direct_hosts_never_pooled() {
         for host in [
             "objects-origin.githubusercontent.com",
@@ -833,19 +774,19 @@ mod tests {
             let tab = g.as_ref().unwrap();
             tab.pools.get("core").unwrap().clone()
         };
-        assert_eq!(
-            ps[0],
-            SerialPlan {
-                ip: "5.6.7.8".into(),
-                sni: "baidu.com".into()
-            },
-            "用户条目保留在前且归一"
-        );
         let core_seed_n = seed_db().get("core").map(|v| v.len()).unwrap_or(0);
         assert_eq!(
             ps.len(),
             1 + core_seed_n,
             "补缺后 = 用户条目 + 全部种子: {ps:?}"
+        );
+        assert_eq!(
+            ps[0],
+            SerialPlan {
+                ip: "5.6.7.8".into(),
+                sni: "real".into()
+            },
+            "sni 原样透传(写什么传什么, 含真名写法)"
         );
         let edge_ps = {
             let g = SERIAL.lock().unwrap();
@@ -856,25 +797,25 @@ mod tests {
         assert!(
             edge_ps.contains(&SerialPlan {
                 ip: "140.82.112.29".into(),
-                sni: "baidu.com".into()
+                sni: "real".into()
             }),
-            "ghapp 伪装条目保留: {edge_ps:?}"
+            "ghapp 条目保留, sni 原样透传: {edge_ps:?}"
         );
         assert!(
             edge_ps.contains(&SerialPlan {
                 ip: "185.199.108.154".into(),
-                sni: "baidu.com".into()
+                sni: "sni".into()
             }) && edge_ps.contains(&SerialPlan {
                 ip: "185.199.109.153".into(),
-                sni: "baidu.com".into()
+                sni: "sni".into()
             }),
-            "Fastly .153/.154 旧表真名强制归一为伪装: {edge_ps:?}"
+            "sni 文件权威——旧表显式真名写法原样保留: {edge_ps:?}"
         );
         assert!(
             edge_ps
                 .iter()
-                .any(|p| route::fastly_last_octet(&p.ip) == Some("133") && p.sni == dial::MODE_SNI),
-            "种子补缺应追加 .133 真名内容域条目: {edge_ps:?}"
+                .any(|p| route::fastly_last_octet(&p.ip) == Some("133") && p.sni == "baidu.com"),
+            "种子补缺应追加 .133 伪装内容域条目: {edge_ps:?}"
         );
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("成功次数") && !b.contains("分数"));
@@ -915,11 +856,12 @@ mod tests {
         );
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(b.contains("185.199.110.133"), "补缺应落盘: {b}");
+        // 2026-10-19 起三个 .133 复活移出退役清单、入种子——应随补缺落盘（伪装形态）
         assert!(
-            !b.contains("185.199.108.133")
-                && !b.contains("185.199.109.133")
-                && !b.contains("185.199.111.133"),
-            "退役死 IP 不应补缺落盘: {b}"
+            b.contains("185.199.108.133")
+                && b.contains("185.199.109.133")
+                && b.contains("185.199.111.133"),
+            "复活的内容边缘应随种子补缺落盘: {b}"
         );
     }
 
@@ -951,7 +893,7 @@ mod tests {
             vec![
                 SerialPlan {
                     ip: "185.199.108.154".into(),
-                    sni: dial::MODE_SNI.into(),
+                    sni: "sni".into(),
                 },
                 SerialPlan {
                     ip: "140.82.112.29".into(),
@@ -990,7 +932,7 @@ mod tests {
         assert_eq!(back["core"].len(), 2);
         assert_eq!(back["core"][0].sni, "baidu.com");
         assert_eq!(back["edge"].len(), 2);
-        assert_eq!(back["edge"][0].sni, dial::MODE_SNI);
+        assert_eq!(back["edge"][0].sni, "sni");
         assert!(!b.contains("fastly") && !b.contains("codeload"));
     }
 
