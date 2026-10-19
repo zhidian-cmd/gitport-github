@@ -1,5 +1,7 @@
 # GitPort GitHub —— GitHub 加速器
 
+[![支持](https://img.shields.io/badge/支持-请作者喝咖啡-orange)](#支持项目)
+
 **中国大陆访问 GitHub 的本地加速器 —— 免插件、免服务器、后台约 12MB。**
 clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网站流量完全不受影响。
 直连流量本机直达 GitHub 官方边缘；镜像链剥凭据，不外泄。
@@ -76,6 +78,16 @@ cargo test
 ## Roadmap
 
 - 多站点加速（HuggingFace 等）：拨号引擎、串发表、镜像链均为数据驱动，扩服务 = 加数据不改代码
+
+## 支持项目
+
+如果 GitPort GitHub 帮到了你，**点个 Star ⭐** 就是最好的支持——它能让更多人看到这个项目。
+
+想再进一步，请作者喝杯咖啡（**完全自愿，不影响任何功能**）：
+
+<p align="center"><img src="docs/qr-sponsor.png" width="280" alt="微信赞赏码"></p>
+
+微信扫一扫 · 金额随缘。本项目没有付费版、也没有付费功能；捐赠与功能开放、版本更新、Issue 响应没有任何关系。
 
 ## 声明
 
