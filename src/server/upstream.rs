@@ -136,7 +136,9 @@ pub async fn dial_h2(
     let (conn_io, ip, shape) = pool::serial_dial(pool_name, host, ctx, true, Some(log))
         .await
         .map_err(|e| e.to_string())?;
-    let form = if shape == pool::dial::MODE_SNI {
+    let form = if shape.is_empty() {
+        "无"
+    } else if shape == host {
         "真名"
     } else {
         "伪装"

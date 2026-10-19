@@ -44,7 +44,7 @@ flowchart TB
     Q --> S4
     subgraph L5["⑤ 上游拨号（所有直连腿共用）"]
         D1["串发：三池一个 IP 一个试"]
-        T1["boring Chrome TLS 指纹<br/>主站族 = 伪装 SNI · Fastly .133 = 真名 SNI"]
+        T1["boring Chrome TLS 指纹<br/>全族 = 伪装 SNI（.133 于 2026-10-19 切换）"]
         H1["h2 多路复用 + 复用优先<br/>活跃窗口每 30s PING 保活（静默 5 分钟停）"]
     end
     S1 --> D1
@@ -152,7 +152,7 @@ flowchart TD
 
 | host 类型 | 只认哪类条目 | SNI 形态 |
 |---|---|---|
-| `*.githubusercontent.com` 内容域 | Fastly 末段 .133 | 真名（伪装会被该边缘挂起） |
+| `*.githubusercontent.com` 内容域 | Fastly 末段 .133 | 伪装（2026-10-19 切换；Fastly 默认证书 SAN 覆盖全系） |
 | `*.githubassets.com` 静态资源 | Fastly 末段 .154 / .215 | 伪装 |
 | `github.io` / `*.github.io` | Fastly 末段 .153 | 伪装 |
 | 主站 / api / auth 主机 | 非 Fastly 段 | 伪装 `baidu.com` |

@@ -40,6 +40,8 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 | 其余一切（example.com、githubstatus.com、fastly.com…） | DIRECT | ✅ |
 | 边界：notgithub.com / xgithub.com / evilgithub.com / github.com.evil.com | DIRECT（不误吞） | ✅ 四个边界主机全 DIRECT |
 
+> 注：池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连的保险链（2026-10-19 晚复核确认，不应视为路由偏差）。
+
 **白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"。
 
 ---
@@ -77,7 +79,7 @@ core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 
 |---|---|---|---|---|---|
 | core | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ github.com/ → 140.82.121.3（core 网站边缘） |
 | api | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ api.github.com/ → 140.82.114.6 |
-| edge | **content** | `*.githubusercontent.com` | **Fastly `.133` + 真名 SNI** | **MirrorDns**（先镜像链后 DNS 腿） | ✅ avatars → 185.199.110.133；raw 直连被 GFW RST 后走镜像（见第 4 节） |
+| edge | **content** | `*.githubusercontent.com` | **Fastly `.133` + 伪装 SNI**（2026-10-19 晚切换，默认证书 SAN 覆盖全系） | **MirrorDns**（先镜像链后 DNS 腿） | ✅ avatars → 185.199.110.133；raw 直连被 GFW RST 后走镜像（见第 4 节） |
 | edge | **assets** | `*.githubassets.com` | Fastly `.154` / `.215` + 伪装 SNI | Dns | ✅ githubassets → 185.199.**108.154**（CSS/JS 200，root 404） |
 | edge | **io** | `*.github.io` | Fastly `.153` + 伪装 SNI | Dns | ✅ octocat.github.io → 185.199.**108.153**，200 |
 | edge | **auth** | `githubapp.com` 系；**兼 edge 未列族 host 的兜底族** | 非 Fastly 段 + 伪装 SNI | Dns | ✅ githubapp.com → **140.82.112.29**（非 Fastly），200 |
@@ -139,7 +141,7 @@ core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 
 - 本机 curl 无 h2 支持，实测连接全是 h1（日志 `alpn=http/1.1` 行可见）；浏览器页面连接走 h2（用户实例日志 `alpn=h2` 佐证），IDM 下载走 h1（上次排查结论）。协议选择本身不影响路由结论。
 - DNS 兜底腿**成功**的路径未实地触发（需要 assets/io/auth 整族死亡）。
 - objects 域自身的镜像 e2e 未做（无法构造有效 signed URL；带凭据的 signed URL 按设计拒绝走镜像）。
-- Tunnel 分支的真实请求未出现（非池域名 PAC 即 DIRECT，永不达代理；该分支只在强制代理时兜底）。
+- ~~Tunnel 分支的真实请求未出现~~ **2026-10-19 晚已实地触发**：强制经代理访问 example.com → 200 直通，响应无诊断头（端到端 TLS 隧道无法注入，属预期形态）。
 - core/api 的「网站 IP 落 api 返 301」互斥现象本次只验证了各自命中正确边缘（114.6 vs 121.3），未构造落错场景。
 
 ---
@@ -169,10 +171,11 @@ core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 
 
 ---
 
-## 8. 复查发现的两个已知边界（非路由错误，登记在案）
+## 8. 复查发现的已知边界（非路由错误，登记在案）
 
 1. **HEAD 假阳性（已修，324faa6）**：交付计数体最初不区分 HEAD，HEAD 大文件请求会误报 `推了(0B/N)后连接终止`。HEAD 响应本就无体、hyper 弃体不轮询，Drop 逻辑误判为客户端中断。已修：HEAD 不包计数体，GET 真中断照常记录。
 2. **裸域 PAC/路由不一致（无实际影响，不动）**：`githubassets.com` 与 `githubusercontent.com` 两个**裸域**（无子域）在 PAC 的 `fpMatch` 里 `h === d` 精确命中 → 送进代理；但代理内 `pool_for` 的通配符卡点号边界不认裸域 → 判 Tunnel（纯隧道直通）。这两个裸域没有业务、浏览器永远不会请求它们；即使被强制请求，纯隧道也能通，只是不走池/MITM。真实业务域的裸域（github.com / api.github.com / githubapp.com / github.io）两边判定一致。
+3. **退役 IP 日内波动（2026-10-19 晚）**：185.199.108/109/111.133 当日午后两测 TCP 死、晚测复活且 raw 出 200——属封锁窗口假死而非真死。已按 RETIRED_IPS 清单自身的设计约定（"复活了就从清单删"）移出退役名单，回填 edge 尾部交串发动态裁决：死时自动垫底、活时自动置顶。140.82.115-120 段当日三测仍 TCP 死，维持退役。另：web 族对其余 vhost 一律 301 重定向（接得住不交付），唯一全服务 IP 为 140.82.113.22；`.9` 段 codeload 专用边缘族为本次测绘新发现，详见 CONFIG.md 认 IP 速查。
 
 ---
 

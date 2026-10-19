@@ -11,8 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-pub const MODE_SNI: &str = "sni"; // BoringSSL 真 SNI
-pub const MODE_FAKE_PFX: &str = "fake:"; // 表内裸域名(如 baidu.com)经 plan_mode 加上, 证书按 host 校验
+pub const MODE_FAKE_PFX: &str = "fake:"; // 旧表伪装前缀, 加载时剥除; sni 原样透传, 证书按 host 校验
 
 pub type BoringTls = tokio_boring::SslStream<TcpStream>;
 
@@ -149,22 +148,10 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
         }
     };
 
-    match mode {
-        MODE_SNI => {
-            ssl.set_hostname(host)
-                .map_err(|e| io_err(format!("SNI 设置失败: {e}")))?;
-        }
-        m if m.starts_with(MODE_FAKE_PFX) => {
-            let fake = m.trim_start_matches(MODE_FAKE_PFX);
-            if fake.is_empty() {
-                return Err(io_err("非法伪装 SNI(空域名)".into()));
-            }
-            ssl.set_hostname(fake)
-                .map_err(|e| io_err(format!("伪装 SNI 设置失败: {e}")))?;
-        }
-        other => {
-            return Err(io_err(format!("未知握手形态 {other:?}")));
-        }
+    // sni 透传:非空即作为 ClientHello SNI,空串 = 无 SNI 扩展;校验名恒为 host(下方 param)。
+    if !mode.is_empty() {
+        ssl.set_hostname(mode)
+            .map_err(|e| io_err(format!("SNI 设置失败: {e}")))?;
     }
     // 校验名恒为目标 host（与 SNI 解耦；IP 形式走 set_ip）。
     let param = ssl.param_mut();
@@ -236,7 +223,7 @@ pub async fn dial_one(
 }
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl(host, MODE_SNI, None)?;
+    let ssl = client_ssl(host, host, None)?;
     let tcp = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         TcpStream::connect((host, 443)),
@@ -406,7 +393,7 @@ mod tests {
             eprintln!("跳过: 未找到 boring 测试证书目录(编译过 boring 后重试, 或设 BORING_TEST_DIR)");
             return;
         };
-        let obs = handshake_probe(OFFICIAL_HOST, MODE_SNI, &material)
+        let obs = handshake_probe(OFFICIAL_HOST, OFFICIAL_HOST, &material)
             .await
             .unwrap();
         assert_eq!(obs.sni.as_deref(), Some(OFFICIAL_HOST));
@@ -419,7 +406,7 @@ mod tests {
             eprintln!("跳过: 未找到 boring 测试证书目录(编译过 boring 后重试, 或设 BORING_TEST_DIR)");
             return;
         };
-        let obs = handshake_probe(OFFICIAL_HOST, "fake:baidu.com", &material)
+        let obs = handshake_probe(OFFICIAL_HOST, "baidu.com", &material)
             .await
             .unwrap();
         assert_eq!(obs.sni.as_deref(), Some("baidu.com"));
