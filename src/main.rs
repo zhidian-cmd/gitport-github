@@ -1,10 +1,6 @@
-// GitPort GitHub —— 多站点加速代理工作台。
-// 桌面框架: tao 原生窗口 + wry(WebView2 渲染 WebUI) + tray-icon 系统托盘。
-// 代理 127.0.0.1:7810 + WebUI http://127.0.0.1:7811(窗口加载该地址, 无 WebView2 时回退浏览器)。
-// 启动参数: -tray 直接驻留托盘不开窗(开机自启用), -headless 只跑代理+WebUI,
-// -port N 覆盖代理端口, -webui N 覆盖 WebUI 端口(与其他实例共存时避开 7810/7811)。
-// Windows 子系统: release 双击运行无控制台黑框(日志走文件+WebUI 环形缓冲,
-// 崩溃取证走 crash.log); headless 仍可用命令行重定向观察 stdout。
+// GitPort GitHub -- GitHub 加速代理工作台。
+// tao 窗口 + wry(WebView2) + 托盘；代理 7810 + WebUI 7811；release 无控制台（日志走 WebUI，崩溃取证 crash.log）。
+// 启动参数：-tray 驻留托盘 / -headless 只跑代理+WebUI / -port N / -webui N。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod certgen;
@@ -35,15 +31,13 @@ fn main() {
 
 fn run() {
     if desktop::already_running() {
-        // 单实例：二次启动不新开托盘，而是让已在运行的那个把工作台唤起来；
-        // 唤起失败（旧版本实例/headless/端口不通）才退回提示框。
+        // 单实例：二次启动唤起已有实例的工作台；唤起失败退回提示框。
         if !desktop::signal_show(config::webui_port()) {
             desktop::notify_already_running();
         }
         return;
     }
-    // 工作目录切到 exe 目录：开机自启/快捷方式的 cwd 不可靠，
-    // 而 ca.crt / settings.json / plans.json 都按相对路径读写
+    // 工作目录切到 exe 目录：自启/快捷方式的 cwd 不可靠，数据文件按相对路径读写。
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -52,10 +46,7 @@ fn run() {
     logger::set_crash_path(&exe_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
-    // 兜底：run 任何正常返回路径（含窗口循环 return / headless
-    // 信号）都再还原一次系统代理。on_quit 已先清，此处幂等无害；端口无关：任何
-    // 127.0.0.1 的 /proxy.pac 残留（含崩溃/被杀遗留）都会被清掉。
-    // 注意：panic/abort 不走本 defer，但崩溃后下次启动 heal_stale_proxy 兜底。
+    // 兜底：正常返回路径再还原一次系统代理（幂等）；panic 由下次启动自愈。
     let _proxy_guard = settings::ProxyGuard::new();
 
     let args: Vec<String> = std::env::args().collect();
@@ -122,7 +113,7 @@ fn run() {
         });
     }
 
-    // headless: 只跑代理+WebUI, 不开窗口/托盘(调试/服务器用)
+    // headless: 只跑代理+WebUI, 不开窗口/托盘
     if headless {
         loop {
             std::thread::park();
@@ -131,9 +122,9 @@ fn run() {
 
     // ---------- 桌面框架 ----------
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        // 退出第一步: 先还原系统代理(在任何退出机器武装之前)
+        // 退出第一步: 先还原系统代理
         settings::remove_system_proxy();
-        // 停代理(异步收尾, 端口随 serve 退出释放)
+        // 停代理(异步收尾)
         let rt = rt.clone();
         std::thread::spawn(move || {
             server::stop_proxy(&rt);

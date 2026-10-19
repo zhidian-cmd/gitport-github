@@ -1,14 +1,8 @@
-//! 串发拨号：plans.json 是唯一权威，纯粹按表重试。
-//!
-//! - 元素 {ip, sni}; sni 形态按 IP 族定(见 shape_for_ip)，SNI 与校验名解耦
-//! - 排序: 成功(ok)置顶, 失败(拨号错/零回包/拦截页)垫底; 同 IP 重复置顶是
-//!   no-op 不写盘不打日志 —— 否则每个成功响应都重写 plans.json
-//! - 全灭: 冷却 30s 快速失败, 不自动拉源 —— 表内容只靠手改维护
-//! - 仅顺序真变更才写盘(2s 内原子写回); 文件可随时手改(改完重启生效)
-//! - 覆盖 core/api/edge 三池(均直连)。edge 混合池按 host 族对口选择
-//!   (entry_serves)；uploads.github.com 与 objects-origin 已非池化(直连兜底)；
-//!   codeload 与 releases 大文件仍全镜像无表
-//! —— 见 config::GROUPS 与 server/mitm.rs。
+//! 串发拨号：plans.json 唯一权威，纯按表重试。
+//! 元素 {ip, sni}，SNI 形态按 IP 族定（shape_for_ip），SNI 与校验名解耦。
+//! ok 置顶 / 失败垫底，同 IP 重复置顶 no-op 不写盘；全灭冷却 30s 快速失败。
+//! 仅顺序真变更才写盘（2s 原子写回），文件可随时手改（重启生效）。
+//! 覆盖 core/api/edge 三池；edge 混合池按 host 族对口选择（见 route.rs）。
 
 pub mod dial;
 pub mod route;
@@ -24,8 +18,7 @@ use tokio_util::sync::CancellationToken;
 /// 日志回调（server/main 注入）。
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 配对表单条：一个连接方案 = IP × SNI 形态。顺序即优先级。
-/// 形态按 IP 族定（shape_for_ip）；显式写法（sni/baidu.com）读入时保留。
+/// 配对表单条：IP × SNI 形态，顺序即优先级。
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SerialPlan {
     pub ip: String,
@@ -33,20 +26,15 @@ pub struct SerialPlan {
     pub sni: String,
 }
 
-/// 串发覆盖的直连池：core（站点）/ api（api.github.com）/
-/// edge（auth 主机 + Fastly 静态边缘，均不外泄镜像/镜像不路由）。codeload 与
-/// releases 大文件全镜像、无表。此常量同时决定落盘/UI 顺序（两者恒一致）。
-/// uploads.github.com 与 objects-origin（上传链路）2026-10-17 起非池化，
-/// 系统 DNS 直连兜底（objects-origin 走 config::DIRECT_HOSTS，连代理都不进）。
+/// 串发池：core（站点）/ api / edge（auth + Fastly 静态边缘）。此常量决定落盘/UI 顺序。
+/// codeload 与 releases 大文件全镜像无表；uploads/objects-origin 非池化直连。
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
 /// 内置种子：首次运行（无 plans.json）时展开成初始表。
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
-/// 第三方镜像候选池（gh-proxy 系，URL 前缀代理：镜像域名 + "/" + 原始完整 URL）。
-/// 域名是常量数组，随时可改。健康度要求（防误加假站）：只收能真返回 GitHub
-/// 文件内容的前缀代理 —— ghproxy.link 之类返 200 + 自家 SPA 主页，永不启用
-/// （mirror_do 假页拒判兜底）。镜像只路由文件内容域，CSS/JS 与 github.io 不过镜像。
+/// 第三方镜像候选池（URL 前缀代理：镜像域名 + "/" + 原始完整 URL），可随时增改。
+/// 只收能真返回 GitHub 内容的前缀代理（假站由 mirror_do 拒判兜底）；CSS/JS 与 github.io 不过镜像。
 pub const MIRRORS: &[&str] = &[
     "https://mirror.ghproxy.com",
     "https://gh-proxy.com",
@@ -61,8 +49,7 @@ pub const MIRRORS: &[&str] = &[
     "https://cf.ghproxy.cn",
 ];
 
-/// 有镜像的内容域 host（镜像链板块只覆盖这些 —— 镜像不路由 CSS/JS 与
-/// github.io，它们归 edge 直连池，无链可记）。
+/// 有镜像的内容域 host（CSS/JS 与 github.io 归 edge 直连池，无链）。
 pub const CONTENT_HOSTS: &[&str] = &[
     "github.com",
     "raw.githubusercontent.com",
@@ -75,10 +62,7 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 默认镜像链（2026-10-15 沙箱实测 8 host × 11 镜像 TTFB 升序；失联镜像
-/// 按池常量序排尾）。每 host 链序不同 —— 同镜像对不同资源差异巨大
-/// （v4 拉 gist 641ms 最快但 codeload 1.4s 开外；cf.ghproxy.cn 独家路由
-/// user-images/media）。校准后顺序以 plans.json mirrors 板块为准。
+/// 默认镜像链（实测 TTFB 序，每 host 链序不同）；校准后以 plans.json mirrors 为准。
 pub const DEFAULT_CHAINS: &[(&str, &[&str])] = &[
     (
         "github.com",
@@ -231,12 +215,8 @@ pub fn serial_pool(name: &str) -> bool {
     SERIAL_POOLS.contains(&name)
 }
 
-/// IP → 默认 SNI 形态（2026-10-14 实测：Fastly 边缘对任意 SNI 都返本边缘
-/// 主证书，推翻"按 SNI 路由证书"旧结论）。.133 伪装会被边缘挂起（握手 OK
-/// 但零回包）只能真名；.153/.154/.215（assets 新代边缘）伪装可正常 HTTP 且
-/// 抗 SNI 阻断（raw 真名被 RST 即前车之鉴）；主站/auth 边缘伪装。
-/// 用于种子展开与旧表空/legacy 值归一；表内显式写法优先（Fastly 段除外
-/// —— 形态由边缘行为决定，显式写法无意义）。
+/// IP → 默认 SNI 形态（Fastly 边缘对任意 SNI 返本边缘主证书）。
+/// .133 伪装被挂起只能真名；.153/.154/.215 伪装抗 SNI 阻断；主站/auth 伪装。Fastly 段强制按族归一。
 fn shape_for_ip(ip: &str) -> &'static str {
     if route::fastly_last_octet(ip) == Some("133") {
         dial::MODE_SNI
@@ -253,32 +233,23 @@ const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
 
 struct SerialTab {
     pools: HashMap<String, Vec<SerialPlan>>,
-    /// 全灭冷却（2026-10-19 起按 host 记账，不再按池）：该 host 所在族全灭
-    /// 一次后 30s 内快速失败。池级冷却会让一个域的全灭毒倒同池其他族的
-    /// 健康腿（实测 camo 无镜像全灭 → 30s 内 assets/io/auth 全部快速失败
-    /// → 落 502）。有镜像兜底的 host 不冷却（内容域熔断已覆盖，见
-    /// mitm content_direct_fail）。
+    /// 全灭冷却按 host 记账（池级会让一个域全灭毒倒同池其他族），30s。
+    /// 有镜像兜底的 host 不冷却（内容域熔断已覆盖）。
     cool: HashMap<String, Instant>,
-    /// per-IP 死亡冷却（2026-10-19）：TCP 层失败 = 该 IP 对谁都不通，直接
-    /// 跳过。仅"逐个沉底"不够 —— 全失败时沉底会把顺序还原成原样，每个
-    /// 请求仍要重撞死 IP（实测 raw 11.3s）。指数退避：连续 TCP 失败
-    /// 60s → 5min → 30min（封顶）—— 10 个死 IP 每 60s 各打扰 3s 的代价
-    /// 实测把 github.com 冷请求拖到 12.4s。成功拨号即清除计数。
+    /// per-IP 死亡冷却：TCP 层失败 = IP 对谁都不通，直接跳过。
+    /// 指数退避 60s → 5min → 30min 封顶；成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
-    /// 镜像使用链：内容域 host -> 有序镜像列表（串行逐个用，禁并发竞速）。
-    /// 顺序来源：内置默认(实测) / UI 校准半自动重排 / 手改。
+    /// 镜像使用链：host → 有序镜像列表（串行）；来源=内置默认/UI 校准/手改。
     mirrors: HashMap<String, Vec<String>>,
     dirty: bool,
 }
 
 static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// 表头轮换日志回调（serial_load 注入）：表头真变时打一行，让 plans.json
-/// 的每次轮换可追溯（哪类事件把哪个 IP 顶上/沉下）。
+/// 表头轮换日志回调：表头真变时打一行，轮换可追溯。
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// plans.json 反序列化：直连池条目 + 镜像链板块（互不干扰，flatten 收纳
-/// 未知键 —— 旧版 ghapp/assets 等残留键随 pools 读入后被按池名过滤）。
+/// plans.json 反序列化：直连池条目 + 镜像链板块；flatten 收纳未知键。
 #[derive(serde::Deserialize)]
 struct PlansFile {
     #[serde(default)]
@@ -300,8 +271,7 @@ pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     out
 }
 
-/// 手工排版序列化：每条目压成单行 —— 表是给人看也给人改的。
-/// 池按 UI 固定顺序输出，末尾附镜像链板块（每 host 一行数组）。
+/// 手工排版序列化：每条目压成单行；池按 UI 固定顺序，末尾附镜像链板块。
 fn encode_plans(
     tab: &HashMap<String, Vec<SerialPlan>>,
     mirrors: &HashMap<String, Vec<String>>,
@@ -355,9 +325,7 @@ fn encode_plans(
     b
 }
 
-/// JSON 字符串字面量（含引号，serde 全量转义）：控制字符/反斜杠/引号都不产
-/// 坏 JSON。旧手写版只转 \ 和 "，值里混入控制字符会写出非法 plans.json，
-/// 下次启动解析失败 → 用户手排表被种子覆盖。
+/// serde 全量转义（手写版漏控制字符会写出非法 plans.json）。
 fn esc(s: &str) -> String {
     serde_json::to_string(s).expect("字符串序列化不会失败")
 }
@@ -388,8 +356,7 @@ fn plans_path() -> PathBuf {
     dir.join("plans.json")
 }
 
-/// 初始化：读 exe 同目录 plans.json；不存在则用内置种子写出。
-/// 同时启动落盘 ticker（顺序变更 2s 内写回）。
+/// 初始化：读 plans.json（无则种子展开），并启动 2s 去抖落盘。
 pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
     *SERIAL_LOG.lock().unwrap() = log.clone();
@@ -397,8 +364,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
     let raw = std::fs::read_to_string(&path).ok();
     let parsed = raw.as_deref().and_then(|b| serde_json::from_str::<PlansFile>(b).ok());
     if let (Some(_raw), None) = (&raw, &parsed) {
-        // 有文件但解析失败(2026-10-17 安全审计 F-006)：不许静默覆丢用户
-        // 手排表 —— 先备份原文件, 再走种子重建, 日志留痕
+        // 解析失败：先备份原文件再按种子重建，不静默覆丢用户手排表。
         let bak = path.with_extension("json.bak");
         if std::fs::copy(&path, &bak).is_ok() {
             if let Some(l) = log.as_ref() {
@@ -420,27 +386,20 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         mirrors: HashMap::new(),
         dirty: false,
     };
-    // 遍历已知池（而非文件里的键）：文件缺池/被旧 exe 误清时用种子补齐，
-    // 防"串发表为空"。文件为准，不做
-    // 种子归属剔除；种子结构变更时删 plans.json 重建（2026-10-13 决定）。
+    // 遍历已知池：文件缺池时用种子补齐；文件为准，不做种子归属剔除。
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
         for p in ps {
-            // 已下线 IP（route::RETIRED_IPS，2026-10-19 TCP 实测死）：
-            // 实表里的也不再保留 —— 死 IP 每分钟打扰一次（3s/个）的代价
-            // 实测把冷请求拖到十几秒
+            // 已下线 IP（route::RETIRED_IPS）实表里也不再保留——死 IP 打扰拖慢冷请求。
             if p.ip.parse::<std::net::IpAddr>().is_err()
                 || p.sni == "ech"
                 || route::is_retired(&p.ip)
             {
                 continue;
             }
-            // ech: 边缘不发布 ECH 记录, 恒失败 —— 清除旧表遗留;
-            // 形态: Fastly 三段(133/153/154)强制按 IP 族归一(形态由边缘行为
-            // 决定, 显式写法无意义 —— 旧表 .153/.154 的真名条目随 2026-10-14
-            // "伪装抗 SNI 阻断"实测结论统一迁移); 其余条目显式写法保留,
-            // 空与旧值(real/nosni)按 IP 族归一; 表内存量统一为裸域名
+            // ech 恒失败，清除旧表遗留；Fastly 段强制按 IP 族归一（形态由边缘行为决定）。
+            // 其余条目显式写法保留，空/旧值按 IP 族归一。
             let sni = if route::fastly_last_octet(&p.ip).is_some() {
                 shape_for_ip(&p.ip).to_string()
             } else {
@@ -448,9 +407,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                     "" | "real" | "nosni" => shape_for_ip(&p.ip).to_string(),
                     dial::MODE_SNI => dial::MODE_SNI.to_string(),
                     s => {
-                        // 表层格式校验(2026-10-17 安全审计 F-003): sni 会进
-                        // WebUI 与 ClientHello, 只认域名形态字符 —— plans.json
-                        // 手改内容不得携带标记进前端
+                        // sni 会进 WebUI 与 ClientHello，只认域名形态字符（防注入）。
                         let bare = s.trim_start_matches(dial::MODE_FAKE_PFX);
                         if !bare.is_empty()
                             && bare
@@ -466,7 +423,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             };
             plans.push(SerialPlan { ip: p.ip, sni });
         }
-        // 文件里该池缺失/被旧版二进制清掉 → 用种子补齐(自愈, 防"串发表为空")
         if plans.is_empty() {
             if let Some(ips) = seed_db().get(*name) {
                 for ip in ips {
@@ -482,9 +438,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 }
             }
         }
-        // 种子补缺：新版本引入的新边缘 IP（如 2026-10-14 的 .133 内容域）在
-        // 用户现存表里没有 —— 追加到表尾并打一行日志，否则头像直连对老用户
-        // 永远无候选。只追加不重排，用户手改的顺序原样保留。
+        // 种子补缺：新边缘 IP 追加表尾（只追加不重排）。
         if let Some(ips) = seed_db().get(*name) {
             let mut added = 0usize;
             for ip in ips {
@@ -511,8 +465,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         }
         tab.pools.insert((*name).to_string(), plans);
     }
-    // 镜像链归一：未知 host / 池外镜像丢弃；缺失 host 用内置默认链（实测
-    // TTFB 序）；池内新增镜像追加到每条链尾部（对齐种子补缺思想）。
+    // 镜像链归一：未知 host/池外镜像丢弃；缺失 host 用默认链；新镜像追加尾部。
     for (host, chain) in loaded_chains {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
             continue;
@@ -543,18 +496,15 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             }
         }
     }
-    // 先设内存态，再统一重写一次（snapshot 读内存）：剥掉旧统计字段/补齐形态，
-    // 文件与内存恒一致。测试场景：先前断言失败可能 poison 全局锁，恢复后再写。
+    // 先设内存态再统一重写：剥旧统计字段/补齐形态，文件与内存恒一致。
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
     write_plans_file(&path, &snap, &chains);
 }
 
-/// 顺序变更 2s 内写回实体文件（变更驱动 + 去抖）。
-/// 必须在 tokio runtime 构建后调用（main 用 rt.spawn 挂起）。
-/// 纯事件驱动：无变更时任务睡在 Notify 上，进程零周期唤醒（托盘态
-/// "几乎无活动"裁定的一部分）—— 原 2s interval ticker 无变更也醒。
+/// 顺序变更 2s 内写回（事件驱动 + 去抖）；须在 tokio runtime 构建后调用。
+/// 无变更时睡在 Notify 上，零周期唤醒。
 static PERSIST_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// dirty 置位后调用：踢醒落盘任务。无等待者时存许可证，语义安全。
@@ -566,7 +516,7 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
     rt.spawn(async move {
         loop {
             PERSIST_KICK.notified().await;
-            // 2s 去抖：合并一串快速变更（页面加载时表头连续翻飞）为一次写盘
+            // 2s 去抖：合并快速变更。
             tokio::time::sleep(Duration::from_secs(2)).await;
             let dirty = {
                 let mut g = SERIAL.lock().unwrap();
@@ -585,10 +535,7 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
     });
 }
 
-/// sni 形态 → dial_one 模式（裸域名 = 伪装，走 "fake:<sni>" 前缀；
-/// 兼容旧表带 "fake:" 前缀的写法，两种格式行为一致）。
-/// MODE_SNI = 真名形态（Fastly 边缘专用，按 SNI 路由证书）。
-/// 旧表 "nosni" 由 serial_load 读入时按 IP 族归一，此处不再特判。
+/// sni 形态 → dial 模式：裸域名 = 伪装（兼容旧表带 fake: 前缀）；MODE_SNI = 真名。
 pub fn plan_mode(sni: &str) -> String {
     match sni {
         dial::MODE_SNI => dial::MODE_SNI.to_string(),
@@ -600,10 +547,8 @@ pub fn plan_mode(sni: &str) -> String {
     }
 }
 
-/// 命中条目整体移位：置顶（保持组内相对序）/垫底。why = 事件原因（进日志）。
-/// 顺序没变（同 IP 重复置顶/已在尾）直接返回：不置 dirty、不打日志 ——
-/// 每个成功响应都 no-op 置顶一次，若都写盘，plans.json 会被无意义地反复重写。
-/// 表头真变了才打一行轮换日志，让"文件在轮换"始终有据可查。
+/// 命中条目整体移位：置顶/垫底。顺序没变直接返回（no-op 不写盘不打日志）。
+/// 表头真变才打一行轮换日志。
 fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front: bool, why: &str) {
     let mut g = SERIAL.lock().unwrap();
     let tab = g.as_mut().unwrap();
@@ -651,12 +596,9 @@ fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front
     }
 }
 
-/// 单串发：按表逐个试，失败条目垫底换下一个，绕表一圈全灭 → 冷却 30s
-/// 报错。置顶只由数据层 ok（serial_note）认证 —— 拨号成功不算成功。
-/// tls_handshake=false 时只做裸 TCP 拨号（透传 CONNECT 隧道）。ctx 到期只
-/// 掐正在试的那条：没试完 ≠ 失败（不沉底）≠ 全灭（不冷却）。
-/// 返回 (连接, 所用 IP, 所用形态)。混合池按 host 选族（route::POOL_ROUTES），
-/// 只试对口条目。
+/// 单串发：按表逐个试，失败垫底换下一个，绕表一圈全灭 → 冷却 30s 报错。
+/// 置顶只由数据层 ok 认证；ctx 到期只掐正在试的那条（不沉底不冷却）。
+/// 混合池按 host 选族只试对口条目。返回 (连接, IP, 形态)。
 pub async fn serial_dial(
     pool_name: &str,
     host: &str,
@@ -664,7 +606,7 @@ pub async fn serial_dial(
     tls_handshake: bool,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
-    // 全灭冷却期内快速失败（按 host：只毒该 host 自己，不毒同池其他族）
+    // 全灭冷却期内快速失败（按 host 记账，只毒该 host 自己）。
     {
         let g = SERIAL.lock().unwrap();
         let tab = g.as_ref().unwrap();
@@ -689,10 +631,7 @@ pub async fn serial_dial(
         g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
-    // 族筛选（路由细分）：池内按 host 选族，只试对口条目 —— 不试也不垫底，
-    // 否则每类请求都把另一类 IP 试败沉底，共享表顺序永久 ping-pong。
-    // 兜底语义与 route::family_for 一致（edge 未列族 host 归 auth 末族），
-    // 由 route::serial_family 单点实现 + serial_family_matches_family_for 钉住。
+    // 族筛选：只试对口条目（不试不垫底防池序乒乓）；兜底语义与 family_for 一致（单测钉住）。
     let family = route::serial_family(pool_name, host);
     let serves = family.map(|f| f.serves);
     let family_name = route::family_for(pool_name, host);
@@ -707,7 +646,6 @@ pub async fn serial_dial(
             }
         }
         eligible += 1;
-        // per-IP 死亡冷却（指数退避）：跳过期间不打扰（见 SerialTab::dead）
         {
             let g = SERIAL.lock().unwrap();
             if let Some((until, _)) = g.as_ref().and_then(|t| t.dead.get(&p.ip)) {
@@ -736,12 +674,9 @@ pub async fn serial_dial(
                 if ctx.is_cancelled() {
                     break; // 请求预算到期：这条没试完，不算失败；没试完 ≠ 全灭，不冷却
                 }
-                // 失败分层沉底（2026-10-18 实测修正）：
-                // · TCP 层失败（拨号超时/拒绝/重置）= 该 IP 对谁都达不通，与域无关，
-                //   内容域也必须沉底 —— 实测 108/109/111.133 TCP 全超时，旧规则
-                //   豁免沉底导致每轮都先撞 9 秒死 IP 才落镜像（页面 10-12s）。
-                // · TLS 层失败（raw 真名被 RST）才保留内容域豁免 —— 那是按域干扰，
-                //   沉底会连坐健康的 .133(avatars 同 IP)（2026-10-15 实锤）。
+                // 失败分层沉底：TCP 层失败 = IP 对谁都达不通，与域无关，内容域也必须沉底
+                // （实测 108/109/111.133 TCP 全超时，豁免导致每轮先撞 9s 死 IP）。
+                // TLS 层失败（raw 真名被 RST）是按域干扰，保留内容域豁免——沉底会连坐健康的 .133。
                 let msg = e.to_string();
                 let tcp_level = msg.starts_with("TCP")
                     || matches!(
@@ -756,9 +691,7 @@ pub async fn serial_dial(
                     serial_move(pool_name, |q| *q == target, false, why);
                 }
                 if tcp_level {
-                    // 指数退避置位：60s → 5min → 30min（封顶）。死 IP 不是
-                    // 每分钟都值得打扰一次 —— 10 个死 IP × 3s 实测把冷请求
-                    // 拖到 12.4s（2026-10-19 github.com 首页实测）
+                    // 指数退避 60s → 5min → 30min 封顶；死 IP 不值得每分钟打扰。
                     if let Ok(mut g) = SERIAL.lock() {
                         if let Some(t) = g.as_mut() {
                             let n = t.dead.get(&p.ip).map(|(_, n)| *n).unwrap_or(0) + 1;
@@ -783,8 +716,7 @@ pub async fn serial_dial(
         return Err("请求预算到期".to_string());
     }
     if tried == 0 {
-        // 一条都没试：对口候选全在死亡冷却（不是全灭，不冷却，快速失败）
-        // 或被形态滤光（同）。两者分开报，排障时一眼可辨
+        // 一条都没试：对口候选全在死亡冷却或被形态滤光；分开报便于排障。
         if eligible > 0 {
             return Err(format!(
                 "全部 {eligible} 个对口候选处于死亡冷却({pool_name}, {host})"
@@ -792,13 +724,9 @@ pub async fn serial_dial(
         }
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
-    // 绕表一圈全灭（每条都真试过）：按 host 冷却 30s。**只有"确实有镜像
-    // 兜底"的 host** 才豁免（2026-10-18 修正）：原判据对所有
-    // *.githubusercontent.com 一刀切豁免，但 camo 根本不在镜像链里（镜像对
-    // camo 一律 301，实测），豁免只会让每张徽章全额重烧整表——12 张
-    // shields.io 徽章的仓库页转圈两分钟（日志：22 候选全灭 12s + DNS 腿
-    // 3s，×十几张）。按 host 冷却（2026-10-19 修正）：原池级冷却会让
-    // camo 的全灭把 assets/io/auth 的健康腿一起毒倒 30s。
+    // 绕表一圈全灭：按 host 冷却 30s；只有确有镜像兜底的 host 豁免
+    // （camo 不在镜像链，豁免只会让每张徽章全额重烧整表）；
+    // 按 host 而非按池（池级冷却曾把 camo 全灭毒倒 assets/io/auth）。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
         let mut g = SERIAL.lock().unwrap();
@@ -821,8 +749,7 @@ pub async fn serial_dial(
     Err(last_err.unwrap_or_else(|| "串发全灭".to_string()))
 }
 
-/// 数据层回写真实结果并修正排序。kind: ok / 其他一切（noreply 零回包/block 错误页/…）。
-/// 通的信号（ok）该 IP 整体置顶；死的信号垫底 —— IP 级移位。
+/// 数据层回写：ok 置顶，其他（noreply/block）垫底，IP 级移位。
 pub fn serial_note(pool_name: &str, ip: &str, kind: &str) {
     if kind == "ok" {
         if let Ok(mut g) = SERIAL.lock() {
@@ -845,8 +772,7 @@ pub fn mirror_chain(host: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 写回一条镜像链（校准/手改入口）：未知 host 与池外镜像拒收，
-/// 与现链相同则 no-op，真变更置 dirty + 一行日志。
+/// 写回一条镜像链：未知 host 与池外镜像拒收，同链 no-op。
 pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     if !CONTENT_HOSTS.contains(&host) {
         return false;
@@ -882,16 +808,12 @@ pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
 
 // ---------- 内容域直连熔断 ----------
 
-/// 内容域直连熔断：githubusercontent 族（avatars/raw/...）的直连被 GFW 按
-/// 域黑洞时，每个请求都会烧满直连预算才回落镜像 —— 头像页几十个请求就是
-/// 几十个 8 秒。失败一次即熔断 120s（期间直接走镜像链），成功立即清除。
-/// 120s 后给直连一次重试机会（GFW 状态会变，恢复时自动回到快路径）。
+/// 内容域直连熔断：直连被按域黑洞时每请求都烧满预算，失败一次熔断 120s 走镜像。
+/// 成功立即清除；120s 后给直连一次重试机会。
 static CONTENT_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
     std::sync::OnceLock::new();
 
-/// host 直连是否处于熔断期。粒度必须按 host —— 同族域直连状态不同
-/// (camo/private-user-images 可通而 raw 被黑洞), 全局单值会让"别的域
-/// 成功"反复清掉 raw 的熔断, 每张图重新烧 8s 黑洞预算(2026-10-15 实锤)。
+/// 粒度必须按 host——同族域直连状态不同，全局单值会让"别的域成功"反复清掉 raw 的熔断。
 pub fn content_direct_open(host: &str) -> bool {
     let g = CONTENT_BREAKER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -922,10 +844,7 @@ pub fn content_direct_fail(host: &str) {
 
 // ---------- 镜像链全灭熔断 ----------
 
-/// 镜像链全灭熔断：链全灭一次后 60s 内同 host 的后续请求快速失败 —— 否则
-/// README 塞二三十张图的仓库在全灭期间每张图都串行烧完整条链(11 家 × 失败
-/// 延迟), 页面 spinner 转几分钟(2026-10-16 实锤: dev-sidecar 20+ 张 raw 图
-/// 撞上直连+镜像双全灭窗口)。成功取回即清除; 60s 后放行一次真实探测。
+/// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
 static MIRROR_BREAKER: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
     std::sync::OnceLock::new();
 
@@ -984,9 +903,7 @@ mod tests {
 
     #[test]
     fn plan_mode_semantics() {
-        // plan_mode 是形态唯一判定入口（dial_shape 已删, serial_dial 直呼）:
-        // 空串返回残缺 "fake:" —— 调用方(serial_dial)对空值兜底 "baidu.com";
-        // 裸域名/带 fake: 前缀均归伪装; MODE_SNI 直通
+        // plan_mode 唯一判定入口：空串返回残缺 fake:（调用方兜底）；裸域名/带前缀均伪装；MODE_SNI 直通。
         assert_eq!(plan_mode(""), "fake:", "空串须由调用方兜底");
         // 旧表 "nosni" 由 serial_load 归一（shape_for_ip），plan_mode 不再特判
         assert_eq!(
@@ -1003,8 +920,7 @@ mod tests {
 
     #[test]
     fn edge_shape_by_ip_family() {
-        // Fastly 三段(2026-10-14 实测): .133 伪装即被边缘挂起 → 真名;
-        // .153/.154 伪装 SNI HTTP 正常(抗 GFW SNI 阻断) → 伪装
+        // Fastly 三段：.133 伪装被挂起 → 真名；.153/.154 伪装正常 → 伪装
         assert_eq!(shape_for_ip("185.199.108.133"), dial::MODE_SNI);
         assert_eq!(shape_for_ip("185.199.111.133"), dial::MODE_SNI);
         for ip in ["185.199.108.154", "185.199.111.153"] {
@@ -1016,15 +932,11 @@ mod tests {
         }
         // .215 新代 assets 边缘(2026-10 GitHub 迁移): 伪装
         assert_eq!(shape_for_ip("185.199.108.215"), "baidu.com");
-        // 域族 → 条目末段对口的 serves 判据已移入 route.rs（family_entry_serves
-        // 测试），此处不再重复；shape_for_ip 只定形态
     }
 
     #[test]
     fn direct_hosts_never_pooled() {
-        // 直连白名单(2026-10-17):
-        // objects-origin/uploads.github.com 为上传链路(只由 GLB/源站本尊服务)
-        // viewscreen 为 mermaid 渲染(代理腿真名 SNI 被间歇掐, 直连有 DoH/ECH)
+        // 直连白名单：上传链路（GLB/源站本尊服务）+ mermaid 渲染（代理腿被间歇掐）。
         for host in [
             "objects-origin.githubusercontent.com",
             "uploads.github.com",
@@ -1043,8 +955,7 @@ mod tests {
         for p in ["core", "api", "edge"] {
             assert!(serial_pool(p), "{p} 应为串发池");
         }
-        // uploads 池 2026-10-17 撤销: 当前网页上传流程不经 uploads.github.com
-        // (objects-origin 已归 core), 非池化走系统直连
+        // uploads 池已撤销：网页上传流程不经 uploads.github.com。
         assert!(!serial_pool("uploads"));
     }
 
@@ -1248,9 +1159,7 @@ mod tests {
 
     #[test]
     fn notify_persist_writes_on_change_and_skips_noop() {
-        // 变更驱动落盘(42b7923): 真变更 → 去抖 2s 内写盘; no-op → 不写盘。
-        // 静默失败形态的回归钉(2026-10-17 QA): kick/dirty 任一环回归都无报错,
-        // 用户感知滞后到下次重启表序复原才爆发 —— 此测试就是防它
+        // 变更驱动落盘：真变更 2s 内写盘，no-op 不写盘（静默失败形态的回归钉）。
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
         serial_load(&dir, None);

@@ -9,9 +9,7 @@ use std::sync::Mutex;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-/// 本地时区偏移（进程内缓存一次）：now_local 每次调用都重新探测，多线程下
-/// 偶发失败会回退 UTC —— 时间戳在 +08:00 和 UTC 之间跳跃。缓存后省掉每次
-/// 系统调用，时间戳恒定本地时区(2026-10-17 复审)。
+/// 本地时区偏移（进程内缓存一次）：多线程探测偶发失败会致时间戳跳跃，缓存后恒定。
 static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
 
 /// 本地时间戳：缓存偏移 + now_utc 换算（time 单一时间库）。
@@ -32,8 +30,7 @@ pub struct Logger {
 
 struct LoggerInner {
     seq: u64,
-    /// VecDeque：满员淘汰是 O(1) pop_front —— Vec::remove(0) 是整段搬移，
-    /// 容量扩到 2000 后每行日志白挪 48KB，不可忍。
+    /// VecDeque：满员淘汰 O(1)；Vec::remove(0) 整段搬移不可忍。
     buf: VecDeque<Entry>,
     echo_stdout: bool,
 }
@@ -74,8 +71,7 @@ impl Logger {
             });
             g.echo_stdout
         };
-        // stdout 回显仅 headless 调试：GUI 构建的 stdout 一旦被重定向就落盘，
-        // 日志含访问域名等浏览痕迹 —— 非调试场景不产生持久化副本。
+        // stdout 回显仅 headless 调试：GUI 构建 stdout 重定向会把浏览痕迹落盘。
         if echo {
             println!("{line}");
         }
@@ -94,10 +90,7 @@ impl Logger {
     }
 }
 
-// ---------- 崩溃取证（唯一落盘的日志） ----------
-// windowsgui 构建的 stderr 不可见：任何线程的 panic = 静默退出，
-// 无 WER 事件无任何痕迹 —— "挂托盘莫名退出"排障全靠它。crash.log 只含
-// panic 堆栈与内部状态行（无域名/无浏览痕迹），与运行日志的隐私边界不同。
+// ---------- 崩溃取证（唯一落盘的日志，只含 panic 堆栈与状态行，无浏览痕迹） ----------
 
 static CRASH: Mutex<CrashState> = Mutex::new(CrashState { path: None });
 
@@ -111,8 +104,7 @@ pub fn set_crash_path(dir: &std::path::Path) {
     g.path = Some(dir.join("crash.log"));
 }
 
-/// 严重事件/panic 取证：追加写 crash.log（带完整堆栈）。
-/// 落盘失败静默放弃（内存里也别丢：调用方通常先 log 一份）。
+/// 严重事件/panic 取证：追加写 crash.log。
 pub fn crash(msg: &str) {
     let path = {
         let g = CRASH.lock().unwrap();
@@ -132,8 +124,7 @@ pub fn crash(msg: &str) {
     }
 }
 
-/// 注册全局 panic hook：任何 panic 先取证落盘，再恢复默认行为（stderr 打印 + abort）。
-/// 供 main 启动时调用一次。
+/// 注册全局 panic hook：先取证落盘再恢复默认行为。
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -143,7 +134,6 @@ pub fn install_panic_hook() {
 }
 
 /// 长驻任务护栏：panic 只断该任务并取证，进程必须活着。
-/// 与 server 的单连接 recover 同思路，覆盖托盘/webui/池刷新。
 pub fn guard(name: &'static str, f: impl FnOnce()) {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         crash(&format!("[panic] {name} 护栏捕获(进程不受影响)"));
@@ -164,7 +154,7 @@ mod tests {
 
     #[test]
     fn ring_evicts_oldest_keeps_window() {
-        // 2000 条窗口: 灌 LOG_BUFFER_SIZE+5 条, 最旧 5 条被挤出, seq 过滤 intact
+        // 2000 条窗口: 灌满+5 条, 最旧 5 条被挤出
         let lg = Logger::new(false);
         for i in 0..(LOG_BUFFER_SIZE + 5) {
             lg.log(&format!("line{i}"));

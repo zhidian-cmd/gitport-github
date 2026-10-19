@@ -1,51 +1,30 @@
-//! 路由细分：每池一张路由表，三池之上一张总路由（2026-10-19 用户裁定）。
-//!
-//! 细分前，路由知识散落四处：`config::GROUPS`（host→池）、`entry_serves`/
-//! `host_family`（池内族筛选）、mitm 的 `is_big_file_host`/
-//! `is_release_asset_path`（镜像 only）、`pool::CONTENT_HOSTS`（镜像链）。
-//! 任何一处漏改都会出现"某类请求走到不该走的腿"类怪 bug —— 2026-10-17
-//! objects-origin 落到 Fastly 500 Domain Not Found 即此类（白名单漏了
-//! PAC 短路）。本表把四者合成一条决策链，唯一真相：
-//!
-//! ```text
-//! master_route(host, method, path)
-//!   → System   直连白名单（不代理，系统 DNS 真名）
-//!   → Mirror   镜像 only（大文件域 / release 附件路径，仅 GET/HEAD）
-//!   → Pool     串发池 + 族（族路由见 POOL_ROUTES）
-//!   → Tunnel   非池域名（CONNECT 隧道直通，浏览器自连）
-//! ```
-//!
-//! 池内：`POOL_ROUTES` 每池一张族表。族 = 一批条目（IP 末段 + SNI 形态）
-//! + 服务的 host 判据 + 全灭兜底策略（`Fallback`）。core/api 单族 all；
-//! edge 四族：content（.133 真名）/ assets（.154/.215 伪装）/
-//! io（.153 伪装）/ auth（非 Fastly 伪装，githubapp.com 系）。
-//! 冷却/健康状态全部按 host 或 IP 记账，不按池 —— 池级冷却会让一个域的
-//! 全灭毒倒同池其他族的健康腿（2026-10-19 实测：camo 全灭 30s 内
-//! assets/io/auth 全部快速失败落 502）。
+//! 路由唯一真相：master_route 总路由 + POOL_ROUTES 每池族表。
+//! 决策链：System（白名单）→ Mirror（大文件/release，仅 GET/HEAD）→ Pool{池,族} → Tunnel。
+//! 族 = host 判据 + 条目判据（IP 末段 + SNI 形态）+ 全灭兜底（Fallback）。
+//! 冷却/健康按 host 或 IP 记账不按池——池级冷却会让一个域的全灭毒倒同池其他族。
 
 use super::{plan_mode, SerialPlan};
 use crate::config;
 
 // ---------- 总路由 ----------
 
-/// 总路由判定结果（`master_route`）。
+/// 总路由判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// 直连白名单：不归任何池、不经代理（`config::DIRECT_HOSTS`）。
+    /// 直连白名单：不归任何池、不经代理。
     System,
     /// 镜像 only：大文件域或 release 附件路径（GET/HEAD）。不试直连。
     Mirror,
-    /// 串发池 + 族名（族路由见 `POOL_ROUTES`）。
+    /// 串发池 + 族名。
     Pool {
         pool: &'static str,
         family: &'static str,
     },
-    /// 非池域名：不进 MITM，CONNECT 隧道直通（浏览器自连系统 DNS）。
+    /// 非池域名：不进 MITM，CONNECT 隧道直通。
     Tunnel,
 }
 
-/// 大文件下载域（整域镜像）：codeload=源码包；objects/release-assets=
-/// release 附件 302 的落点（新旧两代域名）。
+/// 大文件下载域（整域镜像）：codeload=源码包；objects/release-assets=附件 302 落点。
 pub fn is_big_file_host(host: &str) -> bool {
     matches!(
         host,
@@ -55,10 +34,7 @@ pub fn is_big_file_host(host: &str) -> bool {
     )
 }
 
-/// release 附件与源码包路径（/releases/download、/archive）一律走镜像；
-/// git 智能协议路径不在此列 —— 镜像不认，必须走 core 池直连（伪装 SNI）。
-/// /releases/latest/download/<asset> 稳定链形态同归镜像（2026-10-19 补）：
-/// 漏了它会落 core 池直连，与 /releases/download/<tag>/ 语义相同。
+/// /releases/download（含 /releases/latest/download/）与 /archive 走镜像；git 智能协议路径不在此列。
 fn is_release_asset_path(host: &str, path: &str) -> bool {
     if host != "github.com" {
         return false;
@@ -76,12 +52,8 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
     }
 }
 
-/// 镜像链归属 host：请求 host → 实际内容 host 的**专属链**。
-/// github.com 的 releases/download 302 落 release-assets、archive 302 落
-/// codeload —— 镜像跟随 302 时"用谁的链"在本函数定，与请求 host 解耦：
-/// release 附件必须用 release-assets 专属链（实测 3838KB/s 的 gh-proxy 系
-/// 在头部），不能用 github.com 链（头部 ghproxy.net 实测慢且中断——
-/// 2026-10-19 DevSidecar 下载重试风暴的根因）。大文件域自身即链 host。
+/// 镜像链归属：请求 host → 实际内容 host 的专属链（与请求 host 解耦）。
+/// release 附件必须用 release-assets 链——github.com 链头部实测慢且中断。
 pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     if is_big_file_host(host) {
         return host;
@@ -97,11 +69,9 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     host
 }
 
-/// 总路由：host → 处置。唯一真相（取代四处散落的判定）。
-/// method/path 只影响 Mirror 分流（附件路径仅 GET/HEAD 镜像）。
+/// 总路由：host → 处置。method/path 只影响 Mirror 分流（附件路径仅 GET/HEAD）。
 pub fn master_route(host: &str, method: &str, path: &str) -> Route {
-    // 白名单必须先于一切：objects-origin 会落到 edge 的
-    // *.githubusercontent.com 通配符（Fastly 500），2026-10-17 16:53 错路
+    // 白名单必须先于一切：objects-origin 落 edge 通配符会 Fastly 500。
     if config::is_direct(host) {
         return Route::System;
     }
@@ -122,24 +92,21 @@ pub fn master_route(host: &str, method: &str, path: &str) -> Route {
 
 // ---------- 池内族 ----------
 
-/// 族全灭后的兜底策略。执行流在 mitm（`get_direct` 失败分支），
-/// 策略以本表为准：改这里必须同步执行流，单测钉住两端一致。
+/// 族全灭后的兜底策略；执行流在 mitm 的 get_direct 失败分支，单测钉住两端一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
     /// 镜像链（host 有链才走）→ 系统 DNS 直连腿。
     MirrorDns,
-    /// 系统 DNS 直连腿 → 失败（无镜像可走：assets/io/auth）。
+    /// 系统 DNS 直连腿（无镜像可走的族）。
     Dns,
 }
 
-/// 池内族路由：一批条目 + 服务哪些 host + 兜底策略。
+/// 池内族路由：host 判据 + 条目判据 + 兜底策略。
 pub struct FamilyRoute {
     pub name: &'static str,
     /// host 是否归该族（总路由分族用）。
     pub host_of: fn(&str) -> bool,
-    /// 条目是否服务该 host（串发筛选用：IP 末段族 + SNI 形态）。
-    /// 不对口不试不垫底 —— 否则每类请求都把另一类 IP 试败沉底，
-    /// 共享表顺序永久 ping-pong。
+    /// 条目是否服务该 host（串发筛选；不对口不试不垫底，防异类互相污染池序）。
     pub serves: fn(&str, &SerialPlan) -> bool,
     pub fallback: Fallback,
 }
@@ -167,8 +134,7 @@ fn host_is_auth(host: &str) -> bool {
 
 // --- 条目判据 ---
 
-/// Fastly 段 IP 的末段（108-111 段才认），非 Fastly 返回 None。
-/// 末段即域族：133=githubusercontent 内容 / 153=github.io / 154=githubassets。
+/// Fastly 段（185.199.108-111）IP 的末段；非 Fastly 返回 None。
 pub fn fastly_last_octet(ip: &str) -> Option<&str> {
     let mut o = ip.split('.');
     match (o.next(), o.next(), o.next(), o.next()) {
@@ -194,8 +160,7 @@ const FAMILY_ALL: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-/// content：.133 真名（Fastly 校验 SNI==Host，伪装被挂起；真名抗不住
-/// GFW 按域 RST —— raw 的直连腿基本随缘，兜底走镜像链）。
+/// content：.133 真名（伪装会被该边缘挂起）；真名抗不住 GFW 按域 RST，兜底走镜像链。
 const FAMILY_CONTENT: FamilyRoute = FamilyRoute {
     name: "content",
     host_of: host_is_content,
@@ -203,7 +168,7 @@ const FAMILY_CONTENT: FamilyRoute = FamilyRoute {
     fallback: Fallback::MirrorDns,
 };
 
-/// assets：.154/.215 伪装（抗 SNI 阻断；镜像不路由 CSS/JS）。
+/// assets：.154/.215 伪装（抗 SNI 阻断）。
 const FAMILY_ASSETS: FamilyRoute = FamilyRoute {
     name: "assets",
     host_of: host_is_assets,
@@ -211,9 +176,7 @@ const FAMILY_ASSETS: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-/// io：.153 伪装。github.io 裸域实测可服（2026-10-19 e2e 200）——
-/// 早前"*.github.io 证书不覆盖 apex"的担心不影响代理腿（上游证书
-/// 不参与客户端校验），登记在案免再审。
+/// io：.153 伪装。
 const FAMILY_IO: FamilyRoute = FamilyRoute {
     name: "io",
     host_of: host_is_io,
@@ -221,9 +184,7 @@ const FAMILY_IO: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
-/// auth：githubapp.com 系，非 Fastly 段伪装。同时是 edge 的兜底族 ——
-/// 未显式列族的 host（将来的新边缘主机）落这里，保持旧 entry_serves
-/// "_" 分支的兼容语义。
+/// auth：githubapp.com 系，非 Fastly 段伪装；兼 edge 未列族 host 的兜底族。
 const FAMILY_AUTH: FamilyRoute = FamilyRoute {
     name: "auth",
     host_of: host_is_auth,
@@ -252,10 +213,7 @@ pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
     POOL_ROUTES.iter().find(|pr| pr.pool == pool)
 }
 
-/// 串发族筛选：池内按 host 选族。未显式列族的 host 归**末族**兜底
-/// （edge = auth，旧 entry_serves "_" 语义）—— 与 `family_for` 的族名
-/// 判定必须一致：找不到族就完全不过滤会把 Fastly IP 也试败沉底
-/// （打错边缘 Host 必拒），那是 bug 不是兼容。
+/// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（与 family_for 一致，单测钉住）。
 pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
     let pr = pool_route(pool)?;
     pr.families
@@ -270,8 +228,7 @@ pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
         })
 }
 
-/// host 在该池所属族名（"" = 池无路由表）。edge 未显式列族的 host 归
-/// auth（兜底族，见 FAMILY_AUTH 注释）。
+/// host 在该池所属族名（"" = 池无路由表）。edge 未列族 host 归 auth 兜底族。
 pub fn family_for(pool: &str, host: &str) -> &'static str {
     let Some(pr) = pool_route(pool) else {
         return "";
@@ -309,8 +266,7 @@ pub fn is_content_host(host: &str) -> bool {
 
 // ---------- 已下线 IP（种子与实表都不再保留） ----------
 
-/// 2026-10-19 TCP 实测全超时的 IP。复活了就从清单删（别让清单腐化
-/// 成永久真相——它只是"当前这批已知死 IP"的快照）。
+/// 实测死 IP 快照；复活了就从清单删。
 pub const RETIRED_IPS: &[&str] = &[
     // core：140.82.115-120 段（116.x 实测存活，保留）
     "140.82.115.3",
@@ -509,9 +465,7 @@ mod tests {
         assert_eq!(fallback_for("api", "api.github.com"), Fallback::Dns);
     }
 
-    /// 串发族筛选与族名判定必须一致：serial_family 选出的族名 == family_for。
-    /// 两者漂移的后果是"日志报 content 族、实际按 auth 族筛条目"——
-    /// 排障时看到的候选数与真实试的候选数不是一批。
+    /// serial_family 选出的族名必须 == family_for（漂移则日志与实际筛的候选不一致）。
     #[test]
     fn serial_family_matches_family_for() {
         for (pool, host) in [
@@ -529,17 +483,14 @@ mod tests {
             let picked = serial_family(pool, host).map(|f| f.name).unwrap_or("");
             assert_eq!(picked, family_for(pool, host), "{pool}/{host} 族名漂移");
         }
-        // 兜底族真的在筛条目：未列族 host 只试非 Fastly 伪装（Fastly IP
-        // 打错边缘 Host 必被拒，试了也是白沉底）
+        // 兜底族只试非 Fastly 伪装（Fastly IP 打错边缘 Host 必被拒）。
         let f = serial_family("edge", "future.edge.host").unwrap();
         assert_eq!(f.name, "auth");
         assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
         assert!(!(f.serves)("x", &mk("185.199.110.133", crate::pool::dial::MODE_SNI)));
     }
 
-    /// 镜像链归属：release 附件/archive 走专属链，不用请求 host 自己的链。
-    /// 2026-10-19 DevSidecar 下载根因：github.com 链头部 ghproxy.net 慢且
-    /// 中断，而 release-assets 链头部是实测 3838KB/s 的 gh-proxy 系。
+    /// release 附件/archive 走专属链，不用请求 host 自己的链。
     #[test]
     fn mirror_chain_host_dedicated() {
         // release 附件 → release-assets 专属链

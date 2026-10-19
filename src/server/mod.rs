@@ -103,7 +103,7 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
 impl ProxyServer {
     async fn handle(&self, mut client: TcpStream) -> std::io::Result<()> {
         let _ = client.set_nodelay(true);
-        // 活跃窗口计时: 有请求时保持上游 h2 连接保活(跨导航复用), 静默即停
+        // 活跃窗口计时: 保持上游 h2 保活
         upstream::note_activity();
         let head = read_head(&mut client).await?;
         let Some(idx) = find_crlf(&head) else {
@@ -126,7 +126,7 @@ impl ProxyServer {
     /// 双向转发。首字节看门狗 + 数据层结果回写串发表。
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
-        // 池内域名且 MITM 开：本地终结 TLS，上游按表自动重试
+        // 池内域名且 MITM 开：本地终结 TLS
         if mitm::mitm_scope(self.authority.as_ref(), &host) {
             mitm::handle_connect_mitm(self, client, &host).await;
             return;
@@ -150,7 +150,7 @@ impl ProxyServer {
         }
         (self.log)(&format!("[CONNECT] {host} via {ip} -> 200已发, 开始转发"));
 
-        // 首字节看门狗：上游 TCP 活着但 ClientHello 被黑洞时，8s 内判死
+        // 首字节看门狗：ClientHello 被黑洞时 8s 内判死
         let (sent, recv) = bidir_copy(
             &mut client,
             &mut upstream,
@@ -354,8 +354,7 @@ where
 {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    // 同一任务内交替轮询两拷贝循环（避免 &mut 引用跨 spawn 逃逸）；
-    // 任一方向 EOF/错误即收尾，两方向都结束后返回。
+    // 同一任务内交替轮询两拷贝循环；任一方向 EOF/错误即收尾。
     let (up, down) = tokio::join!(
         copy_with_first_byte_timeout(&mut ar, &mut bw, None),
         copy_with_first_byte_timeout(&mut br, &mut aw, first_byte),

@@ -21,9 +21,7 @@ pub struct Authority {
     leaves: Mutex<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
-/// 由 CA 证书 DER + 私钥重建 rcgen Issuer（make_crl/leaf 共用）。
-/// 每次按 DER 重建，低频可接受。Issuer 借用传入的 DER（借用传参，
-/// 生命周期随调用方，签名完成后即弃）。
+/// 由 CA 证书 DER + 私钥重建 rcgen Issuer（每次按 DER 重建，低频可接受）。
 fn issuer_of<'a>(
     cert_der: &'a [u8],
     key: &'a KeyPair,
@@ -111,18 +109,13 @@ pub fn tls_config_of(a: &Arc<Authority>) -> Arc<rustls::ServerConfig> {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    // schannel(curl/git, Windows) 的会话恢复票据与本服务端互操作会报 bad record MAC，
-    // 禁用票据/PSK 恢复：每次全新握手，换取稳定。
+    // schannel 会话恢复票据与本服务端互操作报 bad record MAC，禁用票据恢复。
     cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     Arc::new(cfg)
 }
 
-/// 加载 dir 下 ca.crt/ca.key；不存在则生成（CN=GitPort Root，10 年）。
-/// 兼容 SEC1 旧格式 CA（PEM: CERTIFICATE + EC PRIVATE KEY）。
-/// load 分支重申 key 的 ACL：ACL 若只在首次生成时收紧，旧版遗留/外部复制
-/// 进来的 key 会保持目录继承权限 —— 同机他账户可读根私钥即可伪造叶子证书
-/// 对用户 MITM（2026-10-17 安全审计 F-004）。重申失败不阻断 MITM，但写
-/// 日志必须可见。
+/// 加载 dir 下 ca.crt/ca.key；不存在则生成。兼容 SEC1 旧格式。
+/// load 分支重申 key 的 ACL——同机他账户可读根私钥即可伪造叶子证书 MITM。
 pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
@@ -143,7 +136,7 @@ pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority
 fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| e.to_string())?;
     let key_pem = std::fs::read_to_string(key_path).map_err(|e| e.to_string())?;
-    // 本程序 CA = PKCS#8("PRIVATE KEY")；旧格式 = SEC1("EC PRIVATE KEY") → 转 PKCS#8
+    // 本程序 CA = PKCS#8；旧格式 SEC1 → 转 PKCS#8
     let ca_key = KeyPair::from_pem(&key_pem)
         .or_else(|_| {
             sec1_to_pkcs8(&key_pem).and_then(|der| {
@@ -172,9 +165,7 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     }))
 }
 
-/// SEC1 "EC PRIVATE KEY" PEM → PKCS#8 DER（兼容旧格式 ca.key）。
-/// PKCS#8 包装：PrivateKeyInfo { version=0, algorithm=ecPublicKey(P-256),
-/// privateKey=OCTET STRING(SEC1) }。DER 结构固定，手工 TLV 编码。
+/// SEC1 "EC PRIVATE KEY" PEM → PKCS#8 DER（手工 TLV 编码，结构固定）。
 fn sec1_to_pkcs8(pem: &str) -> Result<Vec<u8>, String> {
     let (item, _) = rustls_pemfile::read_one_from_slice(pem.as_bytes())
         .map_err(|e| format!("PEM 解析失败: {e:?}"))?
@@ -270,14 +261,13 @@ impl Authority {
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
-        // 私钥权限收紧（best-effort）：由 winsec 模块执行
+        // 私钥权限收紧（best-effort）
         let _ = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy());
         Ok(())
     }
 }
 
-/// 把根证书装入"当前用户"的受信任根存储(免管理员)。
-/// 浏览器(Chrome/Edge, 用系统证书库)与 schannel(git) 重启后即信任。
+/// 把根证书装入当前用户的受信任根存储(免管理员)；浏览器与 schannel 重启后即信任。
 pub fn install_ca(dir: &str) -> Result<(), String> {
     let cert_path = std::path::Path::new(dir).join("ca.crt");
     let out = std::process::Command::new("certutil")

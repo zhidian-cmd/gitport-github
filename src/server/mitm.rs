@@ -1,12 +1,6 @@
-//! MITM 路径：池内域名本地终结 TLS 后按 plans.json 串发连上游
-//! (boring Chrome 指纹 + 伪装 SNI)，风控拦截页(403 restricted/400 Whoa)
-//! 本地识别(ghDefuse)，该 IP 垫底换下一个重试。分流总表见
-//! pool::route::master_route（唯一真相）：
-//! - core/api/edge：直连（edge 混合池内按 host 选族，见 route::POOL_ROUTES）
-//! - githubusercontent 内容域（avatars/camo/gist/raw）：直连优先（1s 内 200），
-//!   失败回落镜像串行链
-//! - codeload / objects / release-assets / github.com 的 releases/download、
-//!   archive 路径：镜像 only（禁并发竞速，2026-10-15 裁定），链全灭 502
+//! MITM：池内域名本地终结 TLS，按 route::master_route 分流（唯一真相）：
+//! 直连串发（boring 指纹 + 伪装/真名 SNI）/ 内容域回落镜像链 / 大文件域镜像 only / 流式直通。
+//! 拦截页(403 restricted/400 Whoa)本地识别 gh_defuse。
 use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
@@ -19,30 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 // ---------- 常量与镜像 ----------
-// 镜像腿响应头预算：5s 内必须出响应头，头一到即解除，体不限。
+// 5s 内必须出响应头，头一到即解除，体不限。
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// 内容域镜像链限长（2026-10-17 用户要求）：仍然串行逐家试，只是最多前 5
-/// 家、每家 5s 超时——把一张坏图标的最坏等待从"11 家 × 各自超时"(实测 16s)
-/// 压到 25s 上限内的大概率更早出局。大文件保链全量（各家串行, 不并发）。
-/// 内容域（.133 真名腿）的 h2 响应头预算：比通用 8s 短 —— 该腿被 GFW
-/// 按域黑洞时等满 8s 才换镜像（实测 raw 每 120s 白烧 10s+）。健康边缘
-/// 响应头 <1s（直连成功实测 ~1s，镜像腿 0.65-1.1s），4s 够真流量、又把
-/// 黑洞探测砍半。预算只罩到响应头（h2_send → h2_recv_response），体不限。
+/// 内容域 .133 真名腿的响应头预算：黑洞时快速失败回落镜像；只罩响应头，体不限。
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4);
 const MIRROR_CHAIN_CAP: usize = 5;
 
-/// 内容域小文件（头像/图片/gist/media）的镜像链限长；大文件与 github.com
-/// 归档/release 返回 None = 用全链。
-/// 注意：**镜像链仍是串行**（与直连 IP 串发同一哲学：一家失败再下一家）。
+/// 内容域小文件镜像链限前 5 家（仍串行）；大文件与 github.com 用全链。
 fn mirror_chain_cap(host: &str) -> Option<usize> {
     (host != "github.com" && !pool::route::is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
 }
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
-// ghDefuse 无冷静阈值与尝试上限（用户裁定：试到全表），终止
-// 条件只有"拿到正常页"或"串发全灭"。
-/// 池内域名本地终结 TLS。直连白名单域名（objects-origin 等）pool_for 返回空
-/// → 上面 is_empty 分支已豁免；把它们改回池属契约变更，由
-/// pool::tests::objects_origin_never_pooled 拦，不设运行时护栏。
+// gh_defuse 试到全表无冷静；终止=拿到正常页或串发全灭。
+/// 池内域名才 MITM；白名单域名 pool_for 为空已豁免（单测钉住）。
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
@@ -83,10 +66,7 @@ pub async fn handle_connect_mitm(
         .alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-    // ALPN 落点必记：2026-10-19 下载排查发现 23 条
-    // "connection closed before message completed" 只可能来自 h1 服务端
-    // （hyper h2 无 IncompleteMessage 映射）——不记 ALPN 就无从判断
-    // 客户端当时用的是哪条协议。
+// ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
     let alpn_name = match alpn.as_slice() {
         b"h2" => "h2",
         b"http/1.1" => "http/1.1",
@@ -95,8 +75,7 @@ pub async fn handle_connect_mitm(
     (srv.log)(&format!(
         "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
     ));
-    // axum 0.8 的 Handler 只接受 axum::extract::Request，而本层必须保留原始
-    // Incoming body（重放/嗅探），故不用 axum Router，直接 hyper service_fn。
+// 保留原始 Incoming body（重放/嗅探），不用 axum Router。
     let log = srv.log.clone();
     let svc = hyper::service::service_fn(move |req| {
         let log = log.clone();
@@ -133,9 +112,7 @@ async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
-    // host 优先取 URI authority（h2 :authority / 代理形式绝对 URL）；
-    // CONNECT 隧道内的 h1 请求是 origin-form（GET /），URI 无 host ——
-    // 回退 Host 头（2026-10-13 实测隧道内 502 根因）。
+// h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
     let host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
@@ -148,10 +125,7 @@ async fn mitm_http(
             from_uri
         }
     };
-    // 遥测/心跳本地短路：collector(埋点)与 alive(心跳)是纯丢弃型 POST,
-    // 回 204 不拨号 —— 免掉每笔 8s 预算白烧与无谓新拨(2026-10-15 实锤:
-    // 心跳 connection error 刷屏、遥测超时全是白烧)。WebSocket 心跳走
-    // CONNECT/upgrade 路径, 不受此影响。
+// collector/alive 遥测心跳本地 204，不拨号。
     if host == "collector.github.com" || host == "alive.github.com" {
         return axum::response::Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -178,15 +152,12 @@ async fn mitm_http(
     };
     let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     let path = path_of(req.uri());
-    // 流式直通判定（2026-10-16 方案一落地）：git 智能协议 POST（push/fetch
-    // 包传输）或声明体积超限的请求不进有界缓冲 —— 缓冲路径下 >1MB 的请求
-    // 一律 502, git push 大包必挂。GET/HEAD 无体不涉及。
+// git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
     let mut streaming_reason = stream_decision(req.method(), &path, declared_content_len(&req));
     let mut overflow_prefix: Option<Vec<u8>> = None;
     let mut replay: Option<Bytes> = None;
     if streaming_reason.is_none() {
-        // 有界请求体缓冲(≤1MB)：建连失败换路重试时可安全重放。
-        // 读超限不再 502 —— 已读前缀作为首块, 转流式继续泵送剩余体。
+// 有界缓冲 ≤1MB 可重放；读超限转流式不丢请求。
         let mut buf = Vec::new();
         let limit = upstream::MAX_REPLAY_BODY + 1;
         while let Some(frame) = http_body_util::BodyExt::frame(req.body_mut()).await {
@@ -224,11 +195,7 @@ async fn mitm_http(
         }),
         None => out,
     };
-    // 镜像 only 判定走总路由 pool::route::master_route（唯一真相）：
-    // codeload / objects / release-assets 大文件域、github.com 的
-    // releases/download 与 archive 路径 → Route::Mirror（GET/HEAD）。
-    // 镜像链全灭 → 直接 502，不回落直连。
-    // githubusercontent 内容域不在此列 —— 直连优先（1s 内 200），失败回落镜像链。
+// 镜像 only 判定走 master_route；全灭 502 不回落直连。
     if is_simple
         && matches!(
             pool::route::master_route(&host, req.method().as_str(), &path),
@@ -246,9 +213,7 @@ async fn mitm_http(
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
-            // 直连失败后的兜底策略同样收拢到 route::fallback_for(pool, host)：
-            // edge 内容族（.133 真名）有镜像链 → MirrorDns：先镜像链，再系统
-            // DNS 直连腿；其余族 Dns：镜像链不可用（或非简单请求），只走 DNS 腿。
+// 兜底策略在 route::fallback_for：内容族先镜像后 DNS，其余只 DNS。
             match pool::route::fallback_for(&name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
@@ -264,8 +229,7 @@ async fn mitm_http(
                     ));
                 }
             }
-            // 末路兜底: 系统 DNS 直连腿 —— 池表 IP 漂移(GitHub 边缘迁移,
-            // 如 2026-10 assets .154→.215)时按系统解析自愈。仅 GET/HEAD。
+// 末路兜底：系统 DNS 直连腿（池表 IP 漂移自愈），仅 GET/HEAD。
             if is_simple {
                 match dns_direct_fetch(&log, &out_body, &host, &info, &replay).await {
                     Ok(r) => return write_upstream(r, "dns", &info),
@@ -277,7 +241,7 @@ async fn mitm_http(
             return mitm_unavailable(&req, &host);
         }
     };
-    // 风控拦截页本地化解：实锤 403 restricted/400 Whoa 后垫底换 IP 直连重试
+// 拦截页化解：垫底换 IP 直连重试
     if is_simple
         && (host == "github.com" || host == "api.github.com")
         && resp.status().as_u16() >= 400
@@ -295,9 +259,7 @@ async fn mitm_http(
     }
     write_upstream(resp, "direct", &info)
 }
-/// 流式直通判定：Some(原因) = 不进缓冲直接流式；None = 有界缓冲(≤1MB)。
-/// git 智能协议 POST（push/fetch 包传输端点）与声明超限（含 GB 级 PUT）
-/// 必流式；声明未超限但实际超限的在缓冲读满后转流式（不丢请求也不 502）。
+/// Some(原因)=直接流式；None=有界缓冲。git 智能协议 POST 与声明超限必流式。
 fn stream_decision(
     method: &Method,
     path: &str,
@@ -337,9 +299,7 @@ fn incoming_to_body(body: Incoming) -> BoxBody {
     });
     BoxBody::new(http_body_util::StreamBody::new(stream))
 }
-/// 前缀字节 + 尾体拼接（http_body_util 0.1 无 Chain 组合子，手写）：
-/// 先吐 prefix 一帧，再透传 rest 的全部帧。缓冲转流式用（已读的 ≤1MB+1
-/// 前缀必须原样发给上游，剩余体继续泵送）。
+/// 前缀字节 + 尾体拼接（http_body_util 无 Chain 组合子）。
 fn chain_prefix_body(prefix: Vec<u8>, rest: BoxBody) -> BoxBody {
     let mut prefix = Some(prefix);
     let mut rest = rest;
@@ -361,10 +321,8 @@ fn plain_502() -> axum::response::Response<BoxBody> {
         ))
         .unwrap()
 }
-/// 流式直通：请求体不进缓冲，边收边泵给上游（h2 背压分片）。单次尝试
-/// 语义（同既有"非简单方法不重发"）：预泵段失败 = 连接死且体未动，允许
-/// 换新拨重试一次；体泵启动后体已部分消耗，失败只记日志不重试。响应头
-/// 一到立即交付客户端（响应优先），泵的非致命错误绝不覆盖真实响应。
+/// 流式直通：体不进缓冲边收边泵（h2 背压分片），单次尝试不重发。
+/// 响应头一到立即交付；泵失败绝不覆盖已交付的响应。
 async fn stream_passthrough(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -377,8 +335,7 @@ async fn stream_passthrough(
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
-    // 连接选择：缓存优先（git 场景 info/refs 前置 GET 通常已暖好连接）；
-    // 预泵失败允许新拨重试一次（体未触碰, 重放安全）。
+// 缓存优先；预泵失败允许新拨重试一次（体未触碰，重放安全）。
     let (fut, send, up) = 'conn: {
         if let Some(up) = upstream::cached_h2(host) {
             match upstream::h2_stream_head(&up, out).await {
@@ -402,7 +359,7 @@ async fn stream_passthrough(
         (log)(&format!("[流式] {host}{path} 两条连接腿均失败, 放弃"));
         return plain_502();
     };
-    // 接住泵句柄：响应头失败/超时路径必须 abort，否则泵滞留不回收
+// 泵句柄必须接住：响应头失败/超时路径 abort，防滞留。
     let pump = body
         .take()
         .map(|b| upstream::h2_spawn_pump(send, b, log.clone()));
@@ -455,11 +412,8 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-/// 嗅探响应体头部判定 GitHub 风控拦截页(HTML + 标志串)。
-/// 2026-10-17 起 github.com/api 强制上游 gzip(大页面裸传是"大仓库进页面慢"
-/// 主因, 实测仓库页 327KB → 44.5KB): 嗅探改为**边收边解压**判前 4KB 明文,
-/// 已消费的**原始压缩帧**原样保留(PeekRaw), 写回时拼到最前 —— 浏览器收到的
-/// 字节流与上游完全一致(解压由浏览器负责), 不重压缩、不改 content-length。
+/// 嗅探响应体判 GitHub 风控拦截页。
+/// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     let ct = resp
         .headers()
@@ -477,8 +431,7 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    // 只认 gzip(上游请求由我们强制) 与 identity; 其他编码放弃嗅探(透明转发,
-    // 宁可不判也不误杀)
+// 只认 gzip 与 identity，其他编码放弃嗅探（宁可不判不误杀）。
     if !enc.is_empty() && enc != "identity" && enc != "gzip" {
         return false;
     }
@@ -487,8 +440,7 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     let mut comp: Vec<u8> = Vec::new();
     let mut plain: Vec<u8> = Vec::new();
     let body = resp.body_mut();
-    // 帧式读取: 单帧 16KB, 解压后远超 4KB, 一般 1-2 帧即够。上限 8 帧 /
-    // 128KB 压缩数据, 防异常响应拖住嗅探; 多读的字节原样保留, 不影响完整性。
+// 帧式读取上限 8 帧/128KB，防异常响应拖住嗅探；多读字节原样保留。
     while plain.len() < 4096 && raw.len() < 8 {
         match http_body_util::BodyExt::frame(body).await {
             Some(Ok(frame)) => {
@@ -516,8 +468,7 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         return false;
     }
     let chunk = String::from_utf8_lossy(&plain[..plain.len().min(4096)]).to_lowercase();
-    // "bad request" 串太宽(任何 400 页正文都可能含) —— 必须叠加状态码=400
-    // 才判风控(2026-10-17 安全审计 F-005), 否则正常 400 会触发整池轮换
+// "bad request" 串太宽，须叠加 400 状态码才判风控（防正常 400 触发轮换）。
     chunk.contains("has been restricted")
         || chunk.contains("whoa there")
         || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
@@ -535,8 +486,7 @@ fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
 /// 嗅探/探测已消费的原始帧：最终写回时拼到响应体前端。
 #[derive(Clone)]
 struct PeekRaw(Vec<Bytes>);
-/// 复用缓存 h2 连接发一次请求。Some(Ok)=成功可直接交付；Some(Err)=POST 等
-/// 非简单方法复用失效不重发，直接报错；None=缓存未命中或连接已死，落回串发。
+/// Some(Ok)=成功交付；Some(Err)=非简单方法复用失效不重发；None=落回串发。
 async fn try_cached(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -551,8 +501,7 @@ async fn try_cached(
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
     let up = upstream::cached_h2(host)?;
     let attempt_req = build_request(out, body);
-    // 内容域专用预算 4s（vs 通用 8s）：.133 真名腿被 GFW 黑洞时快速失败，
-    // 省下的 4s 直接让给镜像链 —— 实测黑洞请求必然烧满预算，罩更久纯浪费
+// 内容域 4s（vs 8s）：黑洞必烧满预算，罩更久纯浪费。
     let budget = if is_content {
         CONTENT_REQUEST_BUDGET
     } else {
@@ -581,10 +530,8 @@ async fn try_cached(
         }
     }
 }
-/// 直连串发 = 完整请求逐个试：响应头到手 = 成功连（该 IP 置顶）；超时/
-/// 黑洞 = 垫底换下一个；上限 24 防病态；POST 等非简单方法不重发。
-/// fresh 语义：每 attempt 新拨号（坏 IP 连接不缓存），
-/// 垫底后下一 attempt 必然换 IP —— "垫底换 IP"真实生效。
+/// 直连串发：完整请求逐个试，响应头到手=成功置顶，超时/黑洞=垫底换下一个。
+/// fresh 语义：每 attempt 新拨号，垫底后下一 attempt 必换 IP。
 async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -596,15 +543,12 @@ async fn get_direct(
     let name = pool::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
-    // 内容域判据收拢到 route::is_content_host（*.githubusercontent.com 末段 .133 族）
     let is_content = pool::route::is_content_host(host);
-    // 内容域直连熔断：GFW 按域黑洞期间每个请求烧满预算才回落 —— 熔断中
-    // 直接放弃直连（调用方立即回落镜像链），不再逐条试
+// 内容域直连熔断中直接放弃直连（调用方回落镜像）。
     if name == "edge" && is_content && pool::content_direct_open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    // 复用优先：上次完整成功的那条 h2 连接还活着就直接发请求 —— 零拨号
-    // 零握手。失败 = 连接已死, 清槽落回串发新拨号（POST 同样只试这一次）。
+// 复用优先：活连接直接发请求，失败清槽落回串发。
     if let Some(r) = try_cached(
         log, out, host, info, name, is_simple, is_content, &path, t0, body,
     )
@@ -612,18 +556,14 @@ async fn get_direct(
     {
         return r;
     }
-    // per-host 拨号单飞：并发未命中缓存时只放一个进串发拨号，其余排队；
-    // 首拨入槽后排队者立即放锁、锁外并发复用。锁只罩"拨号等待"不罩发送
-    // —— 2026-10-16 实测：持锁到响应返回会把 129 个并发压成逐个 RTT 串行
-    // （34s FCP / 布局跳动的真凶）。
+// per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
-    // 拿到锁后重查熔断：排队期间排在前面的请求可能已把该 host 拨到熔断
-    // —— 否则队列里每个成员都会再烧一次 8s 黑洞预算（一波头像逐个 8s）
+// 拿锁后重查熔断：排队期间可能已被拨到熔断。
     if name == "edge" && is_content && pool::content_direct_open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    // 首拨已被前面请求完成：立即放单飞，队列全员锁外并发复用
+// 首拨已完成：放锁，队列锁外并发复用。
     if upstream::cached_h2(host).is_some() {
         guard.take();
         if let Some(r) = try_cached(
@@ -633,19 +573,15 @@ async fn get_direct(
         {
             return r;
         }
-        // 极端竞态：复用连接在查与发之间又死了 —— 重新拿锁落回串发拨号
+// 竞态：连接在查与发之间死了，重新拿锁落回串发。
         guard = Some(dial_lock.lock().await);
     }
-    // 串发拨号期间持续持锁（单飞）；所有 return 路径上随函数结束释放
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每 attempt 串发拨号 + h2 握手（boring Chrome 指纹 + 伪装/真名 SNI，
-        // fresh 语义）：失败 attempt 的连接即弃，坏连接复用不可能发生；
-        // 串发表内失败 IP 已由 serial_dial 自动垫底。
+// 每 attempt 新拨+握手（fresh），失败连接即弃；失败 IP 已由 serial_dial 垫底。
         let up = match upstream::dial_h2(name, host, CancellationToken::new(), log).await {
             Ok(up) => up,
             Err(e) => {
-                // 拨号全灭/握手失败（serial_dial 内部已对失败 IP 垫底）
                 (log)(&format!(
                     "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
                     attempt + 1
@@ -661,7 +597,6 @@ async fn get_direct(
             }
         };
         let attempt_req = build_request(out, body);
-        // 内容域（真名 SNI 走 .133）黑洞必烧满预算 —— 同 get_direct 砍到 4s
         let budget = if is_content {
             CONTENT_REQUEST_BUDGET
         } else {
@@ -674,7 +609,6 @@ async fn get_direct(
                 if !name.is_empty() {
                     pool::serial_note(name, &up.ip, "ok"); // 数据到手 = 真成功, 置顶
                 }
-                // 首拨成功入连接缓存：后续同 host 请求复用该 h2 连接
                 upstream::store_h2(host, up.clone());
                 if is_content {
                     pool::content_direct_ok(host); // 直连恢复：清除熔断
@@ -687,10 +621,8 @@ async fn get_direct(
                 return Ok(resp);
             }
             Ok(Err(e)) => {
-                // 数据层失败(含"握手通但响应黑洞")：本次尝试实际拨到的 IP 垫底，
-                // 下一轮自动换候选。垫底只认"幂等且无镜像兜底"的失败：POST(遥
-                // 测)失败不代表 IP 死；githubusercontent 族失败多为 GFW 按域干
-                // 扰而 IP 本身健康。两者垫底都会让池序被噪声刷着轮换。
+                // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
+                // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
                 if !name.is_empty() && is_simple && !is_content {
                     pool::serial_note(name, &up.ip, "noreply");
                 }
@@ -703,15 +635,13 @@ async fn get_direct(
                     return Err(format!("POST 等非简单方法不重发({e})"));
                 }
                 if is_content {
-                    // 一圈即回落，不绕圈等 24 attempts；同时熔断直连 120s，
-                    // 后续请求直接走镜像链（成功自动恢复）
+                    // 一圈即回落，不绕 24 attempts；同时熔断 120s。
                     pool::content_direct_fail(host);
                     return Err(format!("内容域直连全灭({e})"));
                 }
                 continue; // GET/HEAD: 换下一个候选重发完整请求
             }
             Err(_) => {
-                // 响应预算超时（8s 内响应头都没到）：视同数据层失败
                 if !name.is_empty() && is_simple && !is_content {
                     pool::serial_note(name, &up.ip, "noreply");
                 }
@@ -734,9 +664,7 @@ async fn get_direct(
     Err("直连串发全灭(完整请求逐个试完)".to_string())
 }
 
-/// gh_defuse 终止决策（纯函数，仅为可测性抽出）：同 IP 再现 = 整表已轮完
-/// 一圈，全员拦截页 → 终止交付真实响应。调用方必须已完成垫底 + drop_h2
-/// （顺序不可换：终止交付时坏连接不能留在复用缓存）。
+/// 同 IP 再现 = 整表轮完，终止交付真实响应。调用方须先垫底 + drop_h2（顺序不可换）。
 fn defuse_full_cycle(seen: &mut std::collections::HashSet<String>, ip: &str) -> bool {
     !seen.insert(ip.to_string())
 }
@@ -751,10 +679,7 @@ async fn gh_defuse(
     let name = pool::pool_for(host);
     let is_simple = true;
     let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
-    // 不冷静、试到全表(用户裁定) —— 检测出 Whoa 就换 IP 试到底，
-    // 串发表每个候选都要试过才算数。终止条件只有两个：重试拿到正常页(交付)、
-    // 或串发给不出新连接(全灭 → retry 报错，交回最后响应)。中间任一个候选返回
-    // 正常页即交付成功，绝不无谓冷静。
+    // 试到全表无冷静；终止=拿到正常页或串发全灭。
     let mut tried = 0; // 已垫底重试候选数(仅日志)
     let mut seen = std::collections::HashSet::new(); // 本轮已试 IP
     let mut empty_ip_retries = 0u8; // 归属缺失分支的重试上限
@@ -767,9 +692,7 @@ async fn gh_defuse(
             return Ok(resp); // 非池域名: 无表可换, 诚实透传
         }
         if ip.is_empty() {
-            // 复用连接上的拦截页(理论可达：本次没拨号)：直接重试(连接不复用，
-            // 重试必有归属)。归属缺失时 seen 无法追踪 —— 计数上限钉死该
-            // 理论路径(2026-10-17 代码审查: 防未来改动使其真可达时死循环)
+            // 复用连接上的拦截页（归属缺失时 seen 无法追踪，重试上限防死循环）。
             empty_ip_retries += 1;
             if empty_ip_retries > 3 {
                 return Ok(resp);
@@ -807,12 +730,8 @@ async fn gh_defuse(
         };
     }
 }
-/// 交付计数体：包住大响应的体，统计实际推给客户端的字节数。
-/// 推完记"交付完成"；连接被提前关（Drop 时未推完）记"推了 N/总 M 后
-/// 连接终止" —— 2026-10-19 DevSidecar 下载排查的盲区：日志只有
-/// `connection closed before message completed`（hyper h1 服务端
-/// IncompleteMessage = 客户端在响应体未推完时关连接），分不清是
-/// 我们没发够还是客户端自己关的。计数体让下次一眼可判。
+/// 交付计数体：统计实际推给客户端的字节数。
+/// 推完记"推完"，被提前关记"推了 N/总 M 后连接终止"——区分"没发够"与"客户端自己关"。
 struct CountingBody {
     inner: BoxBody,
     sent: u64,
@@ -875,11 +794,8 @@ impl Drop for CountingBody {
         }
     }
 }
-/// 镜像大响应（>1MB）包交付计数体；小响应不包（免噪音）。
-/// HEAD 不包：HEAD 响应本就无体，hyper 不轮询直接弃体 —— 计数体会
-/// 误报"推了(0B/N)后连接终止"（2026-10-19 实测 rel_latest HEAD 假阳性）。
-/// 只罩镜像腿：直连腿的字节账由 `[隧道] ↑↓` 覆盖，镜像腿此前没有任何
-/// 交付记录。
+/// 镜像大响应（>1MB）包交付计数体；小响应与 HEAD 不包（HEAD 无体，包了误报 0B 终止）。
+/// 只罩镜像腿（直连腿字节账由 [隧道] ↑↓ 覆盖）。
 fn counted_mirror(
     resp: hyper::Response<BoxBody>,
     host: &str,
@@ -904,8 +820,7 @@ fn counted_mirror(
     ));
     hyper::Response::from_parts(parts, body)
 }
-/// 把上游响应写回浏览器：剔除 hop-by-hop 头，注入 X-GitPort-Route / X-GitPort-Upstream
-/// 诊断头；嗅探读出的前缀字节拼回响应体前端。
+/// 写回浏览器：剥 hop-by-hop 头，注入 X-GitPort-Route/Upstream，嗅探前缀拼回体前。
 fn write_upstream(
     resp: hyper::Response<BoxBody>,
     route: &str,
@@ -946,8 +861,7 @@ fn mitm_unavailable(
         return plain_502();
     }
     let ui_port = config::webui_port();
-    // host 来自 CONNECT 目标/Host 头, 进 HTML 前转义(2026-10-17 安全审计
-    // F-007: 浏览器路径不可注入, 纯纵深)
+    // host 进 HTML 前转义（防注入）。
     let host = html_escape(host);
     let html = format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
@@ -977,10 +891,7 @@ code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decora
         .unwrap()
 }
 // ---------- 系统 DNS 直连腿(末路兜底) ----------
-/// 串发池全灭且(内容域)镜像链也失败后, 按系统解析的当前 IP 真名 SNI 直拨
-/// —— GitHub 边缘 IP 迁移(如 2026-10 assets .154→.215)导致池表过期的自愈
-/// 路径: 系统解析拿到的就是当下有效的边缘。仅 GET/HEAD 调用(POST 不重发)。
-/// 成功后入连接缓存, 后续同 host 请求自动走复用快路径。
+/// 串发+镜像全灭后按系统解析真名 SNI 直拨（池表漂移自愈）；仅 GET/HEAD，成功入缓存。
 async fn dns_direct_fetch(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -1016,8 +927,7 @@ async fn dns_direct_fetch(
             }
         };
         let attempt_req = build_request(out, body);
-        // 内容域专用预算 4s：.133 真名腿被 GFW 黑洞时快速失败回落镜像链，
-        // 不拖满 8s —— 预算只罩到响应头，体不限
+        // 内容域 4s 预算：黑洞快速失败。
         let budget = if pool::route::is_content_host(host) {
             CONTENT_REQUEST_BUDGET
         } else {
@@ -1046,17 +956,13 @@ async fn dns_direct_fetch(
     ))
 }
 // ---------- 镜像串行链：按链逐个用，禁并发竞速 ----------
-/// 镜像串行链：按链序逐个取用，失败/被拒换下一个，链全灭才报错。
-/// 2026-10-15 裁定废除并发竞速：N 路并发探测会打爆公共镜像（头像全灭
-/// 的推手）。链序 = 内置默认（实测 TTFB）+ UI 校准。
+/// 镜像串行链：逐家取用失败换下一个（并发竞速打爆公共镜像，已废）；链序=内置+UI 校准。
 async fn chain_fetch(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 凭据查询串拒绝走镜像(2026-10-17 安全审计 F-001)：签名凭据
-    // (token/X-Amz-*/sig 类)等价 bearer, 剥头清单管不到它 —— 私库附件
-    // signed URL 交给第三方镜像即外泄。此类请求镜像本也取不回, 直接拒。
+    // 凭据查询串拒走镜像：signed URL 等价 bearer，交第三方镜像即外泄。
     if let Some(q) = out.uri().query() {
         if has_credential_query(q) {
             return Err(format!("{host} 查询串含凭据参数, 拒绝镜像(防外泄)"));
@@ -1070,20 +976,15 @@ async fn chain_fetch(
             .unwrap_or_default()
     );
     let path = path_of(out.uri());
-    // 镜像链归属：release 附件/源码包走**专属链**（release-assets/codeload），
-    // 不用请求 host 自己的链 —— 2026-10-19 DevSidecar 下载根因：github.com
-    // 链头部 ghproxy.net 慢且中断（重试风暴），而 release-assets 链头部是
-    // 实测 3838KB/s 的 gh-proxy 系。URL 仍用原 host 构造（镜像自己跟随
-    // 302 落点），熔断/限长/链序全部按归属 host。
+    // 链归属与请求 host 解耦：release 附件走 release-assets 专属链（github.com 链头慢且中断）。
+    // URL 仍用原 host 构造（镜像自己跟随 302 落点），熔断/限长/链序按归属 host。
     let chain_host = pool::route::mirror_chain_host(host, &path);
     if chain_host != host {
         (log)(&format!(
             "[镜像] {host}{path} 归属链 {chain_host}（不用 {host} 自己的链）"
         ));
     }
-    // 客户端请求形态（2026-10-19 排查盲区）：镜像链此前只记归属链与
-    // via，看不到浏览器到底要的是全量、Range 段还是缓存重验证 ——
-    // 23 条 "connection closed" 无法归因。Range / 条件头出现即记。
+    // 记录客户端 Range/条件头：下载中断归因的关键。
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
     let cond = out
         .headers()
@@ -1100,12 +1001,10 @@ async fn chain_fetch(
     if chain.is_empty() {
         return Err(format!("{host} 无镜像链({chain_host})"));
     }
-    // 全灭熔断：刚整链失败过(60s 内)直接快速失败, 不再逐家重烧 —— 多图
-    // 仓库在全灭窗口里每张图都重烧一遍链, spinner 会转几分钟
+    // 全灭熔断 60s：窗口内不再逐家重烧。
     if pool::mirror_breaker_open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
-    // 内容域小文件限长前 5 家（串行逐家, 2026-10-17 用户要求）; 大文件全链。
     let limit = mirror_chain_cap(chain_host)
         .unwrap_or(chain.len())
         .min(chain.len());
@@ -1145,11 +1044,7 @@ async fn chain_fetch(
     pool::mirror_breaker_set(chain_host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
     Err(format!("{host} 镜像链全灭({chain_host} 链 {limit} 个)"))
 }
-/// 重建请求：头/方法/URI 复制 + 体按 replay 注入（Request<BoxBody> 不可
-/// Clone，换 IP/换候选重发时每 attempt 重建一份）。
-/// 2026-10-14 修复：旧 simple_request 丢体却保留原头（含 content-length）——
-/// GitHub 边缘对"声明 N 字节却永远等不到体"的请求挂起不放，恰是遥测 POST
-/// 全灭（30s 响应预算超时）进而失败垫底刷轮换的根源。GET 无体不受影响。
+/// 重建请求：Request 不可 Clone 每次重建；体必须与头一致（丢体曾致上游挂起）。
 fn build_request(out: &hyper::Request<BoxBody>, body: &Option<Bytes>) -> hyper::Request<BoxBody> {
     let mut builder = hyper::Request::builder()
         .method(out.method())
@@ -1165,8 +1060,7 @@ fn build_request(out: &hyper::Request<BoxBody>, body: &Option<Bytes>) -> hyper::
     };
     builder.body(body).expect("请求构造不会失败")
 }
-/// 镜像腿请求：拼 URL(镜像域名 + 原始 https URL) + 剥身份头
-/// (Cookie/Authorization/Host/Referer —— 镜像站不该收到 GitHub 的凭据)。
+/// 镜像腿请求：拼 URL + 剥身份头（凭据不外泄镜像）。
 fn mirror_request(
     out: &hyper::Request<BoxBody>,
     mirror: &str,
@@ -1176,8 +1070,7 @@ fn mirror_request(
     let mut builder = hyper::Request::builder().method(out.method()).uri(url);
     for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
-        // 身份头不外泄镜像；hop-by-hop 头必须剥净 —— 启用连接池后
-        // `Connection: close` 会让每次请求都新建连接，复用形同虚设
+        // 身份头不外泄；hop-by-hop 剥净（否则连接池复用形同虚设）。
         if upstream::is_hop_by_hop(&low)
             || matches!(low.as_str(), "cookie" | "authorization" | "host" | "referer")
         {
@@ -1189,10 +1082,8 @@ fn mirror_request(
         BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|e| std::io::Error::other(e)));
     builder.body(body).map_err(|e| e.to_string())
 }
-/// 镜像腿单发：有头预算(5s 内必须出响应头，头一到即解除，体不限) +
-/// 假页拒判(≥400 或 text/html = 镜像自身的 SPA 页，不算成绩)。
-/// 2026-10-18 起走共享连接池（upstream::mirror_client）：图片突发/多 Range
-/// 不再各自重付 DNS+TCP+TLS；hop-by-hop 头已在 mirror_request 剥净。
+/// 镜像腿单发：5s 响应头预算 + 假页拒判（≥400 或 text/html 不算成绩）。
+/// 走共享连接池，hop-by-hop 已在 mirror_request 剥净。
 async fn mirror_do(
     req: hyper::Request<BoxBody>,
     mirror: &str,
@@ -1211,18 +1102,11 @@ async fn mirror_do(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
-    // 镜像须直出内容：3xx=甩锅回 GitHub(用户侧被墙，浏览器跟随即断)，
-    // HTML=假站/停车场页面，>=400=镜像侧拒绝。实测(2026-10-14 沙箱)11 候选
-    // 无一带 3xx，护栏常驻防镜像来日改配。
-    // **304 例外**（2026-10-18 实测修复）：浏览器缓存热了会带 If-None-Match，
-    // 镜像如实回 304 Not Modified——这是合法响应，必须原样回给浏览器；
-    // 曾把它当甩锅 → 每家镜像都 304 → 整链全灭 → 熔断 → 封锁窗口内头像/
-    // 图片集体死亡（日志实锤：v4 秒回 304 被判失败）。
+    // 镜像须直出内容：3xx=甩锅、HTML=假站、≥400=拒绝；304 例外（缓存热时合法响应，曾误判致整链全灭）。
     let st = resp.status().as_u16();
     if (st >= 300 && st != 304) || ct.contains("text/html") {
         return Err(format!("{mirror} 状态 {st}"));
     }
-    // hyper Incoming → BoxBody（镜像腿统一响应类型）
     let (parts, body) = resp.into_parts();
     let body = BoxBody::new(http_body_util::BodyExt::map_err(
         body,
@@ -1230,8 +1114,7 @@ async fn mirror_do(
     ));
     Ok(hyper::Response::from_parts(parts, body))
 }
-/// 镜像腿凭据查询串检测：参数名命中凭据形态即拒（大小写不敏感）。
-/// 前缀匹配覆盖 AWS SigV4 全家（x-amz-*），精确名覆盖 gh-proxy 系常见形态。
+/// 镜像腿凭据查询串检测：x-amz-* 前缀 + 常见凭据参数名。
 fn has_credential_query(query: &str) -> bool {
     query.split('&').any(|kv| {
         let name = kv.split('=').next().unwrap_or("").to_lowercase();
@@ -1246,10 +1129,7 @@ fn has_credential_query(query: &str) -> bool {
             || name.starts_with("x-amz-")
     })
 }
-/// 校准模板：每 host 一个内置稳定 URL，校准时经各镜像拉它测 TTFB。
-/// 选型原则：十年不腐 —— octocat 官方 gist/头像、torvalds/linux 的
-/// README 与 v2.6.11 老 tag、git-lfs 的 release 资产（文件名含 v 前缀，
-/// 2026-10-15 实测全镜像 200）。
+/// 校准模板：每 host 一个十年不腐的稳定 URL。
 pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
     (
         "github.com",
@@ -1288,27 +1168,18 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
         "https://media.githubusercontent.com/media/torvalds/linux/master/README",
     ),
 ];
-// ---------- 校准（2026-10-18 重设计：两种模式，host 间严格串行） ----------
-/// 校准模式：
-/// - **Throughput**：大文件四链（github.com / codeload / objects / release-assets），
-///   每链 11 家**并发**竞速真实下载——窗口 12s / 每家上限 5MB，按窗口内实收
-///   字节数排名，字节读完即弃不落盘。TTFB 快 ≠ 下载快，大文件必须按吞吐排
-/// - **Ttfb**：内容域五链（raw / gist / avatars / user-images / media），逐家
-///   实测响应头时间——图片小，TTFB 就是主要成本
-///
-/// 铁律（2026-10-18 用户裁定）：**host 之间严格串行**。同一镜像服务多条链，
-/// 跨链并发校准会让同一镜像被多路同时打，测出的数字互相污染。
-/// 与 10-15"废除并发竞速"裁定的关系：那次废的是**常规流量路径**上的竞速；
-/// 本处的并发只存在于**手动低频校准**（一次 30-50MB 流量），目的是测量。
+// ---------- 校准 ----------
+// 两模式：Throughput=大文件四链 11 家并发竞速（12s 窗口按实收字节排名）；Ttfb=内容域五链响应头测速。
+// 铁律：host 间严格串行——同一镜像服务多条链，跨链并发互相污染测量；并发只在手动低频校准，常规流量竞速已废。
 pub enum CalibMode {
     Throughput,
     Ttfb,
 }
 
-/// 校准重入闸（校准后台化后，防 UI 连点/双开）。
+/// 校准重入闸（防 UI 连点/双开）。
 static CALIB_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 最近一次校准的人读报告（后台任务结束时写入；UI 轮询 GET /api/calibrate 取回展示）。
+/// 最近一次校准的人读报告（UI 轮询取回展示）。
 static CALIB_REPORT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// 校准是否在跑（UI 轮询用）。
@@ -1342,13 +1213,11 @@ pub fn end_calibrate() {
     CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// 吞吐测速参数：固定窗口 12s、每家上限 5MB。窗口从发起请求起算——
-/// 握手/回源都算在里面，镜像快慢一体呈现；字节读完即弃，不落盘。
+/// 吞吐测速：固定窗口 12s、每家上限 5MB；字节读完即弃。
 const CALIB_THROUGHPUT_WINDOW: Duration = Duration::from_secs(12);
 const CALIB_THROUGHPUT_CAP: u64 = 5 * 1024 * 1024;
 
-/// 吞吐测速（Throughput 模式单镜）：固定窗口内统计真实下载字节数。
-/// 到 5MB 上限或 EOF 提前结束，按实际字节计。拒判口径与 mirror_do 一致。
+/// 单镜吞吐测速：窗口内统计真实下载字节数；拒判口径与 mirror_do 一致。
 async fn throughput_probe(
     mirror: &str,
     tmpl: &str,
@@ -1404,10 +1273,8 @@ async fn throughput_probe(
     Ok((n, ms))
 }
 
-/// 吞吐竞速（单 host 内 11 家并发，固定窗口同钟测速）：
-/// 全员同窗口起跑，字节数即排名——先到 5MB 的自然是冠军，
-/// 被窗口掐掉的慢镜像按已收字节排后（截断时刻的进度就是吞吐快照）。
-/// 返回 (镜像, 字节数) 已按字节降序；失败条目为负的耗时，自然沉底。
+/// 单 host 内 11 家并发竞速：同窗口起跑，字节数即排名（先到 5MB 为冠军，被掐的按已收字节排后）。
+/// 返回按字节降序；失败条目为负耗时自然沉底。
 async fn throughput_race(
     host: &str,
     chain: &[String],
@@ -1447,8 +1314,7 @@ async fn throughput_race(
     rows
 }
 
-/// 单镜像校准测速（TTFB 模式）：拉模板 URL，响应头达标（<300 且非 HTML）即有效成绩。
-/// 拒判口径与 mirror_do 一致 —— 3xx=甩锅、HTML=假站、>=400=拒绝路由。
+/// TTFB 单镜测速：拒判口径与 mirror_do 一致。
 async fn calibrate_one(mirror: &str, tmpl: &str, log: &LogFn) -> Result<u16, String> {
     let uri: http::Uri = format!("{mirror}/{tmpl}")
         .parse()
@@ -1483,14 +1349,10 @@ async fn calibrate_one(mirror: &str, tmpl: &str, log: &LogFn) -> Result<u16, Str
         Err(_) => Err("响应头预算超时".to_string()),
     }
 }
-/// 镜像链校准（UI 两个校准按钮的后端，**后台任务**）：host 之间严格串行，
-/// 链内按模式分流——Throughput = 11 家并发竞速真实下载，Ttfb = 逐家实测
-/// 响应头。结果经 set_mirror_chain 写回 plans.json 并返回人读报告（报告
-/// 由调用方写进日志页——校准已后台化，HTTP 响应不再等待它）。
+/// 镜像链校准（后台任务）：host 间严格串行；结果写回 plans.json 并返回人读报告。
 pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     let chains = pool::mirror_chains_snapshot();
     let mut report = String::new();
-    // 铁律：host 之间严格串行（同一镜像服务多条链，跨链并发互相污染测量）
     for (host, chain) in chains {
         let big = pool::route::is_big_file_host(&host);
         let eligible = match mode {
@@ -1557,7 +1419,6 @@ async fn mitm_upgrade(
     req: hyper::Request<Incoming>,
     host: &str,
 ) -> axum::response::Response<BoxBody> {
-    // 取出升级流（hyper 1.x：连接层已标记 upgrade）
     let mut req = req;
     let upgraded = match hyper::upgrade::on(&mut req).await {
         Ok(u) => u,
@@ -1583,7 +1444,6 @@ async fn mitm_upgrade(
             Err(_) => return mitm_unavailable(&req, host),
         }
     };
-    // 原样写请求：请求行 + 全头(含 Upgrade/Connection)
     let mut head = format!(
         "{} {} HTTP/1.1\r\n",
         req.method(),
@@ -1600,7 +1460,7 @@ async fn mitm_upgrade(
     if conn.write_all(head.as_bytes()).await.is_err() {
         return mitm_unavailable(&req, host);
     }
-    // 双向透传：客户端升级流 ↔ 上游（TokioIo 统一 hyper/tokio IO trait）
+    // 双向透传
     let (mut ar, mut aw) = tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
     let (mut br, mut bw) = tokio::io::split(conn);
     let down = tokio::spawn(async move { tokio::io::copy(&mut br, &mut aw).await.unwrap_or(0) });
@@ -1616,8 +1476,7 @@ async fn mitm_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// 镜像链限长范围（2026-10-17 用户要求）：内容域小文件限长前 5 家（仍串行），
-    /// 大文件与 github.com 归档/release 用全链。
+    /// 内容域限长前 5 家；大文件与 github.com 全链。
     #[test]
     fn mirror_chain_cap_scope() {
         for h in [
@@ -1639,8 +1498,7 @@ mod tests {
             assert_eq!(mirror_chain_cap(h), None, "{h} 应用全链");
         }
     }
-    /// 镜像请求剥头（2026-10-18）：身份头不外泄 + hop-by-hop 剥净（启用
-    /// 连接池后 `Connection: close` 会让复用形同虚设）；业务头必须保留。
+    /// 身份头不外泄 + hop-by-hop 剥净；业务头保留。
     #[test]
     fn mirror_request_strips_identity_and_hop_by_hop() {
         let out = hyper::Request::builder()
@@ -1687,8 +1545,7 @@ mod tests {
             "拼 URL 形态: {uri}"
         );
     }
-    /// gzip 嗅探(2026-10-17): 拦截页必须在"解压后的前 4KB"被判出, 且已消费的
-    /// 原始压缩帧必须是压缩流的真前缀 —— 写回时拼回不破坏字节流(浏览器自行解压)。
+    /// gzip 拦截页须在解压后前 4KB 被判出，且已消费原始帧必须是压缩流真前缀。
     #[tokio::test]
     async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
         use std::io::Write;
@@ -1739,8 +1596,7 @@ mod tests {
         let mut resp2 = hyper::Response::from_parts(parts2, body2);
         assert!(!is_gh_block_page(&mut resp2).await);
     }
-    /// 锁住镜像候选池契约：全部 https、互不重复、全部来自统一 MIRRORS 池
-    /// （gh-proxy 系；dh-proxy 无对应服务，域名是本常量数组可改）。
+    /// 镜像候选池契约：全 https、无重复、来自统一 MIRRORS 池。
     #[test]
     fn mirrors_pool_health() {
         assert!(
@@ -1786,8 +1642,7 @@ mod tests {
         );
         assert!(defuse_full_cycle(&mut seen, "1.2.3.4"), "重复终止保持终止");
     }
-    /// release/archive 路径判定（已收拢 route.rs）：只拦下载，不拦 git 智能
-    /// 协议与页面。判定入口是总路由 master_route → Route::Mirror。
+    /// release/archive 只拦下载，不拦 git 智能协议与页面；判定入口 master_route。
     #[test]
     fn release_asset_path_gate() {
         use pool::route::{master_route, Route};
@@ -1805,7 +1660,7 @@ mod tests {
             "github.com",
             "/cli/cli/releases/download/v2.0.0/gh_2.0.0_windows_amd64.zip"
         ));
-        // /releases/latest/download/ 稳定链形态（2026-10-19 补：曾漏，落 core 直连）
+        // /releases/latest/download/ 稳定链形态（曾漏）
         assert!(mirror(
             "github.com",
             "/docmirror/dev-sidecar/releases/latest/download/DevSidecar.exe"
@@ -1827,9 +1682,7 @@ mod tests {
         assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
     }
 
-    /// 流式直通判定契约（2026-10-16 方案一）：git 智能协议 POST 与声明
-    /// 超限必流式；GET/HEAD 与常规小体不流式；超限值恰为 MAX_REPLAY_BODY
-    /// 时不流式（缓冲路径的合法上界）。
+    /// git 智能协议 POST 与声明超限必流式；GET/HEAD 与小体不流式；恰为上界不流式。
     #[test]
     fn stream_decision_contract() {
         use upstream::MAX_REPLAY_BODY;
@@ -1871,9 +1724,7 @@ mod tests {
         assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
     }
 
-    /// 交付计数体（2026-10-19）：推完记"推完"，未推完被弃记"推了 N/总 M
-    /// 后连接终止" —— 下载连接被提前关时，区分"我们没发够"与"客户端
-    /// 自己关了"的唯一交付凭据。
+    /// 推完记"推完"；未推完被弃记"推了 N/总 M 后连接终止"。
     #[tokio::test]
     async fn counting_body_logs_completion_and_truncation() {
         use hyper::body::Body;
@@ -1913,8 +1764,7 @@ mod tests {
         );
     }
 
-    /// HEAD 不包计数体（2026-10-19 rel_latest 实测假阳性）：HEAD 响应本就
-    /// 无体，hyper 弃体不轮询 —— 若包了会误报"推了(0B/N)后连接终止"。
+    /// HEAD 不包计数体：HEAD 无体，包了误报 0B 终止。
     #[test]
     fn counted_mirror_skips_head_and_small() {
         let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

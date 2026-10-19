@@ -16,9 +16,7 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// 写系统剪贴板(CF_UNICODETEXT)。桌面壳与代理同会话, 必成 —— JS 层
-/// clipboard API 在 WebView2 默认被拒, 这里是复制的最终兜底。
-/// (失败路径不 GlobalFree: 分配块极小且极罕见, 交由进程退出回收)
+/// 写系统剪贴板(CF_UNICODETEXT)。WebView2 默认拒 JS 剪贴板 API，这里是复制的最终兜底。
 #[cfg(target_os = "windows")]
 fn write_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::HANDLE;
@@ -86,11 +84,8 @@ fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> 
     Ok(tray)
 }
 
-/// 单实例守卫：已有实例在跑则弹提示并返回 true(调用方直接退出)。
-/// mutex 的 HANDLE 必须存活到进程退出（Windows 关闭最后一个 handle 即销毁
-/// mutex），而 windows crate 的 HANDLE 带 Drop —— 故存 static 锚住（字段
-/// 故意永不读，进程退出由 OS 清理）。
-/// 否则二次启动放行、双实例抢 7810（2026-10-13 实测）。
+/// 单实例守卫：已有实例在跑则弹提示并返回 true。
+/// mutex HANDLE 必须活到进程退出，故存 static 锚住（字段永不读）。
 #[allow(dead_code)]
 struct SingleMutexHandle(windows::Win32::Foundation::HANDLE);
 unsafe impl Send for SingleMutexHandle {}
@@ -98,7 +93,7 @@ unsafe impl Sync for SingleMutexHandle {}
 
 static SINGLE_MUTEX: Mutex<Option<SingleMutexHandle>> = Mutex::new(None);
 
-/// 事件循环代理（WebUI 的 /api/show 用它把托盘里的窗口唤起来）。
+/// 事件循环代理（WebUI 的 /api/show 用它唤起窗口）。
 static EVENT_PROXY: std::sync::OnceLock<tao::event_loop::EventLoopProxy<AppEvent>> =
     std::sync::OnceLock::new();
 
@@ -113,9 +108,7 @@ pub fn show_via_proxy() -> bool {
 pub fn already_running() -> bool {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    // 关键：CreateMutexW 在"互斥量已存在"时**返回成功句柄**，只在 LastError 里
-    // 报 ERROR_ALREADY_EXISTS —— 原实现只判 Err，永远判不出"已在运行"，
-    // 于是二次启动完整跑起来、托盘多一个图标（2026-10-18 实测）。
+    // CreateMutexW 在"互斥量已存在"时返回成功句柄，只在 LastError 报 ALREADY_EXISTS —— 必须查 LastError。
     let r = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\gitport-github")) };
     match r {
         Ok(h) => {
@@ -133,7 +126,7 @@ pub fn already_running() -> bool {
     }
 }
 
-/// 二次启动的兜底提示（唤起失败时用，例如旧版本实例没有 /api/show）。
+/// 二次启动的兜底提示（唤起失败时用）。
 pub fn notify_already_running() {
     use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
     let text = windows::core::w!("GitPort GitHub 已在运行(请看系统托盘)。");
@@ -148,9 +141,7 @@ pub fn notify_already_running() {
     }
 }
 
-/// 请求**已在运行的实例**把托盘里的工作台唤起来（二次启动时调用）。
-/// 走它常驻的 WebUI：POST /api/show → 事件循环 ShowWindow（窗口已释放则重建）。
-/// 返回 false = 没唤起（旧版本实例 / headless / 端口不通），调用方走提示兜底。
+/// 请求已运行实例唤起工作台（POST /api/show）；false = 没唤起，调用方走提示兜底。
 pub fn signal_show(port: u16) -> bool {
     use std::io::{Read, Write};
     let addr = match format!("127.0.0.1:{port}").parse() {
@@ -180,8 +171,7 @@ struct WinSlot {
     wv: Option<wry::WebView>,
 }
 
-/// 在事件循环线程创建窗口并导航。WebView2 运行时不可用/创建失败返回 None
-/// （wry 的 build 会直接报错），调用方走浏览器兜底 + 周期重试。
+/// 在事件循环线程创建窗口并导航；WebView2 不可用返回 None，调用方走浏览器兜底。
 fn create_window(
     slot: &Mutex<WinSlot>,
     elwt: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
@@ -192,11 +182,8 @@ fn create_window(
     if g.win.is_some() {
         return true;
     }
-    // 唯一标准：settings.json 的 winRect（2026-10-18 用户裁定）。
-    // 窗口按它 **出生即在位**（builder 直接定位）——不再"先按默认尺寸出现在
-    // 系统位置，建完 WebView 再跳"，那个跳就是用户看到的闪跳。
-    // 没有记录（首次/异常小）就按主屏居中偏下现算一个并**立刻写回**：
-    // settings.json 从此就是窗口状态的唯一来源，之后每次启动都按它建窗。
+    // 窗口按 winRect 出生即在位（builder 直接定位，避免闪跳）；
+    // 无记录则居中偏下现算并立刻写回——settings.json 是窗口状态唯一来源。
     let (sw, sh) = elwt
         .primary_monitor()
         .map(|m| {
@@ -215,7 +202,7 @@ fn create_window(
         {
             (l, t, w, h)
         }
-        // 记录缺失，或矩形完全落在当前主屏外（拔了显示器等）→ 退回默认居中
+        // 记录缺失或矩形落在当前主屏外（拔了显示器等）→ 退回默认居中
         _ => default_rect(),
     };
     if settings::window_rect() != Some((l, t, w, h)) {
@@ -233,8 +220,7 @@ fn create_window(
     let ipc_log = log.clone();
     match wry::WebViewBuilder::new()
         .with_ipc_handler(move |req: http::Request<String>| {
-            // WebView2 的剪贴板 API(navigator.clipboard/execCommand)默认被拒,
-            // JS 层复制优先经 IPC 到本机写系统剪贴板(同会话, 必成)
+            // WebView2 剪贴板 API 默认被拒，JS 层复制经 IPC 到本机写系统剪贴板
             if let Some(text) = req.body().strip_prefix("copy:") {
                 let ok = write_clipboard(text);
                 let n = text.chars().count();
@@ -248,8 +234,7 @@ fn create_window(
         Ok(wv) => {
             g.win = Some(window);
             g.wv = Some(wv);
-            // OS 可能对位置做了屏幕钳制：把"实际矩形"立刻写回一次，
-            // settings.json 恒等于窗口真实现状（此后收起/退出时再存）
+            // OS 可能钳制位置：把实际矩形立刻写回，settings.json 恒等于窗口现状
             drop(g);
             save_window_rect(slot);
             true
@@ -261,14 +246,12 @@ fn create_window(
     }
 }
 
-/// 读取主窗口当前矩形并持久化(退出时调用, 下次启动恢复)。
+/// 读取主窗口当前矩形并持久化(退出时调用)。
 fn save_window_rect(slot: &Mutex<WinSlot>) {
     let g = slot.lock().unwrap();
     let Some(w) = &g.win else { return };
     let Ok(pos) = w.outer_position() else { return };
-    // 尺寸存 **inner_size**（客户区）：恢复时 builder 用的就是 with_inner_size。
-    // 曾存 outer_size（含标题栏/边框），每次重开都被当成客户区再加一遍装饰 ——
-    // 窗口一轮比一轮大，系统为保在屏内又挪位置 → “位置偏、大小变”（2026-10-18 修）。
+    // 尺寸存 inner_size（客户区）：存 outer_size 会每轮重开叠加装饰，窗口越变越大。
     let size = w.inner_size();
     let (wpx, hpx) = (size.width as i32, size.height as i32);
     if wpx < 400 || hpx < 300 {
@@ -301,8 +284,7 @@ pub struct DesktopArgs {
     pub on_quit: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// 桌面主循环(阻塞)。on_quit = 善后函数(还原系统代理/停代理), 由 main 注入。
-/// 事件循环线程 = 主线程（tao 要求）。
+/// 桌面主循环(阻塞)。on_quit = 善后函数，由 main 注入；事件循环线程 = 主线程。
 pub fn run(args: DesktopArgs) -> ! {
     let url = args.url;
     let log = args.log;
@@ -323,9 +305,7 @@ pub fn run(args: DesktopArgs) -> ! {
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
     let mut _tray = build_tray(show_item, quit_item).ok();
-    // 托盘事件 → 全事件驱动：两个线程各自阻塞收（crossbeam recv 无事件即
-    // 内核级睡眠，零周期唤醒）。原 80ms recv_timeout 轮询 = 12.5 次/秒无谓
-    // 唤醒，违背托盘态"几乎零活动"（2026-10-17 裁定）。
+    // 托盘事件 → 全事件驱动（crossbeam recv 无事件即内核级睡眠，零周期唤醒）。
     {
         let proxy = proxy.clone();
         std::thread::spawn(move || {
@@ -365,8 +345,7 @@ pub fn run(args: DesktopArgs) -> ! {
     }
 
     let quitting = Arc::new(AtomicBool::new(false));
-    // 主动收起到托盘的标记: CloseRequested 置位, 供 Destroyed 事件区分
-    // "自己收的"(不重建, 保持 headless 态)与"外部销毁"(自愈重建)。
+    // 主动收起到托盘的标记: 供 Destroyed 事件区分"自己收的"与"外部销毁"。
     let tray_hidden = Arc::new(AtomicBool::new(false));
     let slot2 = slot.clone();
     let quitting2 = quitting.clone();
@@ -394,9 +373,7 @@ pub fn run(args: DesktopArgs) -> ! {
             }
             Event::UserEvent(AppEvent::RequestQuit) => do_quit(control_flow),
             Event::LoopDestroyed => {
-                // 系统关机/注销(WM_ENDSESSION wParam!=0)：还原系统代理, 防残留
-                // PAC 指向死端口断网。tao 只在 wParam=TRUE 时发 LoopDestroyed
-                // —— 取消关机不会到这, 不误清。与 do_quit 幂等合并(quitting 防重入)。
+                // 系统关机/注销：还原系统代理防残留（tao 只在 wParam=TRUE 时发本事件）。
                 if !quitting.swap(true, Ordering::SeqCst) {
                     save_window_rect(&slot);
                     (on_quit)();
@@ -407,11 +384,8 @@ pub fn run(args: DesktopArgs) -> ! {
                 ..
             } => {
                 if settings::close_to_tray() {
-                    // 托盘化 = 彻底释放 WebView2(扮演 headless): 7 个 Chromium
-                    // 进程(实测 ~286MB commit)全部退出, 只剩代理核心 ~12MB;
-                    // 点击托盘走 ShowWindow 的"无窗则建窗"路径重建。
-                    // 先存窗口矩形, 再放 WebView(持有 controller)后放窗口;
-                    // 随后的 Destroyed 事件由 tray_hidden 标记拦截, 不自愈。
+                    // 托盘化 = 彻底释放 WebView2（~286MB commit 全退，只剩代理核心 ~12MB）；
+                    // 先存矩形再放 WebView/窗口；随后 Destroyed 由 tray_hidden 拦截不自愈。
                     save_window_rect(&slot);
                     tray_hidden.store(true, Ordering::SeqCst);
                     let mut g = slot.lock().unwrap();
@@ -447,9 +421,7 @@ pub fn run(args: DesktopArgs) -> ! {
                     g.wv = None;
                 }
                 if quitting.load(Ordering::SeqCst) {
-                    // 退出流程中: 不重建
                 } else if tray_hidden.swap(false, Ordering::SeqCst) {
-                    // 主动收起到托盘: 保持无窗(headless 态), 等托盘点击再建
                 } else {
                     (log)("工作台窗口被外部销毁, 自愈重建(代理保持运行)");
                     if create_window(&slot, elwt, &url, &log) {

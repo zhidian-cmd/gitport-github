@@ -32,31 +32,21 @@ pub fn set_webui_port(p: u16) {
 
 /// 读 CONNECT/请求头的超时（秒）。
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
-/// 单候选拨号超时（TCP 与 TLS 握手共用）：3s 给 SYN 丢包一次重传机会，
-/// 黑洞型死 IP 不许拖住整轮串发。
+/// 单候选拨号超时（TCP 与 TLS 握手共用）：黑洞型死 IP 不许拖住整轮串发。
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
 
-/// 活跃窗口内 h2 保活：探测间隔（秒）。日志实测上游 h2 连接在空闲
-/// 50-65s 时被边缘回收，30s 探测可稳定续命。
+/// h2 连接空闲 50-65s 被边缘回收，30s 探测可稳定续命。
 pub const KEEPALIVE_PROBE_SECS: u64 = 30;
 /// 保活活跃窗口（秒）：最近一次请求后窗口内的探测，静默超窗即停（回零唤醒）。
 pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
-/// CONNECT 隧道首字节看门狗：客户端已发 ClientHello 而上游 0 回包
-/// （TCP 活着但被黑洞）时，代理先于浏览器 15~30s 超时判死 + 垫底。
+/// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
-/// 流量拨号闸门：限真实流量拨号的总并发 —— 没有它，打开一个页面
-/// 30 并发请求会把自己打爆（实测踩过）。
+/// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
-/// 环形日志条数（供 WebUI 增量拉取，协议按 seq 增量、对容量无感知）。
-/// 2000 = 浏览高峰约十分钟的追溯窗口：500 条在活跃浏览时几分钟即被冲掉，
-/// 排障时"几分钟前的失败"查无实据（2026-10-17 复审裁定扩容）。
+/// 环形日志条数（WebUI 按 seq 增量拉取）。
 pub const LOG_BUFFER_SIZE: usize = 2000;
-/// 域名分组：命中规则的流量按该池的 plans.json 串发表拨号。
-/// IP 名单不在此处 —— plans.json 是唯一权威（首次运行由 pool/seeds.json 初始化）。
-/// 组即串发池（core/api/edge，见 pool::SERIAL_POOLS）—— codeload 2026-10-19
-/// 撤组：它是"纯镜像域"不是池，GET/HEAD 由总路由 pool::route::master_route
-/// 判 Mirror only，其他方法落 core 通配（主站边缘服务 codeload 子域），
-/// 不再有"串发表为空(codeload)"的空转噪音。
+/// 域名分组：命中即按该池 plans.json 串发表拨号；IP 名单不在此（plans.json 唯一权威）。
+/// codeload 非池：GET/HEAD 由 master_route 判 Mirror，其他方法落 core 通配。
 pub struct Group {
     pub name: &'static str,
     pub patterns: &'static [&'static str],
@@ -65,21 +55,16 @@ pub struct Group {
 pub const GROUPS: &[Group] = &[
     Group {
         name: "core",
-        // objects-origin（release 附件上传落点）不在任何池 —— 见 DIRECT_HOSTS：
-        // 该 vhost 只有 GLB 族服务，主站边缘对其 301（无 CORS）会弄死上传。
+        // objects-origin 不在任何池 —— 见 DIRECT_HOSTS（主站边缘对其 301 会弄死上传）。
         patterns: &["github.com", "*.github.com"],
     },
     Group {
-        // api.github.com 走 API 专用边缘（140.82.112-114 的 .5/.6）：落到网站请求返
-        // 404 JSON，反之网站 IP 落到 api 返 301，两族按 IP 分服务互斥，必须精确优先拆池。
+        // api 走专用边缘（.5/.6）：与网站 IP 分服务互斥，落错返 404/301，必须精确优先拆池。
         name: "api",
         patterns: &["api.github.com"],
     },
     Group {
-        // 直连混合池 edge：auth 主机（凭据不外泄镜像）+ Fastly 静态/内容边缘。
-        // avatars/camo/gist 直连 1s 内 200，镜像竞速则全灭 502（头像风暴还
-        // 会打爆公共镜像）；raw 真名 SNI 被 GFW RST，直连失败由 mitm 回落镜像。
-        // 条目按 host 族对口选择（route::POOL_ROUTES），不对口不试不垫底。
+        // auth 主机 + Fastly 静态/内容边缘；条目按 host 族对口选择（route::POOL_ROUTES）。
         name: "edge",
         patterns: &[
             "githubapp.com",
@@ -103,20 +88,10 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
     host == pat
 }
 
-/// 直连白名单：不归任何池、也不经代理的域名（"信任 DNS"清单）。
-/// - objects-origin（网页上传 Release 落点）：该 vhost 只由 GLB 族
-///   (140.82.11x.21/.22, x-github-backend: Kubernetes) 服务；主站网页边缘对它
-///   一律 301 到 github.com 且无 CORS 头 → 浏览器跨域预检直接失败、文件字节
-///   一个都发不出去（2026-10-17 逐 IP 实测：core 池 21/35 是 301 边缘）。
-/// - uploads.github.com（API 式上传源站 alambic → 20.205.243.161）：当前网页
-///   流程不用它；直连让 DNS 交给源站本尊，等价 gh CLI 的已知可用路径
-///   （原专用池 + 验收名覆盖为一处降级，已随之删除）。
-/// - viewscreen.githubusercontent.com（mermaid 服务端渲染）：走代理是真名 SNI
-///   拨 .133 内容边缘，被 GFW 间歇掐断（新建连接 3s 超时 × 多候选、无镜像
-///   兜底）→ 图表等得久；浏览器直连该域时通时断（窗口期），实测"一进仓库
-///   就出图"——**非 ECH**：github.com/viewscreen 均无 HTTPS RR（2026-10-18 实测）。
-/// vhost→边缘的映射只有 GitHub 的 DNS 知道，交给系统解析永远命中正确族，
-/// 代码里不再保留这份会腐化的知识。
+/// 直连白名单：不归任何池、不经代理（vhost→边缘映射只有 GitHub 的 DNS 知道，交给系统解析）。
+/// - objects-origin：仅 GLB 族服务，主站边缘对其 301 无 CORS → 跨域预检失败、上传必败
+/// - uploads.github.com：API 式上传源站，等价 gh CLI 可用路径
+/// - viewscreen：mermaid 渲染，代理腿真名 SNI 被间歇掐断且无镜像兜底，浏览器直连反而可用（非 ECH）
 pub const DIRECT_HOSTS: &[&str] = &[
     "objects-origin.githubusercontent.com",
     "uploads.github.com",
@@ -128,14 +103,9 @@ pub fn is_direct(host: &str) -> bool {
     DIRECT_HOSTS.iter().any(|d| *d == host)
 }
 
-/// 域名 -> 所属池名（唯一路由真相，"" = 非池域名）。
-/// 精确 pattern 优先于通配符 —— api.github.com 必须精确命中 api 组，
-/// 否则会被先遍历到的 core 组 "*.github.com" 抢走。
-/// 总路由（含直连白名单/镜像 only 分流）见 pool::route::master_route。
+/// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
 pub fn pool_for(host: &str) -> &'static str {
-    // 白名单必须先于两次 GROUPS 遍历：只删 pattern 不够 —— objects-origin
-    // 会落到 edge 的 *.githubusercontent.com 通配符（Fastly 500 Domain
-    // Not Found），正是 2026-10-17 16:53 那条错路。
+    // 白名单必须先于 GROUPS 遍历：objects-origin 会被 edge 通配符吞掉（Fastly 500）。
     if is_direct(host) {
         return "";
     }
@@ -192,29 +162,27 @@ mod tests {
         // api 池精确匹配优先于 core 的 "*.github.com"
         assert_eq!(pool_for("api.github.com"), "api");
         assert_eq!(pool_for("api.github.com.cn"), ""); // 不误伤非 api.github.com 后缀
-        // 上传域名全部直连白名单: 不入池不过代理(2026-10-17)
+        // 上传域名全部直连白名单: 不入池不过代理
         assert!(is_direct("objects-origin.githubusercontent.com"));
         assert_eq!(pool_for("objects-origin.githubusercontent.com"), "");
-        // uploads.github.com(API 式上传源站)同在白名单: 原上游专用池已撤销
+        // uploads.github.com 同在白名单: 原上游专用池已撤销
         assert!(is_direct("uploads.github.com"));
         assert_eq!(pool_for("uploads.github.com"), "");
         // viewscreen(mermaid 渲染): 代理腿真名 SNI 被间歇掐, 直连走浏览器 DoH/ECH
         assert!(is_direct("viewscreen.githubusercontent.com"));
         assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
-        // codeload 2026-10-19 撤组：大文件 GET/HEAD 由总路由判 Mirror only，
-        // 其他方法落 core 通配（主站边缘服务该子域）——不再有空池噪音
+        // codeload 撤组：GET/HEAD 判 Mirror，其他方法落 core 通配
         assert_eq!(pool_for("codeload.github.com"), "core");
-        // 文件内容域 → edge 直连（avatars/camo/gist 实测直连 1s 内 200；
-        // 镜像竞速全灭 502 是头像不显示的根源）+ 失败回落镜像在 mitm 侧
+        // 文件内容域 → edge 直连，失败回落镜像在 mitm 侧
         assert_eq!(pool_for("raw.githubusercontent.com"), "edge");
         assert_eq!(pool_for("avatars.githubusercontent.com"), "edge");
         assert_eq!(pool_for("camo.githubusercontent.com"), "edge");
         assert_eq!(pool_for("gist.githubusercontent.com"), "edge");
-        // CSS/JS 与 Pages → 直连池（镜像不路由，实测全 404）
+        // CSS/JS 与 Pages → 直连池（镜像不路由）
         assert_eq!(pool_for("github.githubassets.com"), "edge");
         assert_eq!(pool_for("foo.github.io"), "edge");
         assert_eq!(pool_for("github.io"), "edge");
-        // auth 主机与静态边缘合池 edge（凭据不外泄 + 镜像不路由）
+        // auth 主机与静态边缘合池 edge
         assert_eq!(pool_for("githubapp.com"), "edge");
         assert_eq!(pool_for("api.githubapp.com"), "edge");
         assert_eq!(pool_for("example.com"), "");

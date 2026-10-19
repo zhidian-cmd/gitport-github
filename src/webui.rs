@@ -234,7 +234,7 @@ async fn proxy_pac() -> Response {
 }
 
 #[derive(Serialize)]
-// 键名 camelCase：前端读 s.domainCount —— 曾输出 domain_count(snake) 导致前端显示 undefined。
+// 键名 camelCase：曾输出 snake_case 导致前端读不到。
 #[serde(rename_all = "camelCase")]
 struct StatusResp {
     version: String,
@@ -284,16 +284,14 @@ async fn api_mirrors() -> Response {
     write_json(&serde_json::Value::Object(obj))
 }
 
-/// 镜像链校准（UI"校准"按钮）：串行实测每链 TTFB 后按成绩重排并写盘。
-/// 最坏耗时 ≈ 链长 × 头预算(8s)（host 间已并行），约 30~90s —— 前端显示
-/// "校准中"并等待本响应。
+/// 镜像链校准（UI 按钮）：串行实测每链 TTFB 后重排写盘，前端等待本响应。
 async fn api_calibrate(
     State(st): State<Arc<App>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let logs = st.logs.clone();
     let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
-    // 防重入：校准已后台化，同一时刻只允许一个任务
+    // 防重入：同一时刻只允许一个校准任务
     if !crate::server::mitm::try_begin_calibrate() {
         return (
             [
@@ -312,8 +310,7 @@ async fn api_calibrate(
         crate::server::mitm::CalibMode::Throughput => "大文件链(下载测速)",
         crate::server::mitm::CalibMode::Ttfb => "图片链(响应头测速)",
     };
-    // 后台化：HTTP 立即返回，任务挂在 runtime 上——关窗进托盘校准继续，
-    // 结果经 set_mirror_chain 落盘、报告写进日志页
+    // 后台化：HTTP 立即返回，任务挂 runtime——关窗进托盘校准继续。
     tokio::spawn(async move {
         crate::server::mitm::set_calibrate_report(None);
         let report = crate::server::mitm::calibrate_chains(&log, mode).await;

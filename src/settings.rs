@@ -17,9 +17,7 @@ struct SettingsState {
     github_pac: std::sync::atomic::AtomicBool,
     win_rect: Mutex<[i32; 4]>,
     proxy_backup: Mutex<String>,
-    // our_pac 本程序当前写入的 PAC 地址(持久化到 settings.json)：清理/自愈时
-    // 用来精确判定"AutoConfigURL 是不是我们设的"，避免把用户自己的配置或我们的
-    // 旧残留误判。端口无关兜底见 is_our_pac 的 localhost 正则。
+    // 本程序当前写入的 PAC 地址（持久化）：自愈时精确判定"是不是我们设的"。
     our_pac: Mutex<String>,
 }
 
@@ -30,9 +28,7 @@ fn state() -> &'static SettingsState {
     SETTINGS.get_or_init(|| SettingsState {
         close_to_tray: std::sync::atomic::AtomicBool::new(false),
         mitm: std::sync::atomic::AtomicBool::new(false),
-        // 首启全关（2026-10-18 用户裁定）：MITM / 分流接管 / 关窗到托盘 /
-        // 开机自启全部默认关，让首次使用者逐项自己打开——settings.json 由
-        // 第一次改动（含窗口矩形落地）自动生成
+        // 首启全关：逐项由用户自己打开。
         github_pac: std::sync::atomic::AtomicBool::new(false),
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
@@ -65,8 +61,7 @@ pub fn set_github_pac(on: bool) -> Result<(), String> {
 }
 
 // ---------- 系统代理接管（PAC） ----------
-// 只动 WinINET 的 AutoConfigURL（PAC 脚本位）：接管前备份原值，还原时恢复 ——
-// 用户自己配的代理/脚本不被破坏。ProxyServer/ProxyEnable 永不触碰。
+// 只动 WinINET 的 AutoConfigURL：接管前备份，还原时恢复；ProxyServer/ProxyEnable 永不触碰。
 
 /// 分流 PAC 脚本地址（WebUI 提供，按开关动态生成域名表）。
 pub fn pac_url() -> String {
@@ -159,10 +154,8 @@ fn refresh_wininet() {
     }
 }
 
-/// 按开关状态接管/还原系统代理（幂等，代理运行中调用）。
-/// 只备份用户自己的配置（旧残留若也是我们设的，不当成
-/// "用户原配置"备份 —— 否则污染 proxyBackup 导致自愈时把死端口 PAC 当原
-/// 配置还原而非删除，直观表现为"pac 越积越多 / 退出还生效"）。
+/// 按开关状态接管/还原系统代理（幂等）。只备份用户自己的配置——
+/// 把我们的旧残留当"用户原配置"备份会导致自愈时还原死端口 PAC。
 pub fn ensure_system_proxy() {
     let Ok(key) = internet_settings_key() else {
         return;
@@ -187,10 +180,7 @@ pub fn ensure_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// RAII 兜底：
-/// main 正常返回路径（窗口循环 return / headless）都经过本 guard 的 drop 再
-/// 还原一次系统代理；幂等无害。panic/abort 不走 drop，崩溃后由下次启动的
-/// heal_stale_proxy 兜底。
+/// RAII 兜底：正常退出路径 drop 时再还原一次；panic 由下次启动 heal_stale_proxy 兜底。
 pub struct ProxyGuard;
 impl ProxyGuard {
     pub fn new() -> Self {
@@ -213,8 +203,7 @@ pub fn remove_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// 恢复备份或直接删除（调用前已判定当前 PAC 是我们设的）：回填用户原配置，
-/// 否则清掉；随后清备份落盘 + 广播刷新 + 存盘。
+/// 恢复备份或直接删除；随后清备份 + 广播刷新 + 存盘。
 fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
     if !backup.is_empty() && !is_our_pac(&backup) {
@@ -228,8 +217,7 @@ fn restore_or_clear(key: &RegKey) {
     let _ = save();
 }
 
-/// 当前 PAC 是我们设置的才还原（备份回填或删除）。
-/// 还原用户原配置时也要排除"我们的旧 PAC"，避免把死端口 PAC 当原配置写回。
+/// 当前 PAC 是我们设置的才还原（还原用户原配置时也排除我们的旧 PAC）。
 fn clear_if_ours(key: &RegKey, cur: &str) {
     if !is_our_pac(cur) {
         return;
@@ -277,8 +265,7 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 // ---------- settings.json ----------
 
 #[derive(Serialize, Deserialize)]
-// 字段名(camelCase)即 settings.json 的既有落盘格式，不可改：漏 rename 会让
-// 已有文件 serde 反序列化失败、静默回退全部默认值(MITM 开关失效, 2026-10-13 实测)。
+// 字段名(camelCase)即既有落盘格式，不可改——漏 rename 会让旧文件反序列化失败静默回默认。
 #[serde(rename_all = "camelCase")]
 struct SettingsFile {
     close_to_tray: bool,
@@ -288,8 +275,7 @@ struct SettingsFile {
     github_pac: Option<bool>,
     #[serde(default)]
     proxy_backup: String,
-    // 键名显式写 "ourPAC"(PAC 全大写, 非 camelCase 的 ourPac)：既有落盘即此形，
-    // 缺 rename 会写出 ourPac → 已有文件读不到
+    // 键名显式写 "ourPAC"（非 camelCase）：既有落盘即此形。
     #[serde(default, rename = "ourPAC")]
     our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
 }
@@ -300,7 +286,7 @@ pub fn load() {
     let Ok(data) = std::fs::read_to_string(&path) else {
         return;
     };
-    // 记事本等编辑器可能写入 UTF-8 BOM，serde_json 不认，会静默回退全部默认值
+    // 记事本可能写入 UTF-8 BOM，serde_json 不认，会静默回退全部默认值
     let data = data.strip_prefix('\u{feff}').unwrap_or(&data);
     let Ok(v) = serde_json::from_str::<SettingsFile>(data) else {
         return;
@@ -340,9 +326,7 @@ fn save() -> Result<(), String> {
     Ok(())
 }
 
-/// 陈旧接管自愈（启动时一次）：上次进程异常退出时，注册表里可能残留指向
-/// 本程序 PAC 的 AutoConfigURL。依据 settings.json 留存的备份回填或直接删除。
-/// 端口无关：任何 127.0.0.1 的 /proxy.pac 残留(含旧端口)都视为我们的并清理。
+/// 陈旧接管自愈（启动时一次）：异常退出残留的 AutoConfigURL 按备份回填或删除；端口无关。
 fn heal_stale_proxy() {
     let Ok(key) = internet_settings_key() else {
         return;
@@ -369,7 +353,6 @@ pub fn autostart_enabled() -> bool {
 }
 
 /// 解析 Run 键命令行（`"exe" args` 或裸 exe）并检查 exe 存在。
-/// 从自启命令中解析 exe 路径（首段，带引号则取引号内内容）。
 fn parse_exe_path(cmdline: &str) -> Option<&str> {
     if let Some(rest) = cmdline.strip_prefix('"') {
         if let Some(end) = rest.find('"') {
@@ -395,7 +378,7 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
         .create_subkey(RUN_KEY)
         .map_err(|e| format!("打开 Run 键失败: {e}"))?;
     if on {
-        // -tray: 开机自启直接驻留托盘，不弹工作台窗口
+        // -tray: 开机自启直接驻留托盘，不弹窗口
         key.set_value(RUN_VALUE, &format!("\"{}\" -tray", exe.to_string_lossy()))
             .map_err(|e| format!("写入 Run 键失败: {e}"))?;
     } else {

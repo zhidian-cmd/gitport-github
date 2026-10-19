@@ -1,8 +1,5 @@
-//! 上游 HTTP 客户端。两条腿：
-//! - 池内直连腿：boring Chrome 指纹（GREASE + Chrome 套件/扩展序 + ALPN
-//!   h2,http/1.1；Rust 无 utls 绑定，warpsock 腿已拆除）。SNI 按 IP 族定
-//!   （Fastly 边缘真名 / 主站与 auth 伪装），证书按目标 host 校验（解耦见
-//!   pool/dial.rs）。每请求经串发表新拨号（fresh 语义）。
+//! 上游 HTTP 客户端，两条腿：
+//! - 池内直连腿：boring Chrome 指纹，SNI 按 IP 族定，证书按目标 host 校验（见 pool/dial.rs），fresh 语义。
 //! - 镜像腿：标准 TLS + h1 直拨，无表无阶梯。
 use crate::pool::{self, dial::Dialed, LogFn};
 use bytes::Bytes;
@@ -21,17 +18,13 @@ use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
 // ---------- 自管 h2 连接：拨号、握手、多路复用 ----------
-/// 每 host 一条自管 h2 连接（不用 hyper-util legacy 池：响应体还在转发的
-/// 连接不回池，页面连续取资源时每秒再拨一条——实测新拨与复用各半）。
-/// SendRequest 可 Clone，一条连接承载该 host 全部并发请求；只有"完整请求
-/// 成功过"的连接才入槽（fresh 语义保持）。
+/// 每 host 一条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
+/// SendRequest 可 Clone，一条连接承载该 host 全部并发；只有完整成功过的连接入槽。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
     send: SendRequest<Bytes>,
-    /// h2 PING 句柄（保活用）：连接建立时取出，活跃窗口内发 PING 帧防边缘
-    /// 按空闲回收（约 50-60s）导致跨导航冷启动（1.3s 握手）。None = 取不到
-    /// （理论上不会），保活跳过该连接。
+    /// h2 PING 句柄（保活用）；None = 取不到，保活跳过。
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
 static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, H2Upstream>>> =
@@ -40,7 +33,7 @@ fn conn_pool() -> &'static Mutex<HashMap<String, H2Upstream>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// ---------- 活跃窗口内 h2 保活（跨导航复用，2026-10-17） ----------
+// ---------- 活跃窗口内 h2 保活 ----------
 /// 最近一次代理请求时间（unix 秒）。0 = 从未有请求（任务纯睡）。
 static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 唤醒保活任务（每次请求踢一下；无请求时任务睡在它上面，零周期唤醒）。
@@ -60,8 +53,7 @@ pub fn note_activity() {
 }
 
 /// 启动活跃窗口保活任务（须在 runtime 构建后调用）。
-/// 语义：有请求 → 每 PROBE 秒对 core host 的缓存 h2 连接发 PING；静默超过
-/// WINDOW 秒 → 回睡眠。**空闲零唤醒不变**：无请求 = 无定时器, 进程纯睡。
+/// 有请求 → 每 PROBE 秒对缓存 h2 连接发 PING；静默超窗回睡眠；空闲零唤醒。
 pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
     rt.spawn(async move {
         loop {
@@ -82,11 +74,7 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
     });
 }
 
-/// 一轮保活：对所有**已缓存**的连接发 PING（不主动建新连接——只续命真实
-/// 请求建立过的连接，符合"不预建通道"约束）。覆盖 core(页面骨架) + api +
-/// edge(头像/图片/样式)：2026-10-17 实测只保 core 时，avatars 冷启 741ms、
-/// camo 1823ms、assets 753ms，跨导航后图片/样式明显晚到。
-/// 失败即清槽（下次请求重新拨，等价无保活行为）。
+/// 一轮保活：对所有已缓存连接发 PING（不预建新通道）；失败即清槽。
 async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
         let g = conn_pool().lock().unwrap();
@@ -122,9 +110,7 @@ pub fn drop_h2(host: &str, ip: &str) {
         g.remove(host);
     }
 }
-/// 已拨好的连接(Dialed) → h2 握手。连接驱动 future 必须常驻 —— spawn 到
-/// 后台直到连接自然结束。dial_h2(串发腿)与 dns_direct_fetch(系统 DNS 兜底
-/// 腿)共用。
+/// 已拨连接 → h2 握手；连接驱动 future spawn 到后台直到连接结束。
 pub async fn h2_from_dialed(
     host: &str,
     conn_io: Dialed,
@@ -132,9 +118,7 @@ pub async fn h2_from_dialed(
     form: &str,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    // h2 默认流级/连接级窗口都是 64KB，单页 129 个并发资源流共享连接窗口
-    // 会被压成按 RTT 逐个串行（实测 FCP 34s）——放大为流 1MB/连接 4MB
-    // 让多流真并行（2026-10-16）。
+    // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s），放大为流 1MB/连接 4MB。
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
@@ -142,7 +126,7 @@ pub async fn h2_from_dialed(
         .handshake(conn_io)
         .await
         .map_err(|e| format!("h2 握手失败: {e}"))?;
-    // PING 句柄必须在驱动前取出（只能取一次）；连接驱动 spawn 后句柄仍可发帧
+    // PING 句柄只能取一次，须在驱动前取出。
     let ping = conn
         .ping_pong()
         .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
@@ -175,14 +159,10 @@ pub async fn dial_h2(
     };
     h2_from_dialed(host, conn_io, &ip, form, log).await
 }
-/// 流式直通响应头预算（秒）：git push 大包时 GitHub 收完包并解包校验才回
-/// 响应头, 2GB@1MB/s ≈ 35 分钟 —— 给足 30 分钟。黑洞上游（收包不应答）由
-/// 客户端侧超时/中止兜底。
+/// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
 
-/// hop-by-hop 头（RFC 7230 §6.1）：转发前必须剥掉。
-/// 2026-10-18 审计合并：mirror_request 与 h2_request_head 曾各抄一份名单，
-/// 改一处漏两处就会出"连接不复用/畸形请求"类怪 bug —— 单点维护。
+/// hop-by-hop 头（RFC 7230 §6.1）；mirror_request 与 h2_request_head 单点共用。
 pub fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
@@ -190,9 +170,7 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// 从 out 重建 h2 请求头：剥 h1 hop-by-hop 头 —— 浏览器/git 在隧道内可能
-/// 以 http/1.1 发请求, h1 遗留头转发给 h2 会被判 malformed（RFC 7540
-/// §8.1.2.2）。
+/// 从 out 重建 h2 请求头：剥 h1 hop-by-hop 头（h1 遗留头进 h2 判 malformed）。
 fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, String> {
     let mut builder = hyper::Request::builder()
         .method(out.method())
@@ -206,8 +184,7 @@ fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, 
     }
     builder.body(()).map_err(|e| e.to_string())
 }
-/// h2 响应头 future → Response<BoxBody>。体 RecvStream 逐块即时放窗
-/// （h2 必须显式 release_capacity, 否则大响应死锁）。
+/// h2 响应头 future → Response；体逐块即时放窗（不 release 会死锁）。
 pub async fn h2_recv_response(
     resp_fut: h2::client::ResponseFuture,
 ) -> Result<hyper::Response<BoxBody>, String> {
@@ -229,8 +206,7 @@ pub async fn h2_recv_response(
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
 }
-/// 在自管 h2 连接上发一次请求：请求头从 out 重建, 体按 replay 注入
-/// （SendStream 发送, 不阻塞连接复用）。
+/// 自管 h2 连接上发一次请求：头重建，体按 replay 注入。
 pub async fn h2_send(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -250,8 +226,7 @@ pub async fn h2_send(
     }
     h2_recv_response(resp_fut).await
 }
-/// 流式直通·预泵段：重建请求头并以 EOS=false 发出，返回 (响应future, 发送流)。
-/// 此段失败 = 连接已死且客户端体未被触碰 —— 调用方可安全换新拨重试。
+/// 流式直通·预泵段：头先发（EOS=false）；此段失败=连接死且体未动，可安全换新拨重试。
 pub async fn h2_stream_head(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -264,14 +239,9 @@ pub async fn h2_stream_head(
         .map_err(|e| format!("h2 发送: {e}"))?;
     Ok((resp_fut, stream))
 }
-/// 流式直通·请求体泵：客户端体帧 → SendStream，按对端授予的发送窗口分片
-/// 发送（reserve_capacity/poll_capacity 背压，单次 send_data 严禁超窗口）。
-/// 响应头先到时泵失败只记日志，绝不覆盖已交付的响应（响应优先）。
-/// 客户端体读取出错时不补 EOS 直接弃流 —— git pack 尾带校验和，截断包必须
-/// 被服务端 RST 拒绝，补 EOS 会被当完整包处理。
-/// 返回 JoinHandle 供调用方在失败路径 abort —— 句柄丢弃的话，"上游停发
-/// 窗口 + 客户端挂连接不关"的组合会让泵滞留在 poll_capacity 上，任务/连接
-/// 不回收（2026-10-17 复审裁定）。
+/// 流式直通·请求体泵：按对端授予的发送窗口分片发送（单次 send_data 严禁超窗口）。
+/// 客户端体读取出错不补 EOS 直接弃流——git pack 尾带校验和，截断包必须被 RST 拒绝。
+/// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留在 poll_capacity 不回收）。
 pub fn h2_spawn_pump(
     mut send: h2::SendStream<Bytes>,
     mut body: BoxBody,
@@ -321,10 +291,7 @@ pub fn h2_spawn_pump(
         (log)(&format!("[上游] 请求体泵完成: {sent}B"));
     })
 }
-/// 每 host 拨号单飞闸：并发请求同时缓存未命中时，只有一个真正进串发拨号，
-/// 其余排队等待 —— 首拨成功入槽后，队列里的请求全部直走复用路径。
-/// 实测无闸时一波页面并发 27 条全新拨号（新拨:复用 215:211），握手风暴
-/// 还会触发边缘限流把表头翻飞（39s 翻 33 次）。
+/// 每 host 拨号单飞闸：并发未命中只放一个进串发拨号（无闸时一波 27 条全新拨号，握手风暴触发边缘限流）。
 static HOST_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     std::sync::OnceLock::new();
 pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -336,9 +303,7 @@ pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
-/// 镜像腿：标准 TLS + 直拨（非池域名），无表无阶梯。
-/// ALPN 是 h2,http/1.1：镜像（多为 Cloudflare 前置）常协商 h2，一条连接可
-/// 复用多个请求（图片突发/多 Range），h1 镜像退回串行复用。
+/// 镜像腿：标准 TLS 直拨，ALPN h2,http/1.1（镜像多 Cloudflare 前置，h2 一条连接复用多请求）。
 #[derive(Clone)]
 pub struct MirrorConnector {
     log: LogFn,
@@ -357,7 +322,7 @@ impl Service<Uri> for MirrorConnector {
             let t0 = std::time::Instant::now();
             let tls = pool::dial::dial_tls_simple(&host).await?;
             let alpn = tls.ssl().selected_alpn_protocol().unwrap_or_default();
-            // 只在真正新建 TLS 时出现 —— 复用命中的请求没有这行, 天然无噪音
+            // 只在真正新建 TLS 时出现（复用命中无此行）。
             (log)(&format!(
                 "[镜像拨号] {host} TLS {}ms alpn={}",
                 t0.elapsed().as_millis(),
@@ -367,29 +332,24 @@ impl Service<Uri> for MirrorConnector {
         })
     }
 }
-/// 镜像腿每镜像的空闲连接上限。0 = 关闭连接池（回滚开关，退回"每次新拨"）。
+/// 镜像腿每镜像空闲连接上限。0 = 关闭连接池（回滚开关）。
 const MIRROR_POOL_MAX_IDLE: usize = 4;
-/// 空闲连接保留时长；必须配 pool_timer 才生效（见 mirror_client）。
+/// 空闲连接保留时长；必须配 pool_timer 才生效。
 const MIRROR_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 static MIRROR_CLIENT: std::sync::OnceLock<LegacyClient<MirrorConnector, BoxBody>> =
     std::sync::OnceLock::new();
 
-/// 镜像腿共享客户端（进程内单例，2026-10-18）。
-/// 此前每请求新建 client 且 `pool_max_idle_per_host(0)`，17 张图/多次 Range
-/// 各自重付一次 DNS+TCP+TLS；共享后每镜像只拨 1-4 次。
-/// 边界：h2 下响应头到手连接即回池（并发小请求可复用）；**单流大文件吞吐
-/// 不变**——大文件的速度杠杆是链序置顶（pool::MIRROR_PINS）。
-/// 首次调用者的 log 被永久持有；各调用点传的都是同一 Logger 的克隆，无差别。
+/// 镜像腿共享客户端（进程内单例）：此前每请求新建 client，17 张图各自重付 DNS+TCP+TLS。
+/// 首次调用者的 log 被永久持有（各调用点传的都是同一 Logger 克隆）。
 pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxBody> {
     MIRROR_CLIENT.get_or_init(|| {
         let mut b = LegacyClient::builder(TokioExecutor::new());
         b.pool_max_idle_per_host(MIRROR_POOL_MAX_IDLE)
             .pool_idle_timeout(MIRROR_POOL_IDLE)
-            // 没有 timer 时 pool_idle_timeout 完全不生效（hyper-util 内部
-            // 只在 timer 存在时 spawn 空闲回收任务）
+            // pool_idle_timeout 必须配 pool_timer 才生效（hyper-util 内部行为）。
             .pool_timer(hyper_util::rt::TokioTimer::new())
-            // 复用了已死连接且请求尚未写出 → 自动重发（镜像请求体恒空，安全）
+            // 复用死连接且请求未写出 → 自动重发（镜像请求体恒空）。
             .retry_canceled_requests(true);
         b.build(MirrorConnector { log: log.clone() })
     })
@@ -397,8 +357,7 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
 /// 请求预算：一次上游请求的总预算。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host（github.com/api）强制
-/// gzip 上游压缩（2026-10-17），其余 host 放行浏览器原生压缩。
+/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host（github.com/api）强制 gzip。
 /// 泛型 B：只读头/方法/URI，不触体——测试可用任意体类型构造。
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
@@ -414,12 +373,8 @@ pub fn upstream_request<B>(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
-    // accept-encoding 策略（2026-10-17）：gh_defuse 要读拦截页明文，过去对
-    // github.com/api 强制身份编码 —— 但大页面裸传是"大仓库进页面慢"主因
-    // （实测仓库页 327KB → 44.5KB，7.3x）。现在改为强制 gzip：嗅探在
-    // mitm::is_gh_block_page 里做"边收边解压判前 4KB"，已消费的原始压缩帧
-    // 原样转发给浏览器，不重压缩。其余 host（assets/内容域/avatars，从不
-    // 嗅探响应体）继续放行浏览器原生压缩（br/zstd 由浏览器自己协商）。
+    // github.com/api 强制 gzip（大页面裸传是"进页面慢"主因，实测 327KB→44.5KB）；
+    // 嗅探边收边解压，原始压缩帧原样转发。其余 host 放行浏览器原生压缩。
     let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();
@@ -432,10 +387,7 @@ pub fn upstream_request<B>(
         out = out.header(k, v);
     }
     if sniffed {
-        // 只在客户端声明接受 gzip 时才强制上游 gzip —— 22365f7 曾无条件强制，
-        // 让 curl / git 等未发 accept-encoding 的客户端拿到 gzip 响应解不了码
-        //（2026-10-18 上行实测时暴露的回归）。客户端没声明 → 上游回身份编码，
-        // 行为与"剥掉 accept-encoding"的旧策略等价。
+        // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
         let accepts_gzip = req
             .headers()
             .get("accept-encoding")
@@ -443,8 +395,7 @@ pub fn upstream_request<B>(
             .map(|v| v.to_ascii_lowercase().contains("gzip"))
             .unwrap_or(false);
         if accepts_gzip {
-            // 只认 gzip：代理侧只需一个解压器（flate2），br/zstd 解压要额外依赖。
-            // gzip 已拿回 ~5-6 倍压缩比，足够。
+            // 只认 gzip：代理侧只需一个解压器。
             out = out.header("accept-encoding", "gzip");
         }
     }
@@ -470,9 +421,7 @@ pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
 mod tests {
     use super::*;
 
-    /// 强制 gzip 的门控（2026-10-18 回归修复）：客户端声明接受 gzip → 上游
-    /// 请求带 accept-encoding: gzip；客户端未声明（curl/git）→ 上游不带
-    /// accept-encoding（身份编码），无解压能力的客户端不再收到 gzip。
+    /// 强制 gzip 门控：客户端声明过才强制；未声明（curl/git）回身份编码。
     #[test]
     fn forced_gzip_gated_on_client_accept() {
         let req = hyper::Request::builder()

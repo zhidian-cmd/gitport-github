@@ -1,8 +1,5 @@
-//! Windows 文件 ACL 收紧。Rust 的 0600 权限位在 Windows 上只映射到只读属性，
-//! 不生成 ACL —— 文件缺省继承所在目录 ACL，同机其他账户/进程可读。
-//! ca.key（MITM 根私钥）/settings.json 属敏感本地数据，落盘后收紧为
-//! 仅当前用户与 SYSTEM：根私钥一旦可读，同机进程即可伪造用户已信任的
-//! "GitPort Root" 叶子证书对用户实施中间人。
+//! Windows 文件 ACL 收紧：Rust 0600 在 Windows 只映射只读属性，文件缺省继承目录 ACL。
+//! ca.key（MITM 根私钥）/settings.json 收紧为仅当前用户与 SYSTEM——根私钥可读即可伪造用户已信任的叶子证书。
 
 use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
@@ -16,8 +13,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// 句柄 RAII：本函数有 8 个错误早退路径, 手动 CloseHandle 放尾部会全部漏掉
-/// (2026-10-17 复审)。守卫兜底, 无效句柄不关。
+/// 句柄 RAII：本函数 8 个错误早退路径，手动 CloseHandle 会漏。
 struct AutoCloseHandle(windows::Win32::Foundation::HANDLE);
 impl Drop for AutoCloseHandle {
     fn drop(&mut self) {
@@ -44,7 +40,7 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         .map_err(|e| format!("OpenProcessToken 失败: {e}"))?;
     }
     let _token = AutoCloseHandle(token); // 此后任何早退路径都自动释放
-    // TOKEN_USER 缓冲（SID 大小可变，用固定缓冲 + GetTokenInformation 查询）
+    // TOKEN_USER 缓冲（SID 大小可变）
     let mut buf = vec![0u8; 512];
     let mut size = 0u32;
     let first_ok = unsafe {
@@ -89,7 +85,7 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
         let _ = LocalFree(Some(HLOCAL(sid_str.0 as *mut core::ffi::c_void)));
     }
 
-    // 构造保护 DACL：SYSTEM 与当前用户完全控制，其余一律剥离
+    // 构造保护 DACL：SYSTEM 与当前用户完全控制，其余剥离
     let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid_text})");
     let sd_h = HSTRING::from(sddl.as_str());
     let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
@@ -125,10 +121,8 @@ pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
             None,
         )
     };
-    // dacl 指向 ConvertString... 分配的安全描述符内的 ACL —— 必须等
-    // SetNamedSecurityInfoW 完成后再释放 sd；此前先 LocalFree(sd) 会让 dacl
-    // 变悬垂指针，SetNamedSecurityInfoW 可能写出空 DACL(实测 D:PAI)，
-    // 把文件锁死成谁都打不开(2026-10-13 实测 settings.json 变空 ACL)。
+    // dacl 指向 sd 内的 ACL——必须等 SetNamedSecurityInfoW 完成再释放 sd；
+    // 先释放会让 dacl 悬垂，可能写出空 DACL 把文件锁死（实测）。
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }

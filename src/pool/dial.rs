@@ -1,12 +1,7 @@
 //! 握手执行器：串发表每个 (ip, sni 形态) 的实际拨号。
-//! 2026-10-14 起流量恒为伪装（fake:x）。SNI 与校验名解耦：set_hostname 只改
-//! SNI 扩展，verify param 的 set_host 只改校验名；GREASE + ALPN h2,http/1.1
-//! + BoringSSL 默认套件序 = Chrome 同款指纹（JA3/JA4 不再像库实现）。
-//! 校验名恒为目标 host（无任何覆盖）——上传域名已全部走直连白名单
-//! （config::DIRECT_HOSTS），不再进入本拨号层（2026-10-17）。
-//! 选型：Rust 生态无 utls 绑定（rquest 全 yanked、wreq 无法解耦"拨号 IP"与
-//! "SNI"——本项目生命线），故用 boring（cloudflare/boring 4.22）自建三形态
-//! 握手。
+//! SNI 与校验名解耦（set_hostname 只改 SNI，set_host 只改校验名）；GREASE + ALPN + BoringSSL 默认序 = Chrome 指纹。
+//! 校验名恒为目标 host；上传域名已全部走直连白名单，不进本层。
+//! 选型：Rust 生态无 utls 绑定（rquest 全 yanked、wreq 无法解耦拨号 IP 与 SNI），用 boring 自建三形态握手。
 
 use crate::config::CONNECT_TIMEOUT_SECS;
 use boring::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
@@ -77,9 +72,7 @@ impl AsyncWrite for Dialed {
     }
 }
 
-/// hyper-util legacy 客户端的连接抽象（Dialed 直接可作连接用）。
-/// ALPN 自动探测：tls_connect 强制 h2（池内直连腿），dial_tls_simple 不强制
-/// （镜像腿随服务端协商）—— 按实际协商结果告知 hyper 走 h2/h1。
+/// hyper-util legacy 连接抽象；ALPN 自动探测（tls_connect 强制 h2，dial_tls_simple 随服务端协商）。
 impl hyper_util::client::legacy::connect::Connection for Dialed {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
         let mut c = hyper_util::client::legacy::connect::Connected::new();
@@ -96,9 +89,7 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg)
 }
 
-/// 系统根证书（X509 列表，进程内一次加载）。
-/// 单条解析失败跳过不放大（一颗坏证书不再废掉整池）；
-/// 全部失败返回 None（调用方回退 set_default_verify_paths）。
+/// 系统根证书（进程内一次加载）；单条解析失败跳过，全部失败回退系统默认路径。
 fn system_root_certs() -> Option<&'static [X509]> {
     static CERTS: std::sync::OnceLock<Option<Vec<X509>>> = std::sync::OnceLock::new();
     CERTS.get_or_init(|| {
@@ -114,8 +105,7 @@ fn system_root_certs() -> Option<&'static [X509]> {
     .as_deref()
 }
 
-/// 构建 SslContext（信任锚由调用方给：None = 走系统默认路径）。ctx 与 host
-/// 无关 —— SNI/校验名都建在每次的 Ssl 对象上，因此生产可全局复用。
+/// 构建 SslContext（信任锚由调用方给）。ctx 与 host 无关，生产可全局复用。
 fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::SslContext> {
     let mut ctx_b = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io_err(format!("BoringSSL 上下文初始化失败: {e}")))?;
@@ -144,24 +134,20 @@ fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::S
     Ok(ctx_b.build())
 }
 
-/// 生产路径全局 SslContext 单例：每次拨号重建 store(塞 100-300 张根证书)
-/// 纯属白烧 —— 冷启动一波并发拨号每个都重建一遍(2026-10-17 复审裁定)。
-/// 测试注入 ca_pem 的信任锚各套各的, 保持临时构建不进缓存不互扰。
+/// 生产路径全局 SslContext 单例（每次拨号重建 store 纯属白烧）；测试注入 ca_pem 临时构建不进缓存。
 fn default_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
     static CTX: std::sync::OnceLock<boring::ssl::SslContext> = std::sync::OnceLock::new();
     if let Some(ctx) = CTX.get() {
         return Ok(ctx);
     }
     let built = build_ssl_context(system_root_certs().map(<[X509]>::to_vec))?;
-    // 并发首拨: 后来者自建一份后丢弃(OnceLock 只收第一份), 结果等价
+    // 并发首拨: 后来者自建一份后丢弃, 结果等价
     let _ = CTX.set(built);
     Ok(CTX.get().expect("上下文刚已写入"))
 }
 
-/// 构建三形态的 BoringSSL 客户端连接（SNI 与校验名解耦）：Sni=真名，
-/// Fake(name)=伪装，证书一律按 host 校验。ca_pem 为测试用内存信任锚
-/// （临时构建不进缓存），真实路径 None → 系统根全局单例。
-/// 开启 GREASE + ALPN h2,http/1.1（Chrome 指纹 + 上游必须 h2）。
+/// 构建三形态 BoringSSL 客户端连接（SNI 与校验名解耦，证书一律按 host 校验）。
+/// ca_pem 为测试用内存信任锚；真实路径 None → 系统根全局单例。GREASE + ALPN h2,http/1.1。
 fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
     let mut ssl = match ca_pem {
         None => Ssl::new(default_ssl_context()?)
@@ -191,8 +177,7 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
             return Err(io_err(format!("未知握手形态 {other:?}")));
         }
     }
-    // 校验名恒为目标 host（与 SNI 解耦；IP 形式走 set_ip），无任何覆盖。
-    // 对照 boring 官方 setup_verify_hostname：NO_PARTIAL_WILDCARDS + set_host/set_ip。
+    // 校验名恒为目标 host（与 SNI 解耦；IP 形式走 set_ip）。
     let param = ssl.param_mut();
     param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
     match host.parse::<std::net::IpAddr>() {
@@ -206,8 +191,7 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
     Ok(ssl)
 }
 
-/// 对已建立的 TCP 连接按形态完成 BoringSSL 握手（Chrome 指纹）。
-/// 末尾强制断言协商出 h2。
+/// 对已建立 TCP 连接按形态完成 BoringSSL 握手，末尾强制断言协商出 h2。
 pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
     let ssl = client_ssl(host, mode, None)?;
     let tls = tokio::time::timeout(
@@ -241,8 +225,7 @@ async fn gate_acquire() -> tokio::sync::SemaphorePermit<'static> {
     gate.acquire().await.expect("信号量未关闭")
 }
 
-/// 对单个 IP 走指定握手形态拨号。成功返回已握手连接（强制 h2）；
-/// tls_handshake=false 时只做裸 TCP 拨号（透传 CONNECT 隧道用）。
+/// 对单个 IP 按指定形态拨号（强制 h2）；tls_handshake=false 只做裸 TCP（透传隧道用）。
 pub async fn dial_one(
     host: &str,
     ip: &str,
@@ -267,10 +250,7 @@ pub async fn dial_one(
     Ok(Dialed::Tls(tls))
 }
 
-/// 镜像腿（大文件赛马的非池域名）标准 TLS 直拨：boring 栈 + 系统解析，
-/// 无表无阶梯 —— 镜像无风控；ALPN 由服务端选择（h1 镜像走 http/1.1，
-/// 与上游 mitm_h1_client 对齐）。返回类型与 Dialed::Tls 一致（BoringTls），
-/// 上游 MirrorConnector 可直接包入 Dialed。
+/// 镜像腿标准 TLS 直拨：boring 栈 + 系统解析，ALPN 由服务端选择；返回类型与 Dialed::Tls 一致。
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     let ssl = client_ssl(host, MODE_SNI, None)?;
     let tcp = tokio::time::timeout(
@@ -290,8 +270,7 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     Ok(tls)
 }
 
-/// 系统根证书（rustls 版，供 certgen 测试的 rustls 客户端验证 MITM 证书）。
-/// 加载失败时退回空池（连接会因证书校验失败而快速失败）。
+/// 系统根证书（rustls 版，certgen 测试用）。
 #[cfg(test)]
 pub fn system_roots() -> Arc<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
@@ -305,7 +284,6 @@ pub fn system_roots() -> Arc<rustls::RootCertStore> {
     Arc::new(roots)
 }
 
-/// 供 mitm 上游构造 http 请求时使用（host-only 解析）。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,10 +299,8 @@ mod tests {
         TMP_SEQ.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// 用 BoringSSL 官方测试证书而非 rcgen 自签：rcgen 链在 boring 的 X509
-    /// 链构建下不被认（issued/check_host 均 Ok 仍被拒，已逐一实证），官方
-    /// 材料即真实自签链。位置随 CARGO_HOME 注册表自动出现（或 BORING_TEST_DIR
-    /// 指定）；找不到 = 相关测试跳过（材料不随仓库分发）。
+    /// 用 BoringSSL 官方测试证书而非 rcgen 自签（rcgen 链在 boring 链构建下不被认）。
+    /// 找不到材料 = 相关测试跳过（不随仓库分发）。
     const OFFICIAL_HOST: &str = "foobar.com";
 
     fn boring_test_dir() -> Option<std::path::PathBuf> {
@@ -350,8 +326,7 @@ mod tests {
         None
     }
 
-    /// 官方材料：(信任锚 PEM, 服务端链 PEM=leaf+root, leaf key PEM)。
-    /// 材料缺失返回 None（调用方测试跳过）。
+    /// 官方材料：(信任锚 PEM, 服务端链 PEM, leaf key PEM)；缺失返回 None。
     fn official_material() -> Option<(String, String, String)> {
         let dir = boring_test_dir()?;
         let cert = std::fs::read_to_string(dir.join("cert.pem")).ok()?;
@@ -360,8 +335,7 @@ mod tests {
         Some((root.clone(), format!("{cert}{root}"), key))
     }
 
-    /// BoringSSL 服务端（自签完整链 + 强制协商 h2）。链写入临时文件走
-    /// set_certificate_chain_file（boring 服务端发完整链的标准姿势）。
+    /// BoringSSL 服务端（自签完整链 + 强制协商 h2）。
     fn acceptor_for(chain_pem: &str, key_pem: &str) -> SslAcceptor {
         let dir = std::env::temp_dir();
         let chain_path = dir.join(format!(
@@ -384,9 +358,7 @@ mod tests {
         grease: bool,
     }
 
-    /// 粗解析 ClientHello：SNI 域名在明文中出现即检出；GREASE 值为
-    /// 0x?a?a 双字节（高低一致 + 低半字节 0x0a）——BoringSSL 开启 GREASE 后
-    /// cipher/扩展区必有。
+    /// 粗解析 ClientHello：SNI 域名明文即检出；GREASE 值为 0x?a?a 双字节。
     fn analyze(buf: &[u8]) -> ClientHelloObs {
         let text = String::from_utf8_lossy(buf);
         let mut sni = None;
@@ -407,8 +379,7 @@ mod tests {
         ClientHelloObs { sni, grease }
     }
 
-    /// 起官方自签链 TLS 服务端，客户端用注入根的 store 走指定形态握手，
-    /// 抓 ClientHello 验证 SNI/GREASE，双向读写验证连接可用。
+    /// 起 TLS 服务端，客户端按指定形态握手，抓 ClientHello 验证 SNI/GREASE 并双向读写。
     async fn handshake_probe(
         host: &str,
         mode: &str,
@@ -438,8 +409,7 @@ mod tests {
             });
         let tcp = TcpStream::connect(addr).await?;
         let mut ssl = client_ssl(host, mode, Some(&ca_pem))?;
-        // 官方测试证书年代久远已过期：把验证时间设回证书有效期内
-        // （X509_VERIFY_PARAM_set_time，仅测试用；生产走系统根不过期）。
+        // 官方测试证书已过期：验证时间回拨到证书有效期内（仅测试用）。
         ssl.param_mut().set_time(1_577_836_800); // 2020-01-01 00:00:00 UTC
         let mut tls = tokio_boring::SslStreamBuilder::new(ssl, tcp)
             .connect()
@@ -486,8 +456,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "真实网络直连 GitHub，仅诊断用，非 CI 稳定项"]
     async fn real_network_boring_dial_probe() {
-        // 真实网络直连 GitHub IP（不经代理），三形态各试一次，打印错误定位。
-        // 非 CI 稳定项：仅诊断用。
+        // 真实网络直连 GitHub IP（不经代理），非 CI 稳定项，仅诊断用。
         let host = "github.com";
         for (mode, ip) in [("fake:baidu.com", "140.82.114.4"), ("real", "140.82.112.3")] {
             match tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -516,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn fake_mode_rejects_wrong_host() {
-        // 校验名=wrong.example（≠证书 CN=foobar.com）→ 客户端握手必须失败
+        // 校验名=wrong.example（≠证书 CN）→ 握手必须失败
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let Some(material) = official_material() else {
