@@ -1,6 +1,6 @@
 [package]
 name = "gitport-github"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "GitHub 加速器 —— 串发表驱动的本地加速代理"
 license = "Apache-2.0"

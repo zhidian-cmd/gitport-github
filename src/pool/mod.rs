@@ -24,21 +24,11 @@ pub struct SerialPlan {
 
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
-const SEEDS_JSON: &str = include_str!("seeds.json");
+pub fn serial_pool(name: &str) -> bool {
+    SERIAL_POOLS.contains(&name)
+}
 
-pub const MIRRORS: &[&str] = &[
-    "https://mirror.ghproxy.com",
-    "https://gh-proxy.com",
-    "https://gh-proxy.org",
-    "https://v4.gh-proxy.org",
-    "https://v6.gh-proxy.org",
-    "https://cdn.gh-proxy.org",
-    "https://axisnow.gh-proxy.org",
-    "https://ghproxy.net",
-    "https://ghfast.top",
-    "https://github.moeyy.xyz",
-    "https://cf.ghproxy.cn",
-];
+const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[
     "github.com",
@@ -52,53 +42,13 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 各链只存实测调优的头部 3 家；尾部由 serial_load 补缺按 MIRRORS 序填满，
-/// 校准（Throughput/Ttfb）会重写全序——不手写 11 家全量。
-pub const DEFAULT_CHAINS: &[(&str, &[&str])] = &[
-    (
-        "github.com",
-        &["https://gh-proxy.org", "https://v6.gh-proxy.org", "https://cf.ghproxy.cn"],
-    ),
-    (
-        "raw.githubusercontent.com",
-        &["https://axisnow.gh-proxy.org", "https://v4.gh-proxy.org", "https://cdn.gh-proxy.org"],
-    ),
-    (
-        "gist.githubusercontent.com",
-        &["https://v4.gh-proxy.org", "https://axisnow.gh-proxy.org", "https://gh-proxy.com"],
-    ),
-    (
-        "avatars.githubusercontent.com",
-        &["https://axisnow.gh-proxy.org", "https://gh-proxy.com", "https://v4.gh-proxy.org"],
-    ),
-    (
-        "user-images.githubusercontent.com",
-        &["https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://gh-proxy.com"],
-    ),
-    (
-        "codeload.github.com",
-        &["https://gh-proxy.org", "https://v6.gh-proxy.org", "https://cf.ghproxy.cn"],
-    ),
-    (
-        "objects.githubusercontent.com",
-        &["https://axisnow.gh-proxy.org", "https://gh-proxy.org", "https://cdn.gh-proxy.org"],
-    ),
-    (
-        "release-assets.githubusercontent.com",
-        &["https://gh-proxy.org", "https://v4.gh-proxy.org", "https://gh-proxy.com"],
-    ),
-    (
-        "media.githubusercontent.com",
-        &["https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://gh-proxy.com"],
-    ),
-];
-
-pub fn serial_pool(name: &str) -> bool {
-    SERIAL_POOLS.contains(&name)
-}
-
-fn seed_db() -> HashMap<String, Vec<SerialPlan>> {
-    serde_json::from_str(SEEDS_JSON).unwrap_or_default()
+/// 种子快照 = plans.json 全量拷贝（池 + 镜像链），由现役表生成，勿手改。
+/// 全新安装引导直接走它（镜像链随快照）；补缺只用 pools 段。
+fn seed_db() -> PlansFile {
+    serde_json::from_str(SEEDS_JSON).unwrap_or_else(|_| PlansFile {
+        pools: HashMap::new(),
+        mirrors: HashMap::new(),
+    })
 }
 
 const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
@@ -235,10 +185,8 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             }
         }
     }
-    let loaded: PlansFile = parsed.unwrap_or_else(|| PlansFile {
-        pools: HashMap::new(),
-        mirrors: HashMap::new(),
-    });
+    // plans.json 缺失（全新安装）时按种子快照引导：池由补缺填充，镜像链随快照。
+    let loaded: PlansFile = parsed.unwrap_or_else(seed_db);
     let plans_map = loaded.pools;
     let loaded_chains = loaded.mirrors;
 
@@ -254,15 +202,11 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         let mut plans = Vec::new();
         for p in ps {
             // 已下线 IP（route::RETIRED_IPS）实表里也不再保留——死 IP 打扰拖慢冷请求。
-            if p.ip.parse::<std::net::IpAddr>().is_err()
-                || p.sni == "ech"
-                || route::is_retired(&p.ip)
-            {
+            if p.ip.parse::<std::net::IpAddr>().is_err() || route::is_retired(&p.ip) {
                 continue;
             }
-            // ech 恒失败清除旧遗留；sni 文件权威：显式写法（真名/裸域名）全段保留，
             // sni 原样透传进握手：空串 = 无 SNI 扩展；唯一门槛是字符白名单(防注入)，非法字符该条剥除。
-            let bare = p.sni.trim().trim_start_matches(dial::MODE_FAKE_PFX);
+            let bare = p.sni.trim();
             if !bare.is_empty()
                 && !bare
                     .chars()
@@ -281,7 +225,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
                 sni: bare.to_string(),
             });
         }
-        if let Some(ips) = seed_db().get(*name) {
+        if let Some(ips) = seed_db().pools.get(*name) {
             let mut added = 0usize;
             for sp in ips {
                 if sp.ip.parse::<std::net::IpAddr>().is_err()
@@ -311,30 +255,13 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
             continue;
         }
+        // 镜像链数据权威：不设白名单，自部署镜像照样可用；坏镜像运行期自然失败沉底。
         let vc: Vec<String> = chain
             .into_iter()
-            .filter(|m| MIRRORS.contains(&m.as_str()))
+            .filter(|m| m.starts_with("https://") && !m.contains(' '))
             .collect();
         if !vc.is_empty() {
             tab.mirrors.insert(host, vc);
-        }
-    }
-    for (host, def) in DEFAULT_CHAINS {
-        let e = tab
-            .mirrors
-            .entry(host.to_string())
-            .or_insert_with(|| def.iter().map(|m| m.to_string()).collect());
-        let mut added = 0usize;
-        for m in MIRRORS {
-            if !e.iter().any(|x| x == m) {
-                e.push(m.to_string());
-                added += 1;
-            }
-        }
-        if added > 0 {
-            if let Some(log) = log.as_ref() {
-                log(&format!("[镜像] {host} 链补缺 {added} 条(新镜像上线)"));
-            }
         }
     }
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
@@ -590,7 +517,7 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     }
     let vc: Vec<String> = chain
         .iter()
-        .filter(|m| MIRRORS.contains(&m.as_str()))
+        .filter(|m| m.starts_with("https://") && !m.contains(' '))
         .cloned()
         .collect();
     if vc.is_empty() {
@@ -738,12 +665,12 @@ mod tests {
 
     #[test]
     fn fastly_pools_no_longer_serial() {
-        assert!(!serial_pool("fastly"));
-        assert!(!serial_pool("codeload"));
+        assert!(!SERIAL_POOLS.contains(&"fastly"));
+        assert!(!SERIAL_POOLS.contains(&"codeload"));
         for p in ["core", "api", "edge"] {
-            assert!(serial_pool(p), "{p} 应为串发池");
+            assert!(SERIAL_POOLS.contains(&p), "{p} 应为串发池");
         }
-        assert!(!serial_pool("uploads"));
+        assert!(!SERIAL_POOLS.contains(&"uploads"));
     }
 
     #[test]
@@ -774,14 +701,22 @@ mod tests {
             let tab = g.as_ref().unwrap();
             tab.pools.get("core").unwrap().clone()
         };
-        let core_seed_n = seed_db().get("core").map(|v| v.len()).unwrap_or(0);
+        let core_seed_n = seed_db().pools.get("core").map(|v| v.len()).unwrap_or(0);
         assert_eq!(
             ps.len(),
-            1 + core_seed_n,
+            2 + core_seed_n,
             "补缺后 = 用户条目 + 全部种子: {ps:?}"
         );
         assert_eq!(
             ps[0],
+            SerialPlan {
+                ip: "1.2.3.4".into(),
+                sni: "ech".into()
+            },
+            "sni 原样透传(写什么传什么)"
+        );
+        assert_eq!(
+            ps[1],
             SerialPlan {
                 ip: "5.6.7.8".into(),
                 sni: "real".into()
@@ -848,7 +783,7 @@ mod tests {
             "用户手排顺序保留, 补缺只追加尾部"
         );
         let seeds = seed_db();
-        let seed = seeds.get("edge").unwrap();
+        let seed = seeds.pools.get("edge").unwrap();
         assert_eq!(ps.len(), seed.len(), "补缺后应覆盖全部种子: {ps:?}");
         assert!(
             seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
@@ -976,7 +911,7 @@ mod tests {
             r#"{
   "core": [{"ip": "140.82.112.3", "sni": "baidu.com"}],
   "mirrors": {
-    "raw.githubusercontent.com": ["https://v4.gh-proxy.org", "https://evil.example.com"],
+    "raw.githubusercontent.com": ["https://v4.gh-proxy.org", "https://my-self.example.com"],
     "not-a-content.host": ["https://v4.gh-proxy.org"]
   }
 }"#,
@@ -986,26 +921,21 @@ mod tests {
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
         serial_load(&dir, Some(log));
+        // 镜像链数据权威：用户写什么用什么（含自部署镜像），不白名单、不自动补缺
         let raw_chain = mirror_chain("raw.githubusercontent.com");
-        assert_eq!(raw_chain[0], "https://v4.gh-proxy.org", "用户手改链头保留");
-        assert!(
-            !raw_chain.iter().any(|m| m.contains("evil")),
-            "池外镜像应被丢弃: {raw_chain:?}"
+        assert_eq!(
+            raw_chain,
+            vec![
+                "https://v4.gh-proxy.org".to_string(),
+                "https://my-self.example.com".to_string()
+            ],
+            "用户链原样保留(含自部署镜像): {raw_chain:?}"
         );
-        assert_eq!(raw_chain.len(), MIRRORS.len(), "补缺后应覆盖全池");
-        let media_chain = mirror_chain("media.githubusercontent.com");
-        let def: Vec<String> = DEFAULT_CHAINS
-            .iter()
-            .find(|(h, _)| *h == "media.githubusercontent.com")
-            .unwrap()
-            .1
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for (i, m) in def.iter().enumerate() {
-            assert_eq!(media_chain[i], *m, "默认链头应原序保留");
-        }
-        assert_eq!(media_chain.len(), MIRRORS.len(), "补缺后应覆盖全池");
+        // 缺链 host = 无镜像腿，数据决定
+        assert!(
+            mirror_chain("media.githubusercontent.com").is_empty(),
+            "无链 host 不应被填默认"
+        );
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
         assert!(b.contains("\"mirrors\""), "镜像链应落盘");

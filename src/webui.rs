@@ -97,7 +97,6 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             axum::routing::post(api_github_pac),
         )
         .route("/api/show", axum::routing::post(api_show))
-        .route("/api/mirrors", axum::routing::get(api_mirrors))
         .route(
             "/api/calibrate",
             axum::routing::get(api_calib_status).post(api_calibrate),
@@ -248,20 +247,6 @@ async fn api_pools() -> Response {
             (
                 name.to_string(),
                 serde_json::json!(snap.get(*name).cloned().unwrap_or_default()),
-            )
-        })
-        .collect();
-    write_json(&serde_json::Value::Object(obj))
-}
-
-async fn api_mirrors() -> Response {
-    let chains = pool::mirror_chains_snapshot();
-    let obj: serde_json::Map<String, serde_json::Value> = pool::CONTENT_HOSTS
-        .iter()
-        .map(|h| {
-            (
-                h.to_string(),
-                serde_json::json!(chains.get(*h).cloned().unwrap_or_default()),
             )
         })
         .collect();
