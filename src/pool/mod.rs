@@ -201,8 +201,7 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
         for p in ps {
-            // 已下线 IP（route::RETIRED_IPS）实表里也不再保留——死 IP 打扰拖慢冷请求。
-            if p.ip.parse::<std::net::IpAddr>().is_err() || route::is_retired(&p.ip) {
+            if p.ip.parse::<std::net::IpAddr>().is_err() {
                 continue;
             }
             // sni 原样透传进握手：空串 = 无 SNI 扩展；唯一门槛是字符白名单(防注入)，非法字符该条剥除。
@@ -229,7 +228,6 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
             let mut added = 0usize;
             for sp in ips {
                 if sp.ip.parse::<std::net::IpAddr>().is_err()
-                    || route::is_retired(&sp.ip)
                     || plans.iter().any(|p| p.ip == sp.ip)
                     || plans.len() >= SERIAL_MAX_PLANS
                 {
