@@ -62,6 +62,9 @@ struct SerialTab {
     /// 指数退避 60s → 5min → 30min 封顶；成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
     mirrors: HashMap<String, Vec<String>>,
+    /// 游标：每"池/族"一个记号(= 上次尝试/驻留的 IP),顺序固定不重排。
+    /// 成功 = 记号驻留该条;失败 = 记号前移一格;整圈转完全灭 → 冷却。
+    cursor: HashMap<String, String>,
     dirty: bool,
 }
 
@@ -170,7 +173,7 @@ fn plans_path() -> PathBuf {
     dir.join("plans.json")
 }
 
-pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
+pub fn serial_load(data_dir: &Path, last_ip: HashMap<String, String>, log: Option<LogFn>) {
     *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
     *SERIAL_LOG.lock().unwrap() = log.clone();
     let path = plans_path();
@@ -195,8 +198,13 @@ pub fn serial_load(data_dir: &Path, log: Option<LogFn>) {
         cool: HashMap::new(),
         dead: HashMap::new(),
         mirrors: HashMap::new(),
+        cursor: HashMap::new(),
         dirty: false,
     };
+    // 游标起点:settings.last_ip 的记号(上次驻留的 IP),重启续跑。
+    for (key, ip) in &last_ip {
+        tab.cursor.insert(key.clone(), ip.clone());
+    }
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
         let mut plans = Vec::new();
@@ -297,56 +305,36 @@ pub fn start_persist(rt: &tokio::runtime::Runtime) {
     });
 }
 
-/// 命中条目整体移位：置顶/垫底；顺序没变 no-op，表头真变才打日志。
-fn serial_move(pool_name: &str, match_fn: impl Fn(&SerialPlan) -> bool, to_front: bool, why: &str) {
+/// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
+/// 只动内存游标,不改 plans.json 顺序、零写盘(驻留变更的 settings 落盘由调用方触发)。
+pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool) {
+    let family_name = route::family_for(pool_name, host);
+    let key = format!("{pool_name}/{family_name}");
     let mut g = SERIAL.lock().unwrap();
-    let tab = g.as_mut().unwrap();
-    let Some(pool_plans) = tab.pools.get_mut(pool_name) else {
-        return;
-    };
-    let mut hit = Vec::new();
-    let mut rest = Vec::new();
-    for p in &*pool_plans {
-        if match_fn(p) {
-            hit.push(p.clone());
-        } else {
-            rest.push(p.clone());
-        }
-    }
-    if hit.is_empty() {
+    let Some(t) = g.as_mut() else { return };
+    let Some(ps) = t.pools.get(pool_name) else { return };
+    let family = route::serial_family(pool_name, host);
+    let circle: Vec<&SerialPlan> = ps
+        .iter()
+        .filter(|p| family.map_or(true, |f| (f.serves)(host, p)))
+        .collect();
+    if circle.is_empty() {
         return;
     }
-    let new_plans = if to_front {
-        let mut v = hit;
-        v.extend(rest);
-        v
-    } else {
-        let mut v = rest;
-        v.extend(hit);
-        v
-    };
-    if new_plans == *pool_plans {
-        return; // 顺序没变：不写盘不打日志
+    if ok {
+        t.dead.remove(ip);
+        t.cursor.insert(key, ip.to_string());
+        return;
     }
-    let old_head = pool_plans.first().map(|p| p.ip.clone());
-    let new_head = new_plans.first().map(|p| p.ip.clone());
-    *pool_plans = new_plans;
-    tab.dirty = true;
-    drop(g); // 先放锁再踢醒: 被唤醒的落盘任务要抢同一把锁
-    kick_persist();
-    if old_head != new_head {
-        if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
-            log(&format!(
-                "[串发] {pool_name} 表头 {} -> {} ({why})",
-                old_head.as_deref().unwrap_or("(空)"),
-                new_head.as_deref().unwrap_or("(空)")
-            ));
-        }
+    // 失败:记号前移到圈中该 IP 的下一候选(整圈后自然复测)
+    if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
+        let next = &circle[(pos + 1) % circle.len()];
+        t.cursor.insert(key, next.ip.clone());
     }
 }
 
-/// 单串发：按表逐个试，失败垫底换下一个，绕表全灭 → 冷却 30s。
-/// 置顶只由数据层 ok 认证；ctx 到期只掐当前那条；混合池只试对口条目。
+/// 单串发(圈式):从记号处沿圈逐个试,失败沿圈前进,成功驻留记号;整圈全灭 → 冷却 30s。
+/// 记号持久化在 settings.last_ip(驻留变更时落盘);ctx 到期只掐当前那条;混合池只试对口条目。
 pub async fn serial_dial(
     pool_name: &str,
     host: &str,
@@ -378,25 +366,40 @@ pub async fn serial_dial(
         g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
-    // 族筛选：只试对口条目（不试不垫底防池序乒乓）；兜底语义与 family_for 一致（单测钉住）。
+    // 族圈:对口条目按表序组成一个圈(顺序 = 手排策略,运行时永不重排)。
     let family = route::serial_family(pool_name, host);
     let serves = family.map(|f| f.serves);
     let family_name = route::family_for(pool_name, host);
+    let circle: Vec<&SerialPlan> = snapshot
+        .iter()
+        .filter(|p| serves.map_or(true, |s| s(host, p)))
+        .collect();
+    if circle.is_empty() {
+        return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
+    }
+    let cursor_key = format!("{pool_name}/{family_name}");
+
+    // 起点 = 记号(上次驻留/尝试的 IP);找不到则从 0 号位起步。
+    let start = {
+        let g = SERIAL.lock().unwrap();
+        g.as_ref()
+            .unwrap()
+            .cursor
+            .get(&cursor_key)
+            .and_then(|m| circle.iter().position(|p| &p.ip == m))
+            .unwrap_or(0)
+    };
 
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
-    let mut eligible = 0usize; // 对口候选总数（含死亡冷却跳过的）
-    for p in &snapshot {
-        if let Some(s) = serves {
-            if !s(host, p) {
-                continue;
-            }
-        }
-        eligible += 1;
+    let mut dead_skipped = 0usize;
+    for i in 0..circle.len() {
+        let p = circle[(start + i) % circle.len()];
         {
             let g = SERIAL.lock().unwrap();
-            if let Some((until, _)) = g.as_ref().and_then(|t| t.dead.get(&p.ip)) {
+            if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
                 if Instant::now() < *until {
+                    dead_skipped += 1;
                     continue;
                 }
             }
@@ -409,15 +412,34 @@ pub async fn serial_dial(
             r = attempt => r,
         };
         match result {
-            Ok(conn) => return Ok((conn, p.ip.clone(), p.sni.clone())),
+            Ok(conn) => {
+                // 记号驻留:成功即停,下次请求从同一 IP 起步。
+                // 驻留变更 → settings.last_ip(故障转移级,罕见;set_last_ips 未变化时内部 no-op)。
+                let snap = {
+                    let mut g = SERIAL.lock().unwrap();
+                    let t = g.as_mut().unwrap();
+                    t.cursor.insert(cursor_key.clone(), p.ip.clone());
+                    t.cursor.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                };
+                crate::settings::set_last_ips(snap);
+                return Ok((conn, p.ip.clone(), p.sni.clone()));
+            }
             Err(e) => {
                 last_err = Some(e.to_string());
                 if ctx.is_cancelled() {
                     break; // 请求预算到期：这条没试完，不算失败；没试完 ≠ 全灭，不冷却
                 }
-                // 失败分层沉底：TCP 层失败 = IP 对谁都达不通，与域无关，内容域也必须沉底
-                // （实测 108/109/111.133 TCP 全超时，豁免导致每轮先撞 9s 死 IP）。
-                // TLS 层失败（raw 真名被 RST）是按域干扰，保留内容域豁免——沉底会连坐健康的 .133。
+                // 记号前移到圈中下一候选:下一请求从它起步;物理顺序不动,零写盘。
+                if let Ok(mut g) = SERIAL.lock() {
+                    let n = circle.len();
+                    let next = &circle[(start + i + 1) % n];
+                    g.as_mut()
+                        .unwrap()
+                        .cursor
+                        .insert(cursor_key.clone(), next.ip.clone());
+                }
+                // TCP 层失败 = IP 对谁都达不通:死亡退避表跳过(60s → 5min → 30min 封顶)。
+                // TLS 层失败(raw 真名被 RST)是按域干扰:只前移记号,整圈后自然复测。
                 let msg = e.to_string();
                 let tcp_level = msg.starts_with("TCP")
                     || matches!(
@@ -426,13 +448,7 @@ pub async fn serial_dial(
                             | std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::ConnectionAborted
                     );
-                if !route::is_content_host(host) || tcp_level {
-                    let target = p.clone();
-                    let why = if tcp_level { "IP 不可达" } else { "拨号失败" };
-                    serial_move(pool_name, |q| *q == target, false, why);
-                }
                 if tcp_level {
-                    // 指数退避 60s → 5min → 30min 封顶；死 IP 不值得每分钟打扰。
                     if let Ok(mut g) = SERIAL.lock() {
                         if let Some(t) = g.as_mut() {
                             let n = t.dead.get(&p.ip).map(|(_, n)| *n).unwrap_or(0) + 1;
@@ -457,12 +473,10 @@ pub async fn serial_dial(
         return Err("请求预算到期".to_string());
     }
     if tried == 0 {
-        if eligible > 0 {
-            return Err(format!(
-                "全部 {eligible} 个对口候选处于死亡冷却({pool_name}, {host})"
-            ));
-        }
-        return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
+        return Err(format!(
+            "全部 {} 个对口候选处于死亡冷却({pool_name}, {host})",
+            circle.len()
+        ));
     }
     // 绕表全灭：按 host 冷却 30s，只有确有镜像兜底的 host 豁免
     // （camo 无链，豁免会让每张徽章重烧整表；池级冷却曾毒倒同池其他族）。
@@ -481,23 +495,13 @@ pub async fn serial_dial(
             "无镜像兜底, 冷却 30s 快速失败".to_string()
         };
         log(&format!(
-            "[串发] {host} {pool_name}/{family_name} 全灭({tried}/{eligible} 候选, 累计 {:?}), {tail}",
+            "[串发] {host} {pool_name}/{family_name} 全灭({tried} 试 / {dead_skipped} 冷却中, 累计 {:?}), {tail}",
             last_err.as_deref().unwrap_or("未知")
         ));
     }
     Err(last_err.unwrap_or_else(|| "串发全灭".to_string()))
 }
 
-pub fn serial_note(pool_name: &str, ip: &str, kind: &str) {
-    if kind == "ok" {
-        if let Ok(mut g) = SERIAL.lock() {
-            if let Some(t) = g.as_mut() {
-                t.dead.remove(ip);
-            }
-        }
-    }
-    serial_move(pool_name, |p| p.ip == ip, kind == "ok", kind);
-}
 
 pub fn mirror_chain(host: &str) -> Vec<String> {
     let g = SERIAL.lock().unwrap();
@@ -625,7 +629,7 @@ mod tests {
     }
 
     fn reset_state(dir: &Path) {
-        serial_load(dir, None);
+        serial_load(dir, HashMap::new(), None);
     }
 
     #[test]
@@ -771,7 +775,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
-        serial_load(&dir, Some(log));
+        serial_load(&dir, HashMap::new(), Some(log));
         let ps = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("edge").unwrap().clone()
@@ -870,12 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn notify_persist_writes_on_change_and_skips_noop() {
+    fn cursor_park_is_memory_only_and_freezes_order() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        serial_load(&dir, None);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        start_persist(&rt);
+        serial_load(&dir, HashMap::new(), None);
         let head_before = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("core").unwrap()[0].ip.clone()
@@ -885,19 +887,25 @@ mod tests {
             g.as_ref().unwrap().pools.get("core").unwrap()[2].ip.clone()
         };
         assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
-        serial_note("core", &target, "ok");
-        rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+        let file_before = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+        cursor_note("core", "github.com", &target, true);
+        // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
         assert_eq!(
             SERIAL.lock().unwrap().as_ref().unwrap().pools.get("core").unwrap()[0].ip,
-            target,
-            "置顶应已生效"
+            head_before,
+            "表序冻结"
         );
-        let file1 = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-        assert!(file1.contains(&target), "变更应落盘");
-        let snap_before = plans_snapshot();
-        serial_note("core", &target, "ok");
-        rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
-        assert_eq!(plans_snapshot(), snap_before, "no-op 不应触发写盘");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plans.json")).unwrap(),
+            file_before,
+            "游标驻留零写盘"
+        );
+        let g = SERIAL.lock().unwrap();
+        assert_eq!(
+            g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+            Some(target.as_str()),
+            "游标应驻留 target"
+        );
     }
 
     #[test]
@@ -918,7 +926,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
-        serial_load(&dir, Some(log));
+        serial_load(&dir, HashMap::new(), Some(log));
         // 镜像链数据权威：用户写什么用什么（含自部署镜像），不白名单、不自动补缺
         let raw_chain = mirror_chain("raw.githubusercontent.com");
         assert_eq!(
@@ -954,74 +962,40 @@ mod tests {
     }
 
     #[test]
-    fn noop_move_no_write_and_head_rotation_logs() {
+    fn cursor_advance_on_failure_then_park_on_success() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
-        serial_load(&dir, Some(log));
-        let base_len = seen.lock().unwrap().len(); // 初始表日志条数
-        let base = {
-            let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("core").unwrap().clone()
-        };
-        let head = base[0].ip.clone();
-        serial_note("core", &head, "ok");
-        {
-            let g = SERIAL.lock().unwrap();
-            assert!(!g.as_ref().unwrap().dirty, "顺序没变不该置 dirty");
-        }
-        assert_eq!(seen.lock().unwrap().len(), base_len, "顺序没变不该打日志");
-        let other = base[4].ip.clone();
-        serial_note("core", &other, "ok");
-        {
-            let g = SERIAL.lock().unwrap();
-            assert!(g.as_ref().unwrap().dirty, "表头轮换该置 dirty");
-            let ps = g.as_ref().unwrap().pools.get("core").unwrap();
-            assert_eq!(ps[0].ip, other, "新表头应是置顶 IP");
-        }
-        let lines = seen.lock().unwrap();
-        assert!(
-            lines[base_len..].iter().any(|l| l.contains("表头")
-                && l.contains(&head)
-                && l.contains(&other)
-                && l.contains("ok")),
-            "应打一行带原因的表头轮换日志: {:?}",
-            &lines[base_len..]
-        );
-    }
-
-    #[test]
-    fn serial_moves() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let dir = tmpdir();
-        reset_state(&dir);
+        serial_load(&dir, HashMap::new(), None);
         let base = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("core").unwrap().clone()
         };
         assert!(base.len() >= 6, "初始表过小: {}", base.len());
-        let key = base[3].clone();
-        serial_move("core", |p| *p == key, false, "test");
-        let last = {
+        let head = base[0].ip.clone();
+        let next = base[1].ip.clone();
+
+        // 失败:记号前移到圈中下一候选
+        cursor_note("core", "github.com", &head, false);
+        {
             let g = SERIAL.lock().unwrap();
-            g.as_ref()
-                .unwrap()
-                .pools
-                .get("core")
-                .unwrap()
-                .last()
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(last, key, "失败条目应在表尾");
-        let ip0 = base[0].ip.clone();
-        serial_move("core", |p| p.ip == ip0, true, "ok");
-        let head = {
+            assert_eq!(
+                g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+                Some(next.as_str()),
+                "失败后记号应前移到下一候选"
+            );
+        }
+
+        // 成功:记号驻留;表序全程未变
+        cursor_note("core", "github.com", &next, true);
+        {
             let g = SERIAL.lock().unwrap();
-            g.as_ref().unwrap().pools.get("core").unwrap()[0].clone()
-        };
-        assert_eq!(head.ip, ip0);
+            assert_eq!(
+                g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+                Some(next.as_str())
+            );
+            let ps = g.as_ref().unwrap().pools.get("core").unwrap();
+            let order_unchanged = ps.iter().zip(base.iter()).all(|(a, b)| a.ip == b.ip);
+            assert!(order_unchanged, "表序应冻结(游标不重排)");
+        }
     }
 }

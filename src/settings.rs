@@ -1,5 +1,6 @@
 //! 自启注册表 / 关窗到托盘 / 分流开关（settings.json 持久化）/ 系统代理 PAC 接管。
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
@@ -17,6 +18,8 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 本程序当前写入的 PAC 地址（持久化）：自愈时精确判定"是不是我们设的"。
     our_pac: Mutex<String>,
+    // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
+    last_ip: Mutex<HashMap<String, String>>,
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -30,6 +33,7 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         our_pac: Mutex::new(String::new()),
+        last_ip: Mutex::new(HashMap::new()),
     })
 }
 
@@ -262,6 +266,8 @@ struct SettingsFile {
     // 键名显式写 "ourPAC"（非 camelCase）：既有落盘即此形。
     #[serde(default, rename = "ourPAC")]
     our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    last_ip: HashMap<String, String>, // 串发游标(每池/族上次驻留的 IP)
 }
 
 pub fn load() {
@@ -283,6 +289,7 @@ pub fn load() {
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
     *state().our_pac.lock().unwrap() = v.our_pac;
+    *state().last_ip.lock().unwrap() = v.last_ip;
     if let Some(on) = v.github_pac {
         state()
             .github_pac
@@ -300,6 +307,7 @@ fn save() -> Result<(), String> {
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         our_pac: s.our_pac.lock().unwrap().clone(),
+        last_ip: s.last_ip.lock().unwrap().clone(),
     };
     let json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
     let p = exe_dir().join("settings.json");
@@ -318,6 +326,23 @@ fn heal_stale_proxy() {
         return; // 本来就干净，或是用户自己的配置：绝不触碰
     }
     restore_or_clear(&key);
+}
+
+pub fn last_ips() -> HashMap<String, String> {
+    state().last_ip.lock().unwrap().clone()
+}
+
+/// 故障转移时记录驻留 IP(每池/族一个游标记号),并落盘 settings.json。
+/// 游标变化是窗口级罕见事件,直接同步写;崩溃最多丢最后一跳。
+pub fn set_last_ips(map: HashMap<String, String>) {
+    {
+        let mut st = state().last_ip.lock().unwrap();
+        if *st == map {
+            return;
+        }
+        *st = map;
+    }
+    let _ = save();
 }
 
 

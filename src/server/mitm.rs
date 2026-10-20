@@ -348,7 +348,7 @@ async fn stream_passthrough(
         Ok(Ok(resp)) => {
             info.set(&up.ip);
             if !name.is_empty() {
-                pool::serial_note(name, &up.ip, "ok");
+                pool::cursor_note(name, host, &up.ip, true);
             }
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
@@ -481,7 +481,7 @@ async fn try_cached(
         Ok(Ok(resp)) => {
             info.set(&up.ip);
             if !name.is_empty() {
-                pool::serial_note(name, &up.ip, "ok");
+                pool::cursor_note(name, host, &up.ip, true);
             }
             if is_content {
                 pool::content_direct_ok(host);
@@ -570,7 +570,7 @@ async fn get_direct(
             Ok(Ok(resp)) => {
                 info.set(&up.ip);
                 if !name.is_empty() {
-                    pool::serial_note(name, &up.ip, "ok"); // 数据到手 = 真成功, 置顶
+                    pool::cursor_note(name, host, &up.ip, true); // 数据到手 = 真成功, 置顶
                 }
                 upstream::store_h2(host, up.clone());
                 if is_content {
@@ -589,7 +589,7 @@ async fn get_direct(
         // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
         // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
         if !name.is_empty() && is_simple && !is_content {
-            pool::serial_note(name, &up.ip, "noreply");
+            pool::cursor_note(name, host, &up.ip, false);
         }
         upstream::drop_h2(host, &up.ip);
         (log)(&format!(
@@ -640,7 +640,7 @@ async fn gh_defuse(
             };
             continue;
         }
-        pool::serial_note(name, &ip, "block"); // 错误页垫底: 重试自动跳过该 IP
+        pool::cursor_note(name, host, &ip, false); // 数据层失败: 记号前移, 重试自动跳过该 IP
                                                // 风控页 = 该 IP 的连接不可信(HTTP 层成功所以连接活着) —— 必须同步
                                                // 清复用槽, 否则下一个请求缓存命中又拿到坏连接: 垫底→重拨→再命中→
                                                // 再垫底乒乓死循环(2026-10-15 实锤: 单 IP 重试计数刷到 129, 每个请求
