@@ -28,6 +28,19 @@ pub fn serial_pool(name: &str) -> bool {
     SERIAL_POOLS.contains(&name)
 }
 
+/// 全部游标圈的规范键序(core/api/edge 四族):settings.last_ip 按此序展示。
+pub fn circle_keys() -> Vec<String> {
+    let mut out = Vec::new();
+    for pool in SERIAL_POOLS {
+        if let Some(pr) = route::pool_route(pool) {
+            for f in pr.families {
+                out.push(format!("{pool}/{}", f.name));
+            }
+        }
+    }
+    out
+}
+
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[
@@ -173,7 +186,7 @@ fn plans_path() -> PathBuf {
     dir.join("plans.json")
 }
 
-pub fn serial_load(data_dir: &Path, last_ip: HashMap<String, String>, log: Option<LogFn>) {
+pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<LogFn>) {
     *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
     *SERIAL_LOG.lock().unwrap() = log.clone();
     let path = plans_path();
@@ -201,9 +214,14 @@ pub fn serial_load(data_dir: &Path, last_ip: HashMap<String, String>, log: Optio
         cursor: HashMap::new(),
         dirty: false,
     };
-    // 游标起点:settings.last_ip 的记号(上次驻留的 IP),重启续跑。
+    // 全部圈预写空记号(固定键序,值空 = 未驻留);settings.last_ip 的非空记号覆盖其上。
+    for key in circle_keys() {
+        tab.cursor.insert(key, String::new());
+    }
     for (key, ip) in &last_ip {
-        tab.cursor.insert(key.clone(), ip.clone());
+        if !ip.is_empty() {
+            tab.cursor.insert(key.clone(), ip.clone());
+        }
     }
     for name in SERIAL_POOLS {
         let ps = plans_map.get(*name).cloned().unwrap_or_default();
@@ -419,7 +437,16 @@ pub async fn serial_dial(
                     let mut g = SERIAL.lock().unwrap();
                     let t = g.as_mut().unwrap();
                     t.cursor.insert(cursor_key.clone(), p.ip.clone());
-                    t.cursor.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    let mut snap: Vec<(String, String)> = circle_keys()
+                        .iter()
+                        .filter_map(|k| t.cursor.get(k).map(|v| (k.clone(), v.clone())))
+                        .collect();
+                    for (k, v) in &t.cursor {
+                        if !snap.iter().any(|(ck, _)| ck == k) {
+                            snap.push((k.clone(), v.clone()));
+                        }
+                    }
+                    snap
                 };
                 crate::settings::set_last_ips(snap);
                 return Ok((conn, p.ip.clone(), p.sni.clone()));
@@ -629,7 +656,7 @@ mod tests {
     }
 
     fn reset_state(dir: &Path) {
-        serial_load(dir, HashMap::new(), None);
+        serial_load(dir, Vec::new(), None);
     }
 
     #[test]
@@ -775,7 +802,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
-        serial_load(&dir, HashMap::new(), Some(log));
+        serial_load(&dir, Vec::new(), Some(log));
         let ps = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("edge").unwrap().clone()
@@ -877,7 +904,7 @@ mod tests {
     fn cursor_park_is_memory_only_and_freezes_order() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        serial_load(&dir, HashMap::new(), None);
+        serial_load(&dir, Vec::new(), None);
         let head_before = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("core").unwrap()[0].ip.clone()
@@ -926,7 +953,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
-        serial_load(&dir, HashMap::new(), Some(log));
+        serial_load(&dir, Vec::new(), Some(log));
         // 镜像链数据权威：用户写什么用什么（含自部署镜像），不白名单、不自动补缺
         let raw_chain = mirror_chain("raw.githubusercontent.com");
         assert_eq!(
@@ -965,7 +992,7 @@ mod tests {
     fn cursor_advance_on_failure_then_park_on_success() {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
-        serial_load(&dir, HashMap::new(), None);
+        serial_load(&dir, Vec::new(), None);
         let base = {
             let g = SERIAL.lock().unwrap();
             g.as_ref().unwrap().pools.get("core").unwrap().clone()
