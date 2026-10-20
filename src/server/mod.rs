@@ -125,10 +125,7 @@ impl ProxyServer {
         let (mut upstream, ip) = match connect_upstream(&host, port).await {
             Ok(v) => v,
             Err(_) => {
-                let _ = client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-                (self.log)(&format!("[拒绝] {host} 无可用上游"));
+                reject(&mut client, &self.log, &host).await;
                 return;
             }
         };
@@ -192,10 +189,7 @@ impl ProxyServer {
         let (mut upstream, ip) = match connect_upstream(&host, port).await {
             Ok(v) => v,
             Err(_) => {
-                let _ = client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-                (self.log)(&format!("[拒绝] {host} 无可用上游"));
+                reject(&mut client, &self.log, &host).await;
                 return;
             }
         };
@@ -232,6 +226,14 @@ impl ProxyServer {
             }
         }
     }
+}
+
+/// 无可用上游：502 + 一行日志（CONNECT 与明文 HTTP 共用出口）。
+async fn reject(client: &mut TcpStream, log: &LogFn, host: &str) {
+    let _ = client
+        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        .await;
+    log(&format!("[拒绝] {host} 无可用上游"));
 }
 
 async fn read_head(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {

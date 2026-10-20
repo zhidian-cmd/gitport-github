@@ -86,18 +86,8 @@ pub async fn handle_connect_mitm(
         (srv.log)(&format!("[MITM] {host} 服务层错误: {e}"));
     }
 }
-#[derive(Default, Clone)]
-struct UpstreamInfo {
-    ip: Arc<Mutex<String>>,
-}
-impl UpstreamInfo {
-    fn set(&self, ip: &str) {
-        *self.ip.lock().unwrap() = ip.to_string();
-    }
-    fn get(&self) -> String {
-        self.ip.lock().unwrap().clone()
-    }
-}
+/// 本次请求实际命中的上游 IP（响应头 X-GitPort-Upstream 回填）；单写者、收尾时读一次。
+type UpstreamInfo = Arc<Mutex<String>>;
 async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
@@ -168,7 +158,10 @@ async fn mitm_http(
     }
     if let Some(reason) = streaming_reason {
         let body = match overflow_prefix {
-            Some(prefix) => chain_prefix_body(prefix, incoming_to_body(req.into_body())),
+            Some(prefix) => upstream::prepend_body(
+                vec![Bytes::from(prefix)],
+                incoming_to_body(req.into_body()),
+            ),
             None => incoming_to_body(req.into_body()),
         };
         return stream_passthrough(&log, &out, &host, &info, body, reason).await;
@@ -279,17 +272,6 @@ fn incoming_to_body(body: Incoming) -> BoxBody {
     });
     BoxBody::new(http_body_util::StreamBody::new(stream))
 }
-fn chain_prefix_body(prefix: Vec<u8>, rest: BoxBody) -> BoxBody {
-    let mut prefix = Some(prefix);
-    let mut rest = rest;
-    let stream = futures_util::stream::poll_fn(move |cx| {
-        if let Some(p) = prefix.take() {
-            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(p)))));
-        }
-        hyper::body::Body::poll_frame(std::pin::Pin::new(&mut rest), cx)
-    });
-    BoxBody::new(http_body_util::StreamBody::new(stream))
-}
 fn plain_502() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
@@ -346,7 +328,7 @@ async fn stream_passthrough(
     .await;
     match timed {
         Ok(Ok(resp)) => {
-            info.set(&up.ip);
+            *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
                 pool::cursor_note(name, host, &up.ip, true);
             }
@@ -479,7 +461,7 @@ async fn try_cached(
     let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
     match timed.await {
         Ok(Ok(resp)) => {
-            info.set(&up.ip);
+            *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
                 pool::cursor_note(name, host, &up.ip, true);
             }
@@ -568,7 +550,7 @@ async fn get_direct(
         let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
         let e = match timed.await {
             Ok(Ok(resp)) => {
-                info.set(&up.ip);
+                *info.lock().unwrap() = up.ip.clone();
                 if !name.is_empty() {
                     pool::cursor_note(name, host, &up.ip, true); // 数据到手 = 真成功, 置顶
                 }
@@ -625,7 +607,7 @@ async fn gh_defuse(
         if !is_gh_block_page(&mut resp).await {
             return Ok(resp);
         }
-        let ip = info.get();
+        let ip = info.lock().unwrap().clone();
         if name.is_empty() {
             return Ok(resp); // 非池域名: 无表可换, 诚实透传
         }
@@ -770,7 +752,7 @@ fn write_upstream(
             .headers
             .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
     }
-    let ip = info.get();
+    let ip = info.lock().unwrap().clone();
     if !ip.is_empty() {
         parts
             .headers
@@ -868,7 +850,7 @@ async fn dns_direct_fetch(
         let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
         match timed.await {
             Ok(Ok(resp)) => {
-                info.set(&ip);
+                *info.lock().unwrap() = ip.clone();
                 upstream::store_h2(host, up); // 入缓存: 后续请求走复用快路径
                 (log)(&format!(
                     "[DNS直连] {host}{} 新连接 {ip}, 成功",
@@ -1097,13 +1079,10 @@ pub enum CalibMode {
     Ttfb,
 }
 
-static CALIB_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 校准互斥：webui 用 swap(true) 抢跑，跑完 store(false)。
+pub static CALIB_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static CALIB_REPORT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-pub fn calibrate_running() -> bool {
-    CALIB_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
-}
 
 pub fn last_calibrate_report() -> String {
     CALIB_REPORT
@@ -1117,14 +1096,6 @@ pub fn set_calibrate_report(r: Option<String>) {
     if let Ok(mut g) = CALIB_REPORT.lock() {
         *g = r;
     }
-}
-
-pub fn try_begin_calibrate() -> bool {
-    !CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst)
-}
-
-pub fn end_calibrate() {
-    CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 const CALIB_THROUGHPUT_WINDOW: Duration = Duration::from_secs(12);

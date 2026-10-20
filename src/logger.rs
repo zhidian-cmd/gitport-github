@@ -89,22 +89,15 @@ impl Logger {
 }
 
 
-static CRASH: Mutex<CrashState> = Mutex::new(CrashState { path: None });
-
-struct CrashState {
-    path: Option<PathBuf>,
-}
+/// 崩溃取证落点：未装（headless 以外的早期阶段）时静默丢弃。
+static CRASH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub fn set_crash_path(dir: &std::path::Path) {
-    let mut g = CRASH.lock().unwrap();
-    g.path = Some(dir.join("crash.log"));
+    *CRASH.lock().unwrap() = Some(dir.join("crash.log"));
 }
 
 pub fn crash(msg: &str) {
-    let path = {
-        let g = CRASH.lock().unwrap();
-        g.path.clone()
-    };
+    let path = CRASH.lock().unwrap().clone();
     let Some(path) = path else { return };
     let backtrace = std::backtrace::Backtrace::force_capture();
     let line = format!(

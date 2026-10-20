@@ -1,7 +1,6 @@
 //! 配置常量与域名分组（按表串发版）。
 
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::OnceLock;
 
 /// 默认端口（-port / -webui 可覆盖）。
 pub const DEFAULT_PORT: u16 = 7810;
@@ -114,20 +113,11 @@ pub fn pool_for(host: &str) -> &'static str {
     ""
 }
 
-pub fn pooled_domains() -> &'static [&'static str] {
-    static DOMAINS: OnceLock<Vec<&'static str>> = OnceLock::new();
-    DOMAINS.get_or_init(|| {
-        let mut out: Vec<&'static str> = Vec::new();
-        for g in GROUPS {
-            for pat in g.patterns {
-                let d = pat.strip_prefix("*.").unwrap_or(pat);
-                if !out.contains(&d) {
-                    out.push(d);
-                }
-            }
-        }
-        out
-    })
+/// 全部受管域名的裸形（`*.x` 剥成 `x`），去重由调用方做一次（PAC 本身就是低频请求）。
+pub fn pooled_domains() -> impl Iterator<Item = &'static str> {
+    GROUPS
+        .iter()
+        .flat_map(|g| g.patterns.iter().map(|p| p.strip_prefix("*.").unwrap_or(p)))
 }
 
 #[cfg(test)]

@@ -26,20 +26,29 @@ pub fn is_big_file_host(host: &str) -> bool {
     )
 }
 
-/// /releases/download（含 /releases/latest/download/）与 /archive 走镜像；git 智能协议路径不在此列。
-fn is_release_asset_path(host: &str, path: &str) -> bool {
+/// 走镜像的大文件路径类别：`/releases/download`（含 `latest/download`）与 `/archive`。
+/// git 智能协议路径不在此列；一个解析器同时供路由与镜像链归属用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetKind {
+    Release,
+    Archive,
+}
+
+fn release_asset_kind(host: &str, path: &str) -> Option<AssetKind> {
     if host != "github.com" {
-        return false;
+        return None;
     }
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.as_slice() {
-        [_owner, _repo, kind, ..] if *kind == "releases" => {
-            (segs.len() >= 4 && segs[3] == "download")
-                || (segs.len() >= 5 && segs[3] == "latest" && segs[4] == "download")
-        }
-        [_owner, _repo, kind, ..] if *kind == "archive" => true,
-        _ => false,
+    match (segs.get(2), segs.get(3), segs.get(4)) {
+        (Some(&"archive"), ..) => Some(AssetKind::Archive),
+        (Some(&"releases"), Some(&"download"), _) => Some(AssetKind::Release),
+        (Some(&"releases"), Some(&"latest"), Some(&"download")) => Some(AssetKind::Release),
+        _ => None,
     }
+}
+
+fn is_release_asset_path(host: &str, path: &str) -> bool {
+    release_asset_kind(host, path).is_some()
 }
 
 /// 镜像链归属：请求 host → 实际内容 host 的专属链（与请求 host 解耦）。
@@ -48,15 +57,11 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     if is_big_file_host(host) {
         return host;
     }
-    if is_release_asset_path(host, path) {
-        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        return if matches!(segs.get(2), Some(&"archive")) {
-            "codeload.github.com"
-        } else {
-            "release-assets.githubusercontent.com"
-        };
+    match release_asset_kind(host, path) {
+        Some(AssetKind::Archive) => "codeload.github.com",
+        Some(AssetKind::Release) => "release-assets.githubusercontent.com",
+        None => host,
     }
-    host
 }
 
 /// 总路由：host → 处置。method/path 只影响 Mirror 分流（附件路径仅 GET/HEAD）。

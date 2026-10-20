@@ -169,7 +169,7 @@ fn pac_script() -> String {
     let mut domains: Vec<&str> = Vec::new();
     if settings::github_pac() {
         for d in pooled_domains() {
-            if !domains.contains(d) {
+            if !domains.contains(&d) {
                 domains.push(d);
             }
         }
@@ -259,7 +259,7 @@ async fn api_calibrate(
 ) -> Response {
     let logs = st.logs.clone();
     let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
-    if !crate::server::mitm::try_begin_calibrate() {
+    if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return (
             [
                 ("content-type", "text/plain; charset=utf-8"),
@@ -282,7 +282,7 @@ async fn api_calibrate(
         let report = crate::server::mitm::calibrate_chains(&log, mode).await;
         (log)(&format!("[校准] 完成\n{report}"));
         crate::server::mitm::set_calibrate_report(Some(report));
-        crate::server::mitm::end_calibrate();
+        crate::server::mitm::CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     (
         [
@@ -409,7 +409,7 @@ async fn api_settings() -> Response {
 
 async fn api_calib_status() -> Response {
     write_json(&serde_json::json!({
-        "running": crate::server::mitm::calibrate_running(),
+        "running": crate::server::mitm::CALIB_RUNNING.load(std::sync::atomic::Ordering::SeqCst),
         "report": crate::server::mitm::last_calibrate_report(),
     }))
 }
