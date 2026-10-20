@@ -1,5 +1,33 @@
 # 高级配置
 
+## settings.json 键位契约
+
+位置固定：**exe 同目录**（与 plans.json 同级）。启动读一次，任一开关变更即整份重写。
+
+```json
+{
+  "closeToTray": true,
+  "mitm": true,
+  "winRect": [641, 278, 1820, 1394],
+  "githubPAC": true,
+  "proxyBackup": "",
+  "ourPAC": "http://127.0.0.1:7811/proxy.pac",
+  "lastIp": {
+    "core/all": "20.27.177.114",
+    "api/all": "140.82.114.6",
+    "edge/content": "185.199.110.133",
+    "edge/assets": "185.199.108.154",
+    "edge/io": "",
+    "edge/auth": ""
+  }
+}
+```
+
+- `lastIp` 的 6 个键由 `pool::circle_keys()` 派生（`SERIAL_POOLS` × `POOL_ROUTES` 族表），**从上到下顺序固定、不可调换**；写盘恒为全量 6 位，未驻留的族写 `""`
+- `""` / 缺键 / 整段 `lastIp` 缺失，三者行为等价：该族游标为空，串发从表序 0 号位起步。写空串的唯一意义是让 schema 一眼看全、diff 稳定
+- 手改容错：漏键 → 该键回默认；某字段类型写坏（如 `winRect` 写成字符串）→ **只回退该字段**，不连坐整份配置；`lastIp` 读兼容对象与 `[[k,v],…]` 数组两种形态（写只写对象）
+- 布尔键缺失 = `false`；`winRect` 缺失或宽高小于 400×300 时按默认位置开窗
+
 ## plans.json 手改指南
 
 ```json

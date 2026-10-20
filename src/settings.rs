@@ -1,6 +1,5 @@
 //! 自启注册表 / 关窗到托盘 / 分流开关（settings.json 持久化）/ 系统代理 PAC 接管。
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
@@ -19,7 +18,7 @@ struct SettingsState {
     // 本程序当前写入的 PAC 地址（持久化）：自愈时精确判定"是不是我们设的"。
     our_pac: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
-    last_ip: Mutex<HashMap<String, String>>,
+    last_ip: Mutex<Vec<(String, String)>>,
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -33,7 +32,7 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         our_pac: Mutex::new(String::new()),
-        last_ip: Mutex::new(HashMap::new()),
+        last_ip: Mutex::new(Vec::new()),
     })
 }
 
@@ -252,34 +251,122 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 }
 
 
-#[derive(Serialize, Deserialize)]
+/// 串发游标落盘形态：`{"core/all": "1.2.3.4", ...}`。
+/// 不变量（settings.json 的契约）：
+///   1. 键位恒为 `pool::circle_keys()` 全量——core/all、api/all、edge/{content,assets,io,auth}；
+///   2. 顺序恒为表序，从上到下不随 HashMap 抖动；
+///   3. 值 `""` = 该族未驻留（与"键缺失"语义等价，但写出来让人眼能看全 schema）。
+/// 读兼容三种历史/手写形态：对象、`[[k,v],...]` 数组、整段缺失；写只写对象形态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LastIp(Vec<(String, String)>);
+
+// 默认值也铺满键位：全新安装/整段缺失时落盘同样是 6 个空串，而不是空对象。
+impl Default for LastIp {
+    fn default() -> Self {
+        LastIp(normalize_last_ip(std::iter::empty::<(String, String)>()))
+    }
+}
+
+/// 归一到规范键序：全量 6 位预写空值，非空值覆盖；表外键（族改名/手写残留）按字典序追加尾部，
+/// 不静默丢数据，也不打乱规范序。
+fn normalize_last_ip(pairs: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    let mut map: std::collections::HashMap<String, String> = pairs.into_iter().collect();
+    let canonical = crate::pool::circle_keys();
+    let mut out = Vec::with_capacity(canonical.len() + map.len());
+    for k in &canonical {
+        out.push((k.clone(), map.remove(k).unwrap_or_default()));
+    }
+    let mut extra: Vec<(String, String)> = map.into_iter().collect();
+    extra.sort_by(|a, b| a.0.cmp(&b.0));
+    out.extend(extra);
+    out
+}
+
+impl serde::Serialize for LastIp {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // 逐项按 Vec 现有顺序写入（serde_json 的 serializer 按调用序落盘），
+        // 不能用 Map 容器中转：无 preserve_order 时它会被 BTreeMap 重排成字典序。
+        let mut m = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            m.serialize_entry(k, v)?;
+        }
+        m.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LastIp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Map(std::collections::HashMap<String, String>),
+            List(Vec<(String, String)>),
+        }
+        Ok(match Shape::deserialize(d)? {
+            Shape::Map(m) => LastIp(normalize_last_ip(m)),
+            Shape::List(l) => LastIp(normalize_last_ip(l)),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
 // 字段名(camelCase)即既有落盘格式，不可改——漏 rename 会让旧文件反序列化失败静默回默认。
-#[serde(rename_all = "camelCase")]
+// 容器级 default：手改时漏掉某个键只回退该键，不连坐整份配置。
+#[serde(rename_all = "camelCase", default)]
 struct SettingsFile {
     close_to_tray: bool,
     mitm: bool,
     win_rect: [i32; 4],
     #[serde(rename = "githubPAC", skip_serializing_if = "Option::is_none")]
     github_pac: Option<bool>,
-    #[serde(default)]
     proxy_backup: String,
     // 键名显式写 "ourPAC"（非 camelCase）：既有落盘即此形。
-    #[serde(default, rename = "ourPAC")]
+    #[serde(rename = "ourPAC")]
     our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    last_ip: HashMap<String, String>, // 串发游标(每池/族上次驻留的 IP)
+    last_ip: LastIp, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
+}
+
+/// 宽松解析：先按结构严格读；失败则逐字段取值，坏一个字段只回退该字段。
+/// 目的：settings.json 是允许手改的文件，任何一处笔误都不该让开关/窗口位置/游标全部静默归零。
+fn parse_settings(data: &str) -> SettingsFile {
+    if let Ok(v) = serde_json::from_str::<SettingsFile>(data) {
+        return v;
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(data) else {
+        return SettingsFile::default();
+    };
+    fn pick<T: serde::de::DeserializeOwned + Default>(v: &serde_json::Value, key: &str) -> T {
+        v.get(key)
+            .and_then(|x| serde_json::from_value(x.clone()).ok())
+            .unwrap_or_default()
+    }
+    SettingsFile {
+        close_to_tray: pick(&val, "closeToTray"),
+        mitm: pick(&val, "mitm"),
+        win_rect: pick(&val, "winRect"),
+        github_pac: pick(&val, "githubPAC"),
+        proxy_backup: pick(&val, "proxyBackup"),
+        our_pac: pick(&val, "ourPAC"),
+        last_ip: pick(&val, "lastIp"),
+    }
 }
 
 pub fn load() {
     let path = exe_dir().join("settings.json");
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return;
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        // 全新安装：首启就落一份全键位空模板，"固定位置 + 固定 schema"从第一次运行起成立。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = save();
+            heal_stale_proxy();
+            return;
+        }
+        Err(_) => return,
     };
     // 记事本可能写入 UTF-8 BOM，serde_json 不认，会静默回退全部默认值
     let data = data.strip_prefix('\u{feff}').unwrap_or(&data);
-    let Ok(v) = serde_json::from_str::<SettingsFile>(data) else {
-        return;
-    };
+    let v = parse_settings(data);
     state()
         .close_to_tray
         .store(v.close_to_tray, std::sync::atomic::Ordering::Relaxed);
@@ -289,7 +376,8 @@ pub fn load() {
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
     *state().our_pac.lock().unwrap() = v.our_pac;
-    *state().last_ip.lock().unwrap() = v.last_ip;
+    // 内存侧即按规范序展开：老文件缺的键在这里补空，下次任一 save() 落盘就是全量 6 位。
+    *state().last_ip.lock().unwrap() = normalize_last_ip(v.last_ip.0);
     if let Some(on) = v.github_pac {
         state()
             .github_pac
@@ -307,9 +395,10 @@ fn save() -> Result<(), String> {
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         our_pac: s.our_pac.lock().unwrap().clone(),
-        last_ip: s.last_ip.lock().unwrap().clone(),
+        // 落盘前再归一次：任何入口塞进来的表外/缺键数据都会被补成全量规范序。
+        last_ip: LastIp(normalize_last_ip(s.last_ip.lock().unwrap().clone())),
     };
-    let json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     let p = exe_dir().join("settings.json");
     std::fs::write(&p, json).map_err(|e| e.to_string())?;
     let _ = crate::winsec::restrict_to_current_user(&p.to_string_lossy());
@@ -328,13 +417,14 @@ fn heal_stale_proxy() {
     restore_or_clear(&key);
 }
 
-pub fn last_ips() -> HashMap<String, String> {
+pub fn last_ips() -> Vec<(String, String)> {
     state().last_ip.lock().unwrap().clone()
 }
 
 /// 故障转移时记录驻留 IP(每池/族一个游标记号),并落盘 settings.json。
 /// 游标变化是窗口级罕见事件,直接同步写;崩溃最多丢最后一跳。
-pub fn set_last_ips(map: HashMap<String, String>) {
+pub fn set_last_ips(map: Vec<(String, String)>) {
+    let map = normalize_last_ip(map);
     {
         let mut st = state().last_ip.lock().unwrap();
         if *st == map {
@@ -424,5 +514,90 @@ mod tests {
         assert!(!is_our_pac_like("socks5://127.0.0.1:7811/proxy.pac"));
         assert!(!is_our_pac_like("http://127.0.0.1:78a1/proxy.pac")); // 端口非数字
         assert!(!is_our_pac_like("http://127.0.0.1:7811/proxy.pac?x=1"));
+    }
+
+    fn keys(pairs: &[(String, String)]) -> Vec<&str> {
+        pairs.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn last_ip_object_form_expands_to_full_schema() {
+        // 旧落盘形态：对象、只有 4 个键、乱序。
+        let v = parse_settings(
+            r#"{"closeToTray":true,"mitm":true,"winRect":[0,0,800,600],"githubPAC":true,
+                "lastIp":{"edge/assets":"185.199.108.154","core/all":"20.27.177.114",
+                          "edge/content":"185.199.110.133","api/all":"140.82.114.6"}}"#,
+        );
+        assert!(v.close_to_tray && v.mitm && v.github_pac == Some(true), "其他字段被连坐");
+        assert_eq!(
+            v.last_ip.0,
+            vec![
+                ("core/all".to_string(), "20.27.177.114".to_string()),
+                ("api/all".to_string(), "140.82.114.6".to_string()),
+                ("edge/content".to_string(), "185.199.110.133".to_string()),
+                ("edge/assets".to_string(), "185.199.108.154".to_string()),
+                ("edge/io".to_string(), String::new()),
+                ("edge/auth".to_string(), String::new()),
+            ],
+            "对象形态必须归一到规范键序，缺位补空串"
+        );
+    }
+
+    #[test]
+    fn last_ip_array_and_missing_forms_accepted() {
+        let arr = parse_settings(r#"{"lastIp":[["edge/io","1.2.3.4"],["core/all",""]]}"#);
+        assert_eq!(
+            keys(&arr.last_ip.0),
+            ["core/all", "api/all", "edge/content", "edge/assets", "edge/io", "edge/auth"]
+        );
+        assert_eq!(arr.last_ip.0[4].1, "1.2.3.4");
+
+        let none = parse_settings(r#"{"mitm":true}"#);
+        assert!(none.mitm);
+        assert_eq!(none.last_ip.0.len(), 6, "整段缺失也要铺满键位");
+        assert!(none.last_ip.0.iter().all(|(_, v)| v.is_empty()));
+    }
+
+    #[test]
+    fn save_emits_full_schema_in_canonical_order() {
+        let f = SettingsFile {
+            close_to_tray: true,
+            mitm: false,
+            win_rect: [1, 2, 3, 4],
+            github_pac: Some(false),
+            proxy_backup: String::new(),
+            our_pac: String::new(),
+            last_ip: LastIp(normalize_last_ip(vec![(
+                "api/all".to_string(),
+                "140.82.114.6".to_string(),
+            )])),
+        };
+        let json = serde_json::to_string_pretty(&f).unwrap();
+        let expect = r#"  "lastIp": {
+    "core/all": "",
+    "api/all": "140.82.114.6",
+    "edge/content": "",
+    "edge/assets": "",
+    "edge/io": "",
+    "edge/auth": ""
+  }"#;
+        assert!(json.contains(expect), "落盘 schema 漂移:\n{json}");
+        // 落盘 → 再读必须回同值（写读闭环）
+        let back = parse_settings(&json);
+        assert_eq!(back.last_ip.0, f.last_ip.0);
+        assert_eq!(back.win_rect, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn single_bad_field_does_not_wipe_file() {
+        // winRect 写坏：只回退该字段，开关与游标照读。
+        let v = parse_settings(
+            r#"{"closeToTray":true,"mitm":true,"winRect":"oops","lastIp":{"api/all":"1.1.1.1"}}"#,
+        );
+        assert!(v.close_to_tray && v.mitm, "一个字段笔误不得连坐整份配置");
+        assert_eq!(v.win_rect, [0; 4]);
+        assert_eq!(v.last_ip.0[1], ("api/all".to_string(), "1.1.1.1".to_string()));
+        // 非 JSON 垃圾才整体回默认
+        assert_eq!(parse_settings("not json").close_to_tray, false);
     }
 }
