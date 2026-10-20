@@ -10,11 +10,9 @@
 // 1) DOM 截断: WebView2 网络栈随系统代理刷新重启时可能把正在浏览的页面
 //    拦腰截断半截重载, 断处之后的 DOM 整块丢失。body 尾部的 app.js 不会执行,
 //    所以看门狗放 head —— 截断后仍会跑, 发现哨兵元素缺失就整页重载。
-// 2) 合成器停帧(实测主因, 2026-10-10 CDP 实锤): 窗口隐藏到托盘再恢复后,
-//    WebView2 合成器卡在旧画面不再重绘 —— DOM 完整(455 节点全在)但屏幕
-//    下半截永远是旧画面/黑块, 重启才恢复。药方: 轻推布局(zoom 1.0001 再
-//    复原)强制全量失效重绘, 已在用户窗口实时验证立竿见影。定时+可见性
-//    变化时各推一次, 设置页界面开销可忽略。60s 内最多整页重载 3 次。
+// 2) 合成器停帧(2026-10-10 CDP 实锤): 窗口隐藏到托盘再恢复后, 合成器卡在旧画面
+//    不再重绘 —— DOM 完整但下半截永远是旧画面。药方: 轻推布局(zoom 1.0001 再
+//    复原)强制全量失效重绘。加载/恢复可见/获得焦点时各查一次, 60s 内最多重载 3 次。
 (function () {
   var KEY = "fp_dom_heal", N = 3, WIN = 60000;
   function nudgePaint() {
@@ -35,25 +33,13 @@
     }
   }
   document.addEventListener("DOMContentLoaded", function () {
-    // 滚动确定性: 页面每次加载一律从顶部开始。
-    // 根因(CDP 全链路实测 2026-10-10): 分流开关刷新系统代理(WinINET)曾令旧版
-    // WebView2 重载页面 + Chromium 会话恢复把滚动位置带回半中央 —— DOM/服务端/
-    // 渲染管线全程完好, 但上半页卡片被卷出视野、MITM 下方本就是页尾留白,
-    // 体感即"开关/卡片消失"。显式 scrollRestoration=manual + 回顶, 位置不再漂移。
+    // 滚动确定性: 页面每次加载一律从顶部开始(会话恢复曾把位置带回半中央)。
     try { history.scrollRestoration = "manual"; } catch (e) {}
-    try { sessionStorage.removeItem("fp_scrollY"); } catch (e) {}
     requestAnimationFrame(function () { scrollTo(0, 0); });
-    // 根滚动器保险丝: 本机 WebView2 根滚动器滚动时底部 scrollY px 不重绘(CDP 实测
-    // painted = viewport - scrollY)。CSS 已锁 html overflow:hidden, 这里再兜底——
-    // 任何路径(滚轮链接/锚点/脚本)若把根滚出 0, 立即弹回, 绝不停在非零位置。
-    window.addEventListener("scroll", function () {
-      if (window.scrollY !== 0) scrollTo(0, 0);
-    }, { passive: true });
     setTimeout(heal, 800);
   });
   document.addEventListener("visibilitychange", function () { if (!document.hidden) setTimeout(heal, 300); });
   window.addEventListener("focus", function () { setTimeout(heal, 300); });
-  setInterval(heal, 4000);
 })();
 </script>
 </head>

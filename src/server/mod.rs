@@ -345,6 +345,7 @@ where
     (up, down)
 }
 
+/// 转发一路：可选首字节看门狗（超时 = 判死），其后普通泵；收尾 shutdown 让对端见 EOF。
 async fn copy_with_first_byte_timeout<R, W>(
     r: &mut R,
     w: &mut W,
@@ -356,30 +357,25 @@ where
 {
     let mut buf = vec![0u8; 32 * 1024];
     let mut total = 0u64;
-    let mut first = true;
-    loop {
-        let n = if first {
-            first = false;
-            match first_byte {
-                Some(dur) => match tokio::time::timeout(dur, r.read(&mut buf)).await {
-                    Err(_) => break, // 首字节看门狗超时：判死
-                    Ok(Err(_)) => break,
-                    Ok(Ok(n)) => n,
-                },
-                None => match r.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                },
+    if let Some(dur) = first_byte {
+        match tokio::time::timeout(dur, r.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if w.write_all(&buf[..n]).await.is_err() {
+                    return total;
+                }
+                total += n as u64;
             }
-        } else {
-            match r.read(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => break,
+            _ => {
+                let _ = w.shutdown().await;
+                return total;
             }
-        };
-        if n == 0 {
-            break;
         }
+    }
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
         if w.write_all(&buf[..n]).await.is_err() {
             break;
         }
