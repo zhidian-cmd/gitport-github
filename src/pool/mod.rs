@@ -433,20 +433,15 @@ pub async fn serial_dial(
             Ok(conn) => {
                 // 记号驻留:成功即停,下次请求从同一 IP 起步。
                 // 驻留变更 → settings.last_ip(故障转移级,罕见;set_last_ips 未变化时内部 no-op)。
+                // 键序由 settings 侧统一归一,这里只交出内存记号。
                 let snap = {
                     let mut g = SERIAL.lock().unwrap();
                     let t = g.as_mut().unwrap();
                     t.cursor.insert(cursor_key.clone(), p.ip.clone());
-                    let mut snap: Vec<(String, String)> = circle_keys()
+                    t.cursor
                         .iter()
-                        .filter_map(|k| t.cursor.get(k).map(|v| (k.clone(), v.clone())))
-                        .collect();
-                    for (k, v) in &t.cursor {
-                        if !snap.iter().any(|(ck, _)| ck == k) {
-                            snap.push((k.clone(), v.clone()));
-                        }
-                    }
-                    snap
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 };
                 crate::settings::set_last_ips(snap);
                 return Ok((conn, p.ip.clone(), p.sni.clone()));
