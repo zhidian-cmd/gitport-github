@@ -3,11 +3,11 @@
 use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
-use crate::pool::{self, dial::Dialed, LogFn};
+use crate::pool::{self, dial, LogFn};
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -114,22 +114,18 @@ async fn mitm_http(
             .unwrap();
     }
 
-    let upgrade = req
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_lowercase() == "websocket")
-        .unwrap_or(false);
-    if upgrade {
+    // WebSocket 升级：单开一条 http/1.1 腿，把上游 101 的头原样回给浏览器，之后按裸流转发。
+    if is_ws_upgrade(&req) {
         return mitm_upgrade(log, req, &host).await;
     }
+
     let info = UpstreamInfo::default();
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
     let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     let path = path_of(req.uri());
-// git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
+    // git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
     let mut streaming_reason = stream_decision(req.method(), &path, declared_content_len(&req));
     let mut overflow_prefix: Option<Vec<u8>> = None;
     let mut replay: Option<Bytes> = None;
@@ -181,7 +177,6 @@ async fn mitm_http(
         )
     {
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
-            let resp = counted_mirror(resp, &host, &path, req.method() == &Method::HEAD, &log);
             return write_upstream(resp, "mirror", &info);
         }
         (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
@@ -194,7 +189,6 @@ async fn mitm_http(
             match pool::route::fallback_for(&name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
-                        let r = counted_mirror(r, &host, &path, req.method() == &Method::HEAD, &log);
                         return write_upstream(r, "mirror", &info);
                     }
                     (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
@@ -234,6 +228,151 @@ async fn mitm_http(
     }
     write_upstream(resp, "direct", &info)
 }
+/// 只认 http/1.1 的 `Upgrade: websocket`。
+/// 我们的 h2 服务端没开 `SETTINGS_ENABLE_CONNECT_PROTOCOL`，浏览器无法走 RFC 8441 的扩展
+/// CONNECT，只能另开一条 http/1.1 连接做升级——所以这一条判断就覆盖了真实路径。
+fn is_ws_upgrade(req: &hyper::Request<Incoming>) -> bool {
+    req.headers()
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+/// WebSocket 升级：上游单开一条 http/1.1 腿，转发 101 之后再当裸流转发。
+/// 顺序是关键：先取 `on_upgrade`（不 await）→ 返回 101 → 后台任务里再 await，反了必死锁。
+async fn mitm_upgrade(
+    log: LogFn,
+    req: hyper::Request<Incoming>,
+    host: &str,
+) -> axum::response::Response<BoxBody> {
+    let mut req = req;
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let name = pool::pool_for(host);
+    let (mut conn, _ip, _shape) = match pool::serial_dial(
+        name,
+        host,
+        CancellationToken::new(),
+        dial::DialMode::H1,
+        Some(&log),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            (log)(&format!("[升级] {host} 拨号失败({e})"));
+            return mitm_unavailable(&req, host);
+        }
+    };
+    let (resp, rest) = match ws_handshake(&mut conn, upgrade_head(&req).as_bytes()).await {
+        Ok(v) => v,
+        Err(e) => {
+            (log)(&format!("[升级] {host} 上游握手失败({e})"));
+            return mitm_unavailable(&req, host);
+        }
+    };
+    let log = log.clone();
+    let host = host.to_string();
+    tokio::spawn(async move {
+        let Ok(upgraded) = on_upgrade.await else { return };
+        use tokio::io::AsyncWriteExt;
+        let mut client = TokioIo::new(upgraded);
+        // 握手响应头之后可能已经读到了首帧，先补写再开泵。
+        if !rest.is_empty() && client.write_all(&rest).await.is_err() {
+            return;
+        }
+        let (mut cr, mut cw) = tokio::io::split(client);
+        let (mut sr, mut sw) = tokio::io::split(conn);
+        let (up, down) = tokio::join!(
+            tokio::io::copy(&mut cr, &mut sw),
+            tokio::io::copy(&mut sr, &mut cw),
+        );
+        let _ = (up, down);
+        (log)(&format!("[升级] {host} 隧道结束"));
+    });
+    resp
+}
+
+fn upgrade_head(req: &hyper::Request<Incoming>) -> String {
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\n",
+        req.method(),
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+    );
+    for (k, v) in req.headers() {
+        if let Ok(v) = v.to_str() {
+            head.push_str(&format!("{}: {v}\r\n", k.as_str()));
+        }
+    }
+    head.push_str("\r\n");
+    head
+}
+
+/// 把升级请求写给上游并读回响应头；非 101 直接判失败。
+/// 返回 (要回给浏览器的 101, head 之后已经读到的残余字节)。
+async fn ws_handshake<S>(
+    up: &mut S,
+    head: &[u8],
+) -> Result<(axum::response::Response<BoxBody>, Vec<u8>), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    up.write_all(head)
+        .await
+        .map_err(|e| format!("写升级请求失败: {e}"))?;
+    up.flush().await.map_err(|e| format!("写升级请求失败: {e}"))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let end = loop {
+        if let Some(e) = head_end(&buf) {
+            break e;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err("上游升级响应头过大".to_string());
+        }
+        let n = tokio::time::timeout(Duration::from_secs(8), up.read(&mut chunk))
+            .await
+            .map_err(|_| "上游升级响应超时".to_string())?
+            .map_err(|e| format!("读升级响应失败: {e}"))?;
+        if n == 0 {
+            return Err("上游在升级响应前断开".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head_text = String::from_utf8_lossy(&buf[..end]);
+    let mut lines = head_text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if status != 101 {
+        return Err(format!("上游拒绝升级(状态 {status})"));
+    }
+    let mut b = axum::response::Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        b = b.header(k.trim(), v.trim());
+    }
+    let resp = b
+        .body(BoxBody::new(
+            http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
+        ))
+        .map_err(|e| format!("构造 101 失败: {e}"))?;
+    Ok((resp, buf[end..].to_vec()))
+}
+
+/// 头部结束位置：返回 `\r\n\r\n` 之后的下标。
+fn head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
 fn stream_decision(
     method: &Method,
     path: &str,
@@ -494,7 +633,7 @@ async fn get_direct(
     let name = pool::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
-    let is_content = pool::route::is_content_host(host);
+    let is_content = pool::route::host_is_content(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
@@ -649,96 +788,7 @@ async fn gh_defuse(
         };
     }
 }
-/// 交付计数体：统计实际推给客户端的字节数。
-/// 推完记"推完"，被提前关记"推了 N/总 M 后连接终止"——区分"没发够"与"客户端自己关"。
-struct CountingBody {
-    inner: BoxBody,
-    sent: u64,
-    total: Option<u64>,
-    done: bool,
-    log: LogFn,
-    tag: String,
-}
-impl CountingBody {
-    fn new(inner: BoxBody, total: Option<u64>, log: LogFn, tag: String) -> Self {
-        Self {
-            inner,
-            sent: 0,
-            total,
-            done: false,
-            log,
-            tag,
-        }
-    }
-    fn summary(&self) -> String {
-        match self.total {
-            Some(t) => format!("{}B/{}B", self.sent, t),
-            None => format!("{}B", self.sent),
-        }
-    }
-}
-impl hyper::body::Body for CountingBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
-        let this = self.get_mut();
-        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
-            std::task::Poll::Ready(Some(Ok(frame))) => {
-                if let Some(d) = frame.data_ref() {
-                    this.sent += d.len() as u64;
-                }
-                std::task::Poll::Ready(Some(Ok(frame)))
-            }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(None) => {
-                this.done = true;
-                (this.log)(&format!("[交付] {} 推完({})", this.tag, this.summary()));
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-impl Drop for CountingBody {
-    fn drop(&mut self) {
-        if !self.done {
-            (self.log)(&format!(
-                "[交付] {} 推了({})后连接终止(客户端关闭或响应被弃)",
-                self.tag,
-                self.summary()
-            ));
-        }
-    }
-}
-/// 镜像大响应（>1MB）包交付计数体；小响应与 HEAD 不包（HEAD 无体，包了误报 0B 终止）。
-/// 只罩镜像腿（直连腿字节账由 [隧道] ↑↓ 覆盖）。
-fn counted_mirror(
-    resp: hyper::Response<BoxBody>,
-    host: &str,
-    path: &str,
-    is_head: bool,
-    log: &LogFn,
-) -> hyper::Response<BoxBody> {
-    let total = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if is_head || total.map_or(true, |t| t <= 1024 * 1024) {
-        return resp;
-    }
-    let (parts, body) = resp.into_parts();
-    let body = BoxBody::new(CountingBody::new(
-        body,
-        total,
-        log.clone(),
-        format!("{host}{path}"),
-    ));
-    hyper::Response::from_parts(parts, body)
-}
+
 fn write_upstream(
     resp: hyper::Response<BoxBody>,
     route: &str,
@@ -827,7 +877,7 @@ async fn dns_direct_fetch(
     ));
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, host, true).await {
+        let conn = match pool::dial::dial_one(host, &ip, host, dial::DialMode::H2).await {
             Ok(c) => c,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
@@ -842,7 +892,7 @@ async fn dns_direct_fetch(
             }
         };
         let attempt_req = build_request(out, body);
-        let budget = if pool::route::is_content_host(host) {
+        let budget = if pool::route::host_is_content(host) {
             CONTENT_REQUEST_BUDGET
         } else {
             REQUEST_BUDGET
@@ -1207,6 +1257,11 @@ async fn calibrate_one(mirror: &str, tmpl: &str, log: &LogFn) -> Result<u16, Str
     let resp = mirror_do(mirror_get(uri)?, mirror, log).await?;
     Ok(resp.status().as_u16())
 }
+/// TTFB 排名：毫秒小者优；失败项记负数，一律排最后（同类之间按耗时）。
+fn rank_by_ttfb(rows: &mut [(String, i64)]) {
+    rows.sort_by_key(|(_, ms)| (*ms < 0, ms.unsigned_abs()));
+}
+
 pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     let chains = pool::mirror_chains_snapshot();
     let mut report = String::new();
@@ -1237,11 +1292,11 @@ pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
                         }
                         Err(e) => {
                             (log)(&format!("[校准] {host} {m} 失败({e})"));
-                            rows.push((m.clone(), -ms));
+                            rows.push((m.clone(), -(ms.max(1)))); // 负数 = 失败，沉底
                         }
                     }
                 }
-                rows.sort_by_key(|(_, ms)| -*ms); // TTFB：小者优；失败(负)沉底
+                rank_by_ttfb(&mut rows);
                 rows
             }
         };
@@ -1249,7 +1304,7 @@ pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
         let summary: Vec<String> = rows
             .iter()
             .map(|(m, v)| {
-                if *v > 0 {
+                if *v >= 0 {
                     let human = match mode {
                         CalibMode::Throughput => format!("{}KB", v / 1024),
                         CalibMode::Ttfb => format!("{}ms", v),
@@ -1268,64 +1323,6 @@ pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
     } else {
         report
     }
-}
-async fn mitm_upgrade(
-    log: LogFn,
-    req: hyper::Request<Incoming>,
-    host: &str,
-) -> axum::response::Response<BoxBody> {
-    let mut req = req;
-    let upgraded = match hyper::upgrade::on(&mut req).await {
-        Ok(u) => u,
-        Err(_) => return mitm_unavailable(&req, host),
-    };
-    let name = pool::pool_for(host);
-    let (mut conn, _ip, _shape) = if !pool::serial_pool(name) {
-        let addr = format!("{host}:443");
-        let tcp = match tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        {
-            Ok(Ok(t)) => t,
-            _ => return mitm_unavailable(&req, host),
-        };
-        let _ = tcp.set_nodelay(true);
-        (Dialed::Plain(tcp), "system-dns".to_string(), String::new())
-    } else {
-        match pool::serial_dial(name, host, CancellationToken::new(), true, Some(&log)).await {
-            Ok(v) => v,
-            Err(_) => return mitm_unavailable(&req, host),
-        }
-    };
-    let mut head = format!(
-        "{} {} HTTP/1.1\r\n",
-        req.method(),
-        req.uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-    );
-    for (k, v) in req.headers() {
-        head.push_str(&format!("{}: {}\r\n", k, v.to_str().unwrap_or("")));
-    }
-    head.push_str("\r\n");
-    use tokio::io::AsyncWriteExt;
-    if conn.write_all(head.as_bytes()).await.is_err() {
-        return mitm_unavailable(&req, host);
-    }
-    let (mut ar, mut aw) = tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
-    let (mut br, mut bw) = tokio::io::split(conn);
-    let down = tokio::spawn(async move { tokio::io::copy(&mut br, &mut aw).await.unwrap_or(0) });
-    let _up = tokio::io::copy(&mut ar, &mut bw).await;
-    let _ = down.await;
-    axum::response::Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
-        ))
-        .unwrap()
 }
 #[cfg(test)]
 mod tests {
@@ -1512,6 +1509,88 @@ mod tests {
         assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
     }
 
+    #[tokio::test]
+    async fn ws_handshake_forwards_101_headers_and_leftover() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = tcp.read(&mut buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).contains("Sec-WebSocket-Key: k"));
+            tcp.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\nXYZ",
+            )
+            .await
+            .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (resp, rest) = ws_handshake(
+            &mut client,
+            b"GET /x HTTP/1.1\r\nHost: h\r\nSec-WebSocket-Key: k\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            resp.headers().get("sec-websocket-accept").unwrap(),
+            "abc",
+            "101 的握手头必须原样转发，否则浏览器判失败"
+        );
+        assert_eq!(rest, b"XYZ", "head 之后的残余字节要交给泵");
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_rejects_non_101() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tcp.read(&mut buf).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err = ws_handshake(&mut client, b"GET /x HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        srv.await.unwrap();
+    }
+
+    #[test]
+    fn ttfb_rank_fastest_first_failures_last() {
+        let mut rows = vec![
+            ("slow".to_string(), 900),
+            ("fast".to_string(), 120),
+            ("mid".to_string(), 300),
+            ("dead".to_string(), -50),
+        ];
+        rank_by_ttfb(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(order, ["fast", "mid", "slow", "dead"], "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_refuses_credentialed_url() {
+        let log: LogFn = Arc::new(|_: &str| {});
+        let req = hyper::Request::builder()
+            .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
+            .body(BoxBody::new(
+                http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
+            ))
+            .unwrap();
+        let err = chain_fetch(&log, &req, "raw.githubusercontent.com")
+            .await
+            .unwrap_err();
+        assert!(err.contains("拒绝镜像"), "签名 URL 不得交给第三方镜像: {err}");
+    }
+
     #[test]
     fn stream_decision_contract() {
         use upstream::MAX_REPLAY_BODY;
@@ -1546,72 +1625,5 @@ mod tests {
         assert_eq!(stream_decision(&Method::POST, "/api/x", None), None);
         assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
         assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
-    }
-
-    #[tokio::test]
-    async fn counting_body_logs_completion_and_truncation() {
-        use hyper::body::Body;
-        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let l = logs.clone();
-        let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
-        let two_chunks = || {
-            BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
-                vec![
-                    Ok(hyper::body::Frame::data(Bytes::from_static(b"01234"))),
-                    Ok(hyper::body::Frame::data(Bytes::from_static(b"56789"))),
-                ],
-            )))
-        };
-        let counted = CountingBody::new(two_chunks(), Some(10), log.clone(), "t/full".into());
-        let out = http_body_util::BodyExt::collect(counted).await.unwrap();
-        assert_eq!(out.to_bytes().len(), 10);
-        let mut counted = CountingBody::new(two_chunks(), Some(10), log.clone(), "t/part".into());
-        let f = std::future::poll_fn(|cx| std::pin::Pin::new(&mut counted).poll_frame(cx))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(f.into_data().unwrap().len(), 5);
-        drop(counted);
-        let lines = logs.lock().unwrap();
-        assert!(
-            lines.iter().any(|s| s.contains("t/full 推完(10B/10B)")),
-            "{lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|s| s.contains("t/part 推了(5B/10B)后连接终止")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn counted_mirror_skips_head_and_small() {
-        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let l = logs.clone();
-        let log: LogFn = Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()));
-        let big = BoxBody::new(
-            http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"))
-                .map_err(|never| match never {}),
-        );
-        let big_resp = hyper::Response::builder()
-            .status(StatusCode::OK)
-            .header("content-length", "132855191")
-            .body(big)
-            .unwrap();
-        let r = counted_mirror(big_resp, "h", "/p", true, &log);
-        drop(r);
-        let small = hyper::Response::builder()
-            .status(StatusCode::OK)
-            .header("content-length", "10")
-            .body(BoxBody::new(
-                http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"))
-                    .map_err(|never| match never {}),
-            ))
-            .unwrap();
-        let r = counted_mirror(small, "h", "/p", false, &log);
-        drop(r);
-        let lines = logs.lock().unwrap();
-        assert!(lines.is_empty(), "HEAD 与小响应都不该有交付日志: {lines:?}");
     }
 }
