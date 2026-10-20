@@ -251,6 +251,17 @@ fn show_window(slot: &Mutex<WinSlot>) -> bool {
     true
 }
 
+/// 删除 WebView2 用户数据目录(退出/收托盘清场)。浏览器进程刚被释放,
+/// 交还文件锁有延迟,300ms×10 重试兜底;超时留给下次启动的启动清理。
+fn remove_webview_udf() {
+    for _ in 0..10 {
+        if std::fs::remove_dir_all("gitport-github.exe.WebView2").is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
 pub fn open_browser(url: &str) {
     let _ = std::process::Command::new("rundll32")
         .args(["url.dll,FileProtocolHandler", url])
@@ -329,12 +340,22 @@ pub fn run(args: DesktopArgs) -> ! {
     let do_quit = move |cf: &mut ControlFlow| {
         if !quitting2.swap(true, Ordering::SeqCst) {
             save_window_rect(&slot2);
-            (on_quit2)();
+            // 先释放 WebView2(与托盘收起同路径):浏览器进程退出后用户数据目录才解锁。
+            {
+                let mut g = slot2.lock().unwrap();
+                g.wv = None;
+                g.win = None;
+            }
+            (on_quit2)(); // 撤系统代理 + 停代理核心
+            remove_webview_udf(); // 退出清场：留净土, 超时留待下次启动兜底
             *cf = ControlFlow::Exit;
         }
     };
 
     let mut created_once = false;
+    // 上次会话若退出未及清理，启动即删 WebView2 用户数据目录残留
+    // （此刻 WebView2 尚未创建，无锁；单实例已由 mutex 保证）。
+    let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -367,7 +388,9 @@ pub fn run(args: DesktopArgs) -> ! {
                     let mut g = slot.lock().unwrap();
                     g.wv = None;
                     g.win = None;
-                    (log)("工作台已收起到托盘, WebView2 已释放(点击托盘重开)");
+                    drop(g);
+                    remove_webview_udf(); // 收托盘即清场: UI 不在, 数据目录不驻留
+                    (log)("工作台已收起到托盘, WebView2 及其数据目录已清理(点击托盘重开)");
                 } else {
                     do_quit(control_flow);
                 }
