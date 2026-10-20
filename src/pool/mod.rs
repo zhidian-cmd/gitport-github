@@ -534,7 +534,7 @@ pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
 
 /// 全灭熔断：set 后 ttl 内 open=true 快速失败，clear 解除；必须按 host 记账——
 /// 全局单值会让"别的域成功"反复清掉 raw 的熔断（内容域直连）/同类 host 快速失败。
-struct Breaker {
+pub struct Breaker {
     ttl_secs: u64,
     map: std::sync::OnceLock<Mutex<HashMap<String, Instant>>>,
 }
@@ -551,49 +551,25 @@ impl Breaker {
             .lock()
             .unwrap()
     }
-    fn open(&self, host: &str) -> bool {
+    pub fn open(&self, host: &str) -> bool {
         self.lock()
             .get(host)
             .map(|until| Instant::now() < *until)
             .unwrap_or(false)
     }
-    fn set(&self, host: &str) {
+    pub fn set(&self, host: &str) {
         self.lock()
             .insert(host.to_string(), Instant::now() + Duration::from_secs(self.ttl_secs));
     }
-    fn clear(&self, host: &str) {
+    pub fn clear(&self, host: &str) {
         self.lock().remove(host);
     }
 }
 
 /// 内容域直连熔断：被按域黑洞时每请求烧满预算，失败一次熔断 120s 走镜像，成功清除。
-static CONTENT_BREAKER: Breaker = Breaker::new(120);
+pub static CONTENT_BREAKER: Breaker = Breaker::new(120);
 /// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
-static MIRROR_BREAKER: Breaker = Breaker::new(60);
-
-pub fn content_direct_open(host: &str) -> bool {
-    CONTENT_BREAKER.open(host)
-}
-
-pub fn content_direct_ok(host: &str) {
-    CONTENT_BREAKER.clear(host);
-}
-
-pub fn content_direct_fail(host: &str) {
-    CONTENT_BREAKER.set(host);
-}
-
-pub fn mirror_breaker_open(host: &str) -> bool {
-    MIRROR_BREAKER.open(host)
-}
-
-pub fn mirror_breaker_set(host: &str) {
-    MIRROR_BREAKER.set(host);
-}
-
-pub fn mirror_breaker_clear(host: &str) {
-    MIRROR_BREAKER.clear(host);
-}
+pub static MIRROR_BREAKER: Breaker = Breaker::new(60);
 
 pub use crate::config::pool_for;
 
@@ -622,21 +598,21 @@ mod tests {
     fn breakers_open_set_clear_by_host() {
         let raw = "raw.githubusercontent.com";
         let camo = "camo.githubusercontent.com";
-        assert!(!content_direct_open(raw));
-        content_direct_fail(raw);
-        assert!(content_direct_open(raw));
+        assert!(!CONTENT_BREAKER.open(raw));
+        CONTENT_BREAKER.set(raw);
+        assert!(CONTENT_BREAKER.open(raw));
         assert!(
-            !content_direct_open(camo),
+            !CONTENT_BREAKER.open(camo),
             "熔断按 host 记账，不得串到同池其他域"
         );
-        content_direct_ok(raw);
-        assert!(!content_direct_open(raw));
+        CONTENT_BREAKER.clear(raw);
+        assert!(!CONTENT_BREAKER.open(raw));
 
-        assert!(!mirror_breaker_open(camo));
-        mirror_breaker_set(camo);
-        assert!(mirror_breaker_open(camo));
-        mirror_breaker_clear(camo);
-        assert!(!mirror_breaker_open(camo));
+        assert!(!MIRROR_BREAKER.open(camo));
+        MIRROR_BREAKER.set(camo);
+        assert!(MIRROR_BREAKER.open(camo));
+        MIRROR_BREAKER.clear(camo);
+        assert!(!MIRROR_BREAKER.open(camo));
     }
 
     #[test]
