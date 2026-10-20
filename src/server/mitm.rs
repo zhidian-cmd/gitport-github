@@ -466,7 +466,7 @@ async fn try_cached(
                 pool::cursor_note(name, host, &up.ip, true);
             }
             if is_content {
-                pool::content_direct_ok(host);
+                pool::CONTENT_BREAKER.clear(host);
             }
             (log)(&format!(
                 "[上游] {host}{path} 复用连接, {}ms",
@@ -495,7 +495,7 @@ async fn get_direct(
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let is_content = pool::route::is_content_host(host);
-    if name == "edge" && is_content && pool::content_direct_open(host) {
+    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if let Some(r) = try_cached(
@@ -508,7 +508,7 @@ async fn get_direct(
 // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
-    if name == "edge" && is_content && pool::content_direct_open(host) {
+    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if upstream::cached_h2(host).is_some() {
@@ -535,7 +535,7 @@ async fn get_direct(
                     return Err(format!("POST 等非简单方法不重发({e})"));
                 }
                 if is_content {
-                    pool::content_direct_fail(host);
+                    pool::CONTENT_BREAKER.set(host);
                     return Err(format!("内容域直连全灭({e})"));
                 }
                 continue;
@@ -556,7 +556,7 @@ async fn get_direct(
                 }
                 upstream::store_h2(host, up.clone());
                 if is_content {
-                    pool::content_direct_ok(host); // 直连恢复：清除熔断
+                    pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }
                 (log)(&format!(
                     "[上游] {host}{path} 新连接 {}, {}ms",
@@ -582,7 +582,7 @@ async fn get_direct(
             return Err(format!("POST 等非简单方法不重发({e})"));
         }
         if is_content {
-            pool::content_direct_fail(host);
+            pool::CONTENT_BREAKER.set(host);
             return Err(format!("内容域直连全灭({e})"));
         }
         continue; // GET/HEAD: 换下一个候选重发完整请求
@@ -912,7 +912,7 @@ async fn chain_fetch(
     if chain.is_empty() {
         return Err(format!("{host} 无镜像链({chain_host})"));
     }
-    if pool::mirror_breaker_open(chain_host) {
+    if pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
     let limit = mirror_chain_cap(chain_host)
@@ -940,7 +940,7 @@ async fn chain_fetch(
                     len = chain.len(),
                     ms = t0.elapsed().as_millis()
                 ));
-                pool::mirror_breaker_clear(chain_host); // 链是活的: 清全灭熔断
+                pool::MIRROR_BREAKER.clear(chain_host); // 链是活的: 清全灭熔断
                 return Ok(resp);
             }
             Err(e) => {
@@ -951,7 +951,7 @@ async fn chain_fetch(
             }
         }
     }
-    pool::mirror_breaker_set(chain_host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
+    pool::MIRROR_BREAKER.set(chain_host); // 整链烧完仍全灭: 熔断 60s, 后续图快速失败
     Err(format!("{host} 镜像链全灭({chain_host} 链 {limit} 个)"))
 }
 fn build_request(out: &hyper::Request<BoxBody>, body: &Option<Bytes>) -> hyper::Request<BoxBody> {
