@@ -154,16 +154,16 @@ impl ProxyServer {
         let name = pool::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             match (sent, recv) {
-                (s, r) if s > 0 && r > 0 => pool::serial_note(name, &ip, "ok"),
+                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true),
                 (s, r) if s > 0 && r == 0 => {
-                    pool::serial_note(name, &ip, "noreply");
+                    pool::cursor_note(name, &host, &ip, false);
                     (self.log)(&format!("[串发] {host} 客户端已握手但零回包, 垫底换下一个"));
                 }
                 _ => {}
             }
             // github.com 网页风控逃生（透传看不见状态码，用流量指纹记账）
             if host == "github.com" && sent > 0 && sent < 8192 && recv > 0 && recv < 8192 {
-                pool::serial_note(name, &ip, "block");
+                pool::cursor_note(name, &host, &ip, false);
                 (self.log)(&format!(
                     "[串发] {host} 疑似风控小响应(↑{sent}↓{recv}B), 垫底换 IP"
                 ));
@@ -218,7 +218,7 @@ impl ProxyServer {
         if upstream.write_all(req.as_bytes()).await.is_err() {
             let name = pool::pool_for(&host);
             if !name.is_empty() && ip != "system-dns" {
-                pool::serial_note(name, &ip, "other");
+                pool::cursor_note(name, &host, &ip, false);
             }
             return;
         }
@@ -226,9 +226,9 @@ impl ProxyServer {
         let name = pool::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             if recv == 0 {
-                pool::serial_note(name, &ip, "noreply");
+                pool::cursor_note(name, &host, &ip, false);
             } else {
-                pool::serial_note(name, &ip, "ok");
+                pool::cursor_note(name, &host, &ip, true);
             }
         }
     }
