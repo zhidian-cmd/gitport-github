@@ -1,74 +1,302 @@
 {
   "core": [
-    {"ip": "20.205.243.167", "sni": "baidu.com"},
-    {"ip": "140.82.116.3", "sni": "baidu.com"},
-    {"ip": "20.233.83.145", "sni": "baidu.com"},
-    {"ip": "4.228.31.150", "sni": "baidu.com"},
-    {"ip": "172.182.252.133", "sni": "baidu.com"},
-    {"ip": "140.82.112.3", "sni": "baidu.com"},
-    {"ip": "140.82.112.4", "sni": "baidu.com"},
-    {"ip": "20.205.243.166", "sni": "baidu.com"},
-    {"ip": "20.201.28.151", "sni": "baidu.com"},
-    {"ip": "140.82.113.3", "sni": "baidu.com"},
-    {"ip": "140.82.114.3", "sni": "baidu.com"},
-    {"ip": "140.82.114.4", "sni": "baidu.com"},
-    {"ip": "140.82.116.4", "sni": "baidu.com"},
-    {"ip": "20.87.245.0", "sni": "baidu.com"},
-    {"ip": "20.205.243.168", "sni": "baidu.com"},
-    {"ip": "20.200.245.248", "sni": "baidu.com"},
-    {"ip": "140.82.113.22", "sni": "baidu.com"},
-    {"ip": "4.208.26.197", "sni": "baidu.com"},
-    {"ip": "20.27.177.114", "sni": "baidu.com"},
-    {"ip": "140.82.121.3", "sni": "baidu.com"},
-    {"ip": "4.237.22.38", "sni": "baidu.com"},
-    {"ip": "20.207.73.82", "sni": "baidu.com"},
-    {"ip": "140.82.121.4", "sni": "baidu.com"},
-    {"ip": "20.26.156.215", "sni": "baidu.com"},
-    {"ip": "20.27.177.113", "sni": "baidu.com"},
-    {"ip": "20.200.245.247", "sni": "baidu.com"},
-    {"ip": "140.82.113.4", "sni": "baidu.com"}
+    {
+      "ip": "140.82.121.3",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "4.237.22.38",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.207.73.82",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.121.4",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.26.156.215",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.27.177.113",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.200.245.247",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.4",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.205.243.167",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.116.3",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.233.83.145",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "4.228.31.150",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "172.182.252.133",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.3",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.4",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.205.243.166",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.201.28.151",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.3",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.114.3",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.114.4",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.116.4",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.87.245.0",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.200.245.248",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.22",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "4.208.26.197",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.205.243.168",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "20.27.177.114",
+      "sni": "baidu.com"
+    }
   ],
   "api": [
-    {"ip": "140.82.114.6", "sni": "baidu.com"},
-    {"ip": "140.82.112.6", "sni": "baidu.com"},
-    {"ip": "140.82.112.5", "sni": "baidu.com"},
-    {"ip": "140.82.113.6", "sni": "baidu.com"},
-    {"ip": "140.82.113.5", "sni": "baidu.com"},
-    {"ip": "140.82.114.5", "sni": "baidu.com"}
+    {
+      "ip": "140.82.114.6",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.6",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.5",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.6",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.5",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.114.5",
+      "sni": "baidu.com"
+    }
   ],
   "edge": [
-    {"ip": "185.199.110.133", "sni": "baidu.com"},
-    {"ip": "185.199.108.154", "sni": "baidu.com"},
-    {"ip": "185.199.108.153", "sni": "baidu.com"},
-    {"ip": "140.82.112.29", "sni": "baidu.com"},
-    {"ip": "185.199.109.154", "sni": "baidu.com"},
-    {"ip": "185.199.110.154", "sni": "baidu.com"},
-    {"ip": "185.199.111.154", "sni": "baidu.com"},
-    {"ip": "185.199.109.153", "sni": "baidu.com"},
-    {"ip": "185.199.110.153", "sni": "baidu.com"},
-    {"ip": "185.199.111.153", "sni": "baidu.com"},
-    {"ip": "140.82.112.30", "sni": "baidu.com"},
-    {"ip": "140.82.113.29", "sni": "baidu.com"},
-    {"ip": "140.82.113.30", "sni": "baidu.com"},
-    {"ip": "140.82.114.29", "sni": "baidu.com"},
-    {"ip": "140.82.114.30", "sni": "baidu.com"},
-    {"ip": "185.199.108.215", "sni": "baidu.com"},
-    {"ip": "185.199.109.215", "sni": "baidu.com"},
-    {"ip": "185.199.110.215", "sni": "baidu.com"},
-    {"ip": "185.199.111.215", "sni": "baidu.com"},
-    {"ip": "185.199.108.133", "sni": "baidu.com"},
-    {"ip": "185.199.109.133", "sni": "baidu.com"},
-    {"ip": "185.199.111.133", "sni": "baidu.com"}
+    {
+      "ip": "185.199.108.153",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.29",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.109.153",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.110.153",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.111.153",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.112.30",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.29",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.113.30",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.114.29",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "140.82.114.30",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.108.154",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.109.154",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.110.154",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.111.154",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.110.133",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.108.215",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.108.133",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.109.215",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.109.133",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.110.215",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.111.133",
+      "sni": "baidu.com"
+    },
+    {
+      "ip": "185.199.111.215",
+      "sni": "baidu.com"
+    }
   ],
   "mirrors": {
-    "github.com": ["https://v6.gh-proxy.org", "https://gh-proxy.com", "https://cdn.gh-proxy.org", "https://axisnow.gh-proxy.org", "https://v4.gh-proxy.org", "https://gh-proxy.org", "https://cf.ghproxy.cn", "https://github.moeyy.xyz", "https://mirror.ghproxy.com", "https://ghfast.top", "https://ghproxy.net"],
-    "raw.githubusercontent.com": ["https://axisnow.gh-proxy.org", "https://v6.gh-proxy.org", "https://cdn.gh-proxy.org", "https://gh-proxy.com", "https://v4.gh-proxy.org", "https://gh-proxy.org", "https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://github.moeyy.xyz", "https://ghproxy.net", "https://ghfast.top"],
-    "gist.githubusercontent.com": ["https://axisnow.gh-proxy.org", "https://v4.gh-proxy.org", "https://gh-proxy.com", "https://v6.gh-proxy.org", "https://cdn.gh-proxy.org", "https://gh-proxy.org", "https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://ghproxy.net", "https://github.moeyy.xyz", "https://ghfast.top"],
-    "avatars.githubusercontent.com": ["https://axisnow.gh-proxy.org", "https://cdn.gh-proxy.org", "https://v4.gh-proxy.org", "https://v6.gh-proxy.org", "https://gh-proxy.org", "https://gh-proxy.com", "https://cf.ghproxy.cn", "https://mirror.ghproxy.com", "https://ghfast.top", "https://ghproxy.net", "https://github.moeyy.xyz"],
-    "user-images.githubusercontent.com": ["https://gh-proxy.org", "https://v6.gh-proxy.org", "https://axisnow.gh-proxy.org", "https://v4.gh-proxy.org", "https://cdn.gh-proxy.org", "https://gh-proxy.com", "https://ghfast.top", "https://ghproxy.net", "https://mirror.ghproxy.com", "https://github.moeyy.xyz", "https://cf.ghproxy.cn"],
-    "codeload.github.com": ["https://cdn.gh-proxy.org", "https://v6.gh-proxy.org", "https://gh-proxy.org", "https://gh-proxy.com", "https://axisnow.gh-proxy.org", "https://cf.ghproxy.cn", "https://ghproxy.net", "https://mirror.ghproxy.com", "https://github.moeyy.xyz", "https://v4.gh-proxy.org", "https://ghfast.top"],
-    "objects.githubusercontent.com": ["https://gh-proxy.org", "https://cdn.gh-proxy.org", "https://v6.gh-proxy.org", "https://gh-proxy.com", "https://v4.gh-proxy.org", "https://axisnow.gh-proxy.org", "https://github.moeyy.xyz", "https://mirror.ghproxy.com", "https://ghproxy.net", "https://ghfast.top", "https://cf.ghproxy.cn"],
-    "release-assets.githubusercontent.com": ["https://gh-proxy.org", "https://cdn.gh-proxy.org", "https://v6.gh-proxy.org", "https://v4.gh-proxy.org", "https://gh-proxy.com", "https://axisnow.gh-proxy.org", "https://mirror.ghproxy.com", "https://github.moeyy.xyz", "https://ghproxy.net", "https://ghfast.top", "https://cf.ghproxy.cn"],
-    "media.githubusercontent.com": ["https://v4.gh-proxy.org", "https://gh-proxy.org", "https://v6.gh-proxy.org", "https://cdn.gh-proxy.org", "https://gh-proxy.com", "https://axisnow.gh-proxy.org", "https://cf.ghproxy.cn", "https://github.moeyy.xyz", "https://mirror.ghproxy.com", "https://ghfast.top", "https://ghproxy.net"]
+    "github.com": [
+      "https://v6.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://cdn.gh-proxy.org",
+      "https://axisnow.gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.org"
+    ],
+    "raw.githubusercontent.com": [
+      "https://axisnow.gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.org"
+    ],
+    "gist.githubusercontent.com": [
+      "https://axisnow.gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://v6.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.org"
+    ],
+    "avatars.githubusercontent.com": [
+      "https://axisnow.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://gh-proxy.org",
+      "https://gh-proxy.com"
+    ],
+    "user-images.githubusercontent.com": [
+      "https://gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://axisnow.gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.com"
+    ],
+    "codeload.github.com": [
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://axisnow.gh-proxy.org"
+    ],
+    "objects.githubusercontent.com": [
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://axisnow.gh-proxy.org"
+    ],
+    "release-assets.githubusercontent.com": [
+      "https://v6.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.org",
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://axisnow.gh-proxy.org"
+    ],
+    "media.githubusercontent.com": [
+      "https://v4.gh-proxy.org",
+      "https://gh-proxy.org",
+      "https://v6.gh-proxy.org",
+      "https://cdn.gh-proxy.org",
+      "https://gh-proxy.com",
+      "https://axisnow.gh-proxy.org"
+    ]
   }
 }
