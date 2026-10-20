@@ -4,7 +4,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
-use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls_pki_types::PrivateKeyDer;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -129,17 +129,8 @@ pub fn load_or_generate(dir: &Path, log: Option<&LogFn>) -> Result<Arc<Authority
 fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| e.to_string())?;
     let key_pem = std::fs::read_to_string(key_path).map_err(|e| e.to_string())?;
-    let ca_key = KeyPair::from_pem(&key_pem)
-        .or_else(|_| {
-            sec1_to_pkcs8(&key_pem).and_then(|der| {
-                KeyPair::from_pkcs8_der_and_sign_algo(
-                    &PrivatePkcs8KeyDer::from(der),
-                    &rcgen::PKCS_ECDSA_P256_SHA256,
-                )
-                .map_err(|e| e.to_string())
-            })
-        })
-        .map_err(|e: String| format!("ca.key 解析失败: {e}"))?;
+    // 只认 PKCS#8——本程序 save() 与 rcgen 写出的都是它；无法解析即当无 CA 重建（重装根证书）。
+    let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| format!("ca.key 解析失败: {e}"))?;
     let (item, _) = rustls_pemfile::read_one_from_slice(cert_pem.as_bytes())
         .map_err(|e| format!("ca.crt PEM 解析失败: {e:?}"))?
         .ok_or_else(|| "ca.crt 无 PEM 块".to_string())?;
@@ -154,68 +145,6 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
         ca_key,
         leaves: Mutex::new(HashMap::new()),
     }))
-}
-
-/// SEC1 "EC PRIVATE KEY" PEM → PKCS#8 DER（手工 TLV 编码，结构固定）。
-fn sec1_to_pkcs8(pem: &str) -> Result<Vec<u8>, String> {
-    let (item, _) = rustls_pemfile::read_one_from_slice(pem.as_bytes())
-        .map_err(|e| format!("PEM 解析失败: {e:?}"))?
-        .ok_or_else(|| "无 PEM 块".to_string())?;
-    let sec1 = match item {
-        rustls_pemfile::Item::Sec1Key(k) => k.secret_sec1_der().to_vec(),
-        other => return Err(format!("ca.key 不是 SEC1 私钥: {other:?}")),
-    };
-    // OID: ecPublicKey = 1.2.840.10045.2.1, prime256v1 = 1.2.840.10045.3.1.7
-    let ec_oid = encode_oid(&[1, 2, 840, 10045, 2, 1]);
-    let curve_oid = encode_oid(&[1, 2, 840, 10045, 3, 1, 7]);
-    let alg = der_tlv(
-        0x30,
-        &[der_tlv(0x06, &ec_oid), der_tlv(0x06, &curve_oid)].concat(),
-    );
-    let pki = der_tlv(
-        0x30,
-        &[der_tlv(0x02, &[0x00]), alg, der_tlv(0x04, &sec1)].concat(),
-    );
-    Ok(pki)
-}
-
-/// DER 的 TLV 编码（tag + length + content）。
-fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(content.len() + 8);
-    out.push(tag);
-    if content.len() < 0x80 {
-        out.push(content.len() as u8);
-    } else {
-        let mut len = content.len();
-        let mut lb = Vec::new();
-        while len > 0 {
-            lb.push((len & 0xff) as u8);
-            len >>= 8;
-        }
-        lb.reverse();
-        out.push(0x80 | lb.len() as u8);
-        out.extend(lb);
-    }
-    out.extend(content);
-    out
-}
-
-/// OID 编号：首对合成一个字节(40*a+b)，后续每元素 base-128 大端编码。
-fn encode_oid(oid: &[u32]) -> Vec<u8> {
-    let mut out = vec![(oid[0] * 40 + oid[1]) as u8];
-    for &v in &oid[2..] {
-        let mut n = v;
-        let mut buf = Vec::new();
-        buf.push((n & 0x7f) as u8);
-        n >>= 7;
-        while n > 0 {
-            buf.push((n & 0x7f) as u8 | 0x80);
-            n >>= 7;
-        }
-        buf.reverse();
-        out.extend(buf);
-    }
-    out
 }
 
 fn generate() -> Result<Arc<Authority>, String> {
@@ -287,18 +216,6 @@ mod tests {
         assert_eq!(leaf.cert.len(), 2, "叶子应附带 CA 链");
         let leaf2 = a.leaf("github.com").unwrap();
         assert!(std::ptr::eq(Arc::as_ptr(&leaf), Arc::as_ptr(&leaf2)) || leaf.cert == leaf2.cert);
-    }
-
-    #[test]
-    fn sec1_conversion() {
-        let kp = KeyPair::generate().unwrap();
-        let pkcs8 = kp.serialize_der();
-        let kp2 = KeyPair::from_pkcs8_der_and_sign_algo(
-            &PrivatePkcs8KeyDer::from(pkcs8),
-            &rcgen::PKCS_ECDSA_P256_SHA256,
-        )
-        .unwrap();
-        assert_eq!(kp2.public_key_raw(), kp.public_key_raw());
     }
 
     #[test]

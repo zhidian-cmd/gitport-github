@@ -1,126 +1,66 @@
 //! Windows 文件 ACL 收紧：Rust 0600 在 Windows 只映射只读属性，文件缺省继承目录 ACL。
 //! ca.key（MITM 根私钥）/settings.json 收紧为仅当前用户与 SYSTEM——根私钥可读即可伪造用户已信任的叶子证书。
+//!
+//! 走系统自带 icacls：一条命令 = 断开继承 + 只授当前用户与 SYSTEM，等价于受保护 DACL。
+//! 失败按 best-effort 返回错误，调用方只记日志，不阻断主流程。
 
-use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    SetNamedSecurityInfoW, SE_FILE_OBJECT,
-};
-use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_USER,
-};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 
-/// 句柄 RAII：本函数 8 个错误早退路径，手动 CloseHandle 会漏。
-struct AutoCloseHandle(windows::Win32::Foundation::HANDLE);
-impl Drop for AutoCloseHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
+/// 子进程不弹控制台窗口（本程序是 GUI 子系统）。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 受保护 DACL：仅 SYSTEM 与当前用户完全控制，其余（含继承来的 Administrators）剥离。
+pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.trim().is_empty() {
+        // 拿不到用户名时宁可不改：只授 SYSTEM 会把用户自己锁在外面。
+        return Err("取不到当前用户名，跳过 ACL 收紧".to_string());
     }
+    let grant_user = format!("{user}:(F)");
+    let out = Command::new("icacls")
+        .args([
+            path,
+            "/inheritance:r",
+            "/grant:r",
+            grant_user.as_str(),
+            "/grant:r",
+            "*S-1-5-18:(F)",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("icacls 执行失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(format!(
+        "icacls 退出码 {:?}: {detail}",
+        out.status.code().unwrap_or(-1)
+    ))
 }
 
-/// 受保护 DACL：仅 SYSTEM 与当前用户完全控制，其余剥离；失败按 best-effort 处理。
-pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
-    let mut token = Default::default();
-    unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            windows::Win32::Security::TOKEN_QUERY,
-            &mut token,
-        )
-        .map_err(|e| format!("OpenProcessToken 失败: {e}"))?;
-    }
-    let _token = AutoCloseHandle(token); // 此后任何早退路径都自动释放
-    let mut buf = vec![0u8; 512];
-    let mut size = 0u32;
-    let first_ok = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr().cast()),
-            buf.len() as u32,
-            &mut size,
-        )
-        .is_ok()
-    };
-    if !first_ok {
-        if size > buf.len() as u32 {
-            buf.resize(size as usize, 0);
-            unsafe {
-                GetTokenInformation(
-                    token,
-                    TokenUser,
-                    Some(buf.as_mut_ptr().cast()),
-                    buf.len() as u32,
-                    &mut size,
-                )
-            }
-            .map_err(|e| format!("GetTokenInformation(重试) 失败: {e}"))?;
-        } else {
-            return Err("GetTokenInformation 失败".to_string());
-        }
-    }
-    let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
-    let sid = user.User.Sid;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut sid_str = PWSTR::null();
-    unsafe {
-        ConvertSidToStringSidW(sid, &mut sid_str)
-            .map_err(|e| format!("ConvertSidToStringSidW 失败: {e}"))?;
-    }
-    let sid_text = unsafe { sid_str.to_string() }.unwrap_or_default();
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sid_str.0 as *mut core::ffi::c_void)));
-    }
+    /// 契约：收紧后只剩「当前用户 + SYSTEM」两条 ACE，且继承标记 (I) 全部消失。
+    #[test]
+    fn acl_keeps_only_user_and_system() {
+        let dir = std::env::temp_dir().join(format!("gitport_acl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("ca.key");
+        std::fs::write(&f, b"x").unwrap();
+        let p = f.to_string_lossy().to_string();
+        restrict_to_current_user(&p).unwrap();
 
-    let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid_text})");
-    let sd_h = HSTRING::from(sddl.as_str());
-    let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sd_h.as_ptr()),
-            1, // SDDL_REVISION_1
-            &mut sd,
-            None,
-        )
-        .map_err(|e| format!("SDDL 解析失败: {e}"))?;
+        let out = Command::new("icacls").arg(&p).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text.matches(":(").count(), 2, "应只剩两条 ACE: {text}");
+        assert!(!text.contains("(I)"), "继承 ACE 应已断开: {text}");
+        assert!(
+            text.contains("SYSTEM") || text.contains("S-1-5-18"),
+            "SYSTEM 应保留: {text}"
+        );
     }
-    let mut present = BOOL(0);
-    let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
-    let mut defaulted = BOOL(0);
-    unsafe {
-        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted)
-            .map_err(|e| format!("取 DACL 失败: {e}"))?;
-    }
-    if !present.as_bool() || dacl.is_null() {
-        return Err("SDDL 未产出 DACL".to_string());
-    }
-
-    let path_u16: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    let err = unsafe {
-        SetNamedSecurityInfoW(
-            PCWSTR(path_u16.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(dacl),
-            None,
-        )
-    };
-    // dacl 指向 sd 内的 ACL——必须等 SetNamedSecurityInfoW 完成再释放 sd；
-    // 先释放会让 dacl 悬垂，可能写出空 DACL 把文件锁死（实测）。
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
-    if err.0 != 0 {
-        return Err(format!("SetNamedSecurityInfoW 失败: {}", err.0));
-    }
-    Ok(())
 }
