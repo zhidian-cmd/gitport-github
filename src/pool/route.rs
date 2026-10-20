@@ -9,10 +9,7 @@ use crate::config;
 pub enum Route {
     System,
     Mirror,
-    Pool {
-        pool: &'static str,
-        family: &'static str,
-    },
+    Pool { pool: &'static str },
     Tunnel,
 }
 
@@ -79,10 +76,7 @@ pub fn master_route(host: &str, method: &str, path: &str) -> Route {
     if pool.is_empty() {
         return Route::Tunnel;
     }
-    Route::Pool {
-        pool,
-        family: family_for(pool, host),
-    }
+    Route::Pool { pool }
 }
 
 
@@ -105,10 +99,10 @@ pub struct PoolRoute {
     pub families: &'static [FamilyRoute],
 }
 
-
-fn host_is_content(host: &str) -> bool {
+pub fn host_is_content(host: &str) -> bool {
     host.ends_with("githubusercontent.com")
 }
+
 fn host_is_assets(host: &str) -> bool {
     host.ends_with("githubassets.com")
 }
@@ -212,20 +206,9 @@ pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
         })
 }
 
-/// host 在该池所属族名（"" = 池无路由表）。edge 未列族 host 归 auth 兜底族。
-pub fn family_for(pool: &str, host: &str) -> &'static str {
-    serial_family(pool, host)
-        .map(|f| f.name)
-        .unwrap_or("")
-}
-
 /// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。
 pub fn fallback_for(pool: &str, host: &str) -> Fallback {
     serial_family(pool, host).map_or(Fallback::Dns, |f| f.fallback)
-}
-
-pub fn is_content_host(host: &str) -> bool {
-    host_is_content(host)
 }
 
 #[cfg(test)]
@@ -271,38 +254,23 @@ mod tests {
         assert_eq!(master_route("github.com", "GET", "/o/r/archive/x.zip"), Mirror);
         assert_eq!(
             master_route("github.com", "POST", "/o/r/releases/download/x"),
-            Pool {
-                pool: "core",
-                family: "all"
-            }
+            Pool { pool: "core" }
         );
         assert_eq!(
             master_route("github.com", "GET", "/o/r/releases"),
-            Pool {
-                pool: "core",
-                family: "all"
-            }
+            Pool { pool: "core" }
         );
         assert_eq!(
             master_route("github.com", "GET", "/"),
-            Pool {
-                pool: "core",
-                family: "all"
-            }
+            Pool { pool: "core" }
         );
         assert_eq!(
             master_route("gist.github.com", "GET", "/"),
-            Pool {
-                pool: "core",
-                family: "all"
-            }
+            Pool { pool: "core" }
         );
         assert_eq!(
             master_route("api.github.com", "GET", "/"),
-            Pool {
-                pool: "api",
-                family: "all"
-            }
+            Pool { pool: "api" }
         );
         assert_eq!(master_route("example.com", "GET", "/"), Tunnel);
         assert_eq!(master_route("githubstatus.com", "GET", "/"), Tunnel);
@@ -327,11 +295,13 @@ mod tests {
         ] {
             assert_eq!(
                 master_route(host, "GET", "/x"),
-                Pool {
-                    pool: "edge",
-                    family: fam
-                },
-                "{host} 应归 edge/{fam}"
+                Pool { pool: "edge" },
+                "{host} 应归 edge 池"
+            );
+            assert_eq!(
+                serial_family("edge", host).map(|f| f.name),
+                Some(fam),
+                "{host} 的族应为 {fam}"
             );
         }
     }
@@ -361,16 +331,20 @@ mod tests {
         assert!((FAMILY_ALL.serves)("x", &mk("140.82.112.3", "baidu.com")));
     }
 
+    fn fam(pool: &str, host: &str) -> &'static str {
+        serial_family(pool, host).map_or("", |f| f.name)
+    }
+
     #[test]
     fn family_for_and_fallback() {
-        assert_eq!(family_for("core", "github.com"), "all");
-        assert_eq!(family_for("api", "api.github.com"), "all");
-        assert_eq!(family_for("edge", "raw.githubusercontent.com"), "content");
-        assert_eq!(family_for("edge", "github.githubassets.com"), "assets");
-        assert_eq!(family_for("edge", "octocat.github.io"), "io");
-        assert_eq!(family_for("edge", "githubapp.com"), "auth");
-        assert_eq!(family_for("edge", "future.edge.host"), "auth");
-        assert_eq!(family_for("codeload", "codeload.github.com"), "");
+        assert_eq!(fam("core", "github.com"), "all");
+        assert_eq!(fam("api", "api.github.com"), "all");
+        assert_eq!(fam("edge", "raw.githubusercontent.com"), "content");
+        assert_eq!(fam("edge", "github.githubassets.com"), "assets");
+        assert_eq!(fam("edge", "octocat.github.io"), "io");
+        assert_eq!(fam("edge", "githubapp.com"), "auth");
+        assert_eq!(fam("edge", "future.edge.host"), "auth");
+        assert_eq!(fam("codeload", "codeload.github.com"), "");
         assert_eq!(
             fallback_for("edge", "raw.githubusercontent.com"),
             Fallback::MirrorDns

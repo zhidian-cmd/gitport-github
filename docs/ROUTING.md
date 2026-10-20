@@ -164,16 +164,13 @@ core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 
 
 # /releases/latest/download 也是镜像（曾是直连漏洞）
 [10:40:52] [镜像] github.com/docmirror/dev-sidecar/releases/latest/download/DevSidecar-...exe 归属链 release-assets.githubusercontent.com
-[10:40:53] [交付] github.com/.../releases/latest/download/DevSidecar-...exe 推了(0B/132855191B)后连接终止(客户端关闭或响应被弃)
-          # 6151063 交付计数诊断：此为 HEAD 请求的假阳性（HEAD 本就无体），324faa6 已修——
-          # HEAD 不再包计数体；GET 的真中断照常记录，与 IDM 连接关闭同形态一眼可判
 ```
 
 ---
 
 ## 8. 复查发现的已知边界（非路由错误，登记在案）
 
-1. **HEAD 假阳性（已修，324faa6）**：交付计数体最初不区分 HEAD，HEAD 大文件请求会误报 `推了(0B/N)后连接终止`。HEAD 响应本就无体、hyper 弃体不轮询，Drop 逻辑误判为客户端中断。已修：HEAD 不包计数体，GET 真中断照常记录。
+1. **交付计数体（2026-10-21 整体删除）**：曾用 `CountingBody` 包镜像大响应，产 `[交付] 推完 / 推了 N/M 后连接终止` 两行日志。为一行诊断在每块数据上过手，且 HEAD 有大文件假阳性（324faa6 补过）。现按审计删除：大文件推流看 `content-length` 与 `[镜像]` 链位/耗时即可。
 2. **裸域 PAC/路由不一致（无实际影响，不动）**：`githubassets.com` 与 `githubusercontent.com` 两个**裸域**（无子域）在 PAC 的 `fpMatch` 里 `h === d` 精确命中 → 送进代理；但代理内 `pool_for` 的通配符卡点号边界不认裸域 → 判 Tunnel（纯隧道直通）。这两个裸域没有业务、浏览器永远不会请求它们；即使被强制请求，纯隧道也能通，只是不走池/MITM。真实业务域的裸域（github.com / api.github.com / githubapp.com / github.io）两边判定一致。
 3. **退役 IP 日内波动（2026-10-19 晚）**：185.199.108/109/111.133 当日午后两测 TCP 死、晚测复活且 raw 出 200——属封锁窗口假死而非真死。RETIRED_IPS 退役名单机制已据此整体删除（名单会覆盖文件数据，与数据驱动相悖）：IP 死活全凭串发实测动态裁决，死时自动垫底、活时自动置顶。140.82.115-120 段当日三测仍 TCP 死，不建议手写入表。另：web 族对其余 vhost 一律 301 重定向（接得住不交付），唯一全服务 IP 为 140.82.113.22；`.9` 段 codeload 专用边缘族为本次测绘新发现，详见 CONFIG.md 认 IP 速查。
 

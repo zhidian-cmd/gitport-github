@@ -1,5 +1,5 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
-use crate::pool::{self, dial::Dialed, LogFn};
+use crate::pool::{self, dial, dial::Dialed, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
 use http::Uri;
@@ -133,7 +133,7 @@ pub async fn dial_h2(
     ctx: CancellationToken,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    let (conn_io, ip, shape) = pool::serial_dial(pool_name, host, ctx, true, Some(log))
+    let (conn_io, ip, shape) = pool::serial_dial(pool_name, host, ctx, dial::DialMode::H2, Some(log))
         .await
         .map_err(|e| e.to_string())?;
     let form = if shape.is_empty() {

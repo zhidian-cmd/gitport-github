@@ -16,8 +16,6 @@ struct SettingsState {
     github_pac: std::sync::atomic::AtomicBool,
     win_rect: Mutex<[i32; 4]>,
     proxy_backup: Mutex<String>,
-    // 本程序当前写入的 PAC 地址（持久化）：自愈时精确判定"是不是我们设的"。
-    our_pac: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
 }
@@ -32,7 +30,6 @@ fn state() -> &'static SettingsState {
         github_pac: std::sync::atomic::AtomicBool::new(false),
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
-        our_pac: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
     })
 }
@@ -76,8 +73,9 @@ fn get_auto_config_url(key: &RegKey) -> String {
         .unwrap_or_default()
 }
 
-/// 端口无关：任何 127.0.0.1 的 /proxy.pac 形态都算本程序设置的。
-fn is_our_pac_like(cur: &str) -> bool {
+/// 是否本程序设置的 PAC：端口无关，任何 `127.0.0.1:端口/proxy.pac` 形态都算
+/// （我们写进去的必然是这个形态，不必再逐字记住自己写过什么）。
+pub fn is_our_pac(cur: &str) -> bool {
     let cur = cur.trim();
     let Some(rest) = cur
         .strip_prefix("http://")
@@ -101,18 +99,6 @@ fn is_our_pac_like(cur: &str) -> bool {
     &rest[idx..] == "/proxy.pac"
 }
 
-/// 是否本程序设置的 PAC：精确匹配 our_pac 或兜底形态。
-pub fn is_our_pac(cur: &str) -> bool {
-    if cur.trim().is_empty() {
-        return false;
-    }
-    let op = state().our_pac.lock().unwrap().clone();
-    if !op.is_empty() && cur == op {
-        return true;
-    }
-    is_our_pac_like(cur)
-}
-
 /// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
 fn refresh_wininet() {
     use windows::Win32::Networking::WinInet::{
@@ -133,33 +119,18 @@ pub fn ensure_system_proxy() {
     let pac = pac_url();
     if github_pac() {
         if cur == pac {
-            *state().our_pac.lock().unwrap() = pac.clone();
-            return;
+            return; // 已是我们设的（幂等）
         }
         if !cur.is_empty() && !is_our_pac(&cur) {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
         if key.set_value("AutoConfigURL", &pac).is_ok() {
-            *state().our_pac.lock().unwrap() = pac;
             refresh_wininet();
             let _ = save();
         }
         return;
     }
     clear_if_ours(&key, &cur);
-}
-
-/// RAII 兜底：正常退出路径 drop 时再还原一次；panic 由下次启动 heal_stale_proxy 兜底。
-pub struct ProxyGuard;
-impl ProxyGuard {
-    pub fn new() -> Self {
-        ProxyGuard
-    }
-}
-impl Drop for ProxyGuard {
-    fn drop(&mut self) {
-        remove_system_proxy();
-    }
 }
 
 /// 还原系统代理：端口无关，任何 /proxy.pac 残留都视为我们的并清理。
@@ -179,7 +150,6 @@ fn restore_or_clear(key: &RegKey) {
         let _ = key.delete_value("AutoConfigURL");
     }
     *state().proxy_backup.lock().unwrap() = String::new();
-    *state().our_pac.lock().unwrap() = String::new();
     refresh_wininet();
     let _ = save();
 }
@@ -239,18 +209,17 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
-    /// 按规范键序成表：全量键位预写空值，再以给定记号覆盖；表外键（族改名/手写残留）按字典序
-    /// 追加尾部——不丢数据，也不打乱规范序。
+    /// 按规范键序成表：全量键位预写空值，再以给定记号覆盖；表外键（族改名/手写残留）直接丢弃，
+    /// 键位由 `circle_keys()` 单一决定。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut pending: HashMap<String, String> = marks.into_iter().collect();
-        let mut rows = Vec::with_capacity(pending.len() + 8);
-        for key in crate::pool::circle_keys() {
-            let ip = pending.remove(&key).unwrap_or_default();
-            rows.push((key, ip));
-        }
-        let mut strays: Vec<(String, String)> = pending.into_iter().collect();
-        strays.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.extend(strays);
+        let rows = crate::pool::circle_keys()
+            .into_iter()
+            .map(|key| {
+                let ip = pending.remove(&key).unwrap_or_default();
+                (key, ip)
+            })
+            .collect();
         LastIpTable(rows)
     }
 
@@ -324,9 +293,6 @@ struct SettingsFile {
     github_pac: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     proxy_backup: String,
-    // 键名显式写 "ourPAC"（非 camelCase）：既有落盘即此形。
-    #[serde(rename = "ourPAC", deserialize_with = "lenient")]
-    our_pac: String, // 持久化"我们当前写入的 PAC"用于端口无关自识别
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
 }
@@ -362,7 +328,6 @@ fn apply(v: SettingsFile) {
         .store(v.mitm, std::sync::atomic::Ordering::Relaxed);
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
-    *state().our_pac.lock().unwrap() = v.our_pac;
     *state().last_ip.lock().unwrap() = v.last_ip;
     if let Some(on) = v.github_pac {
         state()
@@ -379,12 +344,12 @@ fn save() -> Result<(), String> {
         win_rect: *s.win_rect.lock().unwrap(),
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
-        our_pac: s.our_pac.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
     };
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     let p = settings_path();
-    std::fs::write(&p, json).map_err(|e| e.to_string())?;
+    crate::fsx::write_atomic(&p, json.as_bytes()).map_err(|e| e.to_string())?;
+    // 每次都要重收紧：rename 换进来的是新文件，继承的是目录 ACL，不是旧文件的受保护 DACL。
     let _ = crate::winsec::restrict_to_current_user(&p.to_string_lossy());
     Ok(())
 }
@@ -486,18 +451,18 @@ mod tests {
 
     #[test]
     fn is_our_pac_port_agnostic() {
-        assert!(is_our_pac_like("http://127.0.0.1:7811/proxy.pac"));
-        assert!(is_our_pac_like("https://127.0.0.1:9999/proxy.pac"));
-        assert!(is_our_pac_like("http://127.0.0.1:65535/proxy.pac"));
-        assert!(!is_our_pac_like("http://127.0.0.2:7811/proxy.pac"));
-        assert!(!is_our_pac_like("http://127.0.0.1/proxy.pac")); // 无端口
-        assert!(!is_our_pac_like("http://localhost:7811/proxy.pac")); // 非 127.0.0.1
-        assert!(!is_our_pac_like("http://127.0.0.1:7811/other.pac"));
-        assert!(!is_our_pac_like("http://example.com:7811/proxy.pac"));
-        assert!(!is_our_pac_like(""));
-        assert!(!is_our_pac_like("socks5://127.0.0.1:7811/proxy.pac"));
-        assert!(!is_our_pac_like("http://127.0.0.1:78a1/proxy.pac")); // 端口非数字
-        assert!(!is_our_pac_like("http://127.0.0.1:7811/proxy.pac?x=1"));
+        assert!(is_our_pac("http://127.0.0.1:7811/proxy.pac"));
+        assert!(is_our_pac("https://127.0.0.1:9999/proxy.pac"));
+        assert!(is_our_pac("http://127.0.0.1:65535/proxy.pac"));
+        assert!(!is_our_pac("http://127.0.0.2:7811/proxy.pac"));
+        assert!(!is_our_pac("http://127.0.0.1/proxy.pac")); // 无端口
+        assert!(!is_our_pac("http://localhost:7811/proxy.pac")); // 非 127.0.0.1
+        assert!(!is_our_pac("http://127.0.0.1:7811/other.pac"));
+        assert!(!is_our_pac("http://example.com:7811/proxy.pac"));
+        assert!(!is_our_pac(""));
+        assert!(!is_our_pac("socks5://127.0.0.1:7811/proxy.pac"));
+        assert!(!is_our_pac("http://127.0.0.1:78a1/proxy.pac")); // 端口非数字
+        assert!(!is_our_pac("http://127.0.0.1:7811/proxy.pac?x=1"));
     }
 
     fn keys(pairs: &[(String, String)]) -> Vec<&str> {
@@ -550,7 +515,6 @@ mod tests {
             win_rect: [1, 2, 3, 4],
             github_pac: Some(false),
             proxy_backup: String::new(),
-            our_pac: String::new(),
             last_ip: LastIpTable::from_marks(vec![(
                 "api/all".to_string(),
                 "140.82.114.6".to_string(),

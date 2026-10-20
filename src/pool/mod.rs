@@ -7,7 +7,6 @@ pub mod route;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -68,9 +67,6 @@ const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
 
 struct SerialTab {
     pools: HashMap<String, Vec<SerialPlan>>,
-    /// 全灭冷却按 host 记账（池级会让一个域全灭毒倒同池其他族），30s。
-    /// 有镜像兜底的 host 不冷却（内容域熔断已覆盖）。
-    cool: HashMap<String, Instant>,
     /// per-IP 死亡冷却：TCP 层失败 = IP 对谁都不通，直接跳过。
     /// 指数退避 60s → 5min → 30min 封顶；成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
@@ -80,11 +76,14 @@ struct SerialTab {
     cursor: HashMap<String, String>,
 }
 
+/// 整圈全灭冷却（按 host 记账 30s）：复用 `Breaker`，不再手写第三份 Instant 表。
+static SERIAL_COOL: Breaker = Breaker::new(30);
+
 static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct PlansFile {
     #[serde(default)]
     mirrors: HashMap<String, Vec<String>>,
@@ -110,44 +109,32 @@ fn encode_plans(
     tab: &HashMap<String, Vec<SerialPlan>>,
     mirrors: &HashMap<String, Vec<String>>,
 ) -> String {
-    let mut b = String::from("{\n");
-    for (i, name) in SERIAL_POOLS.iter().enumerate() {
-        if i > 0 {
-            b.push_str(",\n");
-        }
-        b.push_str(&format!("  \"{name}\": ["));
-        let ps = tab.get(*name).cloned().unwrap_or_default();
-        if ps.is_empty() {
-            b.push(']');
-            continue;
-        }
-        b.push('\n');
-        for (j, p) in ps.iter().enumerate() {
-            if j > 0 {
-                b.push_str(",\n");
-            }
-            b.push_str("    ");
-            b.push_str(&json_of(p));
-        }
-        b.push_str("\n  ]");
-    }
-    let chains: Vec<(&str, &Vec<String>)> = CONTENT_HOSTS
+    let mut blocks: Vec<String> = SERIAL_POOLS
         .iter()
-        .filter_map(|h| mirrors.get(*h).map(|c| (*h, c)))
+        .map(|name| {
+            let rows: Vec<String> = tab
+                .get(*name)
+                .map(|ps| ps.iter().map(json_of).collect())
+                .unwrap_or_default();
+            if rows.is_empty() {
+                format!("  \"{name}\": []")
+            } else {
+                format!("  \"{name}\": [\n    {}\n  ]", rows.join(",\n    "))
+            }
+        })
+        .collect();
+    let chains: Vec<String> = CONTENT_HOSTS
+        .iter()
+        .filter_map(|h| mirrors.get(*h).map(|c| (h, c)))
+        .map(|(host, chain)| {
+            let items: Vec<String> = chain.iter().map(json_of).collect();
+            format!("    {}: [{}]", json_of(host), items.join(", "))
+        })
         .collect();
     if !chains.is_empty() {
-        b.push_str(",\n  \"mirrors\": {");
-        for (i, (host, chain)) in chains.iter().enumerate() {
-            if i > 0 {
-                b.push(',');
-            }
-            let items: Vec<String> = chain.iter().map(json_of).collect();
-            b.push_str(&format!("\n    {}: [{}]", json_of(host), items.join(", ")));
-        }
-        b.push_str("\n  }");
+        blocks.push(format!("  \"mirrors\": {{\n{}\n  }}", chains.join(",\n")));
     }
-    b.push_str("\n}\n");
-    b
+    format!("{{\n{}\n}}\n", blocks.join(",\n"))
 }
 
 fn json_of<T: Serialize>(v: &T) -> String {
@@ -160,14 +147,7 @@ fn write_plans_file(
     mirrors: &HashMap<String, Vec<String>>,
 ) {
     let data = encode_plans(tab, mirrors);
-    let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
-        if f.write_all(data.as_bytes()).is_ok() {
-            let _ = f.flush();
-            drop(f);
-            let _ = std::fs::rename(&tmp, path);
-        }
-    }
+    let _ = crate::fsx::write_atomic(path, data.as_bytes());
 }
 
 fn plans_path() -> PathBuf {
@@ -195,13 +175,13 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     // plans.json 缺失（全新安装）时按种子快照引导：池由补缺填充，镜像链随快照。
-    let loaded: PlansFile = parsed.unwrap_or_else(seed_db);
+    let seeds = seed_db();
+    let loaded: PlansFile = parsed.unwrap_or_else(|| seeds.clone());
     let plans_map = loaded.pools;
     let loaded_chains = loaded.mirrors;
 
     let mut tab = SerialTab {
         pools: HashMap::new(),
-        cool: HashMap::new(),
         dead: HashMap::new(),
         mirrors: HashMap::new(),
         cursor: HashMap::new(),
@@ -242,7 +222,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                 sni: bare.to_string(),
             });
         }
-        if let Some(ips) = seed_db().pools.get(*name) {
+        if let Some(ips) = seeds.pools.get(*name) {
             let mut added = 0usize;
             for sp in ips {
                 if sp.ip.parse::<std::net::IpAddr>().is_err()
@@ -289,12 +269,11 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
 /// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
 /// 只动内存游标,不改 plans.json 顺序、零写盘(驻留变更的 settings 落盘由调用方触发)。
 pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool) {
-    let family_name = route::family_for(pool_name, host);
-    let key = format!("{pool_name}/{family_name}");
+    let family = route::serial_family(pool_name, host);
+    let key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
     let mut g = SERIAL.lock().unwrap();
     let Some(t) = g.as_mut() else { return };
     let Some(ps) = t.pools.get(pool_name) else { return };
-    let family = route::serial_family(pool_name, host);
     let circle: Vec<&SerialPlan> = ps
         .iter()
         .filter(|p| family.map_or(true, |f| (f.serves)(host, p)))
@@ -320,17 +299,14 @@ pub async fn serial_dial(
     pool_name: &str,
     host: &str,
     ctx: CancellationToken,
-    tls_handshake: bool,
+    dial_mode: dial::DialMode,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
     {
         let g = SERIAL.lock().unwrap();
         let tab = g.as_ref().unwrap();
-        if let Some(cool) = tab.cool.get(host) {
-            if Instant::now() < *cool {
-                let remain = cool.duration_since(Instant::now()).as_secs();
-                return Err(format!("串发冷却中(全灭后约 {remain}s), 快速失败"));
-            }
+        if SERIAL_COOL.open(host) {
+            return Err("串发冷却中(全灭后 30s 内), 快速失败".to_string());
         }
         if tab
             .pools
@@ -350,7 +326,7 @@ pub async fn serial_dial(
     // 族圈:对口条目按表序组成一个圈(顺序 = 手排策略,运行时永不重排)。
     let family = route::serial_family(pool_name, host);
     let serves = family.map(|f| f.serves);
-    let family_name = route::family_for(pool_name, host);
+    let family_name = family.map_or("", |f| f.name);
     let circle: Vec<&SerialPlan> = snapshot
         .iter()
         .filter(|p| serves.map_or(true, |s| s(host, p)))
@@ -387,7 +363,7 @@ pub async fn serial_dial(
         }
         tried += 1;
         let mode = p.sni.trim();
-        let attempt = dial::dial_one(host, &p.ip, mode, tls_handshake);
+        let attempt = dial::dial_one(host, &p.ip, mode, dial_mode);
         let result = tokio::select! {
             _ = ctx.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "请求预算到期")),
             r = attempt => r,
@@ -467,11 +443,7 @@ pub async fn serial_dial(
     // （camo 无链，豁免会让每张徽章重烧整表；池级冷却曾毒倒同池其他族）。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
-        let mut g = SERIAL.lock().unwrap();
-        g.as_mut().unwrap().cool.insert(
-            host.to_string(),
-            Instant::now() + Duration::from_secs(30),
-        );
+        SERIAL_COOL.set(host);
     }
     if let Some(log) = log {
         let tail = if has_mirror {

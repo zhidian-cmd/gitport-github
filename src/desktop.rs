@@ -55,26 +55,18 @@ const WIN_W: f64 = 1250.0;
 const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
-fn load_icon() -> Icon {
-    let bytes = include_bytes!("../assets/icon.ico");
-    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico)
-        .expect("内置 icon.ico 解码失败");
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    Icon::from_rgba(rgba.into_raw(), w, h).expect("托盘图标初始化失败")
-}
-
 fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> {
     let menu = Menu::new();
     menu.append_items(&[&show_id, &quit_id])
         .map_err(|e| e.to_string())?;
-    let tray = TrayIconBuilder::new()
+    let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("GitPort GitHub")
-        .with_icon(load_icon())
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(tray)
+        .with_tooltip("GitPort GitHub");
+    // 图标取 exe 内嵌资源（assets/app.rc 的 `1 ICON`），无需解码 ico；取不到也不阻断托盘。
+    if let Ok(icon) = Icon::from_resource(1, None) {
+        builder = builder.with_icon(icon);
+    }
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true。
@@ -165,10 +157,14 @@ fn create_window(
     url: &str,
     log: &LogFn,
 ) -> bool {
-    let mut g = slot.lock().unwrap();
-    if g.win.is_some() {
-        return true;
+    {
+        let g = slot.lock().unwrap();
+        if g.win.is_some() {
+            return true;
+        }
     }
+    join_udf_cleanup(); // 上次收托盘的删除还没收尾：等它删完再建新 profile
+    let mut g = slot.lock().unwrap();
     // 窗口按 winRect 出生即在位（builder 直接定位，避免闪跳）；
     // 无记录则居中偏下现算并立刻写回——settings.json 是窗口状态唯一来源。
     let (sw, sh) = elwt
@@ -251,6 +247,20 @@ fn show_window(slot: &Mutex<WinSlot>) -> bool {
     true
 }
 
+/// 没有窗口就建；WebView2 不可用则退回系统浏览器。
+fn show_or_open(
+    slot: &Mutex<WinSlot>,
+    elwt: &tao::event_loop::EventLoopWindowTarget<AppEvent>,
+    url: &str,
+    log: &LogFn,
+) {
+    if create_window(slot, elwt, url, log) {
+        (log)("工作台窗口已创建");
+    } else {
+        open_browser(url);
+    }
+}
+
 /// 删除 WebView2 用户数据目录(退出/收托盘清场)。浏览器进程刚被释放,
 /// 交还文件锁有延迟,300ms×10 重试兜底;超时留给下次启动的启动清理。
 fn remove_webview_udf() {
@@ -259,6 +269,16 @@ fn remove_webview_udf() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// 收托盘时的清场线程：不在界面线程上等，但重开窗口前必须等它结束——
+/// 否则新 WebView2 刚建的数据目录会被后台重试删掉。
+static UDF_CLEANUP: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+fn join_udf_cleanup() {
+    if let Some(h) = UDF_CLEANUP.lock().unwrap().take() {
+        let _ = h.join();
     }
 }
 
@@ -361,11 +381,7 @@ pub fn run(args: DesktopArgs) -> ! {
         match event {
             Event::UserEvent(AppEvent::ShowWindow) => {
                 if !show_window(&slot) {
-                    if create_window(&slot, elwt, &url, &log) {
-                        (log)("工作台窗口已创建");
-                    } else {
-                        open_browser(&url);
-                    }
+                    show_or_open(&slot, elwt, &url, &log);
                 }
             }
             Event::UserEvent(AppEvent::RequestQuit) => do_quit(control_flow),
@@ -389,7 +405,8 @@ pub fn run(args: DesktopArgs) -> ! {
                     g.wv = None;
                     g.win = None;
                     drop(g);
-                    remove_webview_udf(); // 收托盘即清场: UI 不在, 数据目录不驻留
+                    // 清场放后台：这里重试删除最多等 3s，不能卡住界面线程；重开窗口前 join。
+                    *UDF_CLEANUP.lock().unwrap() = Some(std::thread::spawn(remove_webview_udf));
                     (log)("工作台已收起到托盘, WebView2 及其数据目录已清理(点击托盘重开)");
                 } else {
                     do_quit(control_flow);
@@ -419,9 +436,7 @@ pub fn run(args: DesktopArgs) -> ! {
                     g.win = None;
                     g.wv = None;
                 }
-                if quitting.load(Ordering::SeqCst) {
-                } else if tray_hidden.swap(false, Ordering::SeqCst) {
-                } else {
+                if !quitting.load(Ordering::SeqCst) && !tray_hidden.swap(false, Ordering::SeqCst) {
                     (log)("工作台窗口被外部销毁, 自愈重建(代理保持运行)");
                     if create_window(&slot, elwt, &url, &log) {
                         (log)("工作台窗口重建成功");
@@ -432,11 +447,7 @@ pub fn run(args: DesktopArgs) -> ! {
         }
         if open_window && !created_once {
             created_once = true;
-            if create_window(&slot, elwt, &url, &log) {
-                (log)("工作台窗口已创建");
-            } else {
-                open_browser(&url);
-            }
+            show_or_open(&slot, elwt, &url, &log);
         }
     });
 }

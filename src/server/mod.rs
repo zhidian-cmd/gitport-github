@@ -6,7 +6,7 @@ pub mod upstream;
 
 use crate::certgen::Authority;
 use crate::config::{self, HEAD_TIMEOUT_SECS};
-use crate::pool::{self, dial::Dialed, LogFn};
+use crate::pool::{self, dial, dial::Dialed, LogFn};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -66,7 +66,6 @@ pub async fn stop_proxy_async() {
 }
 
 pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToken) {
-    let _ = ln.local_addr();
     (srv.log)("代理已启动");
     set_running(true);
     loop {
@@ -209,21 +208,14 @@ impl ProxyServer {
             req.push_str("\r\n");
         }
         req.push_str("\r\n");
-        if upstream.write_all(req.as_bytes()).await.is_err() {
-            let name = pool::pool_for(&host);
-            if !name.is_empty() && ip != "system-dns" {
-                pool::cursor_note(name, &host, &ip, false);
-            }
-            return;
-        }
-        let (_, recv) = bidir_copy(&mut client, &mut upstream, None).await;
+        // 写失败 = 上游已坏，按 recv=0 垫底；与正常收尾共用同一条记账路径。
+        let recv = match upstream.write_all(req.as_bytes()).await {
+            Ok(_) => bidir_copy(&mut client, &mut upstream, None).await.1,
+            Err(_) => 0,
+        };
         let name = pool::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
-            if recv == 0 {
-                pool::cursor_note(name, &host, &ip, false);
-            } else {
-                pool::cursor_note(name, &host, &ip, true);
-            }
+            pool::cursor_note(name, &host, &ip, recv > 0);
         }
     }
 }
@@ -312,7 +304,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     let name = pool::pool_for(host);
     if pool::serial_pool(name) {
         let (conn, ip, _shape) =
-            pool::serial_dial(name, host, CancellationToken::new(), false, None).await?;
+            pool::serial_dial(name, host, CancellationToken::new(), dial::DialMode::Plain, None).await?;
         return Ok((conn, ip));
     }
     let addr = format!("{host}:{port}");

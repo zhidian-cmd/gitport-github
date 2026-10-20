@@ -11,7 +11,6 @@
   "winRect": [641, 278, 1820, 1394],
   "githubPAC": true,
   "proxyBackup": "",
-  "ourPAC": "http://127.0.0.1:7811/proxy.pac",
   "lastIp": {
     "core/all": "20.27.177.114",
     "api/all": "140.82.114.6",

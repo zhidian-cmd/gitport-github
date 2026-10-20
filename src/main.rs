@@ -4,6 +4,7 @@
 mod certgen;
 mod config;
 mod desktop;
+mod fsx;
 mod logger;
 mod pool;
 mod server;
@@ -41,8 +42,6 @@ fn run() {
     logger::set_crash_path(&exe_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
-    // 兜底：正常返回路径再还原一次系统代理（幂等）；panic 由下次启动自愈。
-    let _proxy_guard = settings::ProxyGuard::new();
 
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "-headless");

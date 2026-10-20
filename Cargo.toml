@@ -49,7 +49,6 @@ windows = { version = "0.61", features = [
 wry = "0.56"
 tao = "0.34"
 tray-icon = "0.24"
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 # boring 4.22：dial.rs 的 Chrome 指纹直连腿（GREASE + Chrome 默认套件/扩展
 # 顺序 + ALPN h2 + SNI/校验名解耦）—— BoringSSL 即 Chrome 同款 TLS 实现，
 # 等价 utls HelloChrome 的 Rust 落地。boring-sys 声明 links="boringssl"，

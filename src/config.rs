@@ -68,12 +68,12 @@ pub const GROUPS: &[Group] = &[
 
 /// `*.x` 匹配子域，否则全等。
 pub fn pattern_match(host: &str, pat: &str) -> bool {
-    if let Some(suffix) = pat.strip_prefix("*.") {
-        return host.len() > suffix.len()
-            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            && host.ends_with(suffix);
+    match pat.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .map_or(false, |h| h.ends_with('.')),
+        None => host == pat,
     }
-    host == pat
 }
 
 /// 直连白名单：不归任何池、不经代理（vhost→边缘映射只有 GitHub 的 DNS 知道，交给系统解析）。
@@ -98,7 +98,7 @@ pub fn pool_for(host: &str) -> &'static str {
     }
     for g in GROUPS {
         for pat in g.patterns {
-            if *pat == host && pattern_match(host, pat) {
+            if *pat == host {
                 return g.name;
             }
         }
