@@ -113,37 +113,14 @@ pub fn is_our_pac(cur: &str) -> bool {
     is_our_pac_like(cur)
 }
 
-/// 广播代理设置变更（动态加载 wininet.dll）。
+/// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
 fn refresh_wininet() {
-    use windows::core::{s, w};
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
-    const INTERNET_OPTION_REFRESH: u32 = 37;
+    use windows::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    };
     unsafe {
-        let Ok(dll) = LoadLibraryW(w!("wininet.dll")) else {
-            return;
-        };
-        let Some(proc) = GetProcAddress(dll, s!("InternetSetOptionW")) else {
-            return;
-        };
-        let f: extern "system" fn(
-            *const core::ffi::c_void,
-            u32,
-            *const core::ffi::c_void,
-            u32,
-        ) -> i32 = std::mem::transmute(proc);
-        let _ = f(
-            std::ptr::null(),
-            INTERNET_OPTION_SETTINGS_CHANGED,
-            std::ptr::null(),
-            0,
-        );
-        let _ = f(
-            std::ptr::null(),
-            INTERNET_OPTION_REFRESH,
-            std::ptr::null(),
-            0,
-        );
+        let _ = InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0);
+        let _ = InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0);
     }
 }
 
