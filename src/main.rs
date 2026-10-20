@@ -74,7 +74,6 @@ fn run() {
             .expect("tokio runtime 创建失败"),
     );
 
-    pool::start_persist(&rt);
     server::upstream::start_keepalive(&rt);
 
     let srv = Arc::new(server::ProxyServer {

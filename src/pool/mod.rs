@@ -78,7 +78,6 @@ struct SerialTab {
     /// 游标：每"池/族"一个记号(= 上次尝试/驻留的 IP),顺序固定不重排。
     /// 成功 = 记号驻留该条;失败 = 记号前移一格;整圈转完全灭 → 冷却。
     cursor: HashMap<String, String>,
-    dirty: bool,
 }
 
 static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
@@ -105,6 +104,8 @@ pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     out
 }
 
+/// 落盘形态：条目恒单行（每个 plan 交给 serde 序列化，控制字符转义由它保证）；
+/// 池按 SERIAL_POOLS 序、镜像链按 CONTENT_HOSTS 序，便于人眼 diff。
 fn encode_plans(
     tab: &HashMap<String, Vec<SerialPlan>>,
     mirrors: &HashMap<String, Vec<String>>,
@@ -116,26 +117,19 @@ fn encode_plans(
         }
         b.push_str(&format!("  \"{name}\": ["));
         let ps = tab.get(*name).cloned().unwrap_or_default();
-        if !ps.is_empty() {
-            b.push('\n');
-            for (j, p) in ps.iter().enumerate() {
-                if j > 0 {
-                    b.push_str(",\n");
-                }
-                if p.sni.is_empty() {
-                    b.push_str(&format!("    {{\"ip\": {}}}", esc(&p.ip)));
-                } else {
-                    b.push_str(&format!(
-                        "    {{\"ip\": {}, \"sni\": {}}}",
-                        esc(&p.ip),
-                        esc(&p.sni)
-                    ));
-                }
-            }
-            b.push_str("\n  ]");
-        } else {
+        if ps.is_empty() {
             b.push(']');
+            continue;
         }
+        b.push('\n');
+        for (j, p) in ps.iter().enumerate() {
+            if j > 0 {
+                b.push_str(",\n");
+            }
+            b.push_str("    ");
+            b.push_str(&json_of(p));
+        }
+        b.push_str("\n  ]");
     }
     let chains: Vec<(&str, &Vec<String>)> = CONTENT_HOSTS
         .iter()
@@ -147,8 +141,8 @@ fn encode_plans(
             if i > 0 {
                 b.push(',');
             }
-            let items: Vec<String> = chain.iter().map(|m| esc(m)).collect();
-            b.push_str(&format!("\n    {}: [{}]", esc(host), items.join(", ")));
+            let items: Vec<String> = chain.iter().map(json_of).collect();
+            b.push_str(&format!("\n    {}: [{}]", json_of(host), items.join(", ")));
         }
         b.push_str("\n  }");
     }
@@ -156,9 +150,8 @@ fn encode_plans(
     b
 }
 
-/// serde 全量转义（手写版漏控制字符会写出非法 plans.json）。
-fn esc(s: &str) -> String {
-    serde_json::to_string(s).expect("字符串序列化不会失败")
+fn json_of<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("JSON 序列化不会失败")
 }
 
 fn write_plans_file(
@@ -212,7 +205,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         dead: HashMap::new(),
         mirrors: HashMap::new(),
         cursor: HashMap::new(),
-        dirty: false,
     };
     // 全部圈预写空记号(固定键序,值空 = 未驻留);settings.last_ip 的非空记号覆盖其上。
     for key in circle_keys() {
@@ -292,35 +284,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
     write_plans_file(&path, &snap, &chains);
-}
-
-/// 顺序变更 2s 内写回（事件驱动 + 去抖，须在 runtime 构建后调用）；无变更零唤醒。
-static PERSIST_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-fn kick_persist() {
-    PERSIST_KICK.notify_one();
-}
-
-pub fn start_persist(rt: &tokio::runtime::Runtime) {
-    rt.spawn(async move {
-        loop {
-            PERSIST_KICK.notified().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let dirty = {
-                let mut g = SERIAL.lock().unwrap();
-                let dirty = g.as_ref().map(|t| t.dirty).unwrap_or(false);
-                if dirty {
-                    g.as_mut().unwrap().dirty = false;
-                }
-                dirty
-            };
-            if dirty {
-                let snap = plans_snapshot();
-                let chains = mirror_chains_snapshot();
-                write_plans_file(&plans_path(), &snap, &chains);
-            }
-        }
-    });
 }
 
 /// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
@@ -547,15 +510,16 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     if vc.is_empty() {
         return false;
     }
-    let mut g = SERIAL.lock().unwrap();
-    let tab = g.as_mut().unwrap();
-    if tab.mirrors.get(host).map(|c| c == &vc).unwrap_or(false) {
-        return false;
+    {
+        let mut g = SERIAL.lock().unwrap();
+        let tab = g.as_mut().unwrap();
+        if tab.mirrors.get(host).map(|c| c == &vc).unwrap_or(false) {
+            return false;
+        }
+        tab.mirrors.insert(host.to_string(), vc);
     }
-    tab.mirrors.insert(host.to_string(), vc);
-    tab.dirty = true;
-    drop(g); // 先放锁再踢醒: 被唤醒的落盘任务要抢同一把锁
-    kick_persist();
+    // 写者唯一（手动校准）：先放锁再同步落盘，写盘期间不挡拨号。
+    write_plans_file(&plans_path(), &plans_snapshot(), &mirror_chains_snapshot());
     if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
         log(&format!("[镜像] {host} 链序更新({why})"));
     }
