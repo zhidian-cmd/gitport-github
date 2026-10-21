@@ -302,6 +302,19 @@ pub async fn serial_dial(
     tls_handshake: bool,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
+    serial_dial_skip(pool_name, host, ctx, tls_handshake, log, None).await
+}
+
+/// `skip_ip`：本次拨号跳过该 IP（补第二条连接时用，避免两条连接落在同一个边缘 IP 上）。
+/// 全表只有这一个候选时忽略 skip，保证还能拨出去。
+pub async fn serial_dial_skip(
+    pool_name: &str,
+    host: &str,
+    ctx: CancellationToken,
+    tls_handshake: bool,
+    log: Option<&LogFn>,
+    skip_ip: Option<&str>,
+) -> Result<(dial::Dialed, String, String), String> {
     {
         let g = SERIAL.lock().unwrap();
         let tab = g.as_ref().unwrap();
@@ -327,10 +340,16 @@ pub async fn serial_dial(
     let family = route::serial_family(pool_name, host);
     let serves = family.map(|f| f.serves);
     let family_name = family.map_or("", |f| f.name);
-    let circle: Vec<&SerialPlan> = snapshot
+    let mut circle: Vec<&SerialPlan> = snapshot
         .iter()
         .filter(|p| serves.map_or(true, |s| s(host, p)))
         .collect();
+    if let Some(skip) = skip_ip {
+        let filtered: Vec<&SerialPlan> = circle.iter().copied().filter(|p| p.ip != skip).collect();
+        if !filtered.is_empty() {
+            circle = filtered;
+        }
+    }
     if circle.is_empty() {
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
