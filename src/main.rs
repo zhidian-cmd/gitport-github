@@ -94,8 +94,12 @@ fn run() {
     {
         let app = app.clone();
         let rt = rt.clone();
+        let logs = logs.clone();
         logger::spawn("webui", move || {
-            let _ = rt.block_on(webui::serve(app));
+            // 绑定失败(端口被占等)必须留痕：静默吞掉会让用户"页面打不开却不知为何"
+            if let Err(e) = rt.block_on(webui::serve(app)) {
+                logs.log(&format!("管理界面未启动: {e}"));
+            }
         });
     }
 

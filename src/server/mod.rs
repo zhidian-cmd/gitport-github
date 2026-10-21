@@ -83,6 +83,8 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
                         set_running(false);
                         return;
                     }
+                    // 持续性错误(句柄耗尽/socket 失效等)立即重试会全速空转烧核: 小睡再试
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             },
@@ -99,18 +101,25 @@ impl ProxyServer {
         let _ = client.set_nodelay(true);
         upstream::note_activity();
         let head = read_head(&mut client).await?;
-        let Some(idx) = find_crlf(&head) else {
+        // 头块以 \r\n\r\n 收尾；之后的字节是同包到达的请求体首段，必须原样续传。
+        // 明文 HTTP 分发前先切开：体混进头重拼会把体当头行转发、真体丢失。
+        let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return Ok(()); // 头块不完整(超时/EOF 截断): 成不了包, 直接断开
+        };
+        let Some(idx) = find_crlf(&head[..end]) else {
             return Ok(());
         };
         let line = String::from_utf8_lossy(&head[..idx]).to_string();
-        let rest = &head[idx + 2..];
+        let headers = &head[(idx + 2).min(end)..end];
+        let body_prefix = &head[end + 4..];
         let mut parts = line.splitn(3, ' ');
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
         if method == "CONNECT" {
             self.handle_connect(client, &target).await;
         } else {
-            self.handle_http(client, &method, &target, rest).await;
+            self.handle_http(client, &method, &target, headers, body_prefix)
+                .await;
         }
         Ok(())
     }
@@ -167,7 +176,14 @@ impl ProxyServer {
         }
     }
 
-    async fn handle_http(&self, mut client: TcpStream, method: &str, target: &str, rest: &[u8]) {
+    async fn handle_http(
+        &self,
+        mut client: TcpStream,
+        method: &str,
+        target: &str,
+        headers: &[u8],
+        body_prefix: &[u8],
+    ) {
         let Some(rest_target) = target.strip_prefix("http://") else {
             let _ = client
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
@@ -193,7 +209,7 @@ impl ProxyServer {
             }
         };
 
-        let head_text = String::from_utf8_lossy(rest);
+        let head_text = String::from_utf8_lossy(headers);
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
         for l in head_text.lines() {
             let l = l.trim_end_matches('\r');
@@ -208,10 +224,16 @@ impl ProxyServer {
             req.push_str("\r\n");
         }
         req.push_str("\r\n");
+        // 先写重拼后的头，再补"与头同包到达"的体首段（无则跳过），之后交给双向泵。
         // 写失败 = 上游已坏，按 recv=0 垫底；与正常收尾共用同一条记账路径。
-        let recv = match upstream.write_all(req.as_bytes()).await {
-            Ok(_) => bidir_copy(&mut client, &mut upstream, None).await.1,
-            Err(_) => 0,
+        let mut head_sent = upstream.write_all(req.as_bytes()).await.is_ok();
+        if head_sent && !body_prefix.is_empty() {
+            head_sent = upstream.write_all(body_prefix).await.is_ok();
+        }
+        let recv = if head_sent {
+            bidir_copy(&mut client, &mut upstream, None).await.1
+        } else {
+            0
         };
         let name = pool::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
@@ -398,5 +420,93 @@ mod tests {
             split_target("github.com:notaport", 80),
             ("github.com:notaport".into(), 80)
         );
+    }
+
+    /// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发、真体丢失）。
+    /// 127.0.0.1 非池域名走系统直连腿，恰好落在本进程起的假上游上，全程无外网。
+    #[tokio::test]
+    async fn plain_http_post_body_forwarded_intact() {
+        // 假上游：读满 头 + Content-Length 体，校验体原样、头无混入，然后回 200。
+        let up_ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = up_ln.local_addr().unwrap().port();
+        let up_task = tokio::spawn(async move {
+            let (mut sock, _) = up_ln.accept().await.unwrap();
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (head_end, body_len) = loop {
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head_text = String::from_utf8_lossy(&raw[..pos]);
+                    let cl = head_text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if !k.trim().eq_ignore_ascii_case("content-length") {
+                                return None;
+                            }
+                            v.trim().parse::<usize>().ok()
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= pos + 4 + cl {
+                        break (pos, cl);
+                    }
+                }
+                let n = tokio::time::timeout_at(deadline, sock.read(&mut chunk))
+                    .await
+                    .expect("上游读超时: 请求体未被转发")
+                    .unwrap();
+                assert!(n > 0, "上游连接被提前关闭");
+                raw.extend_from_slice(&chunk[..n]);
+            };
+            let head_text = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let body = &raw[head_end + 4..head_end + 4 + body_len];
+            assert_eq!(body, b"hello", "体应原样出现在头块之后");
+            assert!(!head_text.contains("hello"), "体被当头转发: {head_text}");
+            assert_eq!(
+                head_text.matches("Content-Length: 5").count(),
+                1,
+                "Content-Length 不应重复: {head_text}"
+            );
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        // 代理本体：起在随机端口，直接复用 serve()（不经 start_proxy_with 免端口腾挪）。
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = ln.local_addr().unwrap().port();
+        let log: LogFn = Arc::new(|_: &str| {});
+        let srv = Arc::new(ProxyServer {
+            log,
+            authority: None,
+        });
+        let ctx = CancellationToken::new();
+        let serve_task = tokio::spawn(serve(srv, ln, ctx.clone()));
+
+        let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .unwrap();
+        // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI
+        let req = format!(
+            "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        cli.write_all(req.as_bytes()).await.unwrap();
+
+        let mut resp: Vec<u8> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(resp.windows(4).any(|w| w == b"\r\n\r\n") && resp.ends_with(b"ok")) {
+            let mut chunk = [0u8; 1024];
+            let n = tokio::time::timeout_at(deadline, cli.read(&mut chunk))
+                .await
+                .expect("客户端读超时: 未收到响应")
+                .unwrap();
+            assert!(n > 0, "代理提前关闭客户端连接");
+            resp.extend_from_slice(&chunk[..n]);
+        }
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
+
+        up_task.await.unwrap();
+        ctx.cancel();
+        let _ = serve_task.await;
     }
 }
