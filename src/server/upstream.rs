@@ -21,9 +21,13 @@ pub type Incoming = hyper::body::Incoming;
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
+    /// 进程内唯一：同一 IP 的两条连接也要能精确区分，否则 keepalive 会删错。
+    pub id: u64,
     send: SendRequest<Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// 单 host 的连接组：轮转取用 + 补第二条时防重入。
 #[derive(Default)]
@@ -102,7 +106,7 @@ async fn keepalive_pass() {
         .await;
         if !matches!(r, Ok(Ok(_))) {
             drop(guard);
-            drop_h2(&host, &up.ip); // 对端无答/连接已死: 清槽
+            drop_h2_id(&host, up.id); // 对端无答/连接已死: 只摘这一条
         }
     }
 }
@@ -130,7 +134,25 @@ pub fn store_h2(host: &str, up: H2Upstream) {
     h.conns.push(up);
 }
 
-/// 只摘掉坏的那条，另一条继续服务。
+/// 按连接 id 精确摘除（keepalive / 复用失败都走这里）。
+/// 两条同 IP 的连接靠 IP 是分不开的，删错就会把健康的摘掉、坏的留着反复被轮转。
+pub fn drop_h2_id(host: &str, id: u64) {
+    let mut g = conn_pool().lock().unwrap();
+    let empty = match g.get_mut(host) {
+        Some(h) => {
+            if let Some(pos) = h.conns.iter().position(|c| c.id == id) {
+                h.conns.remove(pos);
+            }
+            h.conns.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        g.remove(host);
+    }
+}
+
+/// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：摘第一条匹配的。
 pub fn drop_h2(host: &str, ip: &str) {
     let mut g = conn_pool().lock().unwrap();
     let empty = match g.get_mut(host) {
@@ -201,6 +223,7 @@ pub async fn h2_from_dialed(
     ));
     Ok(H2Upstream {
         ip: ip.to_string(),
+        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         send,
         ping,
     })

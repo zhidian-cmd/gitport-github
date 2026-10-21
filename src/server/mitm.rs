@@ -289,7 +289,7 @@ async fn stream_passthrough(
             match upstream::h2_stream_head(&up, out).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
-                    upstream::drop_h2(host, &up.ip);
+                    upstream::drop_h2_id(host, up.id);
                     (log)(&format!("[流式] {host}{path} 缓存连接失效({e}), 新拨重试"));
                 }
             }
@@ -298,7 +298,7 @@ async fn stream_passthrough(
             Ok(up) => match upstream::h2_stream_head(&up, out).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
-                    upstream::drop_h2(host, &up.ip);
+                    upstream::drop_h2_id(host, up.id);
                     (log)(&format!("[流式] {host}{path} 新拨连接握手即死({e})"));
                 }
             },
@@ -464,7 +464,7 @@ async fn try_cached(
             Some(Ok(resp))
         }
         _ => {
-            upstream::drop_h2(host, &up.ip);
+            upstream::drop_h2_id(host, up.id);
             (log)(&format!("[MITM] {host} 复用连接失效({}), 重走串发", up.ip));
             (!is_simple).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
         }
@@ -487,6 +487,7 @@ async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
+    let had_cached = upstream::cached_h2(host).is_some();
     if let Some(r) = try_cached(
         log, out, host, info, name, is_simple, is_content, &path, t0, body,
     )
@@ -500,7 +501,9 @@ async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    if upstream::cached_h2(host).is_some() {
+    // 只补"等锁期间别人刚建好"这一种情况：已经试过并失败的连接不再试第二条，
+    // 否则两条都失效时一个请求会把响应预算烧两遍（4s/8s × 2）再拨号。
+    if !had_cached && upstream::cached_h2(host).is_some() {
         guard.take();
         if let Some(r) = try_cached(
             log, out, host, info, name, is_simple, is_content, &path, t0, body,
@@ -563,7 +566,7 @@ async fn get_direct(
         if !name.is_empty() && is_simple && !is_content {
             pool::cursor_note(name, host, &up.ip, false);
         }
-        upstream::drop_h2(host, &up.ip);
+        upstream::drop_h2_id(host, up.id);
         (log)(&format!(
             "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
             attempt + 1
