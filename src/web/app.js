@@ -19,7 +19,6 @@ let S = { running: false, mitm: false, port: 7810 };
 
 const titles = {
   overview: ['概览', '代理状态与 GitHub 连通性一览'],
-  pools:    ['IP 池', '三组域名分池管理 · TLS 真证书测速'],
   logs:     ['运行日志', '实时运行日志 · 增量拉取'],
   settings: ['设置', '应用行为偏好 · 分流接管 · MITM'],
 };
@@ -86,30 +85,10 @@ async function refreshStatus() {
   $('mitmBtn').className = 'btn ' + (s.mitm ? 'danger' : 'primary');
   $('mitmBtn').textContent = s.mitm ? '关闭' : '开启';
 
-  /* IP 池卡片: 顺序即优先级, 表头即正在所用(2026-10-12 用户裁定: 不显示颜色/动画) */
-  const poolOrder = ['core', 'api', 'edge'];
-  const poolLabel = {core: 'core · 主站', api: 'api · API', edge: 'edge · 授权/静态/头像'};
-  let sp;
-  try { sp = await (await fetch('/api/pools')).json(); } catch (e) { return; }
-  const total = poolOrder.reduce((a, n) => a + ((sp[n] || []).length), 0);
+  /* 串发候选总数：概览只留一个数；明细页已删（显示不全且无操作价值） */
+  const total = s.poolTotal || 0;
   $('sPoolCount').textContent = total;
   $('sPoolCount').style.color = total ? 'var(--green)' : '';
-  $('navPools').textContent = total;
-  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  $('poolCards').innerHTML = poolOrder.map(name => {
-    const items = sp[name] || [];
-    const shown = items.slice(0, 9);
-    const chips = shown.length
-      ? '<div class="chips">' + shown.map(p =>
-          '<span class="chip"><span>' + esc(p.ip) + '</span><span class="ms">' +
-          esc(p.sni || '自动') + '</span></span>'
-        ).join('') + (items.length > 9 ? '<div class="hint" style="margin:4px 0 0">…其余 ' + (items.length - 9) + ' 条按序候补</div>' : '') + '</div>'
-      : '<div class="pool-empty">表空: 手动往 plans.json 加候选(改完重启生效)</div>';
-    return '<div class="panel pool-card">' +
-      '<div class="pool-head"><span class="pool-name">' + (poolLabel[name] || name) + '</span>' +
-      '<span class="pool-count">' + items.length + ' 候选</span></div>' +
-      chips + '</div>';
-  }).join('');
 }
 
 /* ---------- 日志增量 ---------- */

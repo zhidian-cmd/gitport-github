@@ -83,7 +83,15 @@ pub async fn handle_connect_mitm(
             .await
     };
     if let Err(e) = result {
-        (srv.log)(&format!("[MITM] {host} 服务层错误: {e}"));
+        // 浏览器掐断本地连接(RST/提前关闭/写体中止)是高频日常行为(切页/取消/回收连接),
+        // 不当错误刷屏; 协议类等真错误仍保留。GitHub 侧故障有各自的行([串发]/[镜像]/[上游])。
+        let benign = e.to_string().contains("connection error")
+            || e.is_incomplete_message()
+            || e.is_closed()
+            || e.is_body_write_aborted();
+        if !benign {
+            (srv.log)(&format!("[MITM] {host} 服务层错误: {e}"));
+        }
     }
 }
 /// 本次请求实际命中的上游 IP（响应头 X-GitPort-Upstream 回填）；单写者、收尾时读一次。

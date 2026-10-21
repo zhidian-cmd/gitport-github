@@ -33,7 +33,7 @@
 html{overflow:hidden}
 html,body{height:100%}
 body{
-  display:grid;grid-template-columns:212px 1fr;overflow:hidden;
+  display:grid;grid-template-columns:180px 1fr;overflow:hidden;
   font-family:var(--sans);background:var(--bg);color:var(--txt);font-size:14px;
   -webkit-font-smoothing:antialiased;
 }
@@ -50,7 +50,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 /* ---------- 侧栏 ---------- */
 .side{display:flex;flex-direction:column;background:var(--bg-side);border-right:1px solid var(--line);min-height:0}
-.brand{display:flex;align-items:center;gap:11px;padding:22px 20px 18px}
+.brand{display:flex;align-items:center;gap:10px;padding:20px 14px 16px}
 .mark{width:27px;height:27px;color:var(--green);flex-shrink:0}
 .brand .name{font-size:14.5px;font-weight:600;letter-spacing:.01em}
 .brand .sub{font-size:11px;color:var(--faint);margin-top:2px;letter-spacing:.02em}
@@ -62,10 +62,8 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
       font-size:13px;color:var(--mid);text-decoration:none;transition:background .15s,color .15s}
 .item:hover{background:var(--panel-2);color:var(--txt)}
 .item.active{background:var(--green-soft);color:var(--green);font-weight:600}
-.cnt{margin-left:auto;font:11px var(--mono);color:var(--faint)}
-.item.active .cnt{color:var(--green)}
 
-.side-foot{display:flex;align-items:center;gap:11px;margin:12px;padding:13px 15px;
+.side-foot{display:flex;align-items:center;gap:10px;margin:10px;padding:11px 13px;
            background:var(--panel);border:1px solid var(--line);border-radius:10px}
 .run-dot{width:9px;height:9px;border-radius:50%;background:#39424f;flex-shrink:0}
 .run-dot.on{background:var(--green);animation:pulse 2.4s ease-out infinite}
@@ -145,21 +143,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .badge{font-size:11.5px;padding:3.5px 9px;border-radius:999px;
        background:var(--panel-2);border:1px solid var(--line-strong);color:var(--faint)}
 .badge.on{background:var(--green-soft);border-color:var(--green-line);color:var(--green)}
-
-/* ---------- IP 池 ---------- */
-.pool-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media (max-width:1000px){.pool-grid{grid-template-columns:1fr}}
-.pool-card{margin-bottom:0}
-.pool-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:13px}
-.pool-name{font-size:14px;font-weight:600}
-.pool-count{font:12px var(--mono);color:var(--sub)}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{display:inline-flex;align-items:baseline;gap:7px;padding:5px 11px;border-radius:8px;
-      font:12.5px var(--mono);background:var(--panel-2);color:var(--sub);
-      border:1px solid var(--line-strong)}
-.chip .ms{font-size:11px;opacity:.7}
-.pool-empty{border:1px dashed var(--line-strong);border-radius:9px;padding:20px;
-            font-size:12.5px;color:var(--faint);text-align:center;line-height:1.7}
 
 /* ---------- 设置 ---------- */
 .feature-card{display:flex;align-items:center;gap:20px;background:var(--panel);
