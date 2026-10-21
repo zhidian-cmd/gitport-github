@@ -29,13 +29,23 @@ pub struct H2Upstream {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 单 host 的连接组：轮转取用 + 补第二条时防重入。
+/// 一条连接 + 它最近的响应耗时（EWMA，毫秒）。同 host 两条连接质量可能差很多，
+/// 实测出现过一条 p50 1671ms、另一条 460ms，轮转等于把一半请求喂给慢的。
+struct ConnSlot {
+    up: H2Upstream,
+    ewma: f64,
+    n: u32,
+}
+
+/// 单 host 的连接组：按耗时择优取用（偶尔轮转做探索）+ 补第二条时防重入。
 #[derive(Default)]
 struct HostConns {
-    conns: Vec<H2Upstream>,
+    conns: Vec<ConnSlot>,
     next: usize,
     filling: bool,
 }
+
+static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 值得开两条连接的 host（高频入口）。长尾 host 多一条只是白占 socket。
 const DUAL_CONN_HOSTS: &[&str] = &[
@@ -93,7 +103,7 @@ async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
         let g = conn_pool().lock().unwrap();
         g.iter()
-            .flat_map(|(h, hc)| hc.conns.iter().map(move |u| (h.clone(), u.clone())))
+            .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
             .collect()
     };
     for (host, up) in conns {
@@ -111,16 +121,41 @@ async fn keepalive_pass() {
     }
 }
 
-/// 轮转取一条；两条连接交替用，避免全压在同一条上。
+/// 取一条连接：优先近况最快的那条；每 8 次放一次轮转做探索，避免把慢连接饿死
+/// 到永远发现不了它变快。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
     let mut g = conn_pool().lock().unwrap();
     let h = g.get_mut(host)?;
-    if h.conns.is_empty() {
+    let n = h.conns.len();
+    if n == 0 {
         return None;
     }
-    let i = h.next % h.conns.len();
-    h.next = i + 1;
-    Some(h.conns[i].clone())
+    let mut idx = h.next % n;
+    h.next = idx + 1;
+    if n > 1 && EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 != 0 {
+        if let Some((i, _)) = h
+            .conns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.n >= 3)
+            .min_by(|a, b| a.1.ewma.total_cmp(&b.1.ewma))
+        {
+            idx = i;
+        }
+    }
+    Some(h.conns[idx].up.clone())
+}
+
+/// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
+pub fn note_latency(host: &str, id: u64, ms: u64) {
+    let mut g = conn_pool().lock().unwrap();
+    let Some(h) = g.get_mut(host) else { return };
+    let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) else {
+        return;
+    };
+    let x = ms as f64;
+    c.ewma = if c.n == 0 { x } else { c.ewma * 0.7 + x * 0.3 };
+    c.n = c.n.saturating_add(1);
 }
 
 pub fn store_h2(host: &str, up: H2Upstream) {
@@ -131,7 +166,7 @@ pub fn store_h2(host: &str, up: H2Upstream) {
     if h.conns.len() >= MAX_CONNS_PER_HOST {
         h.conns.remove(0); // 只留最新的两条，避免旧连接占位
     }
-    h.conns.push(up);
+    h.conns.push(ConnSlot { up, ewma: 0.0, n: 0 });
 }
 
 /// 按连接 id 精确摘除（keepalive / 复用失败都走这里）。
@@ -140,7 +175,7 @@ pub fn drop_h2_id(host: &str, id: u64) {
     let mut g = conn_pool().lock().unwrap();
     let empty = match g.get_mut(host) {
         Some(h) => {
-            if let Some(pos) = h.conns.iter().position(|c| c.id == id) {
+            if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
                 h.conns.remove(pos);
             }
             h.conns.is_empty()
@@ -157,7 +192,7 @@ pub fn drop_h2(host: &str, ip: &str) {
     let mut g = conn_pool().lock().unwrap();
     let empty = match g.get_mut(host) {
         Some(h) => {
-            if let Some(pos) = h.conns.iter().position(|c| c.ip == ip) {
+            if let Some(pos) = h.conns.iter().position(|c| c.up.ip == ip) {
                 h.conns.remove(pos);
             }
             h.conns.is_empty()
@@ -186,7 +221,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         .lock()
         .unwrap()
         .get(host)
-        .and_then(|h| h.conns.first().map(|c| c.ip.clone()));
+        .and_then(|h| h.conns.first().map(|c| c.up.ip.clone()));
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
