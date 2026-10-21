@@ -236,6 +236,11 @@ mod tests {
             System
         );
         assert_eq!(
+            master_route("api.mcp.github.com", "GET", "/x"),
+            System,
+            "core 池证书不覆盖 api.mcp，必须白名单短路"
+        );
+        assert_eq!(
             master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
             Mirror
         );
