@@ -15,17 +15,37 @@ use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
-/// 每 host 一条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
-/// SendRequest 可 Clone，一条连接承载该 host 全部并发；只有完整成功过的连接入槽。
+/// 每 host 最多两条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
+/// 一条连接承载该 host 的全部并发，但服务端对单连接的并发流有上限——实测 40 并发时
+/// 两条连接能把 p50 腰斩（2170ms → 1019ms），四条不再改善。只有成功过的连接入槽。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
     send: SendRequest<Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
-static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, H2Upstream>>> =
+
+/// 单 host 的连接组：轮转取用 + 补第二条时防重入。
+#[derive(Default)]
+struct HostConns {
+    conns: Vec<H2Upstream>,
+    next: usize,
+    filling: bool,
+}
+
+/// 值得开两条连接的 host（高频入口）。长尾 host 多一条只是白占 socket。
+const DUAL_CONN_HOSTS: &[&str] = &[
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "avatars.githubusercontent.com",
+    "github.githubassets.com",
+];
+const MAX_CONNS_PER_HOST: usize = 2;
+
+static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, HostConns>>> =
     std::sync::OnceLock::new();
-fn conn_pool() -> &'static Mutex<HashMap<String, H2Upstream>> {
+fn conn_pool() -> &'static Mutex<HashMap<String, HostConns>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -68,7 +88,9 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
 async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
         let g = conn_pool().lock().unwrap();
-        g.iter().map(|(h, u)| (h.clone(), u.clone())).collect()
+        g.iter()
+            .flat_map(|(h, hc)| hc.conns.iter().map(move |u| (h.clone(), u.clone())))
+            .collect()
     };
     for (host, up) in conns {
         let Some(pp) = up.ping.clone() else { continue };
@@ -85,17 +107,73 @@ async fn keepalive_pass() {
     }
 }
 
+/// 轮转取一条；两条连接交替用，避免全压在同一条上。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
-    conn_pool().lock().unwrap().get(host).cloned()
+    let mut g = conn_pool().lock().unwrap();
+    let h = g.get_mut(host)?;
+    if h.conns.is_empty() {
+        return None;
+    }
+    let i = h.next % h.conns.len();
+    h.next = i + 1;
+    Some(h.conns[i].clone())
 }
+
 pub fn store_h2(host: &str, up: H2Upstream) {
-    conn_pool().lock().unwrap().insert(host.to_string(), up);
+    let mut g = conn_pool().lock().unwrap();
+    let h = g.entry(host.to_string()).or_default();
+    h.filling = false;
+    // 同 IP 也允许并存：服务端并发上限是按连接算的，两条同 IP 的 TCP 同样能摊开。
+    if h.conns.len() >= MAX_CONNS_PER_HOST {
+        h.conns.remove(0); // 只留最新的两条，避免旧连接占位
+    }
+    h.conns.push(up);
 }
+
+/// 只摘掉坏的那条，另一条继续服务。
 pub fn drop_h2(host: &str, ip: &str) {
     let mut g = conn_pool().lock().unwrap();
-    if g.get(host).map(|u| u.ip == ip).unwrap_or(false) {
+    let empty = match g.get_mut(host) {
+        Some(h) => {
+            if let Some(pos) = h.conns.iter().position(|c| c.ip == ip) {
+                h.conns.remove(pos);
+            }
+            h.conns.is_empty()
+        }
+        None => false,
+    };
+    if empty {
         g.remove(host);
     }
+}
+
+/// 首条连接建好后，后台补第二条（只对高频 host，失败不影响当前请求）。
+pub fn maybe_spawn_second(host: &str, log: &LogFn) {
+    if !DUAL_CONN_HOSTS.contains(&host) {
+        return;
+    }
+    {
+        let mut g = conn_pool().lock().unwrap();
+        let Some(h) = g.get_mut(host) else { return };
+        if h.conns.len() >= MAX_CONNS_PER_HOST || h.filling {
+            return;
+        }
+        h.filling = true;
+    }
+    let host = host.to_string();
+    let log = log.clone();
+    tokio::spawn(async move {
+        let name = crate::config::pool_for(&host);
+        match dial_h2(name, &host, CancellationToken::new(), &log).await {
+            Ok(up) => store_h2(&host, up),
+            Err(e) => {
+                (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
+                if let Some(h) = conn_pool().lock().unwrap().get_mut(&host) {
+                    h.filling = false;
+                }
+            }
+        }
+    });
 }
 pub async fn h2_from_dialed(
     host: &str,
