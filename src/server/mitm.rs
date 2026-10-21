@@ -105,13 +105,12 @@ async fn mitm_http(
             from_uri
         }
     };
-    if host == "collector.github.com" || host == "alive.github.com" {
-        return axum::response::Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(BoxBody::new(
-                http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
-            ))
-            .unwrap();
+    // GitHub 前端遥测（Datadog RUM / error beacon）只占带宽、不影响页面功能。
+    // 实测 api.github.com 436 个请求里 325 个是它（p50 690ms），把搜索/GraphQL 挤在后面。
+    // 必须先把请求体读掉再回 204：body 不消费会让 hyper 重置连接，反而逼浏览器重开。
+    if is_telemetry(&host, &path_of(req.uri())) {
+        let _ = http_body_util::BodyExt::collect(req.into_body()).await;
+        return no_content();
     }
 
     let info = UpstreamInfo::default();
@@ -347,6 +346,22 @@ async fn stream_passthrough(
         }
     }
 }
+/// 前端遥测端点：不转发，直接 204。
+fn is_telemetry(host: &str, path: &str) -> bool {
+    host == "collector.github.com"
+        || host == "alive.github.com"
+        || (host == "api.github.com" && path.starts_with("/_private/browser/"))
+}
+
+fn no_content() -> axum::response::Response<BoxBody> {
+    axum::response::Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(BoxBody::new(
+            http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
+        ))
+        .unwrap()
+}
+
 fn path_of(uri: &http::Uri) -> String {
     uri.path_and_query()
         .map(|p| p.as_str().to_string())
@@ -1371,6 +1386,17 @@ mod tests {
             "/repos/x/y/releases/assets/1"
         ));
         assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
+    }
+
+    #[test]
+    fn telemetry_paths_intercepted_only() {
+        assert!(is_telemetry("api.github.com", "/_private/browser/rum?ddforward=x"));
+        assert!(is_telemetry("api.github.com", "/_private/browser/errors"));
+        assert!(is_telemetry("collector.github.com", "/"));
+        assert!(is_telemetry("alive.github.com", "/"));
+        assert!(!is_telemetry("api.github.com", "/graphql"));
+        assert!(!is_telemetry("api.github.com", "/search/suggestions"));
+        assert!(!is_telemetry("github.com", "/_private/browser/rum"));
     }
 
     #[test]
