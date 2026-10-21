@@ -28,6 +28,9 @@ pub fn set_webui_port(p: u16) {
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
 /// 单候选拨号超时（TCP 与 TLS 握手共用）：黑洞型死 IP 不许拖住整轮串发。
 pub const CONNECT_TIMEOUT_SECS: u64 = 3;
+/// h2 SETTINGS 握手限时：TCP/TLS 已通但对端装死时快速垫底——裸等会永久持有
+/// per-host 拨号锁，把该域名所有缓存未命中的请求一起拖死。
+pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 /// h2 连接空闲 50-65s 被边缘回收，30s 探测可稳定续命。
 pub const KEEPALIVE_PROBE_SECS: u64 = 30;

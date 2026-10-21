@@ -248,10 +248,15 @@ pub async fn h2_from_dialed(
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
-    let (send, mut conn) = cb
-        .handshake(conn_io)
-        .await
-        .map_err(|e| format!("h2 握手失败: {e}"))?;
+    // h2 握手（等对端回 SETTINGS）必须限时：TCP 3s / TLS 3s / 发请求 8s 都有，
+    // 唯独这步曾裸等——对端 TLS 通了之后装死，会永久持有 per-host 拨号锁，拖死整个域名。
+    let (send, mut conn) = tokio::time::timeout(
+        std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
+        cb.handshake(conn_io),
+    )
+    .await
+    .map_err(|_| format!("h2 握手超时({}s): {host}", crate::config::H2_HANDSHAKE_TIMEOUT_SECS))?
+    .map_err(|e| format!("h2 握手失败: {e}"))?;
     let ping = conn
         .ping_pong()
         .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
