@@ -96,22 +96,7 @@ fn system_root_certs() -> Option<&'static [X509]> {
     .as_deref()
 }
 
-const ALPN_H2: &[u8] = b"\x02h2\x08http/1.1";
-/// 升级连接（WebSocket）只报 http/1.1：握手与之后的数据帧都要按明文 HTTP/1.1 语义走。
-const ALPN_H1: &[u8] = b"\x08http/1.1";
-
-/// 拨号腿的上层形态：明文（CONNECT 隧道）/ TLS+h2（MITM 常规腿）/ TLS+http1.1（WebSocket 升级）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DialMode {
-    Plain,
-    H2,
-    H1,
-}
-
-fn build_ssl_context(
-    roots: Option<Vec<X509>>,
-    alpn: &[u8],
-) -> std::io::Result<boring::ssl::SslContext> {
+fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::SslContext> {
     let mut ctx_b = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io_err(format!("BoringSSL 上下文初始化失败: {e}")))?;
     match roots {
@@ -134,7 +119,7 @@ fn build_ssl_context(
     ctx_b.set_grease_enabled(true); // Chrome GREASE（SSL_CTX_set_grease_enabled）
                                     // ALPN：Chrome 指纹自带 h2,http/1.1；边缘按此协商出 h2（缺 ALPN 会全灭，已实锤）
     ctx_b
-        .set_alpn_protos(alpn)
+        .set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
     Ok(ctx_b.build())
 }
@@ -144,41 +129,23 @@ fn default_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
     if let Some(ctx) = CTX.get() {
         return Ok(ctx);
     }
-    let built = build_ssl_context(system_root_certs().map(<[X509]>::to_vec), ALPN_H2)?;
-    let _ = CTX.set(built);
-    Ok(CTX.get().expect("上下文刚已写入"))
-}
-
-/// 升级腿的上下文：单独一份，ALPN 只报 http/1.1。
-fn h1_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
-    static CTX: std::sync::OnceLock<boring::ssl::SslContext> = std::sync::OnceLock::new();
-    if let Some(ctx) = CTX.get() {
-        return Ok(ctx);
-    }
-    let built = build_ssl_context(system_root_certs().map(<[X509]>::to_vec), ALPN_H1)?;
+    let built = build_ssl_context(system_root_certs().map(<[X509]>::to_vec))?;
     let _ = CTX.set(built);
     Ok(CTX.get().expect("上下文刚已写入"))
 }
 
 /// 构建三形态 BoringSSL 客户端连接；ca_pem 为测试用内存信任锚。
 fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
-    match ca_pem {
-        None => ssl_with(default_ssl_context()?, host, mode),
+    let mut ssl = match ca_pem {
+        None => Ssl::new(default_ssl_context()?)
+            .map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?,
         Some(pem) => {
             let certs = X509::stack_from_pem(pem.as_bytes())
                 .map_err(|e| io_err(format!("CA PEM 解析失败: {e}")))?;
-            ssl_with(&build_ssl_context(Some(certs), ALPN_H2)?, host, mode)
+            let ctx = build_ssl_context(Some(certs))?;
+            Ssl::new(&ctx).map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?
         }
-    }
-}
-
-/// 升级腿：ALPN 只报 http/1.1。
-fn client_ssl_h1(host: &str, mode: &str) -> std::io::Result<Ssl> {
-    ssl_with(h1_ssl_context()?, host, mode)
-}
-
-fn ssl_with(ctx: &boring::ssl::SslContext, host: &str, mode: &str) -> std::io::Result<Ssl> {
-    let mut ssl = Ssl::new(ctx).map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?;
+    };
 
     // sni 透传:非空即作为 ClientHello SNI,空串 = 无 SNI 扩展;校验名恒为 host(下方 param)。
     if !mode.is_empty() {
@@ -201,7 +168,13 @@ fn ssl_with(ctx: &boring::ssl::SslContext, host: &str, mode: &str) -> std::io::R
 
 pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
     let ssl = client_ssl(host, mode, None)?;
-    let tls = handshake(ssl, tcp).await?;
+    let tls = tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS 握手超时"))?
+    .map_err(|e| io_err(format!("TLS 握手失败: {e}")))?;
     let proto = tls.ssl().selected_alpn_protocol().unwrap_or_default();
     if proto != b"h2" {
         return Err(std::io::Error::new(
@@ -210,22 +183,6 @@ pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Res
         ));
     }
     Ok(tls)
-}
-
-/// 升级腿：只报 http/1.1，不要求 h2——之后要在上面写明文 HTTP/1.1 请求头。
-pub async fn tls_connect_h1(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl_h1(host, mode)?;
-    handshake(ssl, tcp).await
-}
-
-async fn handshake(ssl: Ssl, tcp: TcpStream) -> std::io::Result<BoringTls> {
-    tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS 握手超时"))?
-    .map_err(|e| io_err(format!("TLS 握手失败: {e}")))
 }
 
 static DIAL_GATE: tokio::sync::OnceCell<Arc<tokio::sync::Semaphore>> =
@@ -240,7 +197,12 @@ async fn gate_acquire() -> tokio::sync::SemaphorePermit<'static> {
     gate.acquire().await.expect("信号量未关闭")
 }
 
-pub async fn dial_one(host: &str, ip: &str, mode: &str, dm: DialMode) -> std::io::Result<Dialed> {
+pub async fn dial_one(
+    host: &str,
+    ip: &str,
+    mode: &str,
+    tls_handshake: bool,
+) -> std::io::Result<Dialed> {
     let _permit = gate_acquire().await;
     let addr = format!("{ip}:443");
     let tcp = tokio::time::timeout(
@@ -251,11 +213,12 @@ pub async fn dial_one(host: &str, ip: &str, mode: &str, dm: DialMode) -> std::io
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP 拨号超时"))??;
     let _ = tcp.set_nodelay(true);
 
-    match dm {
-        DialMode::Plain => Ok(Dialed::Plain(tcp)),
-        DialMode::H2 => Ok(Dialed::Tls(tls_connect(host, mode, tcp).await?)),
-        DialMode::H1 => Ok(Dialed::Tls(tls_connect_h1(host, mode, tcp).await?)),
+    if !tls_handshake {
+        return Ok(Dialed::Plain(tcp));
     }
+
+    let tls = tls_connect(host, mode, tcp).await?;
+    Ok(Dialed::Tls(tls))
 }
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
@@ -447,58 +410,6 @@ mod tests {
             .unwrap();
         assert_eq!(obs.sni.as_deref(), Some("baidu.com"));
         assert!(obs.grease);
-    }
-
-    /// 升级腿只许报 http/1.1：报出 h2 后还要在连接上写明文 HTTP/1.1，必被对端掐断。
-    #[tokio::test]
-    async fn upgrade_offers_only_http11() {
-        let Some((ca_pem, chain_pem, key_pem)) = official_material() else {
-            eprintln!(
-                "跳过: 未找到 boring 测试证书目录(编译过 boring 后重试, 或设 BORING_TEST_DIR)"
-            );
-            return;
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
-        let seen_srv = seen.clone();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let p = std::env::temp_dir().join(format!(
-                "gitport_h1_{}_{}.pem",
-                std::process::id(),
-                tmp_seq()
-            ));
-            std::fs::write(&p, chain_pem).unwrap();
-            let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-            b.set_certificate_chain_file(&p).unwrap();
-            b.set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
-                .unwrap();
-            b.set_alpn_select_callback(move |_, client| {
-                *seen_srv.lock().unwrap() = client.to_vec();
-                Ok(b"http/1.1")
-            });
-            let _ = tokio_boring::accept(&b.build(), tcp).await;
-        });
-        let certs = X509::stack_from_pem(ca_pem.as_bytes()).unwrap();
-        let ctx = build_ssl_context(Some(certs), ALPN_H1).unwrap();
-        let mut ssl = ssl_with(&ctx, OFFICIAL_HOST, OFFICIAL_HOST).unwrap();
-        ssl.param_mut().set_time(1_577_836_800); // 官方测试材料已过期，回拨验证时间
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let tls = tokio_boring::SslStreamBuilder::new(ssl, tcp)
-            .connect()
-            .await
-            .unwrap();
-        assert_eq!(
-            tls.ssl().selected_alpn_protocol(),
-            Some(b"http/1.1".as_ref())
-        );
-        let _ = server.await;
-        assert_eq!(
-            &*seen.lock().unwrap(),
-            b"\x08http/1.1",
-            "升级腿的 ClientHello 不得携带 h2"
-        );
     }
 
     #[tokio::test]

@@ -3,11 +3,11 @@
 use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
-use crate::pool::{self, dial, LogFn};
+use crate::pool::{self, LogFn};
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -112,11 +112,6 @@ async fn mitm_http(
                 http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
             ))
             .unwrap();
-    }
-
-    // WebSocket 升级：单开一条 http/1.1 腿，把上游 101 的头原样回给浏览器，之后按裸流转发。
-    if is_ws_upgrade(&req) {
-        return mitm_upgrade(log, req, &host).await;
     }
 
     let info = UpstreamInfo::default();
@@ -228,151 +223,6 @@ async fn mitm_http(
     }
     write_upstream(resp, "direct", &info)
 }
-/// 只认 http/1.1 的 `Upgrade: websocket`。
-/// 我们的 h2 服务端没开 `SETTINGS_ENABLE_CONNECT_PROTOCOL`，浏览器无法走 RFC 8441 的扩展
-/// CONNECT，只能另开一条 http/1.1 连接做升级——所以这一条判断就覆盖了真实路径。
-fn is_ws_upgrade(req: &hyper::Request<Incoming>) -> bool {
-    req.headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
-}
-
-/// WebSocket 升级：上游单开一条 http/1.1 腿，转发 101 之后再当裸流转发。
-/// 顺序是关键：先取 `on_upgrade`（不 await）→ 返回 101 → 后台任务里再 await，反了必死锁。
-async fn mitm_upgrade(
-    log: LogFn,
-    req: hyper::Request<Incoming>,
-    host: &str,
-) -> axum::response::Response<BoxBody> {
-    let mut req = req;
-    let on_upgrade = hyper::upgrade::on(&mut req);
-    let name = pool::pool_for(host);
-    let (mut conn, _ip, _shape) = match pool::serial_dial(
-        name,
-        host,
-        CancellationToken::new(),
-        dial::DialMode::H1,
-        Some(&log),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            (log)(&format!("[升级] {host} 拨号失败({e})"));
-            return mitm_unavailable(&req, host);
-        }
-    };
-    let (resp, rest) = match ws_handshake(&mut conn, upgrade_head(&req).as_bytes()).await {
-        Ok(v) => v,
-        Err(e) => {
-            (log)(&format!("[升级] {host} 上游握手失败({e})"));
-            return mitm_unavailable(&req, host);
-        }
-    };
-    let log = log.clone();
-    let host = host.to_string();
-    tokio::spawn(async move {
-        let Ok(upgraded) = on_upgrade.await else { return };
-        use tokio::io::AsyncWriteExt;
-        let mut client = TokioIo::new(upgraded);
-        // 握手响应头之后可能已经读到了首帧，先补写再开泵。
-        if !rest.is_empty() && client.write_all(&rest).await.is_err() {
-            return;
-        }
-        let (mut cr, mut cw) = tokio::io::split(client);
-        let (mut sr, mut sw) = tokio::io::split(conn);
-        let (up, down) = tokio::join!(
-            tokio::io::copy(&mut cr, &mut sw),
-            tokio::io::copy(&mut sr, &mut cw),
-        );
-        let _ = (up, down);
-        (log)(&format!("[升级] {host} 隧道结束"));
-    });
-    resp
-}
-
-fn upgrade_head(req: &hyper::Request<Incoming>) -> String {
-    let mut head = format!(
-        "{} {} HTTP/1.1\r\n",
-        req.method(),
-        req.uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-    );
-    for (k, v) in req.headers() {
-        if let Ok(v) = v.to_str() {
-            head.push_str(&format!("{}: {v}\r\n", k.as_str()));
-        }
-    }
-    head.push_str("\r\n");
-    head
-}
-
-/// 把升级请求写给上游并读回响应头；非 101 直接判失败。
-/// 返回 (要回给浏览器的 101, head 之后已经读到的残余字节)。
-async fn ws_handshake<S>(
-    up: &mut S,
-    head: &[u8],
-) -> Result<(axum::response::Response<BoxBody>, Vec<u8>), String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    up.write_all(head)
-        .await
-        .map_err(|e| format!("写升级请求失败: {e}"))?;
-    up.flush().await.map_err(|e| format!("写升级请求失败: {e}"))?;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let end = loop {
-        if let Some(e) = head_end(&buf) {
-            break e;
-        }
-        if buf.len() > 16 * 1024 {
-            return Err("上游升级响应头过大".to_string());
-        }
-        let n = tokio::time::timeout(Duration::from_secs(8), up.read(&mut chunk))
-            .await
-            .map_err(|_| "上游升级响应超时".to_string())?
-            .map_err(|e| format!("读升级响应失败: {e}"))?;
-        if n == 0 {
-            return Err("上游在升级响应前断开".to_string());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-    let head_text = String::from_utf8_lossy(&buf[..end]);
-    let mut lines = head_text.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    if status != 101 {
-        return Err(format!("上游拒绝升级(状态 {status})"));
-    }
-    let mut b = axum::response::Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        b = b.header(k.trim(), v.trim());
-    }
-    let resp = b
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
-        ))
-        .map_err(|e| format!("构造 101 失败: {e}"))?;
-    Ok((resp, buf[end..].to_vec()))
-}
-
-/// 头部结束位置：返回 `\r\n\r\n` 之后的下标。
-fn head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
 fn stream_decision(
     method: &Method,
     path: &str,
@@ -877,7 +727,7 @@ async fn dns_direct_fetch(
     ));
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, host, dial::DialMode::H2).await {
+        let conn = match pool::dial::dial_one(host, &ip, host, true).await {
             Ok(c) => c,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
@@ -1507,60 +1357,6 @@ mod tests {
             "/repos/x/y/releases/assets/1"
         ));
         assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
-    }
-
-    #[tokio::test]
-    async fn ws_handshake_forwards_101_headers_and_leftover() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let srv = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            let n = tcp.read(&mut buf).await.unwrap();
-            assert!(String::from_utf8_lossy(&buf[..n]).contains("Sec-WebSocket-Key: k"));
-            tcp.write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\nXYZ",
-            )
-            .await
-            .unwrap();
-        });
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (resp, rest) = ws_handshake(
-            &mut client,
-            b"GET /x HTTP/1.1\r\nHost: h\r\nSec-WebSocket-Key: k\r\n\r\n",
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert_eq!(
-            resp.headers().get("sec-websocket-accept").unwrap(),
-            "abc",
-            "101 的握手头必须原样转发，否则浏览器判失败"
-        );
-        assert_eq!(rest, b"XYZ", "head 之后的残余字节要交给泵");
-        srv.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ws_handshake_rejects_non_101() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let srv = tokio::spawn(async move {
-            let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = tcp.read(&mut buf).await.unwrap();
-            tcp.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let err = ws_handshake(&mut client, b"GET /x HTTP/1.1\r\n\r\n")
-            .await
-            .unwrap_err();
-        assert!(err.contains("403"), "{err}");
-        srv.await.unwrap();
     }
 
     #[test]

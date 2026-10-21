@@ -299,7 +299,7 @@ pub async fn serial_dial(
     pool_name: &str,
     host: &str,
     ctx: CancellationToken,
-    dial_mode: dial::DialMode,
+    tls_handshake: bool,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
     {
@@ -363,7 +363,7 @@ pub async fn serial_dial(
         }
         tried += 1;
         let mode = p.sni.trim();
-        let attempt = dial::dial_one(host, &p.ip, mode, dial_mode);
+        let attempt = dial::dial_one(host, &p.ip, mode, tls_handshake);
         let result = tokio::select! {
             _ = ctx.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "请求预算到期")),
             r = attempt => r,
