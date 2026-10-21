@@ -80,10 +80,13 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
 /// - objects-origin：仅 GLB 族服务，主站边缘对其 301 无 CORS → 跨域预检失败、上传必败
 /// - uploads.github.com：API 式上传源站，等价 gh CLI 可用路径
 /// - viewscreen：mermaid 渲染，代理腿真名 SNI 被间歇掐断且无镜像兜底，浏览器直连反而可用（非 ECH）
+/// - api.mcp：Copilot MCP 端点，core 池 IP 证书 SAN 不覆盖它（27 连败全 Hostname mismatch），
+///   走池必然全灭，浏览器 DIRECT 即可
 pub const DIRECT_HOSTS: &[&str] = &[
     "objects-origin.githubusercontent.com",
     "uploads.github.com",
     "viewscreen.githubusercontent.com",
+    "api.mcp.github.com",
 ];
 
 pub fn is_direct(host: &str) -> bool {
@@ -144,6 +147,8 @@ mod tests {
         assert_eq!(pool_for("uploads.github.com"), "");
         assert!(is_direct("viewscreen.githubusercontent.com"));
         assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
+        assert!(is_direct("api.mcp.github.com")); // *.github.com 通配吞它，白名单精确短路
+        assert_eq!(pool_for("api.mcp.github.com"), "");
         assert_eq!(pool_for("codeload.github.com"), "core");
         assert_eq!(pool_for("raw.githubusercontent.com"), "edge");
         assert_eq!(pool_for("avatars.githubusercontent.com"), "edge");
