@@ -182,11 +182,16 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         }
         h.filling = true;
     }
+    let skip = conn_pool()
+        .lock()
+        .unwrap()
+        .get(host)
+        .and_then(|h| h.conns.first().map(|c| c.ip.clone()));
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
         let name = crate::config::pool_for(&host);
-        match dial_h2(name, &host, CancellationToken::new(), &log).await {
+        match dial_h2_skip(name, &host, CancellationToken::new(), &log, skip.as_deref()).await {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
@@ -234,7 +239,20 @@ pub async fn dial_h2(
     ctx: CancellationToken,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    let (conn_io, ip, shape) = pool::serial_dial(pool_name, host, ctx, true, Some(log))
+    dial_h2_skip(pool_name, host, ctx, log, None).await
+}
+
+/// 同 host 补第二条时传 `skip_ip`：两条连接落在同一 IP 上容易被边缘降权（实测一条会
+/// 长时间不响应，落到它上面的请求白等满 8s 预算）。
+pub async fn dial_h2_skip(
+    pool_name: &str,
+    host: &str,
+    ctx: CancellationToken,
+    log: &LogFn,
+    skip_ip: Option<&str>,
+) -> Result<H2Upstream, String> {
+    let (conn_io, ip, shape) =
+        pool::serial_dial_skip(pool_name, host, ctx, true, Some(log), skip_ip)
         .await
         .map_err(|e| e.to_string())?;
     let form = if shape.is_empty() {

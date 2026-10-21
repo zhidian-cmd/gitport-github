@@ -458,7 +458,8 @@ async fn try_cached(
                 pool::CONTENT_BREAKER.clear(host);
             }
             (log)(&format!(
-                "[上游] {host}{path} 复用连接, {}ms",
+                "[上游] {host}{path} 复用连接#{}, {}ms",
+                up.id,
                 t0.elapsed().as_millis()
             ));
             Some(Ok(resp))
