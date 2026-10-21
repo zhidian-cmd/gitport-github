@@ -80,7 +80,6 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/app.js", axum::routing::get(app_js))
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
-        .route("/api/pools", axum::routing::get(api_pools))
         .route("/api/logs", axum::routing::get(api_logs))
         .route("/api/mitm", axum::routing::post(api_mitm))
         .route("/api/settings", axum::routing::get(api_settings))
@@ -226,31 +225,21 @@ struct StatusResp {
     port: u16,
     mitm: bool,
     domain_count: usize,
+    /// 串发候选总数（原 IP 池页删除后并入状态，概览只显示一个数）。
+    pool_total: usize,
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
     let domain_count = config::GROUPS.iter().map(|g| g.patterns.len()).sum();
+    let pool_total: usize = pool::plans_snapshot().values().map(|v| v.len()).sum();
     write_json(&StatusResp {
         version: st.version.to_string(),
         running: crate::server::running(),
         port: config::proxy_port(),
         mitm: settings::mitm(),
         domain_count,
+        pool_total,
     })
-}
-
-async fn api_pools() -> Response {
-    let snap = pool::plans_snapshot();
-    let obj: serde_json::Map<String, serde_json::Value> = pool::SERIAL_POOLS
-        .iter()
-        .map(|name| {
-            (
-                name.to_string(),
-                serde_json::json!(snap.get(*name).cloned().unwrap_or_default()),
-            )
-        })
-        .collect();
-    write_json(&serde_json::Value::Object(obj))
 }
 
 async fn api_calibrate(
