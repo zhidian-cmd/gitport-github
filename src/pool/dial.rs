@@ -2,10 +2,11 @@
 //! GREASE + ALPN + BoringSSL 默认序 = Chrome 指纹；Rust 无 utls 绑定（rquest 全 yanked、wreq 解耦不了拨号 IP 与 SNI），用 boring。
 
 use crate::config::CONNECT_TIMEOUT_SECS;
-use boring::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
+use boring::ssl::{NameType, Ssl, SslContextBuilder, SslMethod, SslSession, SslVerifyMode};
 use boring::x509::verify::X509CheckFlags;
 use boring::x509::X509;
 use rustls_native_certs::CertificateResult;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -81,6 +82,37 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg)
 }
 
+/// TLS 会话恢复缓存：键 = SNI 形态（伪装腿统一一个键，真名腿各 host 自键）。
+/// BoringSSL 在 NewSessionTicket 到达时触发 new_session_cb（TLS 1.2 为握手完成时），
+/// 每个 SNI 只留最近一张 ticket；重拨时经 set_session 走 1-RTT PSK 恢复——
+/// 省掉整条证书链的重传与验签（跨洋链路一次握手少传 ~4KB）。恢复被服务器拒绝时
+/// 协议自动回落完整握手，无副作用。仅存内存，进程重启自然失效；
+/// 不启用 0-RTT（重放面大，且要侵入 hyper 的首包路径）。
+fn session_cache() -> &'static std::sync::Mutex<HashMap<String, SslSession>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, SslSession>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn apply_cached_session(ssl: &mut Ssl, mode: &str) {
+    if mode.is_empty() {
+        return; // 无 SNI 拨号从不进缓存，恒完整握手
+    }
+    let ticket = session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(mode)
+        .cloned();
+    if let Some(s) = ticket {
+        // SAFETY: SSL_set_session 前置条件是 ssl 尚未开始握手——Ssl::new 之后立即调用；
+        // SslSession: Send+Sync（boring foreign_type_and_impl_send_sync），跨任务共享安全。
+        // 返回 Err 仅表示本轮无法注入，走完整握手。
+        unsafe {
+            let _ = ssl.set_session(&s);
+        }
+    }
+}
+
 fn system_root_certs() -> Option<&'static [X509]> {
     static CERTS: std::sync::OnceLock<Option<Vec<X509>>> = std::sync::OnceLock::new();
     CERTS.get_or_init(|| {
@@ -121,6 +153,21 @@ fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::S
     ctx_b
         .set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
+    // 会话恢复：ticket 到手即入缓存（见 session_cache）。键取客户端实际发出的 SNI——
+    // 伪装腿全是同一 SNI，一张 ticket 管整个伪装族；真名腿各自成键。
+    // CLIENT 模式只为触发 new_session_cb（客户端默认 OFF，不开回调不触发）；
+    // BoringSSL 客户端不会自动从内部缓存取会话，注入恒由 apply_cached_session 显式做。
+    ctx_b.set_session_cache_mode(boring::ssl::SslSessionCacheMode::CLIENT);
+    ctx_b.set_new_session_callback(|ssl, session| {
+        if let Some(sni) = ssl.servername(NameType::HOST_NAME) {
+            if !sni.is_empty() {
+                session_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(sni.to_owned(), session);
+            }
+        }
+    });
     Ok(ctx_b.build())
 }
 
@@ -167,7 +214,8 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
 }
 
 pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl(host, mode, None)?;
+    let mut ssl = client_ssl(host, mode, None)?;
+    apply_cached_session(&mut ssl, mode);
     let tls = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
@@ -222,7 +270,8 @@ pub async fn dial_one(
 }
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
-    let ssl = client_ssl(host, host, None)?;
+    let mut ssl = client_ssl(host, host, None)?;
+    apply_cached_session(&mut ssl, host);
     let tcp = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         TcpStream::connect((host, 443)),
@@ -466,5 +515,74 @@ mod tests {
             "校验名 wrong.example 与证书 CN=foobar.com 不匹配应失败"
         );
         let _ = server.await;
+    }
+
+    /// 会话恢复：第一次拨号完整握手并把 ticket 存入缓存，第二次注入后必须命中恢复。
+    /// SNI 用唯一键防与其他测试的缓存竞争；acceptor 复用同一个（ticket key 随 SSL_CTX
+    /// 随机生成，换 acceptor 旧 ticket 解不开会回落完整握手，测试就失去意义）。
+    #[tokio::test]
+    async fn session_resumed_on_second_dial() {
+        let Some(material) = official_material() else {
+            eprintln!("跳过: 未找到 boring 测试证书目录(编译过 boring 后重试, 或设 BORING_TEST_DIR)");
+            return;
+        };
+        let (ca_pem, chain_pem, key_pem) = material;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = acceptor_for(&chain_pem, &key_pem);
+        let server = tokio::spawn(async move {
+            let mut reused = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut s = tokio_boring::accept(&acceptor, tcp).await.unwrap();
+                reused.push(s.ssl().session_reused());
+                s.write_all(b"pong").await.unwrap();
+            }
+            reused
+        });
+
+        let sni = "sess-resume-test"; // 独立缓存键；校验名恒为 foobar.com 不受 SNI 影响
+        let first = {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut ssl = client_ssl(OFFICIAL_HOST, sni, Some(&ca_pem)).unwrap();
+            ssl.param_mut().set_time(1_577_836_800);
+            let mut tls = tokio_boring::SslStreamBuilder::new(ssl, tcp)
+                .connect()
+                .await
+                .unwrap();
+            let mut pong = [0u8; 4];
+            tls.read_exact(&mut pong).await.unwrap(); // 读应用数据顺带解析 NewSessionTicket → 入缓存
+            tls
+        };
+        assert!(
+            !first.ssl().session_reused(),
+            "首拨没有缓存可注入，必须是完整握手"
+        );
+        assert!(
+            session_cache()
+                .lock()
+                .unwrap()
+                .contains_key(sni),
+            "NewSessionTicket 回调应已把 ticket 写入缓存"
+        );
+
+        let second = {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut ssl = client_ssl(OFFICIAL_HOST, sni, Some(&ca_pem)).unwrap();
+            ssl.param_mut().set_time(1_577_836_800);
+            apply_cached_session(&mut ssl, sni);
+            let mut tls = tokio_boring::SslStreamBuilder::new(ssl, tcp)
+                .connect()
+                .await
+                .unwrap();
+            let mut pong = [0u8; 4];
+            tls.read_exact(&mut pong).await.unwrap();
+            tls
+        };
+        assert!(
+            second.ssl().session_reused(),
+            "第二次拨号注入 ticket 后应走 PSK 恢复"
+        );
+        assert_eq!(server.await.unwrap(), [false, true], "服务端视角同判定");
     }
 }
