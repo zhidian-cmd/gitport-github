@@ -463,9 +463,16 @@ async fn try_cached(
             ));
             Some(Ok(resp))
         }
-        _ => {
+        other => {
+            let why = match other {
+                Ok(Err(e)) => e,
+                _ => "响应预算超时".to_string(),
+            };
             upstream::drop_h2_id(host, up.id);
-            (log)(&format!("[MITM] {host} 复用连接失效({}), 重走串发", up.ip));
+            (log)(&format!(
+                "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
+                up.ip
+            ));
             (!is_simple).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
         }
     }
@@ -487,7 +494,6 @@ async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    let had_cached = upstream::cached_h2(host).is_some();
     if let Some(r) = try_cached(
         log, out, host, info, name, is_simple, is_content, &path, t0, body,
     )
@@ -501,9 +507,10 @@ async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    // 只补"等锁期间别人刚建好"这一种情况：已经试过并失败的连接不再试第二条，
-    // 否则两条都失效时一个请求会把响应预算烧两遍（4s/8s × 2）再拨号。
-    if !had_cached && upstream::cached_h2(host).is_some() {
+    // 必须重查：等锁期间别人可能刚建好连接，直接用就不会一起排队拨号。
+    // （曾经为省掉"两条都失效时多烧一个预算"砍掉过这里，结果一条连接收 GOAWAY 时
+    //  18 个在途请求各自拨号，单飞锁前排成 10 秒以上的队。）
+    if upstream::cached_h2(host).is_some() {
         guard.take();
         if let Some(r) = try_cached(
             log, out, host, info, name, is_simple, is_content, &path, t0, body,
