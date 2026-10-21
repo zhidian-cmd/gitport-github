@@ -152,6 +152,7 @@ impl ProxyServer {
             Some(std::time::Duration::from_secs(
                 config::TUNNEL_FIRST_BYTE_TIMEOUT_SECS,
             )),
+            true,
         )
         .await;
         (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
@@ -231,7 +232,7 @@ impl ProxyServer {
             head_sent = upstream.write_all(body_prefix).await.is_ok();
         }
         let recv = if head_sent {
-            bidir_copy(&mut client, &mut upstream, None).await.1
+            bidir_copy(&mut client, &mut upstream, None, false).await.1
         } else {
             0
         };
@@ -339,11 +340,12 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
 }
 
 /// 双向透传，任一方向结束即关闭两侧。返回 (a→b, b→a) 字节数。
-/// 双向透传：任一方向结束即关闭两侧；b→a 可选首字节看门狗（ClientHello 黑洞判死）。
+/// b→a 可选首字节看门狗（ClientHello 黑洞判死）；a→b 可选 TLS 握手首包分片（隧道反 SNI RST）。
 async fn bidir_copy<A, B>(
     a: &mut A,
     b: &mut B,
     first_byte: Option<std::time::Duration>,
+    split_hello: bool,
 ) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -353,17 +355,32 @@ where
     let (mut br, mut bw) = tokio::io::split(b);
     // 同一任务内交替轮询两拷贝循环；任一方向 EOF/错误即收尾。
     let (up, down) = tokio::join!(
-        copy_with_first_byte_timeout(&mut ar, &mut bw, None),
-        copy_with_first_byte_timeout(&mut br, &mut aw, first_byte),
+        copy_with_first_byte_timeout(&mut ar, &mut bw, None, split_hello),
+        copy_with_first_byte_timeout(&mut br, &mut aw, first_byte, false),
     );
     (up, down)
 }
 
+/// TLS 握手首段是否拆分、怎么拆：返回 (头段区间, 余下区间)。
+/// 仅当首字节为 0x16(TLS 握手)且长度超过拆分点才拆——SSH/HTTP/过短流一律不碰。
+fn hello_split_ranges(first_read: &[u8]) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if first_read.len() > config::HELLO_SPLIT_AT && first_read[0] == 0x16 {
+        Some((
+            0..config::HELLO_SPLIT_AT,
+            config::HELLO_SPLIT_AT..first_read.len(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// 转发一路：可选首字节看门狗（超时 = 判死），其后普通泵；收尾 shutdown 让对端见 EOF。
+/// a→b 方向可拆 TLS 握手首包：记录头单独成段 + 间隔 + 余下，DPI 拼不齐 SNI（见 config 常量）。
 async fn copy_with_first_byte_timeout<R, W>(
     r: &mut R,
     w: &mut W,
     first_byte: Option<std::time::Duration>,
+    split_tls_hello: bool,
 ) -> u64
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -371,6 +388,7 @@ where
 {
     let mut buf = vec![0u8; 32 * 1024];
     let mut total = 0u64;
+    let mut first = true;
     if let Some(dur) = first_byte {
         match tokio::time::timeout(dur, r.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
@@ -378,6 +396,7 @@ where
                     return total;
                 }
                 total += n as u64;
+                first = false;
             }
             _ => {
                 let _ = w.shutdown().await;
@@ -390,6 +409,25 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        let do_split = first && split_tls_hello && hello_split_ranges(&buf[..n]).is_some();
+        first = false;
+        if do_split {
+            let (head, rest) = hello_split_ranges(&buf[..n]).expect("上面刚判过 Some");
+            let (head_len, rest_len) = (head.len(), rest.len());
+            if w.write_all(&buf[head]).await.is_err() {
+                break;
+            }
+            total += head_len as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                config::HELLO_SPLIT_DELAY_MS,
+            ))
+            .await;
+            if w.write_all(&buf[rest]).await.is_err() {
+                break;
+            }
+            total += rest_len as u64;
+            continue;
+        }
         if w.write_all(&buf[..n]).await.is_err() {
             break;
         }
@@ -508,5 +546,59 @@ mod tests {
         up_task.await.unwrap();
         ctx.cancel();
         let _ = serve_task.await;
+    }
+
+    /// 分片门槛：TLS 握手(0x16)且够长才拆；SSH/HTTP/过短流不拆。
+    #[test]
+    fn hello_split_ranges_gate() {
+        let tls_long: Vec<u8> = std::iter::once(0x16u8)
+            .chain(std::iter::repeat(0u8).take(300))
+            .collect();
+        let (head, rest) = hello_split_ranges(&tls_long).expect("TLS 握手应拆");
+        assert_eq!(head, 0..config::HELLO_SPLIT_AT);
+        assert_eq!(rest, config::HELLO_SPLIT_AT..tls_long.len());
+
+        let tls_short = vec![0x16u8, 0x03, 0x01];
+        assert!(hello_split_ranges(&tls_short).is_none(), "过短流不拆");
+
+        let ssh: Vec<u8> = b"SSH-2.0-OpenSSH".to_vec();
+        assert!(hello_split_ranges(&ssh).is_none(), "非 TLS 流不拆");
+
+        assert!(hello_split_ranges(&[]).is_none(), "空流不拆");
+    }
+
+    /// 首包分片不丢字节：TLS 握手载荷经分片转发后必须完整到达对端。
+    #[tokio::test]
+    async fn tunnel_hello_split_relays_all_bytes() {
+        let (mut client, mut relay_in) = tokio::io::duplex(4096);
+        let (mut relay_out, mut upstream) = tokio::io::duplex(4096);
+        let payload: Vec<u8> = std::iter::once(0x16u8)
+            .chain((0u8..=255).cycle().take(400))
+            .collect();
+
+        let writer = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                client.write_all(&payload).await.unwrap();
+                drop(client); // EOF：让拷贝循环收尾
+            })
+        };
+        let copier = tokio::spawn(async move {
+            copy_with_first_byte_timeout(&mut relay_in, &mut relay_out, None, true).await
+        });
+
+        writer.await.unwrap();
+        let sent = copier.await.unwrap();
+        assert_eq!(sent, payload.len() as u64, "转发字节数应与载荷一致");
+
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            upstream.read_to_end(&mut received),
+        )
+        .await
+        .expect("读超时：分片转发未收尾")
+        .unwrap();
+        assert_eq!(received, payload, "分片不得丢改字节");
     }
 }

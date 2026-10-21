@@ -37,6 +37,13 @@ pub const KEEPALIVE_PROBE_SECS: u64 = 30;
 pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
+
+/// 隧道模式 TLS 握手首包分片：客户端→上游的第一段若为 TLS 握手记录(0x16 开头)，
+/// 拆成"记录头(5B) 单独成段 + 间隔 + 余下"两段发。DPI 的 SNI 检测需要完整 ClientHello，
+/// 拆段后重组窗口拼不齐 → 真名 SNI 免于 RST（byedpi/GoodbyeDPI 同款思路，纯用户态）；
+/// 边缘的完整 TCP 栈不受影响。仅作用于 CONNECT 隧道，且仅首段——SSH/HTTP 流(非 0x16)不碰。
+pub const HELLO_SPLIT_AT: usize = 5;
+pub const HELLO_SPLIT_DELAY_MS: u64 = 25;
 /// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;
