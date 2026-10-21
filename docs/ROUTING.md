@@ -37,12 +37,13 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 | `objects-origin.githubusercontent.com`（上传落点） | **DIRECT**（白名单） | ✅ DIRECT——且确实先于通配符短路，没被 `*.githubusercontent.com` 吞掉 |
 | `uploads.github.com` | **DIRECT**（白名单） | ✅ DIRECT |
 | `viewscreen.githubusercontent.com`（mermaid 渲染） | **DIRECT**（白名单） | ✅ DIRECT |
+| `api.mcp.github.com`（Copilot MCP 端点） | **DIRECT**（白名单） | ✅ DIRECT——先于 `github.com` 后缀匹配短路 |
 | 其余一切（example.com、githubstatus.com、fastly.com…） | DIRECT | ✅ |
 | 边界：notgithub.com / xgithub.com / evilgithub.com / github.com.evil.com | DIRECT（不误吞） | ✅ 四个边界主机全 DIRECT |
 
 > 注：池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连的保险链（2026-10-19 晚复核确认，不应视为路由偏差）。
 
-**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"。
+**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `*.github.com` 通配吞进 core 池，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
 
 ---
 
@@ -52,7 +53,7 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 
 | host | 方法+路径 | 路由 | 实测结果 |
 |---|---|---|---|
-| objects-origin / uploads / viewscreen | 任意 | **System**（PAC 已 DIRECT，双保险） | ✅ 强制打代理 = 纯 TCP 隧道走 system-dns：405 / 302 / 404（各自 vhost 的真实响应，`[CONNECT] ... via system-dns`） |
+| objects-origin / uploads / viewscreen / api.mcp | 任意 | **System**（PAC 已 DIRECT，双保险） | ✅ 强制打代理 = 纯 TCP 隧道走 system-dns：405 / 302 / 404（各自 vhost 的真实响应，`[CONNECT] ... via system-dns`） |
 | `codeload.github.com` | GET/HEAD 任意路径 | **Mirror** | ✅ 200（Range 206，`via cdn.gh-proxy.org`） |
 | `release-assets.githubusercontent.com` | GET/HEAD 任意路径 | **Mirror** | ✅ 路由正确：无效 URL（/x）11 家镜像全试后 502，**不回落直连**（设计如此） |
 | `objects.githubusercontent.com` | GET/HEAD 任意路径 | **Mirror** | ⚠️ 单测覆盖；e2e 同上形态（release-assets 域直连） |
