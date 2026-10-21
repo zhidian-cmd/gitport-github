@@ -544,6 +544,7 @@ async fn get_direct(
                     pool::cursor_note(name, host, &up.ip, true); // 数据到手 = 真成功, 置顶
                 }
                 upstream::store_h2(host, up.clone());
+                upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }
