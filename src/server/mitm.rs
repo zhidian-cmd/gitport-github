@@ -320,6 +320,7 @@ async fn stream_passthrough(
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
                 pool::cursor_note(name, host, &up.ip, true);
+                upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             }
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
@@ -454,6 +455,7 @@ async fn try_cached(
             if !name.is_empty() {
                 pool::cursor_note(name, host, &up.ip, true);
             }
+            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
             }
