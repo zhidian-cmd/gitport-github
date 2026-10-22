@@ -91,11 +91,7 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/settings/closeToTray",
             axum::routing::post(api_close_to_tray),
         )
-        .route("/api/settings/worker", axum::routing::post(api_worker_url))
-        .route(
-            "/api/settings/workerEnabled",
-            axum::routing::post(api_worker_enabled),
-        )
+        .route("/api/settings/workerMirrors", axum::routing::post(api_worker_mirrors))
         .route(
             "/api/settings/githubPAC",
             axum::routing::post(api_github_pac),
@@ -317,36 +313,16 @@ struct OnBody {
 }
 
 #[derive(Deserialize)]
-struct WorkerUrlBody {
-    url: String,
-    /// 可选开关：带 on = 只翻启停（地址原位保留）；不带 = 保存地址并启用。
-    #[serde(default)]
-    on: Option<bool>,
+struct WorkerMirrorsBody {
+    /// 完整镜像注册表清单（前端每次变更提交全量，后端按新旧差集对齐链）
+    mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 保存自建 CF Worker 镜像地址：填入即启用并注入镜像链；清空保存即移除。
-/// 带 on 的请求只翻启停开关（对齐 free_proxy：停用 ≠ 删除地址）。
-async fn api_worker_url(axum::Json(body): axum::Json<WorkerUrlBody>) -> Response {
-    match crate::settings::set_worker_url(&body.url) {
-        Ok(_) => {
-            if let Some(on) = body.on {
-                let _ = crate::settings::set_worker_enabled(on);
-            }
-            pool::apply_worker_mirror();
-            let enabled = crate::settings::worker_enabled();
-            write_json(&serde_json::json!({"ok": true, "enabled": enabled}))
-        }
-        Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
-    }
-}
-
-/// 自建 CF 镜像启停开关：停用即从镜像链移除（地址保留，随时原位恢复）。
-async fn api_worker_enabled(axum::Json(body): axum::Json<OnBody>) -> Response {
-    match crate::settings::set_worker_enabled(body.on) {
-        Ok(_) => {
-            pool::apply_worker_mirror();
-            write_json(&serde_json::json!({"ok": true}))
-        }
+/// 整表保存自定义镜像注册表：新增/启停/删除都由前端提交完整清单，
+/// 后端按新旧差集对齐镜像链（删除的条目自动从链中消失——彻底删除）。
+async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
+    match settings::set_worker_mirrors(body.mirrors) {
+        Ok(enabled) => write_json(&serde_json::json!({"ok": true, "enabled": enabled})),
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }
@@ -426,8 +402,7 @@ struct SettingsResp {
     close_to_tray: bool,
     #[serde(rename = "githubPAC")]
     github_pac: bool,
-    worker_url: String,
-    worker_enabled: bool,
+    worker_mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
 async fn api_settings() -> Response {
@@ -435,8 +410,7 @@ async fn api_settings() -> Response {
         autostart: settings::autostart_enabled(),
         close_to_tray: settings::close_to_tray(),
         github_pac: settings::github_pac(),
-        worker_url: settings::worker_url(),
-        worker_enabled: settings::worker_enabled(),
+        worker_mirrors: settings::worker_mirrors(),
     })
 }
 

@@ -48,6 +48,7 @@ async function copyText(t) {
 
 /* hash 路由 */
 function route() {
+  if ((location.hash || '#overview') === '#mirrors') refreshMirrors();
   const view = (location.hash || '#overview').slice(1);
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   const el = $('view-' + view);
@@ -146,12 +147,6 @@ async function refreshSettings() {
   $('swAutostart').checked = s.autostart;
   $('swTray').checked = s.closeToTray;
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
-  $('workerUrl').value = s.workerUrl || '';
-  S.workerOn = !!s.workerEnabled; // 停用/启用按钮的状态源
-  /* 停用/启用按钮: 文本与样式随状态翻转(地址原位保留) */
-  const wc = $('workerClear');
-  wc.textContent = S.workerOn ? '停用' : '启用';
-  wc.className = 'btn ' + (S.workerOn ? '' : 'primary');
 }
 async function setSetting(path, on) {
   const r = await postJSON(path, {on});
@@ -162,18 +157,79 @@ $('swAutostart').onchange = e => setSetting('/api/settings/autostart', e.target.
 $('swTray').onchange = e => setSetting('/api/settings/closeToTray', e.target.checked);
 $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked);
 
-/* ---------- Cloudflare 自建镜像: 保存=启用; 停用/启用=只翻开关, 地址原位保留 ---------- */
-async function saveWorker(url, on) {
-  const body = on === undefined ? {url} : {url, on};
-  const r = await postJSON('/api/settings/worker', body);
-  if (!r.ok) { alert('操作失败: ' + (r.error || '')); return; }
-  if (on === false) toast('Cloudflare 镜像已停用（地址保留）');
-  else if (on === true) toast('Cloudflare 镜像已启用');
-  else toast(url ? 'Cloudflare 镜像已启用' : 'Cloudflare 镜像已停用');
-  refreshSettings();
+/* ---------- 自定义镜像注册表 ----------
+   settings.json 永久记录全部网址（点垃圾桶才彻底消失）；
+   启动/关闭只增删 plans.json 镜像链成员，注册表不受影响。 */
+let MIRRORS = [];
+const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
+const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#39;'}[c]));
+
+async function refreshMirrors() {
+  let s;
+  try { s = await (await fetch('/api/settings')).json(); } catch (e) { return; }
+  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
+  renderMirrors();
 }
-$('workerSave').onclick = () => saveWorker($('workerUrl').value.trim());
-$('workerClear').onclick = () => saveWorker($('workerUrl').value.trim(), !s.workerEnabled);
+
+function renderMirrors() {
+  $('mirrorRows').innerHTML = MIRRORS.length
+    ? MIRRORS.map((m, i) => mirrorRow(m, i)).join('')
+    : '<div class="pool-empty">还没有自定义镜像——点下方「＋ 添加镜像」，填入地址后点「启动」</div>';
+}
+
+function mirrorRow(m, i) {
+  const toggle = m.on ? '关闭' : '启动';
+  const cls = m.on ? 'btn sm' : 'btn sm primary';
+  return '<div class="mirror-row">' +
+    '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
+    '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
+    '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +
+    '</div>';
+}
+
+async function commitMirrors() {
+  const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on}));
+  let r;
+  try { r = await postJSON('/api/settings/workerMirrors', {mirrors}); }
+  catch (e) { alert('保存失败: ' + e); return; }
+  if (!r.ok) { alert('保存失败: ' + (r.error || '')); }
+  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
+  renderMirrors();
+}
+
+$('mirrorAdd').onclick = () => {
+  MIRRORS.push({url: '', on: false});
+  renderMirrors();
+  const inputs = $('mirrorRows').querySelectorAll('input[data-idx]');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+};
+
+$('mirrorRows').addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const idx = +btn.dataset.idx;
+  const row = MIRRORS[idx];
+  if (!row) return;
+  if (btn.dataset.act === 'toggle') {
+    const input = $('mirrorRows').querySelector('input[data-idx="' + idx + '"]');
+    const url = (input ? input.value : row.url).trim();
+    if (!url) { toast('请先填入镜像地址'); return; }
+    row.url = url;
+    row.on = !row.on;
+    await commitMirrors();
+  } else if (btn.dataset.act === 'del') {
+    MIRRORS.splice(idx, 1);
+    await commitMirrors();
+    toast('已彻底删除');
+  }
+});
+
+$('mirrorRows').addEventListener('input', e => {
+  if (e.target.matches('input[data-idx]')) {
+    const idx = +e.target.dataset.idx;
+    if (MIRRORS[idx]) MIRRORS[idx].url = e.target.value;
+  }
+});
 
 /* ---------- 镜像链校准 ---------- */
 // 半自动: 点击 -> 后端按内置模板对每条镜像链串行实测 TTFB -> 按成绩重排
@@ -208,7 +264,7 @@ $('calBigBtn').onclick = () => runCal('throughput', $('calBigBtn'), '大文件�
 $('calImgBtn').onclick = () => runCal('ttfb', $('calImgBtn'), '图片链');
 
 /* ---------- 启动 ---------- */
-route(); refreshStatus(); refreshLogs(); refreshSettings();
+route(); refreshStatus(); refreshLogs(); refreshSettings(); refreshMirrors();
 // 页面在后台(挂托盘/切走)时完全停轮询 —— 后台零请求
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 2000);
 setInterval(() => { if (!document.hidden) refreshLogs(); }, 2000);
