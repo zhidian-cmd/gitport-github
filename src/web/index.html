@@ -160,6 +160,18 @@
             <button class="btn primary" id="calImgBtn">校准图片链（响应头）</button>
           </div>
         </div>
+
+        <div class="feature-card">
+          <div class="feature-info">
+            <h2>Cloudflare 自建镜像</h2>
+            <p class="hint">填入你的 Worker 反代地址（https:// 开头），保存后注入全部镜像链首位并参与测速排序；开关关闭即从链中移除（地址保留，随时原位恢复）。若校准测速后它沉底，检查 Cloudflare 的 Bot Fight Mode 是否放行了非浏览器 UA。</p>
+            <input type="text" id="workerUrl" class="text-input" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">
+          </div>
+          <div class="cf-actions">
+            <label class="switch"><input type="checkbox" id="swWorker"><span class="track"></span></label>
+            <button class="btn sm primary" id="workerSave">保存</button>
+          </div>
+        </div>
       </section>
 
       <!-- 运行日志 -->

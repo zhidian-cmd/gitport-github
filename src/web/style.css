@@ -153,6 +153,13 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* 校准双按钮：等宽、上下对齐、同为绿色 */
 .cal-actions{display:flex;flex-direction:column;gap:8px;min-width:236px}
 .cal-actions .btn{width:100%}
+/* 自建镜像：地址输入框 + 右侧开关/保存 */
+.text-input{margin-top:9px;width:100%;max-width:460px;background:var(--panel-2);border:1px solid var(--line-strong);
+            border-radius:8px;padding:8px 11px;font:12.5px var(--mono);color:var(--txt);outline:none;
+            transition:border-color .15s}
+.text-input:focus{border-color:var(--green-line)}
+.text-input::placeholder{color:var(--faint)}
+.cf-actions{display:flex;flex-direction:column;align-items:center;gap:12px;flex-shrink:0}
 
 .set-row{display:flex;align-items:center;gap:20px;padding:6px 0}
 .set-row + .set-row{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}
