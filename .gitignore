@@ -13,6 +13,9 @@
 /dist/*.log
 /dist/*.txt
 
+# ---- 测试进程在仓库根写出的运行态配置（serial 测试副作用）----
+/settings.json
+
 # ---- 验证/诊断日志（防误提交）----
 *.log
 probe*_out.txt
