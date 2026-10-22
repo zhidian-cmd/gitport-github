@@ -160,6 +160,12 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .text-input:focus{border-color:var(--green-line)}
 .text-input::placeholder{color:var(--faint)}
 .cf-actions{display:flex;flex-direction:column;align-items:center;gap:12px;flex-shrink:0}
+/* Worker 代码块：mono、可滚动、深一层底 */
+.code{margin-top:9px;background:var(--panel-2);border:1px solid var(--line-strong);border-radius:9px;
+      padding:12px 14px;font:12px var(--mono);color:var(--mid);line-height:1.7;white-space:pre-wrap;
+      word-break:break-all;max-height:260px;overflow:auto}
+.add-row{margin-top:10px}
+.add-row .text-input{flex:1;min-width:220px;max-width:none;margin-top:0}
 
 .set-row{display:flex;align-items:center;gap:20px;padding:6px 0}
 .set-row + .set-row{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}

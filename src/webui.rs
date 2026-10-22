@@ -319,19 +319,22 @@ struct OnBody {
 #[derive(Deserialize)]
 struct WorkerUrlBody {
     url: String,
+    /// 可选开关：带 on = 只翻启停（地址原位保留）；不带 = 保存地址并启用。
+    #[serde(default)]
+    on: Option<bool>,
 }
 
 /// 保存自建 CF Worker 镜像地址：填入即启用并注入镜像链；清空保存即移除。
+/// 带 on 的请求只翻启停开关（对齐 free_proxy：停用 ≠ 删除地址）。
 async fn api_worker_url(axum::Json(body): axum::Json<WorkerUrlBody>) -> Response {
     match crate::settings::set_worker_url(&body.url) {
         Ok(_) => {
+            if let Some(on) = body.on {
+                let _ = crate::settings::set_worker_enabled(on);
+            }
             pool::apply_worker_mirror();
-            let applied = !crate::settings::worker_url().is_empty();
-            write_json(&serde_json::json!({
-                "ok": true,
-                "applied": applied,
-                "message": if applied { "已注入全部镜像链首位，重启或测速后按实测排序" } else { "已从镜像链移除" }
-            }))
+            let enabled = crate::settings::worker_enabled();
+            write_json(&serde_json::json!({"ok": true, "enabled": enabled}))
         }
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
