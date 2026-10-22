@@ -261,7 +261,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
-    sync_worker_mirror(""); // 自建 CF 镜像：启动即注入（幂等，有变更才落盘）
+    sync_custom_mirrors(&[]); // 自定义镜像注册表对齐：启用中的自建节点确保在链中（幂等）
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
     write_plans_file(&path, &snap, &chains);
@@ -480,60 +480,56 @@ pub async fn serial_dial_skip(
 }
 
 
-/// 单链注入：无则插首位。返回是否有变更。
-fn chain_inject_one(chain: &mut Vec<String>, url: &str) -> bool {
-    if chain.iter().any(|m| m == url) {
-        return false;
+/// 纯逻辑：按清单对齐单张镜像表（幂等，增量检测）。
+/// enabled = 启用中的地址（按清单顺序置前）；disabled = 移除的地址（停用/已删）；
+/// 其余成员相对顺序不变。自建节点优先于公共镜像。返回是否有变更。
+pub fn align_custom_mirrors(
+    mirrors: &mut HashMap<String, Vec<String>>,
+    enabled: &[String],
+    disabled: &[String],
+) -> bool {
+    let mut changed = false;
+    for chain in mirrors.values_mut() {
+        let rest: Vec<String> = chain
+            .iter()
+            .filter(|m| !enabled.contains(m) && !disabled.contains(m))
+            .cloned()
+            .collect();
+        let mut desired: Vec<String> = enabled.to_vec();
+        desired.extend(rest);
+        if *chain != desired {
+            *chain = desired;
+            changed = true;
+        }
     }
-    chain.insert(0, url.to_string());
-    true
+    changed
 }
 
-/// 单链移除：有则删。返回是否有变更。
-fn chain_remove_one(chain: &mut Vec<String>, url: &str) -> bool {
-    let before = chain.len();
-    chain.retain(|m| m != url);
-    before != chain.len()
-}
-
-/// 自建 CF 镜像同步：按设置把 Worker 地址注入/移除全部镜像链（幂等）。
-/// prev_url：换地址时把旧地址一并移除（防新旧并存）。有变更才落盘。
-/// 这是用户自建节点的专属通道：注入首位、参与测速排序，停用即从链中消失。
-pub fn sync_worker_mirror(prev_url: &str) {
-    let url = crate::settings::worker_url();
-    let on = crate::settings::worker_enabled();
-    let inject = on && url.starts_with("https://") && !url.contains(' ');
+/// 全局同步：按 settings 注册表把自定义镜像对齐到全部镜像链（幂等，有变更才落盘）。
+/// removed = 本次从注册表删除的地址（随停用一并从链中消失）。
+pub fn sync_custom_mirrors(removed: &[String]) {
+    let registry = crate::settings::worker_mirrors();
+    let enabled: Vec<String> = registry
+        .iter()
+        .filter(|w| w.on)
+        .map(|w| w.url.clone())
+        .collect();
+    let mut disabled: Vec<String> = registry
+        .iter()
+        .filter(|w| !w.on)
+        .map(|w| w.url.clone())
+        .collect();
+    disabled.extend(removed.iter().cloned());
     let mut g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let tab = match g.as_mut() {
         Some(t) => t,
         None => return,
     };
-    let mut changed = false;
-    for chain in tab.mirrors.values_mut() {
-        let had_new = !url.is_empty() && chain.iter().any(|m| m == &url);
-        let had_prev =
-            !prev_url.is_empty() && prev_url != url && chain.iter().any(|m| m == prev_url);
-        if inject {
-            changed |= chain_inject_one(chain, &url);
-            if had_prev {
-                changed |= chain_remove_one(chain, prev_url);
-            }
-        } else if had_new || had_prev {
-            let u = url.clone();
-            changed |= chain_remove_one(chain, &u);
-            if had_prev {
-                changed |= chain_remove_one(chain, prev_url);
-            }
-        }
-    }
+    let changed = align_custom_mirrors(&mut tab.mirrors, &enabled, &disabled);
     drop(g);
     if changed {
         write_plans_file(&plans_path(), &plans_snapshot(), &mirror_chains_snapshot());
     }
-}
-
-pub fn apply_worker_mirror() {
-    sync_worker_mirror("");
 }
 
 pub fn mirror_chain(host: &str) -> Vec<String> {
@@ -918,28 +914,42 @@ mod tests {
         );
     }
 
-    /// 自建镜像链注入/移除：全部链首位生效、幂等、移除即全链消失。
     #[test]
-    fn worker_chain_inject_remove() {
+    fn custom_mirrors_align() {
+        // 清单对齐：启用的置前（按清单序），停用的移除，其余成员相对顺序不变
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
-        m.insert("github.com".into(), vec!["https://a.example".into()]);
-        m.insert("raw.githubusercontent.com".into(), vec!["https://c.example".into()]);
-        // 注入：全部链首位
-        for c in m.values_mut() {
-            assert!(chain_inject_one(c, "https://my.worker"));
-        }
-        for (h, c) in &m {
-            assert_eq!(c[0], "https://my.worker", "{h} 首位应是自建镜像");
-        }
-        // 幂等：重复注入无变更
-        for c in m.values_mut() {
-            assert!(!chain_inject_one(c, "https://my.worker"));
-        }
-        // 移除：全链消失
-        for c in m.values_mut() {
-            assert!(chain_remove_one(c, "https://my.worker"));
-        }
-        assert!(!m.values().any(|c| c.iter().any(|x| x == "https://my.worker")));
+        m.insert(
+            "github.com".into(),
+            vec![
+                "https://pub1".into(),
+                "https://customA".into(),
+                "https://pub2".into(),
+            ],
+        );
+        m.insert("raw.githubusercontent.com".into(), vec!["https://pub1".into()]);
+        let enabled = vec!["https://customB".to_string(), "https://customA".to_string()];
+        let disabled = vec!["https://customC".to_string()];
+        assert!(align_custom_mirrors(&mut m, &enabled, &disabled));
+        // github.com：customB、customA 按清单序置前，pub1/pub2 保持相对顺序
+        assert_eq!(
+            m["github.com"],
+            vec![
+                "https://customB".to_string(),
+                "https://customA".to_string(),
+                "https://pub1".to_string(),
+                "https://pub2".to_string(),
+            ]
+        );
+        // raw：customB/A 注入，customC 本就不在链中无影响
+        assert_eq!(m["raw.githubusercontent.com"][0], "https://customB");
+        // 幂等：再跑一次无变更
+        assert!(!align_custom_mirrors(&mut m, &enabled, &disabled));
+        // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失
+        let enabled2 = vec!["https://customA".to_string()];
+        let disabled2 = vec!["https://customB".to_string(), "https://customC".to_string()];
+        assert!(align_custom_mirrors(&mut m, &enabled2, &disabled2));
+        assert!(!m["github.com"].iter().any(|x| x == "https://customB"));
+        assert_eq!(m["github.com"][0], "https://customA");
     }
 
     #[test]
@@ -947,12 +957,15 @@ mod tests {
         // 换地址：新地址注入的同时旧地址必须移除（防新旧并存）
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         m.insert("github.com".into(), vec!["https://old.worker".into(), "https://a.example".into()]);
-        let gh = m.get_mut("github.com").unwrap();
-        assert!(chain_inject_one(gh, "https://new.worker"));
-        assert!(chain_remove_one(gh, "https://old.worker"));
+        align_custom_mirrors(
+            &mut m,
+            &["https://new.worker".to_string()],
+            &["https://old.worker".to_string()],
+        );
         let c = &m["github.com"];
         assert_eq!(c[0], "https://new.worker");
         assert!(!c.iter().any(|x| x.contains("old.worker")));
+        assert!(c.contains(&"https://a.example".to_string()));
     }
 
     #[test]

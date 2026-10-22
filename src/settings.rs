@@ -18,9 +18,26 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
-    // 自建 Cloudflare Worker 镜像：地址 + 启用开关（停用 ≠ 删除地址，原位恢复）。
-    worker_url: Mutex<String>,
-    worker_enabled: std::sync::atomic::AtomicBool,
+    // 自定义镜像注册表：settings.json 永久记录（删除 = 彻底消失）；
+    // 启停状态只增删 plans.json 镜像链成员，不动注册表。
+    worker_mirrors: Mutex<Vec<WorkerMirror>>,
+}
+
+/// 一条自定义镜像：url = Worker 反代地址（拼接格式），on = 是否已启用进镜像链。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkerMirror {
+    pub url: String,
+    pub on: bool,
+}
+
+impl Default for WorkerMirror {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            on: false,
+        }
+    }
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -34,8 +51,7 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
-        worker_url: Mutex::new(String::new()),
-        worker_enabled: std::sync::atomic::AtomicBool::new(false),
+        worker_mirrors: Mutex::new(Vec::new()),
     })
 }
 
@@ -300,10 +316,9 @@ struct SettingsFile {
     proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
+    /// 自定义镜像注册表：settings.json 永久记录；启停只增删 plans.json 链成员。
     #[serde(deserialize_with = "lenient")]
-    worker_url: String, // 自建 Cloudflare Worker 镜像地址（空 = 未配置）
-    #[serde(deserialize_with = "lenient")]
-    worker_enabled: bool,
+    worker_mirrors: Vec<WorkerMirror>,
 }
 
 fn settings_path() -> PathBuf {
@@ -343,10 +358,7 @@ fn apply(v: SettingsFile) {
             .github_pac
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
-    *state().worker_url.lock().unwrap() = v.worker_url;
-    state()
-        .worker_enabled
-        .store(v.worker_enabled, std::sync::atomic::Ordering::Relaxed);
+    *state().worker_mirrors.lock().unwrap() = v.worker_mirrors;
 }
 
 fn save() -> Result<(), String> {
@@ -358,8 +370,7 @@ fn save() -> Result<(), String> {
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
-        worker_url: s.worker_url.lock().unwrap().clone(),
-        worker_enabled: s.worker_enabled.load(std::sync::atomic::Ordering::Relaxed),
+        worker_mirrors: s.worker_mirrors.lock().unwrap().clone(),
     };
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     let p = settings_path();
@@ -444,35 +455,40 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 自建 Cloudflare Worker 镜像地址（空 = 未配置）。停用只是开关翻转，地址保留。
-pub fn worker_url() -> String {
-    state().worker_url.lock().unwrap().clone()
+/// 自定义镜像注册表（settings.json 永久记录；启停只增删 plans.json 链成员）。
+pub fn worker_mirrors() -> Vec<WorkerMirror> {
+    state().worker_mirrors.lock().unwrap().clone()
 }
 
-pub fn worker_enabled() -> bool {
-    state().worker_enabled.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// 保存自建镜像地址：填入即启用，清空即停用（对齐 free_proxy 的语义）。
-/// 规则：https:// 开头、不含空格、去掉尾部斜杠。
-pub fn set_worker_url(url: &str) -> Result<(), String> {
-    let u = url.trim().trim_end_matches('/').to_string();
-    let enabled = !u.is_empty();
-    if !u.is_empty() && (!u.starts_with("https://") || u.contains(' ')) {
-        return Err("镜像地址须以 https:// 开头且不含空格".into());
+/// 整表保存自定义镜像注册表：校验（https:// 开头、无空格、去尾斜杠、去重去空）、
+/// 与旧表做差集（新增/停用/删除），交由镜像链对齐后落盘。返回启用中的地址列表。
+/// 删除条目由"新旧差集"自动从链中移除——删除即彻底消失。
+pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String> {
+    let mut norm: Vec<WorkerMirror> = Vec::new();
+    for w in list {
+        let u = w.url.trim().trim_end_matches('/').to_string();
+        if u.is_empty() {
+            continue; // 未填完的空行直接忽略
+        }
+        if !u.starts_with("https://") || u.contains(' ') {
+            return Err(format!("镜像地址须以 https:// 开头且不含空格: {u}"));
+        }
+        if norm.iter().any(|x| x.url == u) {
+            continue; // 去重
+        }
+        norm.push(WorkerMirror { url: u, on: w.on });
     }
-    *state().worker_url.lock().unwrap() = u;
-    state()
-        .worker_enabled
-        .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    save()
-}
-
-pub fn set_worker_enabled(on: bool) -> Result<(), String> {
-    state()
-        .worker_enabled
-        .store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    let old = worker_mirrors();
+    let removed: Vec<String> = old
+        .iter()
+        .map(|w| w.url.clone())
+        .filter(|u| !norm.iter().any(|n| n.url == *u))
+        .collect();
+    let enabled: Vec<String> = norm.iter().filter(|w| w.on).map(|w| w.url.clone()).collect();
+    *state().worker_mirrors.lock().unwrap() = norm;
+    save()?;
+    crate::pool::sync_custom_mirrors(&removed);
+    Ok(enabled)
 }
 
 
@@ -565,8 +581,10 @@ mod tests {
                 "api/all".to_string(),
                 "140.82.114.6".to_string(),
             )]),
-            worker_url: "https://my.worker".to_string(),
-            worker_enabled: true,
+            worker_mirrors: vec![WorkerMirror {
+                url: "https://my.worker".to_string(),
+                on: true,
+            }],
         };
         let json = serde_json::to_string_pretty(&f).unwrap();
         let expect = r#"  "lastIp": {
@@ -598,17 +616,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_fields_roundtrip() {
-        let v = parse(r#"{"workerUrl":"https://my.worker","workerEnabled":true}"#);
-        assert_eq!(v.worker_url, "https://my.worker");
-        assert!(v.worker_enabled);
-        // 缺键 = 未配置（默认值）
+    fn worker_mirrors_roundtrip() {
+        // 正常清单：url + 启停状态原样回读
+        let v = parse(
+            r#"{"workerMirrors":[{"url":"https://my.worker","on":true},{"url":"https://b.worker","on":false}]}"#,
+        );
+        assert_eq!(v.worker_mirrors.len(), 2);
+        assert_eq!(v.worker_mirrors[0].url, "https://my.worker");
+        assert!(v.worker_mirrors[0].on);
+        assert!(!v.worker_mirrors[1].on);
+        // 缺键 = 空注册表
         let v2 = parse("{}");
-        assert_eq!(v2.worker_url, "");
-        assert!(!v2.worker_enabled);
-        // 值写坏只回退该字段
-        let v3 = parse(r#"{"workerUrl":123,"workerEnabled":"oops"}"#);
-        assert_eq!(v3.worker_url, "");
-        assert!(!v3.worker_enabled);
+        assert!(v2.worker_mirrors.is_empty());
+        // 整段写坏 = 回空表（不连坐其他字段）
+        let v3 = parse(r#"{"workerMirrors":"oops","mitm":true}"#);
+        assert!(v3.worker_mirrors.is_empty());
+        assert!(v3.mitm);
     }
 }

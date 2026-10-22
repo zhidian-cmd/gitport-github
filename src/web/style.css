@@ -153,19 +153,26 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* 校准双按钮：等宽、上下对齐、同为绿色 */
 .cal-actions{display:flex;flex-direction:column;gap:8px;min-width:236px}
 .cal-actions .btn{width:100%}
-/* 自建镜像：地址输入框 + 右侧开关/保存 */
+/* 自建镜像：地址输入框 + 行操作 */
 .text-input{margin-top:9px;width:100%;max-width:460px;background:var(--panel-2);border:1px solid var(--line-strong);
             border-radius:8px;padding:8px 11px;font:12.5px var(--mono);color:var(--txt);outline:none;
             transition:border-color .15s}
 .text-input:focus{border-color:var(--green-line)}
 .text-input::placeholder{color:var(--faint)}
-.cf-actions{display:flex;flex-direction:column;align-items:center;gap:12px;flex-shrink:0}
 /* Worker 代码块：mono、可滚动、深一层底 */
 .code{margin-top:9px;background:var(--panel-2);border:1px solid var(--line-strong);border-radius:9px;
       padding:12px 14px;font:12px var(--mono);color:var(--mid);line-height:1.7;white-space:pre-wrap;
       word-break:break-all;max-height:260px;overflow:auto}
 .add-row{margin-top:10px}
 .add-row .text-input{flex:1;min-width:220px;max-width:none;margin-top:0}
+/* 自定义镜像行：地址 + 启停 + 垃圾桶 */
+.mirror-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+.mirror-row .text-input{margin-top:0;flex:1;max-width:none}
+.icon-btn{border:1px solid var(--line-strong);background:var(--panel-2);border-radius:8px;width:34px;height:34px;
+          display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--sub);
+          transition:color .15s,border-color .15s;flex-shrink:0}
+.icon-btn:hover{color:var(--red);border-color:var(--red-line)}
+.icon-btn svg{display:block}
 
 .set-row{display:flex;align-items:center;gap:20px;padding:6px 0}
 .set-row + .set-row{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}
