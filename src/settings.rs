@@ -18,6 +18,9 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
+    // 自建 Cloudflare Worker 镜像：地址 + 启用开关（停用 ≠ 删除地址，原位恢复）。
+    worker_url: Mutex<String>,
+    worker_enabled: std::sync::atomic::AtomicBool,
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -31,6 +34,8 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
+        worker_url: Mutex::new(String::new()),
+        worker_enabled: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -295,6 +300,10 @@ struct SettingsFile {
     proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
+    #[serde(deserialize_with = "lenient")]
+    worker_url: String, // 自建 Cloudflare Worker 镜像地址（空 = 未配置）
+    #[serde(deserialize_with = "lenient")]
+    worker_enabled: bool,
 }
 
 fn settings_path() -> PathBuf {
@@ -334,6 +343,10 @@ fn apply(v: SettingsFile) {
             .github_pac
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
+    *state().worker_url.lock().unwrap() = v.worker_url;
+    state()
+        .worker_enabled
+        .store(v.worker_enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn save() -> Result<(), String> {
@@ -345,6 +358,8 @@ fn save() -> Result<(), String> {
         github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
+        worker_url: s.worker_url.lock().unwrap().clone(),
+        worker_enabled: s.worker_enabled.load(std::sync::atomic::Ordering::Relaxed),
     };
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     let p = settings_path();
@@ -427,6 +442,37 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
         let _ = key.delete_value(RUN_VALUE);
     }
     Ok(())
+}
+
+/// 自建 Cloudflare Worker 镜像地址（空 = 未配置）。停用只是开关翻转，地址保留。
+pub fn worker_url() -> String {
+    state().worker_url.lock().unwrap().clone()
+}
+
+pub fn worker_enabled() -> bool {
+    state().worker_enabled.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 保存自建镜像地址：填入即启用，清空即停用（对齐 free_proxy 的语义）。
+/// 规则：https:// 开头、不含空格、去掉尾部斜杠。
+pub fn set_worker_url(url: &str) -> Result<(), String> {
+    let u = url.trim().trim_end_matches('/').to_string();
+    let enabled = !u.is_empty();
+    if !u.is_empty() && (!u.starts_with("https://") || u.contains(' ')) {
+        return Err("镜像地址须以 https:// 开头且不含空格".into());
+    }
+    *state().worker_url.lock().unwrap() = u;
+    state()
+        .worker_enabled
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    save()
+}
+
+pub fn set_worker_enabled(on: bool) -> Result<(), String> {
+    state()
+        .worker_enabled
+        .store(on, std::sync::atomic::Ordering::Relaxed);
+    save()
 }
 
 
@@ -519,6 +565,8 @@ mod tests {
                 "api/all".to_string(),
                 "140.82.114.6".to_string(),
             )]),
+            worker_url: "https://my.worker".to_string(),
+            worker_enabled: true,
         };
         let json = serde_json::to_string_pretty(&f).unwrap();
         let expect = r#"  "lastIp": {
@@ -547,5 +595,20 @@ mod tests {
         assert_eq!(v.last_ip.marks()[1], ("api/all".to_string(), "1.1.1.1".to_string()));
         // 非 JSON 垃圾才整体回默认
         assert_eq!(parse("not json").close_to_tray, false);
+    }
+
+    #[test]
+    fn worker_fields_roundtrip() {
+        let v = parse(r#"{"workerUrl":"https://my.worker","workerEnabled":true}"#);
+        assert_eq!(v.worker_url, "https://my.worker");
+        assert!(v.worker_enabled);
+        // 缺键 = 未配置（默认值）
+        let v2 = parse("{}");
+        assert_eq!(v2.worker_url, "");
+        assert!(!v2.worker_enabled);
+        // 值写坏只回退该字段
+        let v3 = parse(r#"{"workerUrl":123,"workerEnabled":"oops"}"#);
+        assert_eq!(v3.worker_url, "");
+        assert!(!v3.worker_enabled);
     }
 }

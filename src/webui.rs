@@ -91,6 +91,11 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/settings/closeToTray",
             axum::routing::post(api_close_to_tray),
         )
+        .route("/api/settings/worker", axum::routing::post(api_worker_url))
+        .route(
+            "/api/settings/workerEnabled",
+            axum::routing::post(api_worker_enabled),
+        )
         .route(
             "/api/settings/githubPAC",
             axum::routing::post(api_github_pac),
@@ -311,6 +316,38 @@ struct OnBody {
     on: bool,
 }
 
+#[derive(Deserialize)]
+struct WorkerUrlBody {
+    url: String,
+}
+
+/// 保存自建 CF Worker 镜像地址：填入即启用并注入镜像链；清空保存即移除。
+async fn api_worker_url(axum::Json(body): axum::Json<WorkerUrlBody>) -> Response {
+    match crate::settings::set_worker_url(&body.url) {
+        Ok(_) => {
+            pool::apply_worker_mirror();
+            let applied = !crate::settings::worker_url().is_empty();
+            write_json(&serde_json::json!({
+                "ok": true,
+                "applied": applied,
+                "message": if applied { "已注入全部镜像链首位，重启或测速后按实测排序" } else { "已从镜像链移除" }
+            }))
+        }
+        Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
+    }
+}
+
+/// 自建 CF 镜像启停开关：停用即从镜像链移除（地址保留，随时原位恢复）。
+async fn api_worker_enabled(axum::Json(body): axum::Json<OnBody>) -> Response {
+    match crate::settings::set_worker_enabled(body.on) {
+        Ok(_) => {
+            pool::apply_worker_mirror();
+            write_json(&serde_json::json!({"ok": true}))
+        }
+        Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +423,8 @@ struct SettingsResp {
     close_to_tray: bool,
     #[serde(rename = "githubPAC")]
     github_pac: bool,
+    worker_url: String,
+    worker_enabled: bool,
 }
 
 async fn api_settings() -> Response {
@@ -393,6 +432,8 @@ async fn api_settings() -> Response {
         autostart: settings::autostart_enabled(),
         close_to_tray: settings::close_to_tray(),
         github_pac: settings::github_pac(),
+        worker_url: settings::worker_url(),
+        worker_enabled: settings::worker_enabled(),
     })
 }
 

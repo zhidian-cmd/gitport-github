@@ -146,6 +146,8 @@ async function refreshSettings() {
   $('swAutostart').checked = s.autostart;
   $('swTray').checked = s.closeToTray;
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
+  $('workerUrl').value = s.workerUrl || '';
+  $('swWorker').checked = !!s.workerEnabled;
 }
 async function setSetting(path, on) {
   const r = await postJSON(path, {on});
@@ -155,6 +157,18 @@ async function setSetting(path, on) {
 $('swAutostart').onchange = e => setSetting('/api/settings/autostart', e.target.checked);
 $('swTray').onchange = e => setSetting('/api/settings/closeToTray', e.target.checked);
 $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked);
+
+/* ---------- Cloudflare 自建镜像 ---------- */
+$('swWorker').onchange = e => setSetting('/api/settings/workerEnabled', e.target.checked);
+$('workerSave').onclick = async () => {
+  const url = $('workerUrl').value.trim();
+  let r;
+  try { r = await postJSON('/api/settings/worker', {url}); }
+  catch (e) { alert('保存失败: ' + e); return; }
+  if (!r.ok) { alert('保存失败: ' + (r.error || '')); return; }
+  toast(r.message || (url ? '已注入镜像链' : '已从镜像链移除'));
+  refreshSettings();
+};
 
 /* ---------- 镜像链校准 ---------- */
 // 半自动: 点击 -> 后端按内置模板对每条镜像链串行实测 TTFB -> 按成绩重排

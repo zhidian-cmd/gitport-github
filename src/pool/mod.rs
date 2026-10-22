@@ -261,6 +261,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
+    sync_worker_mirror(""); // 自建 CF 镜像：启动即注入（幂等，有变更才落盘）
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
     write_plans_file(&path, &snap, &chains);
@@ -478,6 +479,62 @@ pub async fn serial_dial_skip(
     Err(last_err.unwrap_or_else(|| "串发全灭".to_string()))
 }
 
+
+/// 单链注入：无则插首位。返回是否有变更。
+fn chain_inject_one(chain: &mut Vec<String>, url: &str) -> bool {
+    if chain.iter().any(|m| m == url) {
+        return false;
+    }
+    chain.insert(0, url.to_string());
+    true
+}
+
+/// 单链移除：有则删。返回是否有变更。
+fn chain_remove_one(chain: &mut Vec<String>, url: &str) -> bool {
+    let before = chain.len();
+    chain.retain(|m| m != url);
+    before != chain.len()
+}
+
+/// 自建 CF 镜像同步：按设置把 Worker 地址注入/移除全部镜像链（幂等）。
+/// prev_url：换地址时把旧地址一并移除（防新旧并存）。有变更才落盘。
+/// 这是用户自建节点的专属通道：注入首位、参与测速排序，停用即从链中消失。
+pub fn sync_worker_mirror(prev_url: &str) {
+    let url = crate::settings::worker_url();
+    let on = crate::settings::worker_enabled();
+    let inject = on && url.starts_with("https://") && !url.contains(' ');
+    let mut g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let tab = match g.as_mut() {
+        Some(t) => t,
+        None => return,
+    };
+    let mut changed = false;
+    for chain in tab.mirrors.values_mut() {
+        let had_new = !url.is_empty() && chain.iter().any(|m| m == &url);
+        let had_prev =
+            !prev_url.is_empty() && prev_url != url && chain.iter().any(|m| m == prev_url);
+        if inject {
+            changed |= chain_inject_one(chain, &url);
+            if had_prev {
+                changed |= chain_remove_one(chain, prev_url);
+            }
+        } else if had_new || had_prev {
+            let u = url.clone();
+            changed |= chain_remove_one(chain, &u);
+            if had_prev {
+                changed |= chain_remove_one(chain, prev_url);
+            }
+        }
+    }
+    drop(g);
+    if changed {
+        write_plans_file(&plans_path(), &plans_snapshot(), &mirror_chains_snapshot());
+    }
+}
+
+pub fn apply_worker_mirror() {
+    sync_worker_mirror("");
+}
 
 pub fn mirror_chain(host: &str) -> Vec<String> {
     let g = SERIAL.lock().unwrap();
@@ -859,6 +916,43 @@ mod tests {
             Some(target.as_str()),
             "游标应驻留 target"
         );
+    }
+
+    /// 自建镜像链注入/移除：全部链首位生效、幂等、移除即全链消失。
+    #[test]
+    fn worker_chain_inject_remove() {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        m.insert("github.com".into(), vec!["https://a.example".into()]);
+        m.insert("raw.githubusercontent.com".into(), vec!["https://c.example".into()]);
+        // 注入：全部链首位
+        for c in m.values_mut() {
+            assert!(chain_inject_one(c, "https://my.worker"));
+        }
+        for (h, c) in &m {
+            assert_eq!(c[0], "https://my.worker", "{h} 首位应是自建镜像");
+        }
+        // 幂等：重复注入无变更
+        for c in m.values_mut() {
+            assert!(!chain_inject_one(c, "https://my.worker"));
+        }
+        // 移除：全链消失
+        for c in m.values_mut() {
+            assert!(chain_remove_one(c, "https://my.worker"));
+        }
+        assert!(!m.values().any(|c| c.iter().any(|x| x == "https://my.worker")));
+    }
+
+    #[test]
+    fn worker_chain_replace_old_url() {
+        // 换地址：新地址注入的同时旧地址必须移除（防新旧并存）
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        m.insert("github.com".into(), vec!["https://old.worker".into(), "https://a.example".into()]);
+        let gh = m.get_mut("github.com").unwrap();
+        assert!(chain_inject_one(gh, "https://new.worker"));
+        assert!(chain_remove_one(gh, "https://old.worker"));
+        let c = &m["github.com"];
+        assert_eq!(c[0], "https://new.worker");
+        assert!(!c.iter().any(|x| x.contains("old.worker")));
     }
 
     #[test]
