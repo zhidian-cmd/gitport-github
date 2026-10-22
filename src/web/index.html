@@ -170,7 +170,7 @@
     const url = new URL(request.url);
     let rest = decodeURIComponent(url.pathname.slice(1)) + url.search;
     if (rest.startsWith("https:/") && !rest.startsWith("https://")) rest = "https:/" + rest;
-    if (!/^https:\/\/([\w.-]+\.)*(github\.com|githubusercontent\.com|githubassets\.com|github\.io|githubapp\.com)(\/|$)/.test(rest)) {
+    if (!/^https:\/\/([\w.-]+\.)*(github\.com|githubusercontent\.com|githubassets\.com|github\.io|githubapp\.com|build\.nvidia\.com|google\.com|google\.com\.hk|googleapis\.com|googleapis\.cn|gstatic\.com|gstatic\.cn|googleusercontent\.com|ggpht\.com)(\/|$)/.test(rest)) {
       return new Response("usage: /https://github.com/...", { status: 400 });
     }
     const headers = new Headers(request.headers);
