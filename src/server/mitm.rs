@@ -8,7 +8,8 @@ use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioExecutor;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,6 +97,144 @@ pub async fn handle_connect_mitm(
 }
 /// 本次请求实际命中的上游 IP（响应头 X-GitPort-Upstream 回填）；单写者、收尾时读一次。
 type UpstreamInfo = Arc<Mutex<String>>;
+
+// ---------- 页面缓存（github.com 文档导航 GET）----------
+// 动机：搜索页每次进入会引爆 ~15 个并行请求（主搜索 + 12 分类计数 + blackbird），
+// 反复进出仓库/列表会反复触发，GitHub 软限流就开始吐"0 条结果"。
+// 缓存命中 = 秒回 + 零上游请求。过期：持续 2.5 小时无流量进入代理即整体清空；
+// 数量上限 30 页；Ctrl+F5（no-cache）绕过；通知/设置/登录页永不缓存。
+const PAGE_CACHE_IDLE_SECS: u64 = 150 * 60; // 2.5 小时
+const PAGE_CACHE_MAX: usize = 30;
+
+struct CachedPage {
+    status: hyper::StatusCode,
+    headers: hyper::HeaderMap,
+    body: Bytes,
+    at: std::time::Instant,
+}
+
+static PAGE_CACHE: OnceLock<Mutex<HashMap<String, CachedPage>>> = OnceLock::new();
+static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn page_cache_map() -> &'static Mutex<HashMap<String, CachedPage>> {
+    PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 记一次流量，并判断是否应清空缓存（持续 PAGE_CACHE_IDLE_SECS 无流量）。
+fn touch_activity() -> bool {
+    let now = now_secs();
+    let prev = LAST_ACTIVITY.swap(now, std::sync::atomic::Ordering::Relaxed);
+    prev != 0 && now.saturating_sub(prev) > PAGE_CACHE_IDLE_SECS
+}
+
+fn page_cache_clear() {
+    page_cache_map().lock().unwrap().clear();
+}
+
+fn page_cache_allowed(path: &str) -> bool {
+    !path.starts_with("/notifications")
+        && !path.starts_with("/settings")
+        && !path.starts_with("/login")
+        && !path.starts_with("/logout")
+        && !path.starts_with("/session")
+        && !path.starts_with("/search/count")
+        && !path.starts_with("/search/blackbird")
+        && !path.starts_with("/search/warm")
+}
+
+fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
+    let uri = req.uri();
+    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    format!("GET {host}{}{q}", uri.path())
+}
+
+fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
+    let mut map = page_cache_map().lock().unwrap();
+    let page = map.get_mut(key)?;
+    page.at = std::time::Instant::now();
+    let status = page.status;
+    let headers = page.headers.clone();
+    let body = page.body.clone();
+    drop(map);
+    let mut resp = hyper::Response::builder()
+        .status(status)
+        .body(BoxBody::new(
+            http_body_util::Full::new(body).map_err(std::io::Error::other),
+        ))
+        .unwrap();
+    *resp.headers_mut() = headers;
+    resp.headers_mut().insert(
+        "x-gitport-cache",
+        hyper::header::HeaderValue::from_static("hit"),
+    );
+    Some(resp)
+}
+
+/// 缓冲 200 text/html 页面进缓存（≤2MB），并原样重建响应交付（始终返回 Some 形态）。
+async fn page_cache_store(
+    key: String,
+    resp: axum::response::Response<BoxBody>,
+) -> axum::response::Response<BoxBody> {
+    let (parts, body) = resp.into_parts();
+    let is_html = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.starts_with("text/html"))
+        .unwrap_or(false);
+    if !is_html {
+        return hyper::Response::from_parts(parts, body);
+    }
+    match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            if bytes.len() <= 2 * 1024 * 1024 {
+                let mut map = page_cache_map().lock().unwrap();
+                if map.len() >= PAGE_CACHE_MAX {
+                    if let Some(oldest) =
+                        map.iter().min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone())
+                    {
+                        map.remove(&oldest);
+                    }
+                }
+                map.insert(
+                    key,
+                    CachedPage {
+                        status: parts.status,
+                        headers: parts.headers.clone(),
+                        body: bytes.clone(),
+                        at: std::time::Instant::now(),
+                    },
+                );
+            }
+            let mut rebuilt = hyper::Response::builder()
+                .status(parts.status)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(bytes).map_err(std::io::Error::other),
+                ))
+                .unwrap();
+            *rebuilt.headers_mut() = parts.headers;
+            rebuilt
+        }
+        Err(_) => {
+            // 收集失败（罕见）：无内容可交付，回 502 兜底
+            hyper::Response::builder()
+                .status(hyper::StatusCode::BAD_GATEWAY)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from_static(b"page collect failed"))
+                        .map_err(std::io::Error::other),
+                ))
+                .unwrap()
+        }
+    }
+}
 async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
@@ -122,6 +261,40 @@ async fn mitm_http(
     }
 
     let info = UpstreamInfo::default();
+    // ---------- 页面缓存（github.com 文档导航 GET）----------
+    // 动机：搜索页每次进入会引爆 ~15 个并行请求（主搜索 + 12 分类计数 + blackbird），
+    // 反复进出仓库/列表会反复触发，GitHub 软限流就开始吐"0 条结果"。
+    // 缓存命中 = 秒回 + 零上游请求。过期：持续 2.5 小时无流量进入代理即整体清空；
+    // 数量上限 30 页；Ctrl+F5（no-cache）绕过；通知/设置/登录页永不缓存。
+    if touch_activity() {
+        page_cache_clear();
+    }
+    let dest_ok = match req.headers().get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        Some(d) => d == "document",
+        None => true, // curl/git 等本机工具无该头：同一用户，命中无妨
+    };
+    let no_cache_bypass = req
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("no-cache") || c.contains("max-age=0"))
+        .unwrap_or(false);
+    let cacheable = host == "github.com"
+        && req.method() == Method::GET
+        && dest_ok
+        && !no_cache_bypass
+        && page_cache_allowed(&path_of(req.uri()));
+    let cache_key = if cacheable {
+        Some(page_cache_key(&req, &host))
+    } else {
+        None
+    };
+    if let Some(key) = &cache_key {
+        if let Some(cached) = page_cache_get(key) {
+            (log)(&format!("[缓存] 命中 {}", path_of(req.uri())));
+            return write_upstream(cached, "cache", &info);
+        }
+    }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
@@ -226,6 +399,12 @@ async fn mitm_http(
                 ));
                 return mitm_unavailable(&req, &host);
             }
+        }
+    }
+    // 可缓存页面：缓冲落缓存（200 + text/html），再原样交付
+    if let Some(key) = &cache_key {
+        if resp.status().as_u16() == 200 {
+            resp = page_cache_store(key.clone(), resp).await;
         }
     }
     write_upstream(resp, "direct", &info)
@@ -1481,5 +1660,46 @@ mod tests {
         assert_eq!(stream_decision(&Method::POST, "/api/x", None), None);
         assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
         assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
+    }
+}
+
+#[cfg(test)]
+mod page_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn page_cache_roundtrip_and_exclusion() {
+        // 放入 → 命中（含 x-gitport-cache: hit 头）
+        let resp = hyper::Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(BoxBody::new(
+                http_body_util::Full::new(Bytes::from_static(b"<html>ok</html>"))
+                    .map_err(std::io::Error::other),
+            ))
+            .unwrap();
+        page_cache_store("GET github.com/search?q=x".into(), resp).await;
+        let hit = page_cache_get("GET github.com/search?q=x").expect("应命中");
+        assert_eq!(hit.headers().get("x-gitport-cache").unwrap(), "hit");
+        let bytes = http_body_util::BodyExt::collect(hit.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), b"<html>ok</html>");
+        // 非 HTML 不缓存
+        let resp = hyper::Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(BoxBody::new(
+                http_body_util::Full::new(Bytes::from_static(b"{}"))
+                    .map_err(std::io::Error::other),
+            ))
+            .unwrap();
+        page_cache_store("GET github.com/api/x".into(), resp).await;
+        assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
+        // 排除名单
+        assert!(!page_cache_allowed("/notifications"));
+        assert!(!page_cache_allowed("/search/count?q=x"));
+        assert!(page_cache_allowed("/search?q=x&type=repositories"));
     }
 }
