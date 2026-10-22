@@ -44,6 +44,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 | 加速所有网站 | 只路由 GitHub 系域名 | 其他站点用通用代理 |
 | 私库 release 附件走镜像 | 镜像链剥凭据 + 拒签名查询串（防外泄） | 公库无感；私库等直连恢复 |
 | raw/头像偶发被掐 | GFW 对 Fastly 内容边缘间歇阻断 | 内容域熔断 + 镜像链自动接管 |
+| 透传遇会话级风控页会持续 | GitHub 对会话（cookie）标记后，垫底轮换会加速"会话-IP 漂移"，放大风控信号 | 切 MITM（连接池驻留、零 IP 漂移）或等风控过期 |
 | schannel 系 CLI 走 MITM | 叶子证书无 OCSP/CRL，Windows 吊销检查硬失败 | `curl --ssl-no-revoke`；git 关 `schannelCheckRevoke`；浏览器无感 |
 
 ## 常见问题
