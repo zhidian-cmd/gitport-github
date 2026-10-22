@@ -260,6 +260,31 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.mirrors.insert(host, vc);
         }
     }
+    // 自定义镜像收编（在表装入全局之前）：链中存在非内置镜像的条目 → 自动进注册表（幂等）。
+    // 手改 plans.json 塞进来的自建节点重启不丢，列表里可见、可停用。
+    {
+        let builtin = builtin_mirror_urls();
+        let mut registry = crate::settings::worker_mirrors();
+        let mut adopted = false;
+        for chain in tab.mirrors.values() {
+            for u in chain {
+                if builtin.contains(u) {
+                    continue;
+                }
+                if registry.iter().any(|w| w.url == *u) {
+                    continue;
+                }
+                registry.push(crate::settings::WorkerMirror {
+                    url: u.clone(),
+                    on: true,
+                });
+                adopted = true;
+            }
+        }
+        if adopted {
+            crate::settings::save_worker_mirrors(registry);
+        }
+    }
     *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
     sync_custom_mirrors(&[]); // 自定义镜像注册表对齐：启用中的自建节点确保在链中（幂等）
     let snap = plans_snapshot();
@@ -481,8 +506,10 @@ pub async fn serial_dial_skip(
 
 
 /// 纯逻辑：按清单对齐单张镜像表（幂等，增量检测）。
-/// enabled = 启用中的地址（按清单顺序置前）；disabled = 移除的地址（停用/已删）；
-/// 其余成员相对顺序不变。自建节点优先于公共镜像。返回是否有变更。
+/// enabled 中尚不在链中的地址插到链首（新启用的自建节点优先试用，后续位置
+/// 交给测速排序）；disabled 中仍在链中的地址移除（停用/已删）。
+/// 已在链中的启用成员位置保持不变——顺序归测速校准管，这里不重排。
+/// 返回是否有变更。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
     enabled: &[String],
@@ -490,19 +517,28 @@ pub fn align_custom_mirrors(
 ) -> bool {
     let mut changed = false;
     for chain in mirrors.values_mut() {
-        let rest: Vec<String> = chain
-            .iter()
-            .filter(|m| !enabled.contains(m) && !disabled.contains(m))
-            .cloned()
-            .collect();
-        let mut desired: Vec<String> = enabled.to_vec();
-        desired.extend(rest);
-        if *chain != desired {
-            *chain = desired;
-            changed = true;
+        // 移除：停用/已删且仍在链中的
+        for u in disabled {
+            if chain.iter().any(|m| m == u) {
+                chain.retain(|m| m != u);
+                changed = true;
+            }
+        }
+        // 注入：启用中但链里还没有的 → 插到首位（倒序插入使清单首项排在最前）
+        for u in enabled.iter().rev() {
+            if !chain.iter().any(|m| m == u) {
+                chain.insert(0, u.clone());
+                changed = true;
+            }
         }
     }
     changed
+}
+
+/// 内置镜像集合（seeds 快照里的全部镜像地址）：区分"链里的公共镜像"与
+/// "用户自建镜像"——后者自动收编进注册表，重启不丢、列表可见。
+fn builtin_mirror_urls() -> std::collections::HashSet<String> {
+    seed_db().mirrors.into_values().flatten().collect()
 }
 
 /// 全局同步：按 settings 注册表把自定义镜像对齐到全部镜像链（幂等，有变更才落盘）。
@@ -930,26 +966,34 @@ mod tests {
         let enabled = vec!["https://customB".to_string(), "https://customA".to_string()];
         let disabled = vec!["https://customC".to_string()];
         assert!(align_custom_mirrors(&mut m, &enabled, &disabled));
-        // github.com：customB、customA 按清单序置前，pub1/pub2 保持相对顺序
+        // github.com：链里没有的 customB 插到首位；已在链中的 customA 位置不动
+        //（顺序归测速校准管）；pub1/pub2 保持相对顺序
         assert_eq!(
             m["github.com"],
             vec![
                 "https://customB".to_string(),
-                "https://customA".to_string(),
                 "https://pub1".to_string(),
+                "https://customA".to_string(),
                 "https://pub2".to_string(),
             ]
         );
-        // raw：customB/A 注入，customC 本就不在链中无影响
+        // raw：customB 注入，customC 本就不在链中无影响
         assert_eq!(m["raw.githubusercontent.com"][0], "https://customB");
         // 幂等：再跑一次无变更
         assert!(!align_custom_mirrors(&mut m, &enabled, &disabled));
-        // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失
+        // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失；其余不动
         let enabled2 = vec!["https://customA".to_string()];
         let disabled2 = vec!["https://customB".to_string(), "https://customC".to_string()];
         assert!(align_custom_mirrors(&mut m, &enabled2, &disabled2));
         assert!(!m["github.com"].iter().any(|x| x == "https://customB"));
-        assert_eq!(m["github.com"][0], "https://customA");
+        assert_eq!(
+            m["github.com"],
+            vec![
+                "https://pub1".to_string(),
+                "https://customA".to_string(),
+                "https://pub2".to_string(),
+            ]
+        );
     }
 
     #[test]
