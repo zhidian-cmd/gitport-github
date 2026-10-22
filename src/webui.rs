@@ -356,10 +356,13 @@ struct WorkerMirrorsBody {
 }
 
 /// 整表保存自定义镜像注册表：新增/启停/删除都由前端提交完整清单，
-/// 后端按新旧差集对齐镜像链（删除的条目自动从链中消失——彻底删除）。
+/// 后端按新旧差集对齐镜像链（删除的条目自动从链中消失——彻底删除），
+/// 并回传规范化后的注册表（前端据此重绘，避免本地态与服务端漂移）。
 async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
-        Ok(enabled) => write_json(&serde_json::json!({"ok": true, "enabled": enabled})),
+        Ok(_) => write_json(
+            &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
+        ),
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }

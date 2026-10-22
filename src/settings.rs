@@ -461,8 +461,9 @@ pub fn worker_mirrors() -> Vec<WorkerMirror> {
 }
 
 /// 收编保存（启动迁移用）：仅落盘注册表，不动镜像链——链中本来就有，
-/// 位置交给测速校准。调用方保证已去重。
-pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
+/// 位置交给测速校准。按 url 排序保证注册表顺序确定（面板显示稳定）。
+pub fn save_worker_mirrors(mut list: Vec<WorkerMirror>) {
+    list.sort_by(|a, b| a.url.cmp(&b.url));
     *state().worker_mirrors.lock().unwrap() = list;
     let _ = save();
 }
