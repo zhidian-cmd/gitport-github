@@ -266,8 +266,12 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         let builtin = builtin_mirror_urls();
         let mut registry = crate::settings::worker_mirrors();
         let mut adopted = false;
-        for chain in tab.mirrors.values() {
-            for u in chain {
+        // 按 host 字典序遍历（HashMap 本序随机）——仅为确定性；收编顺序无关紧要，
+        // 启动时追加链尾、校准会重排
+        let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
+        hosts.sort();
+        for h in hosts {
+            for u in &tab.mirrors[h] {
                 if builtin.contains(u) {
                     continue;
                 }
@@ -506,9 +510,9 @@ pub async fn serial_dial_skip(
 
 
 /// 纯逻辑：按清单对齐单张镜像表（幂等，增量检测）。
-/// enabled 中尚不在链中的地址插到链首（新启用的自建节点优先试用，后续位置
-/// 交给测速排序）；disabled 中仍在链中的地址移除（停用/已删）。
-/// 已在链中的启用成员位置保持不变——顺序归测速校准管，这里不重排。
+/// enabled 中尚不在链中的地址追加到链尾（顺序无所谓，校准会重排）；
+/// disabled 中仍在链中的地址移除（停用/已删）。
+/// 已在链中的成员位置保持不变——这里只做成员增删，不重排。
 /// 返回是否有变更。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
@@ -524,10 +528,10 @@ pub fn align_custom_mirrors(
                 changed = true;
             }
         }
-        // 注入：启用中但链里还没有的 → 插到首位（倒序插入使清单首项排在最前）
-        for u in enabled.iter().rev() {
+        // 注入：启用中但链里还没有的 → 追加到链尾
+        for u in enabled {
             if !chain.iter().any(|m| m == u) {
-                chain.insert(0, u.clone());
+                chain.push(u.clone());
                 changed = true;
             }
         }
@@ -966,19 +970,21 @@ mod tests {
         let enabled = vec!["https://customB".to_string(), "https://customA".to_string()];
         let disabled = vec!["https://customC".to_string()];
         assert!(align_custom_mirrors(&mut m, &enabled, &disabled));
-        // github.com：链里没有的 customB 插到首位；已在链中的 customA 位置不动
-        //（顺序归测速校准管）；pub1/pub2 保持相对顺序
+        // github.com：链里没有的 customB 追加到链尾；已在链中的成员位置不动
         assert_eq!(
             m["github.com"],
             vec![
-                "https://customB".to_string(),
                 "https://pub1".to_string(),
                 "https://customA".to_string(),
                 "https://pub2".to_string(),
+                "https://customB".to_string(),
             ]
         );
-        // raw：customB 注入，customC 本就不在链中无影响
-        assert_eq!(m["raw.githubusercontent.com"][0], "https://customB");
+        // raw：customB、customA 都追加到链尾，customC 本就不在链中无影响
+        assert_eq!(
+            m["raw.githubusercontent.com"],
+            vec!["https://pub1".to_string(), "https://customB".to_string(), "https://customA".to_string()]
+        );
         // 幂等：再跑一次无变更
         assert!(!align_custom_mirrors(&mut m, &enabled, &disabled));
         // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失；其余不动
@@ -998,18 +1004,18 @@ mod tests {
 
     #[test]
     fn worker_chain_replace_old_url() {
-        // 换地址：新地址注入的同时旧地址必须移除（防新旧并存）
+        // 换地址：新地址追加到链尾的同时旧地址必须移除（防新旧并存）
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         m.insert("github.com".into(), vec!["https://old.worker".into(), "https://a.example".into()]);
-        align_custom_mirrors(
-            &mut m,
-            &["https://new.worker".to_string()],
-            &["https://old.worker".to_string()],
-        );
+        let new = vec!["https://new.worker".to_string()];
+        let old = vec!["https://old.worker".to_string()];
+        align_custom_mirrors(&mut m, &new, &old);
         let c = &m["github.com"];
-        assert_eq!(c[0], "https://new.worker");
+        assert_eq!(
+            c,
+            &vec!["https://a.example".to_string(), "https://new.worker".to_string()]
+        );
         assert!(!c.iter().any(|x| x.contains("old.worker")));
-        assert!(c.contains(&"https://a.example".to_string()));
     }
 
     #[test]
