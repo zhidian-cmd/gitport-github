@@ -147,7 +147,11 @@ async function refreshSettings() {
   $('swTray').checked = s.closeToTray;
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
   $('workerUrl').value = s.workerUrl || '';
-  $('swWorker').checked = !!s.workerEnabled;
+  S.workerOn = !!s.workerEnabled; // 停用/启用按钮的状态源
+  /* 停用/启用按钮: 文本与样式随状态翻转(地址原位保留) */
+  const wc = $('workerClear');
+  wc.textContent = S.workerOn ? '停用' : '启用';
+  wc.className = 'btn ' + (S.workerOn ? '' : 'primary');
 }
 async function setSetting(path, on) {
   const r = await postJSON(path, {on});
@@ -158,17 +162,18 @@ $('swAutostart').onchange = e => setSetting('/api/settings/autostart', e.target.
 $('swTray').onchange = e => setSetting('/api/settings/closeToTray', e.target.checked);
 $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked);
 
-/* ---------- Cloudflare 自建镜像 ---------- */
-$('swWorker').onchange = e => setSetting('/api/settings/workerEnabled', e.target.checked);
-$('workerSave').onclick = async () => {
-  const url = $('workerUrl').value.trim();
-  let r;
-  try { r = await postJSON('/api/settings/worker', {url}); }
-  catch (e) { alert('保存失败: ' + e); return; }
-  if (!r.ok) { alert('保存失败: ' + (r.error || '')); return; }
-  toast(r.message || (url ? '已注入镜像链' : '已从镜像链移除'));
+/* ---------- Cloudflare 自建镜像: 保存=启用; 停用/启用=只翻开关, 地址原位保留 ---------- */
+async function saveWorker(url, on) {
+  const body = on === undefined ? {url} : {url, on};
+  const r = await postJSON('/api/settings/worker', body);
+  if (!r.ok) { alert('操作失败: ' + (r.error || '')); return; }
+  if (on === false) toast('Cloudflare 镜像已停用（地址保留）');
+  else if (on === true) toast('Cloudflare 镜像已启用');
+  else toast(url ? 'Cloudflare 镜像已启用' : 'Cloudflare 镜像已停用');
   refreshSettings();
-};
+}
+$('workerSave').onclick = () => saveWorker($('workerUrl').value.trim());
+$('workerClear').onclick = () => saveWorker($('workerUrl').value.trim(), !s.workerEnabled);
 
 /* ---------- 镜像链校准 ---------- */
 // 半自动: 点击 -> 后端按内置模板对每条镜像链串行实测 TTFB -> 按成绩重排

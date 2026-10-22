@@ -916,12 +916,19 @@ fn mirror_request(
     for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
         if upstream::is_hop_by_hop(&low)
-            || matches!(low.as_str(), "cookie" | "authorization" | "host" | "referer")
+            || matches!(
+                low.as_str(),
+                "cookie" | "authorization" | "host" | "referer" | "user-agent"
+            )
         {
             continue;
         }
         builder = builder.header(k, v);
     }
+    // CF 系镜像的 Bot Fight Mode 拦非浏览器 UA：镜像腿恒定浏览器 UA（剥掉
+    // 客户端原 UA 后统一注入，否则 builder.header 是追加会出现两个 UA），
+    // 校准/无 UA 客户端也能过；对外特征一致（见 MIRROR_UA 注释）。
+    builder = builder.header(http::header::USER_AGENT, http::HeaderValue::from_static(MIRROR_UA));
     let body =
         BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|e| std::io::Error::other(e)));
     builder.body(body).map_err(|e| e.to_string())
@@ -1038,11 +1045,16 @@ pub fn set_calibrate_report(r: Option<String>) {
 const CALIB_THROUGHPUT_WINDOW: Duration = Duration::from_secs(12);
 const CALIB_THROUGHPUT_CAP: u64 = 5 * 1024 * 1024;
 
+/// 镜像腿统一浏览器 UA：CF 系镜像的 Bot Fight Mode 会拦非浏览器 UA（裸
+/// Mozilla/5.0 一律 403），校准等代理自发的请求没有 UA 更过不了——恒定注入
+/// Chrome UA，浏览器/校准/命令行走镜像腿的对外特征完全一致。
+const MIRROR_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 fn mirror_get(uri: http::Uri) -> Result<hyper::Request<BoxBody>, String> {
     hyper::Request::builder()
         .method(Method::GET)
         .uri(uri)
-        .header("user-agent", "Mozilla/5.0")
+        .header("user-agent", MIRROR_UA)
         .header("accept", "*/*")
         .body(BoxBody::new(
             http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
@@ -1274,7 +1286,7 @@ mod tests {
         }
         assert_eq!(h.get("range").unwrap(), "bytes=0-1023", "业务头必须保留");
         assert_eq!(h.get("accept-encoding").unwrap(), "gzip");
-        assert_eq!(h.get("user-agent").unwrap(), "UA/1.0");
+        assert_eq!(h.get("user-agent").unwrap(), MIRROR_UA);
         let uri = req.uri().to_string();
         assert!(
             uri.starts_with("https://gh-proxy.com/https://raw.githubusercontent.com/"),

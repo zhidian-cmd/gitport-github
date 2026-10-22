@@ -163,14 +163,47 @@
 
         <div class="feature-card">
           <div class="feature-info">
-            <h2>Cloudflare 自建镜像</h2>
-            <p class="hint">填入你的 Worker 反代地址（https:// 开头），保存后注入全部镜像链首位并参与测速排序；开关关闭即从链中移除（地址保留，随时原位恢复）。若校准测速后它沉底，检查 Cloudflare 的 Bot Fight Mode 是否放行了非浏览器 UA。</p>
-            <input type="text" id="workerUrl" class="text-input" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">
+            <h2>Cloudflare Worker 自建镜像（强烈推荐）</h2>
+            <p>部署一个你自己的 Cloudflare Worker（免费）作为私人镜像：直连失败或被 GitHub 风控拦截时，镜像链自动经它转发——<b>本地终结 TLS → Worker → GitHub 看到的全是 Cloudflare 的 IP</b>，且 302 重定向由 Worker 服务器侧跟随，大文件不再裸连。需开启本页上方的 MITM（安装根证书）。若 workers.dev 域名被干扰，在 Worker 的「设置 → 域和路由」绑定自有域名即可。</p>
+            <pre id="workercode" class="code">export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    let rest = decodeURIComponent(url.pathname.slice(1)) + url.search;
+    if (rest.startsWith("https:/") && !rest.startsWith("https://")) rest = "https:/" + rest;
+    if (!/^https:\/\/([\w.-]+\.)*(github\.com|githubusercontent\.com|githubassets\.com|github\.io|githubapp\.com)(\/|$)/.test(rest)) {
+      return new Response("usage: /https://github.com/...", { status: 400 });
+    }
+    const headers = new Headers(request.headers);
+    headers.delete("host"); headers.delete("cf-connecting-ip");
+    headers.delete("cf-ipcity"); headers.delete("cf-ipcountry");
+    headers.delete("cf-ray"); headers.delete("cf-visitor");
+    headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
+    headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
+    const target = new URL(rest);
+    return fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
+  }
+}</pre>
+            <div class="row">
+              <button class="btn sm" onclick="copyText(document.getElementById('workercode').textContent)">复制 Worker 代码</button>
+            </div>
+            <div class="row add-row">
+              <input type="text" id="workerUrl" class="text-input" placeholder="粘贴 Worker 地址，如 https://gh-proxy.yourname.workers.dev" autocomplete="off" spellcheck="false">
+              <button class="btn primary" id="workerSave">保存</button>
+              <button class="btn" id="workerClear">停用</button>
+            </div>
+            <p class="hint" style="margin-top:8px">有自有域名就优先用它：在 Worker 的「设置 → 域和路由」绑定自定义域，地址填 <code>https://你的域名</code>——workers.dev 被干扰时自定义域通常照常可用。若镜像链校准测速后它沉底，检查 Cloudflare 的 Bot Fight Mode 是否放行了非浏览器 UA（校准请求已内置浏览器 UA，一般无需处理）。</p>
           </div>
-          <div class="cf-actions">
-            <label class="switch"><input type="checkbox" id="swWorker"><span class="track"></span></label>
-            <button class="btn sm primary" id="workerSave">保存</button>
-          </div>
+        </div>
+
+        <div class="panel">
+          <h2>部署教程（约 3 分钟，全程免费）</h2>
+          <p class="hint" style="margin-top:6px;line-height:1.9">
+            ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
+            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy；<br>
+            ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
+            ④ 把地址粘贴到上方输入框 → 「保存」。之后「停用/启用」只翻开关，地址原位保留；<br>
+            ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。
+          </p>
         </div>
       </section>
 
