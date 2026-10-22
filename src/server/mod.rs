@@ -361,17 +361,41 @@ where
     (up, down)
 }
 
-/// TLS 握手首段是否拆分、怎么拆：返回 (头段区间, 余下区间)。
-/// 仅当首字节为 0x16(TLS 握手)且长度超过拆分点才拆——SSH/HTTP/过短流一律不碰。
-fn hello_split_ranges(first_read: &[u8]) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    if first_read.len() > config::HELLO_SPLIT_AT && first_read[0] == 0x16 {
-        Some((
-            0..config::HELLO_SPLIT_AT,
-            config::HELLO_SPLIT_AT..first_read.len(),
-        ))
-    } else {
-        None
+/// 轻量随机（stdlib RandomState 技巧，避免引入 rand 依赖）：每次调用值不同。
+fn fresh_rand() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
+
+fn split_delay() -> std::time::Duration {
+    let span = config::HELLO_SPLIT_DELAY_MAX_MS - config::HELLO_SPLIT_DELAY_MIN_MS + 1;
+    std::time::Duration::from_millis(
+        config::HELLO_SPLIT_DELAY_MIN_MS + (fresh_rand() % span),
+    )
+}
+
+/// TLS 握手首段分片方案：返回切点列表（升序无缝，2~3 段，切点每连接随机）。
+/// 仅当总闸开启、首字节为 0x16(TLS 握手)且长度足够才拆——SSH/HTTP/过短流一律不碰。
+fn hello_split_ranges(first_read: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    if !config::HELLO_SPLIT_ENABLED || first_read.len() < 32 || first_read[0] != 0x16 {
+        return None;
     }
+    let n = first_read.len();
+    let r = fresh_rand();
+    // 首刀：1..=16 字节（覆盖 TLS 记录头一带，具体位置随机）
+    let c1 = 1 + (r % config::HELLO_SPLIT_FIRST_MAX as u64) as usize;
+    // 约 2/3 概率三段：二刀落在 n 的 1/3 ~ 2/3 处（SNI 通常在这一带）
+    let three = (r >> 8) % 3 != 0;
+    if !three {
+        return Some(vec![0..c1, c1..n]);
+    }
+    let lo = (n / 3).max(c1 + 8);
+    let hi = (n * 2 / 3).min(n - 8);
+    if hi <= lo {
+        return Some(vec![0..c1, c1..n]);
+    }
+    let c2 = lo + ((r >> 16) % ((hi - lo) as u64)) as usize;
+    Some(vec![0..c1, c1..c2, c2..n])
 }
 
 /// 转发一路：可选首字节看门狗（超时 = 判死），其后普通泵；收尾 shutdown 让对端见 EOF。
@@ -412,20 +436,23 @@ where
         let do_split = first && split_tls_hello && hello_split_ranges(&buf[..n]).is_some();
         first = false;
         if do_split {
-            let (head, rest) = hello_split_ranges(&buf[..n]).expect("上面刚判过 Some");
-            let (head_len, rest_len) = (head.len(), rest.len());
-            if w.write_all(&buf[head]).await.is_err() {
+            let ranges = hello_split_ranges(&buf[..n]).expect("上面刚判过 Some");
+            let mut ok = true;
+            let mut added = 0u64;
+            for (idx, seg) in ranges.iter().enumerate() {
+                if idx > 0 {
+                    tokio::time::sleep(split_delay()).await;
+                }
+                if w.write_all(&buf[seg.clone()]).await.is_err() {
+                    ok = false;
+                    break;
+                }
+                added += seg.len() as u64;
+            }
+            total += added;
+            if !ok {
                 break;
             }
-            total += head_len as u64;
-            tokio::time::sleep(std::time::Duration::from_millis(
-                config::HELLO_SPLIT_DELAY_MS,
-            ))
-            .await;
-            if w.write_all(&buf[rest]).await.is_err() {
-                break;
-            }
-            total += rest_len as u64;
             continue;
         }
         if w.write_all(&buf[..n]).await.is_err() {
@@ -549,14 +576,23 @@ mod tests {
     }
 
     /// 分片门槛：TLS 握手(0x16)且够长才拆；SSH/HTTP/过短流不拆。
+    /// 拆分形态：2~3 段、无缝覆盖全量、首刀 1..=16。
     #[test]
     fn hello_split_ranges_gate() {
         let tls_long: Vec<u8> = std::iter::once(0x16u8)
             .chain(std::iter::repeat(0u8).take(300))
             .collect();
-        let (head, rest) = hello_split_ranges(&tls_long).expect("TLS 握手应拆");
-        assert_eq!(head, 0..config::HELLO_SPLIT_AT);
-        assert_eq!(rest, config::HELLO_SPLIT_AT..tls_long.len());
+        let ranges = hello_split_ranges(&tls_long).expect("TLS 握手应拆");
+        assert!(ranges.len() == 2 || ranges.len() == 3, "段数应在 2~3: {ranges:?}");
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert!(ranges.first().unwrap().len() >= 1);
+        assert!(ranges.first().unwrap().len() <= config::HELLO_SPLIT_FIRST_MAX);
+        let mut cursor = 0usize;
+        for r in &ranges {
+            assert_eq!(r.start, cursor, "切点应无缝衔接: {ranges:?}");
+            cursor = r.end;
+        }
+        assert_eq!(cursor, tls_long.len(), "应覆盖整个首段: {ranges:?}");
 
         let tls_short = vec![0x16u8, 0x03, 0x01];
         assert!(hello_split_ranges(&tls_short).is_none(), "过短流不拆");
@@ -565,6 +601,29 @@ mod tests {
         assert!(hello_split_ranges(&ssh).is_none(), "非 TLS 流不拆");
 
         assert!(hello_split_ranges(&[]).is_none(), "空流不拆");
+    }
+
+    /// 随机化：同一载荷多次拆分，首刀位置必须出现变化（防退化成固定形态被签名）。
+    #[test]
+    fn hello_split_randomizes_cuts() {
+        let tls_long: Vec<u8> = std::iter::once(0x16u8)
+            .chain(std::iter::repeat(0u8).take(600))
+            .collect();
+        let mut firsts = std::collections::HashSet::new();
+        let mut seg_counts = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let ranges = hello_split_ranges(&tls_long).expect("应拆");
+            firsts.insert(ranges[0].len());
+            seg_counts.insert(ranges.len());
+        }
+        assert!(
+            firsts.len() >= 3,
+            "40 次拆分首刀位置应多变(随机化失效?): {firsts:?}"
+        );
+        assert!(
+            seg_counts.len() >= 2,
+            "段数应在 2~3 间变化: {seg_counts:?}"
+        );
     }
 
     /// 首包分片不丢字节：TLS 握手载荷经分片转发后必须完整到达对端。

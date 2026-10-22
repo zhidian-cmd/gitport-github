@@ -39,11 +39,18 @@ pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 
 /// 隧道模式 TLS 握手首包分片：客户端→上游的第一段若为 TLS 握手记录(0x16 开头)，
-/// 拆成"记录头(5B) 单独成段 + 间隔 + 余下"两段发。DPI 的 SNI 检测需要完整 ClientHello，
+/// 拆成 2~3 段（切点/间隔每连接随机）发出。DPI 的 SNI 检测需要完整 ClientHello，
 /// 拆段后重组窗口拼不齐 → 真名 SNI 免于 RST（byedpi/GoodbyeDPI 同款思路，纯用户态）；
-/// 边缘的完整 TCP 栈不受影响。仅作用于 CONNECT 隧道，且仅首段——SSH/HTTP 流(非 0x16)不碰。
-pub const HELLO_SPLIT_AT: usize = 5;
-pub const HELLO_SPLIT_DELAY_MS: u64 = 25;
+/// 边缘的完整 TCP 栈不受影响。仅作用于 CONNECT 隧道首段——SSH/HTTP 流(非 0x16)不碰。
+/// 随机化而非固定形态的原因：教科书式"5B 记录头 + 固定间隔"是公开知识，
+/// 会被签名后针对性反制（2026-10-21 夜间窗口疑似即此）；随机让每条连接长得都不一样。
+/// 总闸：A/B 对照时改 false 重编译即全关。
+pub const HELLO_SPLIT_ENABLED: bool = true;
+/// 首刀上限：1..=FIRST_MAX 字节随机（覆盖 TLS 记录头 5B 一带）。
+pub const HELLO_SPLIT_FIRST_MAX: usize = 16;
+/// 段间隔随机范围（毫秒），每段间隔独立抽取。
+pub const HELLO_SPLIT_DELAY_MIN_MS: u64 = 20;
+pub const HELLO_SPLIT_DELAY_MAX_MS: u64 = 70;
 /// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;

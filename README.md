@@ -13,7 +13,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - **不查 DNS**：内置 GitHub 真实 IP 表（`plans.json`），DNS 污染免疫
 - **连不上就换**：IP 按表逐个试，坏的垫底，单点故障只慢不掉
 - **TLS 指纹是 Chrome 同款**：BoringSSL + 伪装 SNI，绕过针对明文域名的阻断
-- **隧道握手首包分片**：CONNECT 透传把 ClientHello 拆成两段再发，DPI 拼不齐 SNI——真名腿免于 RST 的掩体（byedpi 同款思路，纯用户态）
+- **隧道握手首包分片**：CONNECT 透传把 ClientHello 拆成 2~3 段（切点/间隔每连接随机）再发，DPI 拼不齐 SNI——真名腿免于 RST 的掩体（byedpi 同款思路，纯用户态，可 A/B 开关）
 - **连接复用到极限**：高频 host 双 h2 连接 + 按实测耗时择优，GitHub 前端遥测本地拦掉（一个字节不发往上游）
 - **大文件多一条路**：Release / 源码包走镜像串行链，直连全灭仍能下载
 
