@@ -118,15 +118,6 @@
       <!-- 自定义镜像 -->
       <section id="view-mirrors" class="view">
         <div class="panel">
-          <h2>镜像拼接格式要求</h2>
-          <p class="hint" style="margin-top:6px;line-height:1.9">
-            镜像站必须支持<b>拼接格式</b>：把完整 GitHub 地址原样拼在镜像域名后面——<br>
-            <code>https://镜像地址/https://github.com/owner/repo/...</code><br>
-            本工具按此格式调用（gh-proxy 系镜像均兼容）。启用中的镜像注入全部镜像链首位并参与测速排序；关闭的从 plans.json 移除（注册表保留，随时可再启用）。<b>需开启 MITM 模式</b>镜像链才会参与兜底。
-          </p>
-        </div>
-
-        <div class="panel">
           <h2>我的镜像</h2>
           <div id="mirrorRows"></div>
           <button class="btn primary" id="mirrorAdd" style="margin-top:12px">＋ 添加镜像</button>
@@ -154,6 +145,12 @@
 }</pre>
           <div class="row">
             <button class="btn sm" onclick="copyText(document.getElementById('workercode').textContent)">复制 Worker 代码</button>
+          <div class="guide-step"><img src="/guide/step1.jpg" alt="创建应用程序" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step2.jpg" alt="从 Hello World 开始" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step3.jpg" alt="起名并部署" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step4.jpg" alt="贴入反代代码" loading="lazy"></div>
+          <div class="guide-step"><img src="/guide/step5.jpg" alt="拿 Worker 地址" loading="lazy"></div>
+
           </div>
           <p class="hint" style="margin-top:6px;line-height:1.9">
             ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>

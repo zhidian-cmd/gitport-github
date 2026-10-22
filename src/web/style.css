@@ -173,6 +173,9 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
           transition:color .15s,border-color .15s;flex-shrink:0}
 .icon-btn:hover{color:var(--red);border-color:var(--red-line)}
 .icon-btn svg{display:block}
+/* 部署教程步骤截图 */
+.guide-step{margin-top:10px}
+.guide-step img{width:100%;max-width:640px;border:1px solid var(--line-strong);border-radius:10px;display:block}
 
 .set-row{display:flex;align-items:center;gap:20px;padding:6px 0}
 .set-row + .set-row{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}

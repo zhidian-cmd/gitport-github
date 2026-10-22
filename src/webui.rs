@@ -12,6 +12,14 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLE_CSS: &str = include_str!("web/style.css");
 const APP_JS: &str = include_str!("web/app.js");
+/// 部署教程截图（free_proxy 同款五步图，编译期内嵌）
+const GUIDE_JPEGS: [&[u8]; 5] = [
+    include_bytes!("web/guide/step1.jpg"),
+    include_bytes!("web/guide/step2.jpg"),
+    include_bytes!("web/guide/step3.jpg"),
+    include_bytes!("web/guide/step4.jpg"),
+    include_bytes!("web/guide/step5.jpg"),
+];
 
 #[derive(Clone)]
 pub struct App {
@@ -78,6 +86,26 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/", axum::routing::get(index))
         .route("/style.css", axum::routing::get(style))
         .route("/app.js", axum::routing::get(app_js))
+        .route(
+            "/guide/step1.jpg",
+            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[0]).await }),
+        )
+        .route(
+            "/guide/step2.jpg",
+            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[1]).await }),
+        )
+        .route(
+            "/guide/step3.jpg",
+            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[2]).await }),
+        )
+        .route(
+            "/guide/step4.jpg",
+            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[3]).await }),
+        )
+        .route(
+            "/guide/step5.jpg",
+            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[4]).await }),
+        )
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
         .route("/api/logs", axum::routing::get(api_logs))
@@ -164,6 +192,15 @@ async fn app_js() -> Response {
         .into_response()
 }
 
+
+/// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
+async fn img_jpeg(bytes: &'static [u8]) -> Response {
+    (
+        [("cache-control", "no-cache"), ("content-type", "image/jpeg")],
+        bytes,
+    )
+        .into_response()
+}
 /// 分流 PAC：白名单 DIRECT 短路必须在通配符匹配之前（否则被 *.githubusercontent.com 吞掉）。
 fn pac_script() -> String {
     let mut domains: Vec<&str> = Vec::new();

@@ -460,6 +460,13 @@ pub fn worker_mirrors() -> Vec<WorkerMirror> {
     state().worker_mirrors.lock().unwrap().clone()
 }
 
+/// 收编保存（启动迁移用）：仅落盘注册表，不动镜像链——链中本来就有，
+/// 位置交给测速校准。调用方保证已去重。
+pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
+    *state().worker_mirrors.lock().unwrap() = list;
+    let _ = save();
+}
+
 /// 整表保存自定义镜像注册表：校验（https:// 开头、无空格、去尾斜杠、去重去空）、
 /// 与旧表做差集（新增/停用/删除），交由镜像链对齐后落盘。返回启用中的地址列表。
 /// 删除条目由"新旧差集"自动从链中移除——删除即彻底消失。
