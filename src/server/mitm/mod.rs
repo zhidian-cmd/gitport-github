@@ -131,7 +131,7 @@ async fn mitm_http(
     // 页面缓存：取/存两个路由，判定/键/元数据/索引知识收拢在 page_cache 模块内。
     // 新鲜度模型：用户点击行为驱动（命中秒回 + 写失效即时刷新），
     // SWR 后台 ETag 验证保鲜（回放命中请求的完整 cookie 头 = 与浏览器相同身份）。
-    if let Some(cached) = page_cache::cache_take(&req, &host) {
+    if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
@@ -241,7 +241,6 @@ async fn mitm_http(
             }
         }
     }
-    // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
     // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
     if host == "github.com"
         && matches!(

@@ -64,6 +64,15 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
 }
 
+/// 解风控循环的单步决策（纯函数，便于测试）：
+/// 归属缺失 → 重试上限 3 次；同 IP 再现 = 全员拦截页 → 交回真实响应。
+fn defuse_retry(ip_empty: bool, empty_retries: u8, ip_seen: bool) -> bool {
+    if ip_empty {
+        return empty_retries <= 3;
+    }
+    !ip_seen
+}
+
 fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -96,7 +105,7 @@ pub(super) async fn gh_defuse(
         }
         if ip.is_empty() {
             empty_ip_retries += 1;
-            if empty_ip_retries > 3 {
+            if !defuse_retry(true, empty_ip_retries, false) {
                 return Ok(resp);
             }
             resp = match get_direct(log, out, host, info, is_simple, body).await {
@@ -117,7 +126,8 @@ pub(super) async fn gh_defuse(
         // 整表轮换完一圈(同 IP 再现) = 全员拦截页: 再转只会重复, 交回 GitHub
         // 真实拦截响应终止。垫底+拔连接必须发生在终止判定之前 —— 否则交付时
         // 坏连接仍挂在复用缓存, 下个请求乒乓(2026-10-17 复审补充)
-        if !seen.insert(ip.to_string()) {
+        let ip_seen = !seen.insert(ip.to_string());
+        if !defuse_retry(false, empty_ip_retries, ip_seen) {
             (log)(&format!(
                 "[MITM] {host} 全部可用边缘均返回拦截页({tried}), 交付真实响应"
             ));
@@ -136,6 +146,17 @@ pub(super) async fn gh_defuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defuse_retry_decision() {
+        // 空归属：重试上限 3 次
+        assert!(defuse_retry(true, 0, false));
+        assert!(defuse_retry(true, 3, false));
+        assert!(!defuse_retry(true, 4, false));
+        // 有归属：新 IP 重试，同 IP 再现 = 全灭终止
+        assert!(defuse_retry(false, 0, false));
+        assert!(!defuse_retry(false, 0, true));
+    }
 
     #[tokio::test]
     async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
