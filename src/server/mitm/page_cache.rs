@@ -145,6 +145,22 @@ fn page_cache_dir() -> std::path::PathBuf {
     crate::settings::exe_dir().join(".cache")
 }
 
+static CACHE_ACL_APPLIED: OnceLock<()> = OnceLock::new();
+
+/// 确保 .cache 目录存在；本进程首次触达时套一次 Windows ACL
+/// （icacls 断继承 + 只授当前用户与 SYSTEM，与 ca.key/settings.json 同款手段）。
+/// 页面 HTML 含个人信息（仪表盘/动态流/用户名），不给同机其他账户留读取面。
+/// ACL 随目录持久化，跨重启仍有效；icacls 是进程 spawn，OnceLock 保证只跑一次。
+fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    if CACHE_ACL_APPLIED.set(()).is_ok() {
+        let _ = crate::winsec::restrict_to_current_user(&dir.to_string_lossy());
+    }
+    true
+}
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,7 +212,7 @@ fn touch_activity() -> bool {
     if last_write == 0 || now.saturating_sub(last_write) >= 30 {
         ACTIVITY_LAST_WRITE.store(now, std::sync::atomic::Ordering::Relaxed);
         let dir = page_cache_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        ensure_cache_dir_with_acl(&dir);
         let _ = std::fs::write(dir.join("last_activity"), now.to_string());
     }
     prev != 0 && now.saturating_sub(prev) > PAGE_CACHE_IDLE_SECS
@@ -423,7 +439,9 @@ fn persist_page_entry_blocking(
     status: u16,
     hdrs: &[Vec<String>],
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    if !ensure_cache_dir_with_acl(dir) {
+        return Err("缓存目录创建失败".to_string());
+    }
     enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
     let meta = serde_json::json!({
         "url": key,
