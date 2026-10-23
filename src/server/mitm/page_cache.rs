@@ -11,19 +11,21 @@
 //! 页面内容 = 上次访问时的样子（用户明确接受的取舍，Ctrl+F5 绕过缓存取最新）。
 //! cookie 语义：单用户本地代理，cookie 全量转发 GitHub（等同浏览器行为）；
 //! 仅镜像腿剥离（镜像站是第三方，不认识会话，剥离防凭证泄露）。
-use super::BoxBody;
+use super::{get_direct, BoxBody, UpstreamInfo};
 use crate::pool::LogFn;
 use crate::server::upstream::Incoming;
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use http_body_util::BodyExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const WORKER_CHANNEL_CAP: usize = 64; // 任务筐上限：满了丢弃（缓存写是 best-effort）
+const VALIDATE_WINDOW_MS: u64 = 10 * 60 * 1000; // 同页验证窗口
+const VALIDATE_COOLDOWN_MS: u64 = 2000; // 全局验证冷却（防点击风暴）
 
 /// 管家线程的任务消息：目前只有 Save（写盘+淘汰+孤儿回收）。
 enum CacheMsg {
@@ -32,6 +34,13 @@ enum CacheMsg {
         bytes: Bytes,
         status: u16,
         hdrs: Vec<Vec<String>>,
+    },
+    Validate {
+        key: String,
+        pq: String,
+        cookies: Option<String>,
+        ua: Option<String>,
+        etag: String,
     },
 }
 
@@ -58,18 +67,61 @@ fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
 
 /// 取路由：主调用路径唯一入口。命中 = 纯本地磁盘读（对 GitHub 零请求）；
 /// 未命中/不可缓存 = None，主路走上游。
-pub(super) fn cache_take(req: &hyper::Request<Incoming>, host: &str) -> Option<axum::response::Response<BoxBody>> {
+pub(super) fn cache_take(
+    log: &LogFn,
+    req: &hyper::Request<Incoming>,
+    host: &str,
+) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
     if !cache_eligible(req, host) {
         return None;
     }
     let key = page_cache_key(req, host);
-    page_cache_get(&key)
+    let (cached, etag) = page_cache_get(&key)?;
+    (log)(&format!("[缓存] 命中 {}", req.uri()));
+    // SWR：同页验证窗口（10 分钟）过期且过全局冷却 → 向管家投一条
+    // If-None-Match 静默保鲜任务（只带 user_session，不带 _gh_sess——
+    // 后者每请求轮换，回放旧值 = 会话固定信号）。
+    let now_ms = now_millis();
+    let last_start = LAST_VALIDATE_START.load(std::sync::atomic::Ordering::Relaxed);
+    let cooldown_ok = now_ms.saturating_sub(last_start) >= VALIDATE_COOLDOWN_MS;
+    let due = {
+        let map = last_verified_map().lock().unwrap();
+        validation_due(&map, &key, now_ms)
+    };
+    if due && cooldown_ok && etag.is_some() {
+        LAST_VALIDATE_START.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        mark_validated(&mut last_verified_map().lock().unwrap(), &key, now_ms);
+        let cookies = swr_session_cookie(req);
+        let ua = req
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default();
+        let etag2 = etag.clone().unwrap_or_default();
+        worker_send(
+            CacheMsg::Validate {
+                key: key.clone(),
+                pq,
+                cookies,
+                ua,
+                etag: etag2,
+            },
+            log,
+        );
+    }
+    Some((cached, etag))
 }
 
 /// 存路由：上游响应唯一入口。内部复判可缓存性、构造键（含会话指纹）、
 /// 剥离 Set-Cookie、收集体并投递 Save 消息；不可缓存原样透传。
 /// 主路径零磁盘等待：写盘在管家线程。
 pub(super) async fn cache_put(
+    log: &LogFn,
     req: &hyper::Request<Incoming>,
     host: &str,
     resp: axum::response::Response<BoxBody>,
@@ -87,7 +139,7 @@ pub(super) async fn cache_put(
         }
     }
     let key = page_cache_key(req, host);
-    collect_and_submit(&key, resp).await
+    collect_and_submit(log, &key, resp).await
 }
 
 // ---------- 内部：管家线程 ----------
@@ -95,18 +147,24 @@ pub(super) async fn cache_put(
 static WORKER_SENDER: OnceLock<mpsc::SyncSender<CacheMsg>> = OnceLock::new();
 static WORKER_LOG: OnceLock<LogFn> = OnceLock::new();
 
+/// 每个缓存页上次后台验证的时间（毫秒历元）。内存态：重启后为空，
+/// 每页首次命中验证一次，本来就是正确语义。
+static LAST_VERIFIED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志（缓存写是 best-effort）。
 /// 日志用管家初始化时捕获的 WORKER_LOG（投递方无需自带）。
-fn worker_send(msg: CacheMsg) -> bool {
+fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     let tx = WORKER_SENDER.get_or_init(|| {
+        WORKER_LOG.set(log.clone());
         let (tx, rx) = mpsc::sync_channel::<CacheMsg>(WORKER_CHANNEL_CAP);
-        let log = WORKER_LOG.get().expect("worker_send 必在 cache_put/take 之后").clone();
+        let log2 = log.clone();
         let _ = std::thread::Builder::new()
             .name("page-cache-worker".into())
-            .spawn(move || worker_loop(log, rx));
+            .spawn(move || worker_loop(log2, rx));
         tx
     });
-    let log = WORKER_LOG.get().expect("同上").clone();
     match tx.try_send(msg) {
         Ok(()) => true,
         Err(e) => {
@@ -132,6 +190,18 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>) {
                 {
                     (log)(&format!("[缓存] 后台写盘失败({e})，{key} 本次不缓存"));
                 }
+            }
+            CacheMsg::Validate {
+                key,
+                pq,
+                cookies,
+                ua,
+                etag,
+            } => {
+                // 网络验证（慢）不阻塞磁盘循环——立即 spawn 异步跑
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_spawn_validate(log.clone(), key, pq, cookies, ua, etag);
+                }));
             }
         }
     }
@@ -167,6 +237,13 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 页面可缓存判定（2026-10-23 定案：全量缓存，唯一禁区=登录态翻转三件套）。
 /// 通知页同权：内容陈旧由用户自行刷新（Ctrl+F5 绕过缓存取最新）；
 /// 搜索碎片（count/blackbird/warm）是 XHR 碎片，已被
@@ -178,6 +255,35 @@ fn page_cache_allowed(path: &str) -> bool {
     !path.starts_with("/login")
         && !path.starts_with("/logout")
         && !path.starts_with("/session")
+}
+
+fn last_verified_map() -> &'static Mutex<HashMap<String, u64>> {
+    LAST_VERIFIED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 距上次验证是否已过窗口（纯判定，便于测试）。
+fn validation_due(map: &HashMap<String, u64>, key: &str, now_ms: u64) -> bool {
+    match map.get(key) {
+        Some(t) => now_ms.saturating_sub(*t) >= VALIDATE_WINDOW_MS,
+        None => true,
+    }
+}
+
+fn mark_validated(map: &mut HashMap<String, u64>, key: &str, now_ms: u64) {
+    map.insert(key.to_string(), now_ms);
+}
+
+/// SWR 验证专用的会话 cookie：只取 user_session（长效鉴权 token，不轮换），
+/// 不带 _gh_sess（每请求轮换的 Rails 会话 cookie，回放旧值 = 会话固定信号）。
+/// GitHub 看 user_session 做鉴权 → 登录态页面内容正确，无轮换冲突。
+fn swr_session_cookie(req: &hyper::Request<Incoming>) -> Option<String> {
+    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
+    let session = cookies
+        .split(';')
+        .map(str::trim)
+        .find_map(|kv| kv.strip_prefix("user_session="))
+        .filter(|v| !v.is_empty())?;
+    Some(format!("user_session={session}"))
 }
 
 /// 会话指纹：只取 user_session（长效鉴权 cookie，不随请求轮换）的值做 FNV。
@@ -213,7 +319,7 @@ fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
 }
 
 /// 命中缓存：返回重建的响应（纯本地磁盘读，对 GitHub 零请求）。
-fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
+fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
     let dir = page_cache_dir();
     let md = cacache::metadata_sync(&dir, key).ok()??;
     let status = u16::try_from(md.metadata.get("status")?.as_u64()?).ok()?;
@@ -231,6 +337,10 @@ fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
             hdrmap.insert(name, val);
         }
     }
+    let etag = hdrmap
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let mut resp = hyper::Response::builder()
         .status(status)
         .body(BoxBody::new(
@@ -242,7 +352,7 @@ fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
         "x-gitport-cache",
         hyper::header::HeaderValue::from_static("hit"),
     );
-    Some(resp)
+    Some((resp, etag))
 }
 
 /// 淘汰超限的最旧页面（按 cacache 索引的写入时间），直到总体积回到上限内；
@@ -313,8 +423,80 @@ fn persist_page_entry_blocking(
     w.commit().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// 管家线程里 Validate 的异步执行入口（通过 tokio Handle spawn 调用）。
+fn handle_spawn_validate(
+    log: LogFn,
+    key: String,
+    pq: String,
+    cookies: Option<String>,
+    ua: Option<String>,
+    etag: String,
+) {
+    let rt = tokio::runtime::Handle::current();
+    rt.spawn(async move {
+        swr_revalidate(&log, &key, &pq, cookies, ua, etag).await;
+    });
+}
+
+/// 后台 SWR 验证：If-None-Match 条件请求（只带 user_session，不带 _gh_sess
+/// ——后者每请求轮换，回放旧值 = 会话固定信号，曾致三次强制下线）。
+/// 304 → 只记账（内容没变）；200 → 静默换新；404/410 → 删死链。
+/// 失败（网络抖动）→ 保留原页，下个窗口再试。
+async fn swr_revalidate(
+    log: &LogFn,
+    key: &str,
+    path_and_query: &str,
+    cookies: Option<String>,
+    ua: Option<String>,
+    etag: String,
+) {
+    let uri = format!("https://github.com{path_and_query}");
+    let mut builder = hyper::Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .header("accept", "text/html")
+        .header("accept-encoding", "gzip")
+        .header("if-none-match", etag);
+    builder = builder.header(
+        "user-agent",
+        ua.unwrap_or_else(|| "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".into()),
+    );
+    if let Some(c) = cookies {
+        builder = builder.header("cookie", c);
+    }
+    let Ok(out) = builder.body(BoxBody::new(
+        http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
+    )) else {
+        return;
+    };
+    let info = UpstreamInfo::default();
+    let resp = match get_direct(log, &out, "github.com", &info, true, &None).await {
+        Ok(r) => r,
+        Err(e) => {
+            (log)(&format!("[缓存] 后台验证失败({e})，{} 保留原页", path_and_query));
+            return;
+        }
+    };
+    match resp.status().as_u16() {
+        304 => (log)(&format!("[缓存] 后台验证 304，{} 内容未变", path_and_query)),
+        200 | 201 => {
+            (log)(&format!("[缓存] 后台验证 200，{} 静默换新", path_and_query));
+            let _ = collect_and_submit(log, key, resp).await;
+        }
+        404 | 410 => {
+            (log)(&format!("[缓存] 后台验证 404，{} 已是死链，删除", path_and_query));
+            if let Ok(Some(md)) = cacache::metadata_sync(&page_cache_dir(), key) {
+                gc_orphaned_content(&page_cache_dir(), &[md.integrity]);
+            }
+            let _ = cacache::remove_sync(&page_cache_dir(), key);
+        }
+        _ => {}
+    }
+}
+
 /// 收集体并投递 Save 消息；返回重建的响应（克隆体交浏览器，零磁盘等待）。
 async fn collect_and_submit(
+    log: &LogFn,
     key: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
@@ -341,12 +523,15 @@ async fn collect_and_submit(
                     })
                     .collect();
                 let status = parts.status.as_u16();
-                worker_send(CacheMsg::Save {
-                    key: key.to_string(),
-                    bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
-                    status,
-                    hdrs,
-                });
+                worker_send(
+                    CacheMsg::Save {
+                        key: key.to_string(),
+                        bytes: bytes.clone(),
+                        status,
+                        hdrs,
+                    },
+                    log,
+                );
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -451,8 +636,9 @@ mod page_cache_tests {
         .unwrap();
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 1, "应有一个缓存条目");
-        let hit = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
+        let (hit, etag) = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
         assert_eq!(hit.headers().get("x-gitport-cache").unwrap(), "hit");
+        assert_eq!(etag.as_deref(), Some("W/\"test\""));
         let bytes = http_body_util::BodyExt::collect(hit.into_body())
             .await
             .unwrap()
@@ -468,7 +654,8 @@ mod page_cache_tests {
                     .map_err(std::io::Error::other),
             ))
             .unwrap();
-        let _ = collect_and_submit("GET github.com/api/x", resp).await;
+        let log: LogFn = std::sync::Arc::new(|_: &str| {});
+        let _ = collect_and_submit(&log, "GET github.com/api/x", resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
         // ③ 排除名单定案（全量缓存，唯一禁区=登录态翻转三件套）：
