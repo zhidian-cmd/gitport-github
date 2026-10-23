@@ -282,17 +282,16 @@ fn mark_validated(map: &mut HashMap<String, u64>, key: &str, now_ms: u64) {
     map.insert(key.to_string(), now_ms);
 }
 
-/// SWR 验证专用的会话 cookie：只取 user_session（长效鉴权 token，不轮换），
-/// 不带 _gh_sess（每请求轮换的 Rails 会话 cookie，回放旧值 = 会话固定信号）。
-/// GitHub 看 user_session 做鉴权 → 登录态页面内容正确，无轮换冲突。
+/// SWR 验证专用的会话 cookie：使用命中请求的完整 cookie 头。
+/// 这些 cookie 在命中那一刻刚被 GitHub 接受（浏览器正常导航返回 200），
+/// 回放它们 = 以与浏览器完全相同的身份发起条件请求 → 无会话固定信号。
+/// 之前的教训：只带 user_session 不带 _gh_sess → GitHub 不认完整会话
+/// → 返回未登录页（200）→ 缓存被污染（2026-10-24 实测踩坑）。
 fn swr_session_cookie(req: &hyper::Request<Incoming>) -> Option<String> {
-    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
-    let session = cookies
-        .split(';')
-        .map(str::trim)
-        .find_map(|kv| kv.strip_prefix("user_session="))
-        .filter(|v| !v.is_empty())?;
-    Some(format!("user_session={session}"))
+    req.headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 /// 会话指纹：单用户代理只需区分「已登录」和「未登录」两个状态。
