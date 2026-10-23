@@ -66,6 +66,7 @@ fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
 }
 
 /// 取路由：主调用路径唯一入口。命中 = 纯本地磁盘读（对 GitHub 零请求）；
+/// 命中时"摸"一下条目（重写索引刷新时间戳）防被容量淘汰误杀；
 /// 未命中/不可缓存 = None，主路走上游。
 pub(super) fn cache_take(
     log: &LogFn,
@@ -78,6 +79,9 @@ pub(super) fn cache_take(
     let key = page_cache_key(req, host);
     let (cached, etag) = page_cache_get(&key)?;
     (log)(&format!("[缓存] 命中 {}", req.uri()));
+    // 摸一下：重写索引刷新时间戳（内容去重，只更新索引行 ~0.1ms），
+    // 防止频繁访问的页面因"写入时间旧"被容量淘汰误杀（偶发转圈的根因）
+    touch_cache_entry(&key);
     // SWR：同页验证窗口（10 分钟）过期且过全局冷却 → 向管家投一条
     // If-None-Match 静默保鲜任务（只带 user_session，不带 _gh_sess——
     // 后者每请求轮换，回放旧值 = 会话固定信号）。
@@ -157,7 +161,7 @@ static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
 /// 日志用管家初始化时捕获的 WORKER_LOG（投递方无需自带）。
 fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     let tx = WORKER_SENDER.get_or_init(|| {
-        WORKER_LOG.set(log.clone());
+        let _ = WORKER_LOG.set(log.clone());
         let (tx, rx) = mpsc::sync_channel::<CacheMsg>(WORKER_CHANNEL_CAP);
         let log2 = log.clone();
         let _ = std::thread::Builder::new()
@@ -392,6 +396,47 @@ fn gc_orphaned_content(dir: &std::path::Path, removed: &[cacache::Integrity]) {
     for sri in removed {
         if !referenced.contains(&sri.to_string()) {
             let _ = cacache::remove_hash_sync(dir, sri);
+        }
+    }
+}
+
+/// 命中缓存"摸一下"：重写索引行刷新时间戳（内容去重不重复写 blob，~0.1ms），
+/// 防止频繁访问的页面因"写入时间旧"被容量淘汰误杀（偶发转圈的根因）。
+fn touch_cache_entry(key: &str) {
+    let dir = page_cache_dir();
+    // 读元数据拿已有 headers/status，原样重写（内容 blob 已去重不重复写）
+    if let Ok(Some(md)) = cacache::metadata_sync(&dir, key) {
+        let status = md.metadata.get("status").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+        let hdrs: Vec<Vec<String>> = md
+            .metadata
+            .get("headers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|pair| {
+                        let k = pair.get(0)?.as_str()?.to_string();
+                        let v = pair.get(1)?.as_str()?.to_string();
+                        Some(vec![k, v])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 读取内容 blob 并原样写回（cacache 去重 → 同哈希不重复写 blob，只更新索引）
+        if let Ok(body) = cacache::read_sync(&dir, key) {
+            let meta = serde_json::json!({
+                "url": key,
+                "status": status,
+                "headers": hdrs,
+            });
+            let w = cacache::WriteOpts::new()
+                .size(body.len())
+                .metadata(meta)
+                .open_sync(&dir, key);
+            if let Ok(mut w) = w {
+                use std::io::Write as _;
+                let _ = w.write_all(&body);
+                let _ = w.commit();
+            }
         }
     }
 }
