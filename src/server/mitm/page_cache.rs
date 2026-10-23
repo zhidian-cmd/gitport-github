@@ -257,23 +257,35 @@ fn page_cache_allowed(path: &str) -> bool {
         && !path.starts_with("/session")
 }
 
-fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
-    let uri = req.uri();
-    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    // 会话身份进键：登录/登出态的同一 URL 页面内容不同，防串页
-    let cookie_tag = req
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(|c| format!("-c{}", {
+/// 会话指纹：只取 user_session（长效鉴权 cookie，不随请求轮换）的值做 FNV。
+/// 整个 cookie header 的哈希会被 _gh_sess 每请求轮换打散——每次导航键都变，
+/// 登录态缓存永不命中。无 user_session = 未登录 → 固定标签。
+/// 登录/登出/多账号三态天然分离：取路由按指纹给对应状态的缓存页。
+fn session_fingerprint(cookies: Option<&str>) -> String {
+    let session = cookies.and_then(|c| {
+        c.split(';')
+            .map(str::trim)
+            .find_map(|kv| kv.strip_prefix("user_session=").filter(|v| !v.is_empty()))
+    });
+    match session {
+        Some(v) => {
             let mut h: u64 = 0xcbf29ce484222325;
-            for b in c.as_bytes() {
+            for b in v.as_bytes() {
                 h ^= u64::from(*b);
                 h = h.wrapping_mul(0x100000001b3);
             }
-            format!("{h:016x}")
-        }))
-        .unwrap_or_else(|| "-c0".into());
+            format!("-c{h:016x}")
+        }
+        None => "-cloggedout".into(),
+    }
+}
+
+fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
+    let uri = req.uri();
+    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    // 会话指纹进键：登录/登出态的同一 URL 页面内容不同，防串页
+    let cookie_tag =
+        session_fingerprint(req.headers().get("cookie").and_then(|v| v.to_str().ok()));
     format!("GET {host}{}{q}{cookie_tag}", uri.path())
 }
 
@@ -606,6 +618,16 @@ mod page_cache_tests {
         assert!(page_cache_get(sk).is_some(), "前提：条目已缓存");
         invalidate_after_write("github.com", "/settings/profile");
         assert!(page_cache_get(sk).is_none(), "写操作后应失效");
+
+        // ⑧ 会话指纹：_gh_sess 轮换不换键；user_session 变化换键；未登录固定标签
+        let s1 = session_fingerprint(Some("user_session=abc; _gh_sess=r1"));
+        let s1b = session_fingerprint(Some("user_session=abc; _gh_sess=r2"));
+        let s2 = session_fingerprint(Some("user_session=def; _gh_sess=r1"));
+        let s0 = session_fingerprint(None);
+        assert_eq!(s1, s1b, "_gh_sess 轮换不应换键");
+        assert_ne!(s1, s2, "换账号应换键");
+        assert_eq!(s0, "-cloggedout", "未登录固定标签");
+        assert_ne!(s1, s0, "登录/未登录必须分键");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
