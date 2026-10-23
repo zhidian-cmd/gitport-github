@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 
 mod defuse;
 mod mirror;
-mod page_cache;
 
 pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CalibMode, CALIB_RUNNING};
 
@@ -130,9 +129,6 @@ async fn mitm_http(
     let info = UpstreamInfo::default();
     // 页面缓存：取/存两个路由，判定/键/元数据/索引知识收拢在 page_cache 模块内。
     // 新鲜度模型：用户点击行为驱动（命中秒回 + 写失效即时刷新），无后台验证。
-    if let Some((cached, _etag)) = page_cache::cache_take(&log, &req, &host) {
-        return write_upstream(cached, "cache", &info);
-    }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
@@ -240,18 +236,25 @@ async fn mitm_http(
             }
         }
     }
-    // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
-    if host == "github.com"
-        && matches!(
-            req.method(),
-            &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH
-        )
-        && (resp.status().is_success() || resp.status().is_redirection())
-    {
-        page_cache::invalidate_after_write(&host, req.uri().path());
-    }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
-    let resp = page_cache::cache_put(&log, &req, &host, resp).await;
+    // 浏览器缓存加速：GitHub 的 max-age=0 强制每次重验证（~300ms 条件请求），
+    // 改为 max-age=300 → 浏览器 5 分钟内直接用本地缓存（0ms），
+    // 过期后浏览器自动带 If-None-Match 通过代理条件请求 GitHub → 304 或 200。
+    // 会话安全：浏览器自主管理缓存和重验证，代理不加任何额外请求。
+    if host == "github.com"
+        && resp.status().as_u16() == 200
+        && resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|c| c.starts_with("text/html"))
+            .unwrap_or(false)
+    {
+        resp.headers_mut().insert(
+            "cache-control",
+            http::HeaderValue::from_static("private, max-age=300"),
+        );
+    }
     write_upstream(resp, "direct", &info)
 }
 fn stream_decision(
