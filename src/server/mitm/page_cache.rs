@@ -11,15 +11,15 @@
 //! 页面内容 = 上次访问时的样子（用户明确接受的取舍，Ctrl+F5 绕过缓存取最新）。
 //! cookie 语义：单用户本地代理，cookie 全量转发 GitHub（等同浏览器行为）；
 //! 仅镜像腿剥离（镜像站是第三方，不认识会话，剥离防凭证泄露）。
-use super::{get_direct, BoxBody, UpstreamInfo};
+use super::BoxBody;
 use crate::pool::LogFn;
 use crate::server::upstream::Incoming;
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use http_body_util::BodyExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
