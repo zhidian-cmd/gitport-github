@@ -322,13 +322,25 @@ fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
     format!("GET {host}{}{q}{cookie_tag}", uri.path())
 }
 
-/// 命中缓存：返回重建的响应（纯本地磁盘读，对 GitHub 零请求）。
+/// 检测 body 是否为未登录页面（GitHub 未登录时 body 带 logged-out class 标记）。
+/// 请求带会话 cookie 但响应是未登录页 = 会话已死 → 不缓存/不当命中（防污染）。
+fn is_logged_out_body(bytes: &[u8]) -> bool {
+    let check_len = bytes.len().min(4096);
+    let chunk = String::from_utf8_lossy(&bytes[..check_len]);
+    chunk.contains("logged-out env-") || chunk.contains("class=\"logged-out")
+}
+
+/// 命中缓存：返回重建的响应 + 该页的 ETag（后台验证用）。
+/// 检测 body 是否为未登录页（会话死亡期间的污染条目）→ 当作 miss 处理。
 fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
     let dir = page_cache_dir();
     let md = cacache::metadata_sync(&dir, key).ok()??;
     let status = u16::try_from(md.metadata.get("status")?.as_u64()?).ok()?;
     let headers = md.metadata.get("headers")?.as_array()?;
     let body = cacache::read_sync(&dir, key).ok()?;
+    if is_logged_out_body(&body) {
+        return None; // 未登录污染条目：当作 miss
+    }
     let mut hdrmap = hyper::HeaderMap::new();
     for pair in headers {
         let (Some(k), Some(v)) = (pair.get(0)?.as_str(), pair.get(1)?.as_str()) else {
@@ -549,7 +561,7 @@ async fn collect_and_submit(
     key: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
-    let (mut parts, body) = resp.into_parts();
+    let (parts, body) = resp.into_parts();
     let is_html = parts
         .headers
         .get("content-type")
@@ -559,25 +571,28 @@ async fn collect_and_submit(
     if !is_html {
         return hyper::Response::from_parts(parts, body);
     }
-    parts.headers.remove("set-cookie");
+    // Set-Cookie 必须到达浏览器（GitHub 靠它做会话轮换/续期，剥离 = 浏览器
+    // cookie 冻结 → 轮换后旧值被拒 → 未登录页）。只从缓存元数据中排除
+    // （防缓存命中回灌旧值），响应本身原样透传。
+    let cache_hdrs: Vec<Vec<String>> = parts
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+        .map(|(k, v)| {
+            vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()]
+        })
+        .collect();
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
             if bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES {
-                let hdrs: Vec<Vec<String>> = parts
-                    .headers
-                    .iter()
-                    .map(|(k, v)| {
-                        vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()]
-                    })
-                    .collect();
                 let status = parts.status.as_u16();
                 worker_send(
                     CacheMsg::Save {
                         key: key.to_string(),
                         bytes: bytes.clone(),
                         status,
-                        hdrs,
+                        hdrs: cache_hdrs,
                     },
                     log,
                 );
