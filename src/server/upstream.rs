@@ -67,10 +67,7 @@ static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static ACTIVITY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    pool::now_ms() / 1000
 }
 
 pub fn note_activity() {

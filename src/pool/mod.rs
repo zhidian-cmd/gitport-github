@@ -14,6 +14,14 @@ use tokio_util::sync::CancellationToken;
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 全仓统一的毫秒历元时钟（upstream 保活 / page_cache TTL 共用）。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SerialPlan {
     pub ip: String,

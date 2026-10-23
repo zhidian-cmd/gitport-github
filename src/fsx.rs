@@ -8,7 +8,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(data)?;
-    f.flush()?;
+    f.sync_all()?; // 断电也不留空/半截文件（flush 只到 OS 页缓存，不够）
     drop(f);
     std::fs::rename(&tmp, path)
 }
