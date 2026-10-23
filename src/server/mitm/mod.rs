@@ -239,6 +239,26 @@ async fn mitm_http(
             }
         }
     }
+    // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
+    if host == "github.com"
+        && matches!(
+            req.method(),
+            &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH
+        )
+        && (resp.status().is_success() || resp.status().is_redirection())
+    {
+        page_cache::invalidate_after_write(&host, req.uri().path());
+    }
+    // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
+    if host == "github.com"
+        && matches!(
+            req.method(),
+            &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH
+        )
+        && (resp.status().is_success() || resp.status().is_redirection())
+    {
+        page_cache::invalidate_after_write(&host, req.uri().path());
+    }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
     let resp = page_cache::cache_put(&log, &req, &host, resp).await;
     write_upstream(resp, "direct", &info)
