@@ -233,7 +233,7 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
         return false;
     }
     if CACHE_ACL_APPLIED.set(()).is_ok() {
-        let _ = crate::winsec::restrict_to_current_user(&dir.to_string_lossy());
+        let _ = crate::winsec::restrict_dir_to_current_user(&dir.to_string_lossy());
     }
     true
 }
