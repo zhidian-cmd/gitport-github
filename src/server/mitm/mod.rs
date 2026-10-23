@@ -129,7 +129,7 @@ async fn mitm_http(
 
     let info = UpstreamInfo::default();
     // 页面缓存：取/存两个路由，判定/键/元数据/索引知识收拢在 page_cache 模块内。
-    if let Some((cached, _etag)) = page_cache::cache_take(&log, &req, &host) {
+    if let Some(cached) = page_cache::cache_take(&req, &host) {
         return write_upstream(cached, "cache", &info);
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
@@ -260,7 +260,7 @@ async fn mitm_http(
         page_cache::invalidate_after_write(&host, req.uri().path());
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
-    let resp = page_cache::cache_put(&log, &req, &host, resp).await;
+    let resp = page_cache::cache_put(&req, &host, resp).await;
     write_upstream(resp, "direct", &info)
 }
 fn stream_decision(

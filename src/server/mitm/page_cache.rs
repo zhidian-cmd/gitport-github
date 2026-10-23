@@ -1,34 +1,31 @@
 //! 页面缓存（github.com 文档导航 GET，cacache 内容寻址磁盘缓存）。
 //! 架构：取/存两个路由 + 一个后台管家线程。
-//! - cache_take：命中秒回（零上游请求）+ SWR 窗口节流派发；
+//! - cache_take：命中秒回（对 GitHub 零请求）；
 //! - cache_put：资格判定 + 收集体（≤2MB）+ 投递 Save 消息（主路径零磁盘等待）；
 //! - 管家线程（懒启动，专用 OS 线程串行消费任务筐）：写盘、容量淘汰（200MB）、
-//!   孤儿内容块回收、SWR 网络验证派发。磁盘 IO 永不阻塞请求路径。
-//! 新鲜度：SWR（10 分钟窗口 + If-None-Match 304/200）+ 写失效（POST 后同路径
-//! 条目即删）；无任何定时清空——陈旧度由访问时验证保证，磁盘由字节上限保证。
+//!   孤儿内容块回收。磁盘 IO 永不阻塞请求路径。
+//! 新鲜度模型（2026-10-23 定案）：**没有后台验证**。
+//! 之前的 ETag 后台验证回放"命中时刻冻结的会话 cookie"，与浏览器实时轮换的
+//! _gh_sess 交错出现，被 GitHub 风控判定为会话固定 → 当天三次强制下线。
+//! 现在的新鲜度 = 你自己的写操作（POST 后同路径条目即删）+ 会话指纹分键；
+//! 页面内容 = 上次访问时的样子（用户明确接受的取舍，Ctrl+F5 绕过缓存取最新）。
 //! cookie 语义：单用户本地代理，cookie 全量转发 GitHub（等同浏览器行为）；
 //! 仅镜像腿剥离（镜像站是第三方，不认识会话，剥离防凭证泄露）。
-use super::{get_direct, BoxBody, UpstreamInfo};
-use crate::server::upstream::Incoming;
+use super::BoxBody;
 use crate::pool::LogFn;
+use crate::server::upstream::Incoming;
 use bytes::Bytes;
-use http::Method;
+use http::{Method, StatusCode};
 use http_body_util::BodyExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const VALIDATE_WINDOW_MS: u64 = 10 * 60 * 1000; // 同页验证窗口
-const VALIDATE_COOLDOWN_MS: u64 = 2000; // 全局验证冷却（防点击风暴）
 const WORKER_CHANNEL_CAP: usize = 64; // 任务筐上限：满了丢弃（缓存写是 best-effort）
 
-static LAST_VERIFIED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// 管家线程的任务消息。Save = 写盘（含淘汰/孤儿回收）；Validate = 网络验证。
+/// 管家线程的任务消息：目前只有 Save（写盘+淘汰+孤儿回收）。
 enum CacheMsg {
     Save {
         key: String,
@@ -36,17 +33,10 @@ enum CacheMsg {
         status: u16,
         hdrs: Vec<Vec<String>>,
     },
-    Validate {
-        key: String,
-        pq: String,
-        cookies: Option<String>,
-        ua: Option<String>,
-        etag: String,
-    },
 }
 
 // ---------- 对外唯二入口：取 / 存 ----------
-// 知识收拢：可缓存判定、键构造（含会话指纹）、窗口节流、元数据与索引、
+// 知识收拢：可缓存判定、键构造（含会话指纹）、元数据与索引、
 // 容量淘汰全部在本模块内；调用方只见 cache_take / cache_put 两个路由。
 
 /// 取/存共用的可缓存判定。
@@ -66,66 +56,20 @@ fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
         && page_cache_allowed(&req.uri().path().to_string())
 }
 
-/// 取路由：主调用路径唯一入口。命中返回 (响应, etag) 并按窗口向管家投递
-/// SWR 验证任务；未命中/不可缓存 = None。
-pub(super) fn cache_take(
-    log: &LogFn,
-    req: &hyper::Request<Incoming>,
-    host: &str,
-) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
+/// 取路由：主调用路径唯一入口。命中 = 纯本地磁盘读（对 GitHub 零请求）；
+/// 未命中/不可缓存 = None，主路走上游。
+pub(super) fn cache_take(req: &hyper::Request<Incoming>, host: &str) -> Option<axum::response::Response<BoxBody>> {
     if !cache_eligible(req, host) {
         return None;
     }
     let key = page_cache_key(req, host);
-    let (cached, etag) = page_cache_get(&key)?;
-    (log)(&format!("[缓存] 命中 {}", req.uri()));
-    // SWR：同页验证窗口（10 分钟）过期且过全局冷却 → 向管家投一条
-    // If-None-Match 静默保鲜任务（带会话 cookie）。窗口内点多少次都不问。
-    let now_ms = now_millis();
-    let last_start = LAST_VALIDATE_START.load(std::sync::atomic::Ordering::Relaxed);
-    let cooldown_ok = now_ms.saturating_sub(last_start) >= VALIDATE_COOLDOWN_MS;
-    let due = {
-        let map = last_verified_map().lock().unwrap();
-        validation_due(&map, &key, now_ms)
-    };
-    if due && cooldown_ok && etag.is_some() {
-        LAST_VALIDATE_START.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-        mark_validated(&mut last_verified_map().lock().unwrap(), &key, now_ms);
-        let cookies = req
-            .headers()
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let ua = req
-            .headers()
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let pq = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_default();
-        let etag2 = etag.clone().unwrap_or_default();
-        worker_send(
-            CacheMsg::Validate {
-                key: key.clone(),
-                pq,
-                cookies,
-                ua,
-                etag: etag2,
-            },
-            log,
-        );
-    }
-    Some((cached, etag))
+    page_cache_get(&key)
 }
 
 /// 存路由：上游响应唯一入口。内部复判可缓存性、构造键（含会话指纹）、
 /// 剥离 Set-Cookie、收集体并投递 Save 消息；不可缓存原样透传。
-/// 磁盘零等待：collect 是网络收尾（不可避免），写盘在管家线程。
+/// 主路径零磁盘等待：写盘在管家线程。
 pub(super) async fn cache_put(
-    log: &LogFn,
     req: &hyper::Request<Incoming>,
     host: &str,
     resp: axum::response::Response<BoxBody>,
@@ -143,24 +87,26 @@ pub(super) async fn cache_put(
         }
     }
     let key = page_cache_key(req, host);
-    collect_and_submit(log, &key, resp).await
+    collect_and_submit(&key, resp).await
 }
 
 // ---------- 内部：管家线程 ----------
 
 static WORKER_SENDER: OnceLock<mpsc::SyncSender<CacheMsg>> = OnceLock::new();
+static WORKER_LOG: OnceLock<LogFn> = OnceLock::new();
 
 /// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志（缓存写是 best-effort）。
-fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
+/// 日志用管家初始化时捕获的 WORKER_LOG（投递方无需自带）。
+fn worker_send(msg: CacheMsg) -> bool {
     let tx = WORKER_SENDER.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<CacheMsg>(WORKER_CHANNEL_CAP);
-        let handle = tokio::runtime::Handle::current();
-        let log2 = log.clone();
+        let log = WORKER_LOG.get().expect("worker_send 必在 cache_put/take 之后").clone();
         let _ = std::thread::Builder::new()
             .name("page-cache-worker".into())
-            .spawn(move || worker_loop(log2, rx, handle));
+            .spawn(move || worker_loop(log, rx));
         tx
     });
+    let log = WORKER_LOG.get().expect("同上").clone();
     match tx.try_send(msg) {
         Ok(()) => true,
         Err(e) => {
@@ -170,9 +116,8 @@ fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     }
 }
 
-/// 管家循环：专用 OS 线程串行消费任务筐。磁盘写在这个线程上做（阻塞无害）；
-/// 网络验证（慢）不排进磁盘循环——立即 handle.spawn 异步跑。
-fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>, handle: tokio::runtime::Handle) {
+/// 管家循环：专用 OS 线程串行消费任务筐。磁盘写在这个线程上做（阻塞无害）。
+fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             CacheMsg::Save {
@@ -187,22 +132,6 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>, handle: tokio::runtime:
                 {
                     (log)(&format!("[缓存] 后台写盘失败({e})，{key} 本次不缓存"));
                 }
-            }
-            CacheMsg::Validate {
-                key,
-                pq,
-                cookies,
-                ua,
-                etag,
-            } => {
-                let log2 = log.clone();
-                // 保险丝：进程退出瞬间若 Runtime 已销毁，spawn 会 panic——
-                // catch_unwind 兜住，管家线程不陪葬（真实触发窗口毫秒级，纯保险）
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.spawn(async move {
-                        swr_revalidate(&log2, &key, &pq, cookies, ua, etag).await;
-                    });
-                }));
             }
         }
     }
@@ -238,73 +167,10 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// 距上次验证是否已过窗口（纯判定，便于测试）。
-fn validation_due(map: &HashMap<String, u64>, key: &str, now_ms: u64) -> bool {
-    match map.get(key) {
-        Some(t) => now_ms.saturating_sub(*t) >= VALIDATE_WINDOW_MS,
-        None => true,
-    }
-}
-
-fn mark_validated(map: &mut HashMap<String, u64>, key: &str, now_ms: u64) {
-    map.insert(key.to_string(), now_ms);
-}
-
-fn last_verified_map() -> &'static Mutex<HashMap<String, u64>> {
-    LAST_VERIFIED.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 清空缓存（测试用；生产路径靠容量淘汰与写失效，无定时清空）。
-#[cfg(test)]
-fn page_cache_clear() {
-    let dir = page_cache_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            let _ = std::fs::remove_dir_all(&p);
-        } else {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-    last_verified_map().lock().unwrap().clear();
-}
-
-/// 写操作后的缓存失效：POST/PUT/DELETE 成功（2xx/3xx）即删除同路径前缀的
-/// 缓存条目——否则改完设置/发完评论跳回来看到的是旧页面（像保存失败）。
-/// 同时清掉对应条目的验证时间戳（条目已删，时间戳留着无意义）。
-pub(super) fn invalidate_after_write(host: &str, path: &str) {
-    let prefix = format!("GET {host}{path}");
-    let dir = page_cache_dir();
-    let mut evicted: Vec<cacache::Integrity> = Vec::new();
-    for entry in cacache::list_sync(&dir).flatten() {
-        if entry.key.starts_with(&prefix) {
-            evicted.push(entry.integrity.clone());
-            let _ = cacache::remove_sync(&dir, &entry.key);
-        }
-    }
-    gc_orphaned_content(&dir, &evicted);
-    if !evicted.is_empty() {
-        last_verified_map()
-            .lock()
-            .unwrap()
-            .retain(|k, _| !k.starts_with(&prefix));
-    }
-}
-
 /// 页面可缓存判定（2026-10-23 定案：全量缓存，唯一禁区=登录态翻转三件套）。
-/// 通知页同权：SWR 一次滞后的代价（新通知晚一拍可见）+ 写失效已保护
-/// mark-as-read 流程；搜索碎片（count/blackbird/warm）是 XHR 碎片，
-/// 已被 sec-fetch-dest=document 闸门排除，无需路径名单。
+/// 通知页同权：内容陈旧由用户自行刷新（Ctrl+F5 绕过缓存取最新）；
+/// 搜索碎片（count/blackbird/warm）是 XHR 碎片，已被
+/// sec-fetch-dest=document 闸门排除，无需路径名单。
 /// 保留 /login /logout /session：登录表单的 CSRF token 绑定匿名会话
 /// _gh_sess（每请求轮换），缓存页的旧 token 提交必被拒 → 锁死登录页；
 /// 登出被截胡 = 假登出。这是功能边界，不是缓存策略。
@@ -346,8 +212,8 @@ fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
     format!("GET {host}{}{q}{cookie_tag}", uri.path())
 }
 
-/// 命中缓存：返回重建的响应 + 该页的 ETag（后台验证用）。
-fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
+/// 命中缓存：返回重建的响应（纯本地磁盘读，对 GitHub 零请求）。
+fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
     let dir = page_cache_dir();
     let md = cacache::metadata_sync(&dir, key).ok()??;
     let status = u16::try_from(md.metadata.get("status")?.as_u64()?).ok()?;
@@ -365,10 +231,6 @@ fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Optio
             hdrmap.insert(name, val);
         }
     }
-    let etag = hdrmap
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
     let mut resp = hyper::Response::builder()
         .status(status)
         .body(BoxBody::new(
@@ -380,7 +242,7 @@ fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Optio
         "x-gitport-cache",
         hyper::header::HeaderValue::from_static("hit"),
     );
-    Some((resp, etag))
+    Some(resp)
 }
 
 /// 淘汰超限的最旧页面（按 cacache 索引的写入时间），直到总体积回到上限内；
@@ -424,10 +286,35 @@ fn gc_orphaned_content(dir: &std::path::Path, removed: &[cacache::Integrity]) {
     }
 }
 
-/// 前台半段：收集体（≤2MB 保护）→ 立即克隆构建响应交还浏览器；
-/// 写盘任务投递给管家线程，主路径零磁盘等待。
+/// 后台半段（管家线程内执行）：建目录（含 ACL）→ 容量淘汰 → 写 cacache 条目。
+fn persist_page_entry_blocking(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+    status: u16,
+    hdrs: &[Vec<String>],
+) -> Result<(), String> {
+    if !ensure_cache_dir_with_acl(dir) {
+        return Err("缓存目录创建失败".to_string());
+    }
+    enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
+    let meta = serde_json::json!({
+        "url": key,
+        "status": status,
+        "headers": hdrs,
+    });
+    let mut w = cacache::WriteOpts::new()
+        .size(bytes.len()) // 索引 size 默认 0，必须显式设置，容量淘汰才有依据
+        .metadata(meta)
+        .open_sync(dir, key)
+        .map_err(|e| e.to_string())?;
+    use std::io::Write as _;
+    w.write_all(bytes).map_err(|e| e.to_string())?;
+    w.commit().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 收集体并投递 Save 消息；返回重建的响应（克隆体交浏览器，零磁盘等待）。
 async fn collect_and_submit(
-    log: &LogFn,
     key: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
@@ -454,15 +341,12 @@ async fn collect_and_submit(
                     })
                     .collect();
                 let status = parts.status.as_u16();
-                worker_send(
-                    CacheMsg::Save {
-                        key: key.to_string(),
-                        bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
-                        status,
-                        hdrs,
-                    },
-                    log,
-                );
+                worker_send(CacheMsg::Save {
+                    key: key.to_string(),
+                    bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
+                    status,
+                    hdrs,
+                });
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -476,7 +360,7 @@ async fn collect_and_submit(
         Err(_) => {
             // 收集失败（罕见）：无内容可交付，回 502 兜底
             hyper::Response::builder()
-                .status(hyper::StatusCode::BAD_GATEWAY)
+                .status(StatusCode::BAD_GATEWAY)
                 .body(BoxBody::new(
                     http_body_util::Full::new(Bytes::from_static(b"page collect failed"))
                         .map_err(std::io::Error::other),
@@ -486,98 +370,36 @@ async fn collect_and_submit(
     }
 }
 
-/// 后台半段（管家线程内执行）：建目录（含 ACL）→ 容量淘汰 → 写 cacache 条目。
-/// 自上次全量淘汰扫描以来的新增字节记账：常态 Save 零扫描，
-/// 攒够 ENFORCE_TRIGGER_BYTES 才触发一次 enforce（含孤儿回收）。
-static NEW_BYTES_SINCE_ENFORCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-const ENFORCE_TRIGGER_BYTES: u64 = 16 * 1024 * 1024;
-
-fn persist_page_entry_blocking(
-    dir: &std::path::Path,
-    key: &str,
-    bytes: &[u8],
-    status: u16,
-    hdrs: &[Vec<String>],
-) -> Result<(), String> {
-    if !ensure_cache_dir_with_acl(dir) {
-        return Err("缓存目录创建失败".to_string());
+/// 写操作后的缓存失效：POST/PUT/DELETE 成功（2xx/3xx）即删除同路径前缀的
+/// 缓存条目——否则改完设置/发完评论跳回来看到的是旧页面（像保存失败）。
+/// 随后回收孤儿内容块（被删条目的内容若无残余引用 → 删块）。
+pub(super) fn invalidate_after_write(host: &str, path: &str) {
+    let prefix = format!("GET {host}{path}");
+    let dir = page_cache_dir();
+    let mut evicted: Vec<cacache::Integrity> = Vec::new();
+    for entry in cacache::list_sync(&dir).flatten() {
+        if entry.key.starts_with(&prefix) {
+            evicted.push(entry.integrity.clone());
+            let _ = cacache::remove_sync(&dir, &entry.key);
+        }
     }
-    // 记账降频：enforce 是全量索引扫描（~千条 = 数十毫秒），不能每存一页扫一遍。
-    // 磁盘真值由 cacache 压缩存储打折，计数按原始体积偏保守（提前触发，无害）。
-    let prev = NEW_BYTES_SINCE_ENFORCE.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    if prev + bytes.len() as u64 >= ENFORCE_TRIGGER_BYTES {
-        NEW_BYTES_SINCE_ENFORCE.store(0, std::sync::atomic::Ordering::Relaxed);
-        enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
-    }
-    let meta = serde_json::json!({
-        "url": key,
-        "status": status,
-        "headers": hdrs,
-    });
-    let mut w = cacache::WriteOpts::new()
-        .size(bytes.len()) // 索引 size 默认 0，必须显式设置，容量淘汰才有依据
-        .metadata(meta)
-        .open_sync(dir, key)
-        .map_err(|e| e.to_string())?;
-    use std::io::Write as _;
-    w.write_all(bytes).map_err(|e| e.to_string())?;
-    w.commit().map(|_| ()).map_err(|e| e.to_string())
+    gc_orphaned_content(&dir, &evicted);
 }
 
-/// 后台 SWR 验证：If-None-Match 条件请求（带会话 cookie + 命中时捕获的 UA）。
-/// 304 → 只记账（内容没变）；200 → 静默换新；404/410 → 删死链（含孤儿回收）。
-/// 失败（网络抖动）→ 保留原页，下个窗口再试。
-async fn swr_revalidate(
-    log: &LogFn,
-    key: &str,
-    path_and_query: &str,
-    cookies: Option<String>,
-    ua: Option<String>,
-    etag: String,
-) {
-    let uri = format!("https://github.com{path_and_query}");
-    let mut builder = hyper::Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .header("accept", "text/html")
-        .header("accept-encoding", "gzip")
-        .header("if-none-match", etag);
-    builder = builder.header(
-        "user-agent",
-        ua.unwrap_or_else(|| "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".into()),
-    );
-    if let Some(c) = cookies {
-        builder = builder.header("cookie", c);
-    }
-    let Ok(out) = builder.body(BoxBody::new(
-        http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-    )) else {
+/// 清空缓存（测试专用；生产路径靠容量淘汰与写失效，无定时清空）。
+#[cfg(test)]
+fn page_cache_clear() {
+    let dir = page_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    let info = UpstreamInfo::default();
-    let resp = match get_direct(log, &out, "github.com", &info, true, &None).await {
-        Ok(r) => r,
-        Err(e) => {
-            (log)(&format!("[缓存] 后台验证失败({e})，{} 保留原页", path_and_query));
-            return;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
         }
-    };
-    match resp.status().as_u16() {
-        304 => (log)(&format!("[缓存] 后台验证 304，{} 内容未变", path_and_query)),
-        200 | 201 => {
-            (log)(&format!("[缓存] 后台验证 200，{} 静默换新", path_and_query));
-            let _ = collect_and_submit(log, key, resp).await;
-        }
-        404 | 410 => {
-            (log)(&format!("[缓存] 后台验证 404，{} 已是死链，删除", path_and_query));
-            if let Some(md) = cacache::metadata_sync(&page_cache_dir(), key).ok().flatten() {
-                gc_orphaned_content(&page_cache_dir(), &[md.integrity]);
-            }
-            let _ = cacache::remove_sync(&page_cache_dir(), key);
-            last_verified_map().lock().unwrap().remove(key);
-        }
-        _ => {}
     }
 }
 
@@ -607,14 +429,14 @@ mod page_cache_tests {
     }
 
     /// 单测试顺序覆盖（OnceLock 全局只能设一次，多测试并行会互相踩目录）：
-    /// roundtrip → 非 HTML 排除 → 排除名单 → 验证窗口判定 → 容量淘汰+孤儿回收 → 清空。
+    /// roundtrip → 非 HTML 排除 → 排除名单 → 容量淘汰+孤儿回收 → 清空 → 写失效。
     #[tokio::test]
     async fn page_cache_disk_all_scenarios() {
         let dir = std::env::temp_dir().join(format!("gitport_pc_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         CACHE_DIR_OVERRIDE.set(dir.clone()).ok();
 
-        // ① roundtrip：写入（直接走 blocking 写，避免与管家线程竞速）→ 命中带 hit 头 + etag 回传
+        // ① roundtrip：写入（直接走 blocking 写，避免与管家线程竞速）→ 命中带 hit 头
         let hdrs = vec![
             vec!["content-type".into(), "text/html; charset=utf-8".into()],
             vec!["etag".into(), "W/\"test\"".into()],
@@ -629,9 +451,8 @@ mod page_cache_tests {
         .unwrap();
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 1, "应有一个缓存条目");
-        let (hit, etag) = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
+        let hit = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
         assert_eq!(hit.headers().get("x-gitport-cache").unwrap(), "hit");
-        assert_eq!(etag.as_deref(), Some("W/\"test\""));
         let bytes = http_body_util::BodyExt::collect(hit.into_body())
             .await
             .unwrap()
@@ -647,12 +468,11 @@ mod page_cache_tests {
                     .map_err(std::io::Error::other),
             ))
             .unwrap();
-        let log: LogFn = std::sync::Arc::new(|_: &str| {});
-        let _ = collect_and_submit(&log, "GET github.com/api/x", resp).await;
+        let _ = collect_and_submit("GET github.com/api/x", resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
         // ③ 排除名单定案（全量缓存，唯一禁区=登录态翻转三件套）：
-        // 通知页同权（SWR 一次滞后）；搜索碎片已被 sec-fetch-dest 闸门排除
+        // 通知页同权（陈旧由用户自行刷新）；搜索碎片已被 sec-fetch-dest 闸门排除
         assert!(page_cache_allowed("/"));
         assert!(page_cache_allowed("/notifications"));
         assert!(page_cache_allowed("/search?q=x&type=repositories"));
@@ -661,14 +481,7 @@ mod page_cache_tests {
         assert!(!page_cache_allowed("/logout"));
         assert!(!page_cache_allowed("/session/xxx"));
 
-        // ④ 验证窗口判定（纯逻辑）：未验证 → due；窗口内 → not due；超窗 → due
-        let mut vmap: HashMap<String, u64> = HashMap::new();
-        assert!(validation_due(&vmap, "k", 10_000_000));
-        mark_validated(&mut vmap, "k", 10_000_000);
-        assert!(!validation_due(&vmap, "k", 10_000_000 + VALIDATE_WINDOW_MS - 1));
-        assert!(validation_due(&vmap, "k", 10_000_000 + VALIDATE_WINDOW_MS));
-
-        // ⑤ 容量淘汰（字节上限）+ 孤儿回收：1.2KB × 5 页，上限 2KB
+        // ④ 容量淘汰（字节上限）+ 孤儿回收：1.2KB × 5 页，上限 2KB
         let small_cap: u64 = 2 * 1024;
         for i in 0..5 {
             let body = pseudo_body(i, 1200);
@@ -692,19 +505,19 @@ mod page_cache_tests {
         assert!(total <= small_cap, "淘汰后总体积应回到上限内");
         assert!(page_cache_get("GET github.com/p0").is_none(), "最旧应被淘汰");
 
-        // ⑥ 清空：cacache 条目全没
+        // ⑤ 清空：cacache 条目全没（page_cache_clear 是测试专用工具）
         page_cache_clear();
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 0, "清空后条目应为零");
 
-        // ⑦ 写操作失效：POST 成功后同路径前缀条目删除（设置页缓存的安全搭档）
+        // ⑥ 写操作失效：POST 成功后同路径前缀条目删除（设置页缓存的安全搭档）
         let sk = "GET github.com/settings/profile-cabc";
         let _ = persist_page_entry_blocking(&dir, sk, b"<html>s</html>", 200, &test_hdrs());
         assert!(page_cache_get(sk).is_some(), "前提：条目已缓存");
         invalidate_after_write("github.com", "/settings/profile");
         assert!(page_cache_get(sk).is_none(), "写操作后应失效");
 
-        // ⑧ 会话指纹：_gh_sess 轮换不换键；user_session 变化换键；未登录固定标签
+        // ⑦ 会话指纹：_gh_sess 轮换不换键；user_session 变化换键；未登录固定标签
         let s1 = session_fingerprint(Some("user_session=abc; _gh_sess=r1"));
         let s1b = session_fingerprint(Some("user_session=abc; _gh_sess=r2"));
         let s2 = session_fingerprint(Some("user_session=def; _gh_sess=r1"));
