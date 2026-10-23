@@ -4,6 +4,7 @@ use super::{path_of, BoxBody};
 use crate::pool::{self, LogFn};
 use crate::server::upstream;
 use bytes::Bytes;
+#[cfg(test)]
 use std::sync::Arc;
 use http::Method;
 use http_body_util::BodyExt;

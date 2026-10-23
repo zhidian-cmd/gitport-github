@@ -3,6 +3,7 @@ use super::{get_direct, BoxBody, PeekRaw, UpstreamInfo};
 use crate::server::upstream;
 use crate::pool::{self, LogFn};
 use bytes::Bytes;
+#[cfg(test)]
 use http_body_util::BodyExt;
 
 /// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
