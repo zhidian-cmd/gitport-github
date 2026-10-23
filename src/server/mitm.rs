@@ -105,6 +105,8 @@ type UpstreamInfo = Arc<Mutex<String>>;
 // 304 只记账、200 静默换新、404/410 删死链。休眠期无命中，验证自然停摆。
 // 删除：持续 2.5 小时无流量 → 整目录清空（last_activity 跨重启记账）；
 // 容量：条目体积合计超 200MB → 按写入时间淘汰最旧。
+// cookie 语义：单用户本地代理，cookie 全量转发 GitHub（等同浏览器行为）；
+// 仅镜像腿剥离（镜像站是第三方，不认识会话，剥离防凭证泄露）。
 const PAGE_CACHE_IDLE_SECS: u64 = 150 * 60; // 2.5 小时
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const VALIDATE_WINDOW_MS: u64 = 10 * 60 * 1000; // 同页验证窗口
@@ -121,16 +123,16 @@ static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static CACHE_DIR_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
     std::sync::OnceLock::new();
 
+fn last_verified_map() -> &'static Mutex<HashMap<String, u64>> {
+    LAST_VERIFIED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn page_cache_dir() -> std::path::PathBuf {
     #[cfg(test)]
     if let Some(d) = CACHE_DIR_OVERRIDE.get() {
         return d.clone();
     }
     crate::settings::exe_dir().join(".cache")
-}
-
-fn last_verified_map() -> &'static Mutex<HashMap<String, u64>> {
-    LAST_VERIFIED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn now_millis() -> u64 {
@@ -337,7 +339,7 @@ async fn page_cache_store(
                     "status": parts.status.as_u16(),
                     "headers": hdrs,
                 });
-                let mut w = cacache::WriteOpts::new()
+                let w = cacache::WriteOpts::new()
                     .size(bytes.len()) // 索引 size 默认 0，必须显式设置，容量淘汰才有依据
                     .metadata(meta)
                     .open_sync(&dir, &key);
@@ -448,28 +450,22 @@ async fn mitm_http(
     }
 
     let info = UpstreamInfo::default();
-    // ---------- 页面缓存（github.com 文档导航 GET）----------
-    // 动机：搜索页每次进入会引爆 ~15 个并行请求（主搜索 + 12 分类计数 + blackbird），
-    // 反复进出仓库/列表会反复触发，GitHub 软限流就开始吐"0 条结果"。
-    // 缓存命中 = 秒回 + 零上游请求。过期：持续 2.5 小时无流量进入代理即整体清空；
-    // 数量上限 30 页；Ctrl+F5（no-cache）绕过；通知/设置/登录页永不缓存。
+    // 页面缓存集成：cookie 全量转发 GitHub（等同浏览器）；仅镜像腿剥离。
     if touch_activity() {
-        page_cache_clear();
+        page_cache_clear(); // 2.5h 无流量的磁盘安全网
     }
-    let dest_ok = match req.headers().get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
-        Some(d) => d == "document",
-        None => true, // curl/git 等本机工具无该头：同一用户，命中无妨
-    };
-    let no_cache_bypass = req
-        .headers()
-        .get("cache-control")
-        .and_then(|v| v.to_str().ok())
-        .map(|c| c.contains("no-cache") || c.contains("max-age=0"))
-        .unwrap_or(false);
     let cacheable = host == "github.com"
         && req.method() == Method::GET
-        && dest_ok
-        && !no_cache_bypass
+        && (match req.headers().get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+            Some(d) => d == "document",
+            None => true, // curl/git 等本机工具无该头：同一用户，命中无妨
+        })
+        && !req
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(|c| c.contains("no-cache") || c.contains("max-age=0"))
+            .unwrap_or(false)
         && page_cache_allowed(&path_of(req.uri()));
     let cache_key = if cacheable {
         Some(page_cache_key(&req, &host))
@@ -490,10 +486,7 @@ async fn mitm_http(
             };
             if due && cooldown_ok && etag.is_some() {
                 LAST_VALIDATE_START.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                last_verified_map()
-                    .lock()
-                    .unwrap()
-                    .insert(key.clone(), now_ms);
+                mark_validated(&mut last_verified_map().lock().unwrap(), key, now_ms);
                 let cookies = req
                     .headers()
                     .get("cookie")
@@ -522,6 +515,7 @@ async fn mitm_http(
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
     };
+
     let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     let path = path_of(req.uri());
     // git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
