@@ -32,7 +32,7 @@ static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
 enum CacheMsg {
     Save {
         key: String,
-        bytes: Vec<u8>,
+        bytes: Bytes,
         status: u16,
         hdrs: Vec<Vec<String>>,
     },
@@ -196,9 +196,13 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>, handle: tokio::runtime:
                 etag,
             } => {
                 let log2 = log.clone();
-                handle.spawn(async move {
-                    swr_revalidate(&log2, &key, &pq, cookies, ua, etag).await;
-                });
+                // 保险丝：进程退出瞬间若 Runtime 已销毁，spawn 会 panic——
+                // catch_unwind 兜住，管家线程不陪葬（真实触发窗口毫秒级，纯保险）
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.spawn(async move {
+                        swr_revalidate(&log2, &key, &pq, cookies, ua, etag).await;
+                    });
+                }));
             }
         }
     }
@@ -453,7 +457,7 @@ async fn collect_and_submit(
                 worker_send(
                     CacheMsg::Save {
                         key: key.to_string(),
-                        bytes: bytes.to_vec(),
+                        bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
                         status,
                         hdrs,
                     },
@@ -483,6 +487,12 @@ async fn collect_and_submit(
 }
 
 /// 后台半段（管家线程内执行）：建目录（含 ACL）→ 容量淘汰 → 写 cacache 条目。
+/// 自上次全量淘汰扫描以来的新增字节记账：常态 Save 零扫描，
+/// 攒够 ENFORCE_TRIGGER_BYTES 才触发一次 enforce（含孤儿回收）。
+static NEW_BYTES_SINCE_ENFORCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const ENFORCE_TRIGGER_BYTES: u64 = 16 * 1024 * 1024;
+
 fn persist_page_entry_blocking(
     dir: &std::path::Path,
     key: &str,
@@ -493,7 +503,13 @@ fn persist_page_entry_blocking(
     if !ensure_cache_dir_with_acl(dir) {
         return Err("缓存目录创建失败".to_string());
     }
-    enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
+    // 记账降频：enforce 是全量索引扫描（~千条 = 数十毫秒），不能每存一页扫一遍。
+    // 磁盘真值由 cacache 压缩存储打折，计数按原始体积偏保守（提前触发，无害）。
+    let prev = NEW_BYTES_SINCE_ENFORCE.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if prev + bytes.len() as u64 >= ENFORCE_TRIGGER_BYTES {
+        NEW_BYTES_SINCE_ENFORCE.store(0, std::sync::atomic::Ordering::Relaxed);
+        enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
+    }
     let meta = serde_json::json!({
         "url": key,
         "status": status,
