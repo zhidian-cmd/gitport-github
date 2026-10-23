@@ -150,6 +150,9 @@ pub(super) async fn cache_put(
 
 static WORKER_SENDER: OnceLock<mpsc::SyncSender<CacheMsg>> = OnceLock::new();
 static WORKER_LOG: OnceLock<LogFn> = OnceLock::new();
+/// 管家线程 spawn 网络验证所需的 tokio Handle——在 worker_send 首次调用时
+/// 从 tokio 上下文捕获（管家 OS 线程本身没有 tokio runtime，不能 Handle::current()）。
+static WORKER_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 /// 每个缓存页上次后台验证的时间（毫秒历元）。内存态：重启后为空，
 /// 每页首次命中验证一次，本来就是正确语义。
@@ -162,6 +165,8 @@ static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
 fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     let tx = WORKER_SENDER.get_or_init(|| {
         let _ = WORKER_LOG.set(log.clone());
+        // 在 tokio 上下文内捕获 Handle——管家 OS 线程稍后用它 spawn 网络验证
+        let _ = WORKER_HANDLE.set(tokio::runtime::Handle::current());
         let (tx, rx) = mpsc::sync_channel::<CacheMsg>(WORKER_CHANNEL_CAP);
         let log2 = log.clone();
         let _ = std::thread::Builder::new()
@@ -473,8 +478,12 @@ fn handle_spawn_validate(
     ua: Option<String>,
     etag: String,
 ) {
-    let rt = tokio::runtime::Handle::current();
-    rt.spawn(async move {
+    // 使用初始化时捕获的 Handle（管家 OS 线程没有 tokio 上下文，
+    // Handle::current() 会 panic——catch_unwind 曾静默吞掉这个 panic）
+    let handle = WORKER_HANDLE
+        .get()
+        .expect("WORKER_HANDLE 必在 worker_send 初始化时捕获");
+    handle.spawn(async move {
         swr_revalidate(&log, &key, &pq, cookies, ua, etag).await;
     });
 }
