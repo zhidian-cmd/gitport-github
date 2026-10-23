@@ -212,7 +212,10 @@ fn page_cache_clear() {
 }
 
 fn page_cache_allowed(path: &str) -> bool {
-    !path.starts_with("/notifications")
+    // 根路径登录态敏感（未登录=营销页 200，登录=302 仪表盘），永不缓存——
+    // 否则登录态翻转后会被旧态页面钉死（实测踩过：未登录首页缓存回放）
+    path != "/"
+        && !path.starts_with("/notifications")
         && !path.starts_with("/settings")
         && !path.starts_with("/login")
         && !path.starts_with("/logout")
@@ -1948,7 +1951,8 @@ mod page_cache_tests {
         page_cache_store("GET github.com/api/x".into(), resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
-        // ③ 排除名单
+        // ③ 排除名单（根路径登录态敏感，实测踩过：未登录首页缓存回放）
+        assert!(!page_cache_allowed("/"));
         assert!(!page_cache_allowed("/notifications"));
         assert!(!page_cache_allowed("/search/count?q=x"));
         assert!(page_cache_allowed("/search?q=x&type=repositories"));
