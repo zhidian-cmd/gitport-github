@@ -213,11 +213,24 @@ fn page_cache_clear() {
     last_verified_map().lock().unwrap().clear();
 }
 
-fn page_cache_allowed(path: &str) -> bool {
-    // 根路径登录态敏感（未登录=营销页 200，登录=302 仪表盘），永不缓存——
-    // 否则登录态翻转后会被旧态页面钉死（实测踩过：未登录首页缓存回放）
-    path != "/"
-        && !path.starts_with("/notifications")
+/// 浏览器是否带着 GitHub 会话 cookie（登录态标志）。
+fn has_session_cookie(req: &hyper::Request<Incoming>) -> bool {
+    req.headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("user_session") || c.contains("logged_in"))
+        .unwrap_or(false)
+}
+
+/// 页面可缓存判定。
+/// 根路径按登录态分治（用户定案）：未登录（无会话 cookie）的营销页长期稳定，
+/// 可缓存、回访秒开；登录态下 / 会 302 仪表盘（本就不落盘）；**会话已死但
+/// cookie 还在的中间态明确不缓存**——防"死会话看到的页面"污染登录态键（实测踩过）。
+fn page_cache_allowed(path: &str, has_session: bool) -> bool {
+    if path == "/" {
+        return !has_session;
+    }
+    !path.starts_with("/notifications")
         && !path.starts_with("/settings")
         && !path.starts_with("/login")
         && !path.starts_with("/logout")
@@ -466,7 +479,7 @@ async fn mitm_http(
             .and_then(|v| v.to_str().ok())
             .map(|c| c.contains("no-cache") || c.contains("max-age=0"))
             .unwrap_or(false)
-        && page_cache_allowed(&path_of(req.uri()));
+        && page_cache_allowed(&path_of(req.uri()), has_session_cookie(&req));
     let cache_key = if cacheable {
         Some(page_cache_key(&req, &host))
     } else {
@@ -1945,11 +1958,13 @@ mod page_cache_tests {
         page_cache_store("GET github.com/api/x".into(), resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
-        // ③ 排除名单（根路径登录态敏感，实测踩过：未登录首页缓存回放）
-        assert!(!page_cache_allowed("/"));
-        assert!(!page_cache_allowed("/notifications"));
-        assert!(!page_cache_allowed("/search/count?q=x"));
-        assert!(page_cache_allowed("/search?q=x&type=repositories"));
+        // ③ 排除名单；根路径分状态（用户定案）：未登录营销页可缓存，
+        // 登录态/死会话中间态不缓存（实测踩过：未登录首页缓存回放）
+        assert!(page_cache_allowed("/", false), "未登录营销页可缓存");
+        assert!(!page_cache_allowed("/", true), "登录态下 / 会 302，不缓存");
+        assert!(!page_cache_allowed("/notifications", false));
+        assert!(!page_cache_allowed("/search/count?q=x", false));
+        assert!(page_cache_allowed("/search?q=x&type=repositories", false));
 
         // ④ 验证窗口判定（纯逻辑）：未验证 → due；窗口内 → not due；超窗 → due
         let mut vmap: HashMap<String, u64> = HashMap::new();
