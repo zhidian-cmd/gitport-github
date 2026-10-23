@@ -240,7 +240,7 @@ async fn mitm_http(
         }
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
-    let resp = page_cache::cache_put(&req, &host, resp).await;
+    let resp = page_cache::cache_put(&log, &req, &host, resp).await;
     write_upstream(resp, "direct", &info)
 }
 fn stream_decision(

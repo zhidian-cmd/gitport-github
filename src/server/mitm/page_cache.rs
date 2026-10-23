@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 // 仅镜像腿剥离（镜像站是第三方，不认识会话，剥离防凭证泄露）。
 const PAGE_CACHE_IDLE_SECS: u64 = 150 * 60; // 2.5 小时
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const VALIDATE_WINDOW_MS: u64 = 10 * 60 * 1000; // 同页验证窗口
 const VALIDATE_COOLDOWN_MS: u64 = 2000; // 全局验证冷却（防点击风暴）
 
@@ -107,6 +108,7 @@ pub(super) fn cache_take(
 /// 存路由：上游响应唯一入口。内部复判可缓存性、构造键（含会话指纹）、
 /// 剥离 Set-Cookie、写元数据与索引、容量淘汰；不可缓存原样透传。
 pub(super) async fn cache_put(
+    log: &LogFn,
     req: &hyper::Request<Incoming>,
     host: &str,
     resp: axum::response::Response<BoxBody>,
@@ -114,8 +116,17 @@ pub(super) async fn cache_put(
     if !cache_eligible(req, host) {
         return resp;
     }
+    // Content-Length 粗筛（压缩后大小）：超限直接放行不缓存，collect 前先挡一道。
+    // chunked 无该头则放行进 collect（解压后仍有 2MB 上限二次保护）。
+    if let Some(cl) = resp.headers().get("content-length").and_then(|v| v.to_str().ok()) {
+        if let Ok(n) = cl.parse::<u64>() {
+            if n > PAGE_CACHE_MAX_BODY_BYTES as u64 {
+                return resp;
+            }
+        }
+    }
     let key = page_cache_key(req, host);
-    page_cache_store(key, resp).await
+    page_cache_collect_and_dispatch(log, key, resp).await
 }
 
 #[cfg(test)]
@@ -318,7 +329,10 @@ fn enforce_page_cache_limit(dir: &std::path::Path, cap_bytes: u64) {
 
 /// 缓冲 200 text/html 页面进 cacache（≤2MB；Set-Cookie 不落盘，防旧会话回灌），
 /// 并原样重建响应交付。
-async fn page_cache_store(
+/// 前台半段：收集体（≤2MB 保护）→ 立即克隆构建响应交还浏览器；
+/// 写盘整体丢给后台（spawn_blocking），主路径零磁盘等待。
+async fn page_cache_collect_and_dispatch(
+    log: &LogFn,
     key: String,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
@@ -336,9 +350,7 @@ async fn page_cache_store(
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
-            let dir = page_cache_dir();
-            if bytes.len() <= 2 * 1024 * 1024 && std::fs::create_dir_all(&dir).is_ok() {
-                enforce_page_cache_limit(&dir, PAGE_CACHE_MAX_BYTES);
+            if bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES {
                 let hdrs: Vec<Vec<String>> = parts
                     .headers
                     .iter()
@@ -346,20 +358,21 @@ async fn page_cache_store(
                         vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()]
                     })
                     .collect();
-                let meta = serde_json::json!({
-                    "url": key,
-                    "status": parts.status.as_u16(),
-                    "headers": hdrs,
+                let status = parts.status.as_u16();
+                let dir = page_cache_dir();
+                let log2 = log.clone();
+                let key2 = key.clone();
+                let write_bytes = bytes.clone();
+                // 后台写盘：失败只打日志，与当前请求无关
+                tokio::spawn(async move {
+                    let r = tokio::task::spawn_blocking(move || {
+                        persist_page_entry_blocking(&dir, &key2, &write_bytes, status, &hdrs)
+                    })
+                    .await;
+                    if let Err(e) = r {
+                        (log2)(&format!("[缓存] 后台写盘失败({e})，{} 本次不缓存", key));
+                    }
                 });
-                let w = cacache::WriteOpts::new()
-                    .size(bytes.len()) // 索引 size 默认 0，必须显式设置，容量淘汰才有依据
-                    .metadata(meta)
-                    .open_sync(&dir, &key);
-                if let Ok(mut w) = w {
-                    use std::io::Write as _;
-                    let _ = w.write_all(&bytes);
-                    let _ = w.commit();
-                }
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -381,6 +394,31 @@ async fn page_cache_store(
                 .unwrap()
         }
     }
+}
+
+/// 后台半段（spawn_blocking 内执行）：建目录 → 容量淘汰 → 写 cacache 条目。
+fn persist_page_entry_blocking(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+    status: u16,
+    hdrs: &[Vec<String>],
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    enforce_page_cache_limit(dir, PAGE_CACHE_MAX_BYTES);
+    let meta = serde_json::json!({
+        "url": key,
+        "status": status,
+        "headers": hdrs,
+    });
+    let mut w = cacache::WriteOpts::new()
+        .size(bytes.len()) // 索引 size 默认 0，必须显式设置，容量淘汰才有依据
+        .metadata(meta)
+        .open_sync(dir, key)
+        .map_err(|e| e.to_string())?;
+    use std::io::Write as _;
+    w.write_all(bytes).map_err(|e| e.to_string())?;
+    w.commit().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// 后台 SWR 验证：If-None-Match 条件请求（带会话 cookie + 命中时捕获的 UA）。
@@ -425,7 +463,7 @@ async fn swr_revalidate(
         304 => (log)(&format!("[缓存] 后台验证 304，{} 内容未变", path_and_query)),
         200 | 201 => {
             (log)(&format!("[缓存] 后台验证 200，{} 静默换新", path_and_query));
-            let _ = page_cache_store(key.to_string(), resp).await;
+            let _ = page_cache_collect_and_dispatch(log, key.to_string(), resp).await;
         }
         404 | 410 => {
             (log)(&format!("[缓存] 后台验证 404，{} 已是死链，删除", path_and_query));
@@ -455,16 +493,11 @@ mod page_cache_tests {
         s
     }
 
-    fn html_resp(body: &str) -> axum::response::Response<BoxBody> {
-        hyper::Response::builder()
-            .status(200)
-            .header("content-type", "text/html; charset=utf-8")
-            .header("etag", "W/\"test\"")
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from(body.to_owned()))
-                    .map_err(std::io::Error::other),
-            ))
-            .unwrap()
+    fn test_hdrs() -> Vec<Vec<String>> {
+        vec![
+            vec!["content-type".into(), "text/html; charset=utf-8".into()],
+            vec!["etag".into(), "W/\"evict\"".into()],
+        ]
     }
 
     /// 单测试顺序覆盖（OnceLock 全局只能设一次，多测试并行会互相踩目录）：
@@ -476,8 +509,19 @@ mod page_cache_tests {
         CACHE_DIR_OVERRIDE.set(dir.clone()).ok();
         assert!(!touch_activity(), "首次流量不触发清空");
 
-        // ① roundtrip：写入 → 命中带 hit 头 + etag 回传 + 内容原样
-        page_cache_store("GET github.com/search?q=x-cabc".into(), html_resp("<html>ok</html>")).await;
+        // ① roundtrip：写入（直接走 blocking 写，避免与后台写竞速）→ 命中带 hit 头 + etag 回传
+        let hdrs = vec![
+            vec!["content-type".into(), "text/html; charset=utf-8".into()],
+            vec!["etag".into(), "W/\"test\"".into()],
+        ];
+        persist_page_entry_blocking(
+            &dir,
+            "GET github.com/search?q=x-cabc",
+            b"<html>ok</html>",
+            200,
+            &hdrs,
+        )
+        .unwrap();
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 1, "应有一个缓存条目");
         let (hit, etag) = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
@@ -498,7 +542,8 @@ mod page_cache_tests {
                     .map_err(std::io::Error::other),
             ))
             .unwrap();
-        page_cache_store("GET github.com/api/x".into(), resp).await;
+        let log: LogFn = std::sync::Arc::new(|_: &str| {});
+        let _ = page_cache_collect_and_dispatch(&log, "GET github.com/api/x".into(), resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
         // ③ 排除名单；根路径分状态（用户定案）：未登录营销页可缓存，
@@ -520,15 +565,13 @@ mod page_cache_tests {
         let small_cap: u64 = 2 * 1024;
         for i in 0..5 {
             let body = pseudo_body(i, 1200);
-            let resp = hyper::Response::builder()
-                .status(200)
-                .header("content-type", "text/html")
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(body))
-                        .map_err(std::io::Error::other),
-                ))
-                .unwrap();
-            page_cache_store(format!("GET github.com/p{i}"), resp).await;
+            let _ = persist_page_entry_blocking(
+                &dir,
+                &format!("GET github.com/p{i}"),
+                body.as_bytes(),
+                200,
+                &test_hdrs(),
+            );
             std::thread::sleep(std::time::Duration::from_millis(25)); // Windows 粗时钟：拉开索引 time
         }
         let entries: Vec<cacache::Metadata> =
