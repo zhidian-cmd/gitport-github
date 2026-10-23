@@ -23,9 +23,9 @@ use std::sync::{Mutex, OnceLock};
 
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const WORKER_CHANNEL_CAP: usize = 64; // 任务筐上限：满了丢弃（缓存写是 best-effort）
-const VALIDATE_WINDOW_MS: u64 = 10 * 60 * 1000; // 同页验证窗口
-const VALIDATE_COOLDOWN_MS: u64 = 2000; // 全局验证冷却（防点击风暴）
+const WORKER_CHANNEL_CAP: usize = 64;
+/// 时钟路由 TTL：条目写入超过此时长 → 视为过期（miss → 上游刷新）
+const PAGE_CACHE_TTL_MS: u64 = 30 * 60 * 1000; // 30 分钟 // 任务筐上限：满了丢弃（缓存写是 best-effort）
 
 /// 管家线程的任务消息：目前只有 Save（写盘+淘汰+孤儿回收）。
 enum CacheMsg {
@@ -34,13 +34,6 @@ enum CacheMsg {
         bytes: Bytes,
         status: u16,
         hdrs: Vec<Vec<String>>,
-    },
-    Validate {
-        key: String,
-        pq: String,
-        cookies: Option<String>,
-        ua: Option<String>,
-        etag: String,
     },
 }
 
@@ -69,56 +62,22 @@ fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
 /// 命中时"摸"一下条目（重写索引刷新时间戳）防被容量淘汰误杀；
 /// 未命中/不可缓存 = None，主路走上游。
 pub(super) fn cache_take(
-    log: &LogFn,
     req: &hyper::Request<Incoming>,
     host: &str,
-) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
+) -> Option<axum::response::Response<BoxBody>> {
     if !cache_eligible(req, host) {
         return None;
     }
     let key = page_cache_key(req, host);
-    let (cached, etag) = page_cache_get(&key)?;
-    (log)(&format!("[缓存] 命中 {}", req.uri()));
+    let (cached, _etag, cached_at_ms) = page_cache_get(&key)?;
+    // 时钟路由：条目写入超 TTL → 过期 → miss → 上游刷新（拿最新内容并重缓存）
+    if now_millis().saturating_sub(cached_at_ms) > PAGE_CACHE_TTL_MS {
+        return None;
+    }
     // 摸一下：重写索引刷新时间戳（内容去重，只更新索引行 ~0.1ms），
     // 防止频繁访问的页面因"写入时间旧"被容量淘汰误杀（偶发转圈的根因）
     touch_cache_entry(&key);
-    // SWR：同页验证窗口（10 分钟）过期且过全局冷却 → 向管家投一条
-    // If-None-Match 静默保鲜任务（只带 user_session，不带 _gh_sess——
-    // 后者每请求轮换，回放旧值 = 会话固定信号）。
-    let now_ms = now_millis();
-    let last_start = LAST_VALIDATE_START.load(std::sync::atomic::Ordering::Relaxed);
-    let cooldown_ok = now_ms.saturating_sub(last_start) >= VALIDATE_COOLDOWN_MS;
-    let due = {
-        let map = last_verified_map().lock().unwrap();
-        validation_due(&map, &key, now_ms)
-    };
-    if due && cooldown_ok && etag.is_some() {
-        LAST_VALIDATE_START.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-        mark_validated(&mut last_verified_map().lock().unwrap(), &key, now_ms);
-        let cookies = swr_session_cookie(req);
-        let ua = req
-            .headers()
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let pq = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_default();
-        let etag2 = etag.clone().unwrap_or_default();
-        worker_send(
-            CacheMsg::Validate {
-                key: key.clone(),
-                pq,
-                cookies,
-                ua,
-                etag: etag2,
-            },
-            log,
-        );
-    }
-    Some((cached, etag))
+    Some(cached)
 }
 
 /// 存路由：上游响应唯一入口。内部复判可缓存性、构造键（含会话指纹）、
@@ -153,12 +112,6 @@ static WORKER_LOG: OnceLock<LogFn> = OnceLock::new();
 /// 管家线程 spawn 网络验证所需的 tokio Handle——在 worker_send 首次调用时
 /// 从 tokio 上下文捕获（管家 OS 线程本身没有 tokio runtime，不能 Handle::current()）。
 static WORKER_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
-
-/// 每个缓存页上次后台验证的时间（毫秒历元）。内存态：重启后为空，
-/// 每页首次命中验证一次，本来就是正确语义。
-static LAST_VERIFIED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-static LAST_VALIDATE_START: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志（缓存写是 best-effort）。
 /// 日志用管家初始化时捕获的 WORKER_LOG（投递方无需自带）。
@@ -199,18 +152,6 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>) {
                 {
                     (log)(&format!("[缓存] 后台写盘失败({e})，{key} 本次不缓存"));
                 }
-            }
-            CacheMsg::Validate {
-                key,
-                pq,
-                cookies,
-                ua,
-                etag,
-            } => {
-                // 网络验证（慢）不阻塞磁盘循环——立即 spawn 异步跑
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_spawn_validate(log.clone(), key, pq, cookies, ua, etag);
-                }));
             }
         }
     }
@@ -266,34 +207,6 @@ fn page_cache_allowed(path: &str) -> bool {
         && !path.starts_with("/session")
 }
 
-fn last_verified_map() -> &'static Mutex<HashMap<String, u64>> {
-    LAST_VERIFIED.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 距上次验证是否已过窗口（纯判定，便于测试）。
-fn validation_due(map: &HashMap<String, u64>, key: &str, now_ms: u64) -> bool {
-    match map.get(key) {
-        Some(t) => now_ms.saturating_sub(*t) >= VALIDATE_WINDOW_MS,
-        None => true,
-    }
-}
-
-fn mark_validated(map: &mut HashMap<String, u64>, key: &str, now_ms: u64) {
-    map.insert(key.to_string(), now_ms);
-}
-
-/// SWR 验证专用的会话 cookie：使用命中请求的完整 cookie 头。
-/// 这些 cookie 在命中那一刻刚被 GitHub 接受（浏览器正常导航返回 200），
-/// 回放它们 = 以与浏览器完全相同的身份发起条件请求 → 无会话固定信号。
-/// 之前的教训：只带 user_session 不带 _gh_sess → GitHub 不认完整会话
-/// → 返回未登录页（200）→ 缓存被污染（2026-10-24 实测踩坑）。
-fn swr_session_cookie(req: &hyper::Request<Incoming>) -> Option<String> {
-    req.headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-}
-
 /// 会话指纹：单用户代理只需区分「已登录」和「未登录」两个状态。
 /// 不哈希 user_session 的值——GitHub 会安全轮换 user_session（值变化），
 /// 值哈希会导致每次轮换后全部缓存键失效。二态指纹永远稳定：
@@ -332,7 +245,7 @@ fn is_logged_out_body(bytes: &[u8]) -> bool {
 
 /// 命中缓存：返回重建的响应 + 该页的 ETag（后台验证用）。
 /// 检测 body 是否为未登录页（会话死亡期间的污染条目）→ 当作 miss 处理。
-fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Option<String>)> {
+fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Option<String>, u64)> {
     let dir = page_cache_dir();
     let md = cacache::metadata_sync(&dir, key).ok()??;
     let status = u16::try_from(md.metadata.get("status")?.as_u64()?).ok()?;
@@ -357,6 +270,7 @@ fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Optio
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let cached_at_ms = (md.time / 1_000_000) as u64;
     let mut resp = hyper::Response::builder()
         .status(status)
         .body(BoxBody::new(
@@ -368,7 +282,7 @@ fn page_cache_get(key: &str) -> Option<(axum::response::Response<BoxBody>, Optio
         "x-gitport-cache",
         hyper::header::HeaderValue::from_static("hit"),
     );
-    Some((resp, etag))
+    Some((resp, etag, cached_at_ms))
 }
 
 /// 淘汰超限的最旧页面（按 cacache 索引的写入时间），直到总体积回到上限内；
@@ -478,81 +392,6 @@ fn persist_page_entry_blocking(
     use std::io::Write as _;
     w.write_all(bytes).map_err(|e| e.to_string())?;
     w.commit().map(|_| ()).map_err(|e| e.to_string())
-}
-
-/// 管家线程里 Validate 的异步执行入口（通过 tokio Handle spawn 调用）。
-fn handle_spawn_validate(
-    log: LogFn,
-    key: String,
-    pq: String,
-    cookies: Option<String>,
-    ua: Option<String>,
-    etag: String,
-) {
-    // 使用初始化时捕获的 Handle（管家 OS 线程没有 tokio 上下文，
-    // Handle::current() 会 panic——catch_unwind 曾静默吞掉这个 panic）
-    let handle = WORKER_HANDLE
-        .get()
-        .expect("WORKER_HANDLE 必在 worker_send 初始化时捕获");
-    handle.spawn(async move {
-        swr_revalidate(&log, &key, &pq, cookies, ua, etag).await;
-    });
-}
-
-/// 后台 SWR 验证：If-None-Match 条件请求（只带 user_session，不带 _gh_sess
-/// ——后者每请求轮换，回放旧值 = 会话固定信号，曾致三次强制下线）。
-/// 304 → 只记账（内容没变）；200 → 静默换新；404/410 → 删死链。
-/// 失败（网络抖动）→ 保留原页，下个窗口再试。
-async fn swr_revalidate(
-    log: &LogFn,
-    key: &str,
-    path_and_query: &str,
-    cookies: Option<String>,
-    ua: Option<String>,
-    etag: String,
-) {
-    let uri = format!("https://github.com{path_and_query}");
-    let mut builder = hyper::Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .header("accept", "text/html")
-        .header("accept-encoding", "gzip")
-        .header("if-none-match", etag);
-    builder = builder.header(
-        "user-agent",
-        ua.unwrap_or_else(|| "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".into()),
-    );
-    if let Some(c) = cookies {
-        builder = builder.header("cookie", c);
-    }
-    let Ok(out) = builder.body(BoxBody::new(
-        http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-    )) else {
-        return;
-    };
-    let info = UpstreamInfo::default();
-    let resp = match get_direct(log, &out, "github.com", &info, true, &None).await {
-        Ok(r) => r,
-        Err(e) => {
-            (log)(&format!("[缓存] 后台验证失败({e})，{} 保留原页", path_and_query));
-            return;
-        }
-    };
-    match resp.status().as_u16() {
-        304 => (log)(&format!("[缓存] 后台验证 304，{} 内容未变", path_and_query)),
-        200 | 201 => {
-            (log)(&format!("[缓存] 后台验证 200，{} 静默换新", path_and_query));
-            let _ = collect_and_submit(log, key, resp).await;
-        }
-        404 | 410 => {
-            (log)(&format!("[缓存] 后台验证 404，{} 已是死链，删除", path_and_query));
-            if let Ok(Some(md)) = cacache::metadata_sync(&page_cache_dir(), key) {
-                gc_orphaned_content(&page_cache_dir(), &[md.integrity]);
-            }
-            let _ = cacache::remove_sync(&page_cache_dir(), key);
-        }
-        _ => {}
-    }
 }
 
 /// 收集体并投递 Save 消息；返回重建的响应（克隆体交浏览器，零磁盘等待）。
@@ -700,9 +539,8 @@ mod page_cache_tests {
         .unwrap();
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 1, "应有一个缓存条目");
-        let (hit, etag) = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
+        let (hit, _etag, _ts) = page_cache_get("GET github.com/search?q=x-cabc").expect("应命中");
         assert_eq!(hit.headers().get("x-gitport-cache").unwrap(), "hit");
-        assert_eq!(etag.as_deref(), Some("W/\"test\""));
         let bytes = http_body_util::BodyExt::collect(hit.into_body())
             .await
             .unwrap()
