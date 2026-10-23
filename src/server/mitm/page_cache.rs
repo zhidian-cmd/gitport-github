@@ -244,18 +244,17 @@ pub(super) fn invalidate_after_write(host: &str, path: &str) {
     }
 }
 
-/// 页面可缓存判定。
-/// 根路径 / 不再特殊：登录态=仪表盘、未登录=营销页，内容都随会话指纹
-/// 分键存储——同键内容与 GitHub 对该 cookie 态的真实响应一致（含死会话
-/// 中间态），重新登录即换键自愈，无需排除（2026-10-23 用户定案）。
+/// 页面可缓存判定（2026-10-23 定案：全量缓存，唯一禁区=登录态翻转三件套）。
+/// 通知页同权：SWR 一次滞后的代价（新通知晚一拍可见）+ 写失效已保护
+/// mark-as-read 流程；搜索碎片（count/blackbird/warm）是 XHR 碎片，
+/// 已被 sec-fetch-dest=document 闸门排除，无需路径名单。
+/// 保留 /login /logout /session：登录表单的 CSRF token 绑定匿名会话
+/// _gh_sess（每请求轮换），缓存页的旧 token 提交必被拒 → 锁死登录页；
+/// 登出被截胡 = 假登出。这是功能边界，不是缓存策略。
 fn page_cache_allowed(path: &str) -> bool {
-    !path.starts_with("/notifications")
-        && !path.starts_with("/login")
+    !path.starts_with("/login")
         && !path.starts_with("/logout")
         && !path.starts_with("/session")
-        && !path.starts_with("/search/count")
-        && !path.starts_with("/search/blackbird")
-        && !path.starts_with("/search/warm")
 }
 
 fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
@@ -554,13 +553,15 @@ mod page_cache_tests {
         let _ = page_cache_collect_and_dispatch(&log, "GET github.com/api/x".into(), resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
-        // ③ 排除名单；根路径按普通页处理（会话指纹键天然分状态）：
-        // 登录态=仪表盘、未登录=营销页，各自成键互不干扰
+        // ③ 排除名单定案（全量缓存，唯一禁区=登录态翻转三件套）：
+        // 通知页同权（SWR 一次滞后）；搜索碎片已被 sec-fetch-dest 闸门排除
         assert!(page_cache_allowed("/"), "根路径按普通页缓存");
-        assert!(!page_cache_allowed("/notifications"));
-        assert!(!page_cache_allowed("/search/count?q=x"));
+        assert!(page_cache_allowed("/notifications"));
         assert!(page_cache_allowed("/search?q=x&type=repositories"));
         assert!(page_cache_allowed("/settings/profile"), "设置页已解除排除");
+        assert!(!page_cache_allowed("/login"));
+        assert!(!page_cache_allowed("/logout"));
+        assert!(!page_cache_allowed("/session/xxx"));
 
         // ④ 验证窗口判定（纯逻辑）：未验证 → due；窗口内 → not due；超窗 → due
         let mut vmap: HashMap<String, u64> = HashMap::new();
