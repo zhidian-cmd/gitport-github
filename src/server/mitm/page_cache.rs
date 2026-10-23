@@ -614,7 +614,7 @@ mod page_cache_tests {
 
         // ⑦ 写操作失效：POST 成功后同路径前缀条目删除（设置页缓存的安全搭档）
         let sk = "GET github.com/settings/profile-cabc";
-        persist_page_entry_blocking(&dir, sk, b"<html>s</html>", 200, &test_hdrs());
+        let _ = persist_page_entry_blocking(&dir, sk, b"<html>s</html>", 200, &test_hdrs());
         assert!(page_cache_get(sk).is_some(), "前提：条目已缓存");
         invalidate_after_write("github.com", "/settings/profile");
         assert!(page_cache_get(sk).is_none(), "写操作后应失效");
