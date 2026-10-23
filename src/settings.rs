@@ -59,7 +59,8 @@ pub fn init_exe_dir(dir: &Path) {
     let _ = EXE_DIR.set(dir.to_path_buf());
 }
 
-fn exe_dir() -> PathBuf {
+/// exe 所在目录（缓存/配置落盘基准）。供页面缓存等模块取 .cache 基准路径。
+pub fn exe_dir() -> PathBuf {
     EXE_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("."))
 }
 

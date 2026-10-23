@@ -16,6 +16,10 @@
 # ---- 测试进程在仓库根写出的运行态配置（serial 测试副作用）----
 /settings.json
 
+# ---- 页面磁盘缓存（exe 同目录自动生成）----
+/.cache/
+/dist/.cache/
+
 # ---- 验证/诊断日志（防误提交）----
 *.log
 probe*_out.txt

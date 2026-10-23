@@ -8,8 +8,7 @@ use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioExecutor;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,21 +102,31 @@ type UpstreamInfo = Arc<Mutex<String>>;
 // 反复进出仓库/列表会反复触发，GitHub 软限流就开始吐"0 条结果"。
 // 缓存命中 = 秒回 + 零上游请求。过期：持续 2.5 小时无流量进入代理即整体清空；
 // 数量上限 30 页；Ctrl+F5（no-cache）绕过；通知/设置/登录页永不缓存。
+// ---------- 页面缓存（github.com 文档导航 GET，纯磁盘实现）----------
+// 存放：exe 同目录 .cache/（自动生成）。每页两文件：<fnv16>.bin（原始响应体，
+// 含压缩编码原样字节）+ <fnv16>.json（url/status/headers/at 元数据）。
+// 过期：持续 2.5 小时无流量进入代理 → 整目录清空（last_activity 文件跨重启
+// 记账闲置时长；懒清理，下次流量到达时执行）。上限 30 页，超出删最旧。
+// ---------- 页面缓存（github.com 文档导航 GET，cacache 内容寻址磁盘缓存）----------
+// 存放：exe 同目录 .cache/（自动生成，cacache 格式：内容寻址 + 键索引 + 元数据）。
+// 过期：持续 2.5 小时无流量进入代理 → 清空（last_activity 文件跨重启记账闲置
+// 时长；懒清理，下次流量到达时执行）。上限 30 页，超出按写入时间删最旧。
 const PAGE_CACHE_IDLE_SECS: u64 = 150 * 60; // 2.5 小时
 const PAGE_CACHE_MAX: usize = 30;
 
-struct CachedPage {
-    status: hyper::StatusCode,
-    headers: hyper::HeaderMap,
-    body: Bytes,
-    at: std::time::Instant,
-}
-
-static PAGE_CACHE: OnceLock<Mutex<HashMap<String, CachedPage>>> = OnceLock::new();
 static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACTIVITY_LAST_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn page_cache_map() -> &'static Mutex<HashMap<String, CachedPage>> {
-    PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[cfg(test)]
+static CACHE_DIR_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+fn page_cache_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(d) = CACHE_DIR_OVERRIDE.get() {
+        return d.clone();
+    }
+    crate::settings::exe_dir().join(".cache")
 }
 
 fn now_secs() -> u64 {
@@ -127,15 +136,55 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 记一次流量，并判断是否应清空缓存（持续 PAGE_CACHE_IDLE_SECS 无流量）。
+/// 上次流量的记账秒数：先读内存，首次从文件恢复（跨重启仍能判定闲置时长）。
+fn last_activity_secs() -> u64 {
+    let mem = LAST_ACTIVITY.load(std::sync::atomic::Ordering::Relaxed);
+    if mem != 0 {
+        return mem;
+    }
+    let f = page_cache_dir().join("last_activity");
+    let v = std::fs::read_to_string(f)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    LAST_ACTIVITY.store(v, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+/// 记一次流量，并判断是否应清空缓存（持续 PAGE_CACHE_IDLE_SECS 无流量，跨重启生效）。
+/// 记账文件最多 30s 落盘一次（每请求写盘太吵）。
 fn touch_activity() -> bool {
     let now = now_secs();
-    let prev = LAST_ACTIVITY.swap(now, std::sync::atomic::Ordering::Relaxed);
+    let prev = last_activity_secs();
+    LAST_ACTIVITY.store(now, std::sync::atomic::Ordering::Relaxed);
+    let last_write = ACTIVITY_LAST_WRITE.load(std::sync::atomic::Ordering::Relaxed);
+    if last_write == 0 || now.saturating_sub(last_write) >= 30 {
+        ACTIVITY_LAST_WRITE.store(now, std::sync::atomic::Ordering::Relaxed);
+        let dir = page_cache_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("last_activity"), now.to_string());
+    }
     prev != 0 && now.saturating_sub(prev) > PAGE_CACHE_IDLE_SECS
 }
 
+/// 清空缓存（保留 last_activity 记账文件，不能用 cacache::clear_sync——
+/// 它会把目录里所有条目连记账文件一起 remove_dir_all）。
 fn page_cache_clear() {
-    page_cache_map().lock().unwrap().clear();
+    let dir = page_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name() == "last_activity" {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn page_cache_allowed(path: &str) -> bool {
@@ -156,17 +205,28 @@ fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
 }
 
 fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
-    let mut map = page_cache_map().lock().unwrap();
-    let page = map.get_mut(key)?;
-    page.at = std::time::Instant::now();
-    let status = page.status;
-    let headers = page.headers.clone();
-    let body = page.body.clone();
-    drop(map);
+    let dir = page_cache_dir();
+    let md = cacache::metadata_sync(&dir, key).ok()??;
+    let status = u16::try_from(md.metadata.get("status")?.as_u64()?).ok()?;
+    let body = cacache::read_sync(&dir, key).ok()?;
+    let mut headers = hyper::HeaderMap::new();
+    if let Some(hdrs) = md.metadata.get("headers").and_then(|v| v.as_array()) {
+        for pair in hdrs {
+            let (Some(k), Some(v)) = (pair.get(0)?.as_str(), pair.get(1)?.as_str()) else {
+                continue;
+            };
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+    }
     let mut resp = hyper::Response::builder()
         .status(status)
         .body(BoxBody::new(
-            http_body_util::Full::new(body).map_err(std::io::Error::other),
+            http_body_util::Full::new(Bytes::from(body)).map_err(std::io::Error::other),
         ))
         .unwrap();
     *resp.headers_mut() = headers;
@@ -177,7 +237,21 @@ fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
     Some(resp)
 }
 
-/// 缓冲 200 text/html 页面进缓存（≤2MB），并原样重建响应交付（始终返回 Some 形态）。
+/// 淘汰超限的最旧页面（按 cacache 索引的写入时间）。
+fn enforce_page_cache_limit(dir: &std::path::Path) {
+    let entries: Vec<cacache::Metadata> = cacache::list_sync(dir).flatten().collect();
+    if entries.len() < PAGE_CACHE_MAX {
+        return;
+    }
+    let mut sorted = entries;
+    sorted.sort_by_key(|m| m.time);
+    let excess = sorted.len() + 1 - PAGE_CACHE_MAX;
+    for m in sorted.into_iter().take(excess) {
+        let _ = cacache::remove_sync(dir, &m.key);
+    }
+}
+
+/// 缓冲 200 text/html 页面进 cacache（≤2MB，元数据挂 status/headers），并原样重建响应交付。
 async fn page_cache_store(
     key: String,
     resp: axum::response::Response<BoxBody>,
@@ -195,24 +269,29 @@ async fn page_cache_store(
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
-            if bytes.len() <= 2 * 1024 * 1024 {
-                let mut map = page_cache_map().lock().unwrap();
-                if map.len() >= PAGE_CACHE_MAX {
-                    if let Some(oldest) =
-                        map.iter().min_by_key(|(_, p)| p.at).map(|(k, _)| k.clone())
-                    {
-                        map.remove(&oldest);
-                    }
+            let dir = page_cache_dir();
+            if bytes.len() <= 2 * 1024 * 1024 && std::fs::create_dir_all(&dir).is_ok() {
+                enforce_page_cache_limit(&dir);
+                let hdrs: Vec<Vec<String>> = parts
+                    .headers
+                    .iter()
+                    .map(|(k, v)| {
+                        vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()]
+                    })
+                    .collect();
+                let meta = serde_json::json!({
+                    "url": key,
+                    "status": parts.status.as_u16(),
+                    "headers": hdrs,
+                });
+                let w = cacache::WriteOpts::new()
+                    .metadata(meta)
+                    .open_sync(&dir, &key);
+                if let Ok(mut w) = w {
+                    use std::io::Write as _;
+                    let _ = w.write_all(&bytes);
+                    let _ = w.commit();
                 }
-                map.insert(
-                    key,
-                    CachedPage {
-                        status: parts.status,
-                        headers: parts.headers.clone(),
-                        body: bytes.clone(),
-                        at: std::time::Instant::now(),
-                    },
-                );
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -235,6 +314,7 @@ async fn page_cache_store(
         }
     }
 }
+
 async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
@@ -1667,18 +1747,30 @@ mod tests {
 mod page_cache_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn page_cache_roundtrip_and_exclusion() {
-        // 放入 → 命中（含 x-gitport-cache: hit 头）
-        let resp = hyper::Response::builder()
+    fn html_resp(body: &str) -> axum::response::Response<BoxBody> {
+        hyper::Response::builder()
             .status(200)
             .header("content-type", "text/html; charset=utf-8")
             .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(b"<html>ok</html>"))
+                http_body_util::Full::new(Bytes::from(body.to_owned()))
                     .map_err(std::io::Error::other),
             ))
-            .unwrap();
-        page_cache_store("GET github.com/search?q=x".into(), resp).await;
+            .unwrap()
+    }
+
+    /// 单测试顺序覆盖：记账 → roundtrip → 非 HTML 排除 → 排除名单 → 超限淘汰 → 清空。
+    /// （OnceLock 全局只能设一次，两测试并行会互相踩目录，故合并。）
+    #[tokio::test]
+    async fn page_cache_disk_all_scenarios() {
+        let dir = std::env::temp_dir().join(format!("gitport_pc_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        CACHE_DIR_OVERRIDE.set(dir.clone()).ok();
+        assert!(!touch_activity(), "首次流量不触发清空");
+
+        // ① roundtrip：cacache 写入、命中带 hit 头且内容原样
+        page_cache_store("GET github.com/search?q=x".into(), html_resp("<html>ok</html>")).await;
+        let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
+        assert_eq!(n, 1, "应有一个缓存条目");
         let hit = page_cache_get("GET github.com/search?q=x").expect("应命中");
         assert_eq!(hit.headers().get("x-gitport-cache").unwrap(), "hit");
         let bytes = http_body_util::BodyExt::collect(hit.into_body())
@@ -1686,7 +1778,8 @@ mod page_cache_tests {
             .unwrap()
             .to_bytes();
         assert_eq!(bytes.as_ref(), b"<html>ok</html>");
-        // 非 HTML 不缓存
+
+        // ② 非 HTML 不缓存
         let resp = hyper::Response::builder()
             .status(200)
             .header("content-type", "application/json")
@@ -1697,9 +1790,30 @@ mod page_cache_tests {
             .unwrap();
         page_cache_store("GET github.com/api/x".into(), resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
-        // 排除名单
+
+        // ③ 排除名单
         assert!(!page_cache_allowed("/notifications"));
         assert!(!page_cache_allowed("/search/count?q=x"));
         assert!(page_cache_allowed("/search?q=x&type=repositories"));
+
+        // ④ 超限淘汰：写满上限 +2，应保持 30 页且最旧的消失
+        for i in 0..(PAGE_CACHE_MAX + 2) {
+            page_cache_store(
+                format!("GET github.com/p{i}"),
+                html_resp(&format!("<html>p{i}</html>")),
+            )
+            .await;
+            std::thread::sleep(std::time::Duration::from_millis(5)); // 索引 time 可分辨
+        }
+        let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
+        assert_eq!(n, PAGE_CACHE_MAX, "超限应淘汰最旧，保持上限");
+        assert!(page_cache_get("GET github.com/p0").is_none(), "最旧应被淘汰");
+
+        // ⑤ 清空：cacache 条目全没，last_activity 记账保留
+        page_cache_clear();
+        let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
+        assert_eq!(n, 0, "清空后条目应为零");
+        assert!(dir.join("last_activity").exists(), "记账文件应保留");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
