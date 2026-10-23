@@ -223,6 +223,27 @@ fn page_cache_clear() {
     last_verified_map().lock().unwrap().clear();
 }
 
+/// 写操作后的缓存失效：POST/PUT/DELETE 成功（2xx/3xx）即删除同路径前缀的
+/// 缓存条目——否则改完设置/发完评论跳回来看到的是旧页面（像保存失败）。
+/// 同时清掉对应条目的验证时间戳（条目已删，时间戳留着无意义）。
+pub(super) fn invalidate_after_write(host: &str, path: &str) {
+    let prefix = format!("GET {host}{path}");
+    let dir = page_cache_dir();
+    let mut removed = 0usize;
+    for entry in cacache::list_sync(&dir).flatten() {
+        if entry.key.starts_with(&prefix) {
+            let _ = cacache::remove_sync(&dir, &entry.key);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        last_verified_map()
+            .lock()
+            .unwrap()
+            .retain(|k, _| !k.starts_with(&prefix));
+    }
+}
+
 /// 浏览器是否带着 GitHub 会话 cookie（登录态标志）。
 fn has_session_cookie(req: &hyper::Request<Incoming>) -> bool {
     req.headers()
@@ -241,7 +262,6 @@ fn page_cache_allowed(path: &str, has_session: bool) -> bool {
         return !has_session;
     }
     !path.starts_with("/notifications")
-        && !path.starts_with("/settings")
         && !path.starts_with("/login")
         && !path.starts_with("/logout")
         && !path.starts_with("/session")
@@ -553,6 +573,7 @@ mod page_cache_tests {
         assert!(!page_cache_allowed("/notifications", false));
         assert!(!page_cache_allowed("/search/count?q=x", false));
         assert!(page_cache_allowed("/search?q=x&type=repositories", false));
+        assert!(page_cache_allowed("/settings/profile", true), "设置页已解除排除");
 
         // ④ 验证窗口判定（纯逻辑）：未验证 → due；窗口内 → not due；超窗 → due
         let mut vmap: HashMap<String, u64> = HashMap::new();
@@ -590,6 +611,13 @@ mod page_cache_tests {
         let n = cacache::list_sync(&dir).filter_map(|r| r.ok()).count();
         assert_eq!(n, 0, "清空后条目应为零");
         assert!(dir.join("last_activity").exists(), "记账文件应保留");
+
+        // ⑦ 写操作失效：POST 成功后同路径前缀条目删除（设置页缓存的安全搭档）
+        let sk = "GET github.com/settings/profile-cabc";
+        persist_page_entry_blocking(&dir, sk, b"<html>s</html>", 200, &test_hdrs());
+        assert!(page_cache_get(sk).is_some(), "前提：条目已缓存");
+        invalidate_after_write("github.com", "/settings/profile");
+        assert!(page_cache_get(sk).is_none(), "写操作后应失效");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
