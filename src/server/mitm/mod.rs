@@ -419,6 +419,32 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// 内容域 4s（vs 8s）：黑洞必烧满预算，罩更久纯浪费。
+fn request_budget(is_content: bool) -> Duration {
+    if is_content {
+        CONTENT_REQUEST_BUDGET
+    } else {
+        REQUEST_BUDGET
+    }
+}
+
+/// 在给定连接上发一次请求、等响应头，返回 (响应, 耗时ms)。
+/// 三处调用点（复用快路径 / 串发新拨 / 系统 DNS 直连）共用这一份：
+/// 请求必须每次重建（BoxBody 不可克隆），预算与记账口径也只该有一处。
+async fn send_once(
+    up: &upstream::H2Upstream,
+    out: &hyper::Request<BoxBody>,
+    body: &Option<Bytes>,
+    budget: Duration,
+) -> Result<(hyper::Response<BoxBody>, u64), String> {
+    let t0 = Instant::now();
+    let req = build_request(out, body);
+    match tokio::time::timeout(budget, upstream::h2_send(up, &req, body)).await {
+        Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
+        Err(_) => Err("响应预算超时".to_string()),
+    }
+}
+
 async fn try_cached(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -428,40 +454,23 @@ async fn try_cached(
     is_simple: bool,
     is_content: bool,
     path: &str,
-    t0: Instant,
     body: &Option<Bytes>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
     let up = upstream::cached_h2(host)?;
-    let attempt_req = build_request(out, body);
-// 内容域 4s（vs 8s）：黑洞必烧满预算，罩更久纯浪费。
-    let budget = if is_content {
-        CONTENT_REQUEST_BUDGET
-    } else {
-        REQUEST_BUDGET
-    };
-    let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
-    match timed.await {
-        Ok(Ok(resp)) => {
+    match send_once(&up, out, body, request_budget(is_content)).await {
+        Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
                 pool::cursor_note(name, host, &up.ip, true);
             }
-            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
+            upstream::note_latency(host, up.id, ms);
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
             }
-            (log)(&format!(
-                "[上游] {host}{path} 复用连接#{}, {}ms",
-                up.id,
-                t0.elapsed().as_millis()
-            ));
+            (log)(&format!("[上游] {host}{path} 复用连接#{}, {ms}ms", up.id));
             Some(Ok(resp))
         }
-        other => {
-            let why = match other {
-                Ok(Err(e)) => e,
-                _ => "响应预算超时".to_string(),
-            };
+        Err(why) => {
             upstream::drop_h2_id(host, up.id);
             (log)(&format!(
                 "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
@@ -482,13 +491,12 @@ pub(super) async fn get_direct(
 ) -> Result<hyper::Response<BoxBody>, String> {
     let name = pool::pool_for(host);
     let path = path_of(out.uri());
-    let t0 = Instant::now();
     let is_content = pool::route::host_is_content(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if let Some(r) = try_cached(
-        log, out, host, info, name, is_simple, is_content, &path, t0, body,
+        log, out, host, info, name, is_simple, is_content, &path, body,
     )
     .await
     {
@@ -506,7 +514,7 @@ pub(super) async fn get_direct(
     if upstream::cached_h2(host).is_some() {
         guard.take();
         if let Some(r) = try_cached(
-            log, out, host, info, name, is_simple, is_content, &path, t0, body,
+            log, out, host, info, name, is_simple, is_content, &path, body,
         )
         .await
         {
@@ -533,33 +541,24 @@ pub(super) async fn get_direct(
                 continue;
             }
         };
-        let attempt_req = build_request(out, body);
-        let budget = if is_content {
-            CONTENT_REQUEST_BUDGET
-        } else {
-            REQUEST_BUDGET
-        };
-        let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
-        let e = match timed.await {
-            Ok(Ok(resp)) => {
-                *info.lock().unwrap() = up.ip.clone();
+        let e = match send_once(&up, out, body, request_budget(is_content)).await {
+            Ok((resp, ms)) => {
+                let id = up.id;
+                let up_ip = up.ip.clone();
+                *info.lock().unwrap() = up_ip.clone();
                 if !name.is_empty() {
-                    pool::cursor_note(name, host, &up.ip, true); // 数据到手 = 真成功, 置顶
+                    pool::cursor_note(name, host, &up_ip, true); // 数据到手 = 真成功, 置顶
                 }
-                upstream::store_h2(host, up.clone());
+                upstream::store_h2(host, up);
+                upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
                 upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }
-                (log)(&format!(
-                    "[上游] {host}{path} 新连接 {}, {}ms",
-                    up.ip,
-                    t0.elapsed().as_millis()
-                ));
+                (log)(&format!("[上游] {host}{path} 新连接 {up_ip}, {ms}ms"));
                 return Ok(resp);
             }
-            Ok(Err(e)) => e,
-            Err(_) => "响应预算超时".to_string(),
+            Err(e) => e,
         };
         // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
         // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
@@ -685,26 +684,23 @@ async fn dns_direct_fetch(
                 continue;
             }
         };
-        let attempt_req = build_request(out, body);
-        let budget = if pool::route::host_is_content(host) {
-            CONTENT_REQUEST_BUDGET
-        } else {
-            REQUEST_BUDGET
-        };
-        let timed = tokio::time::timeout(budget, upstream::h2_send(&up, &attempt_req, body));
-        match timed.await {
-            Ok(Ok(resp)) => {
+        match send_once(&up, out, body, request_budget(pool::route::host_is_content(host))).await {
+            Ok((resp, ms)) => {
+                let id = up.id;
                 *info.lock().unwrap() = ip.clone();
                 upstream::store_h2(host, up); // 入缓存: 后续请求走复用快路径
+                upstream::note_latency(host, id, ms);
                 (log)(&format!(
-                    "[DNS直连] {host}{} 新连接 {ip}, 成功",
+                    "[DNS直连] {host}{} 新连接 {ip}, 成功({ms}ms)",
                     path_of(out.uri())
                 ));
                 return Ok(resp);
             }
-            _ => {
+            Err(e) => {
                 upstream::drop_h2(host, &ip);
-                (log)(&format!("[DNS直连] {host} <- {ip} 请求失败, 换下个解析 IP"));
+                (log)(&format!(
+                    "[DNS直连] {host} <- {ip} 请求失败({e}), 换下个解析 IP"
+                ));
             }
         }
     }

@@ -73,7 +73,8 @@ fn defuse_retry(ip_empty: bool, empty_retries: u8, ip_seen: bool) -> bool {
     !ip_seen
 }
 
-fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
+/// 解 gzip 的前 max 字节（page_cache 的未登录页检测共用：主站正文恒压缩）。
+pub(super) fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
     let _ = flate2::read::GzDecoder::new(data)

@@ -98,7 +98,7 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
 
 async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
-        let g = conn_pool().lock().unwrap();
+        let g = pool::lock(conn_pool());
         g.iter()
             .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
             .collect()
@@ -121,7 +121,7 @@ async fn keepalive_pass() {
 /// 取一条连接：优先近况最快的那条；每 8 次放一次轮转做探索，避免把慢连接饿死
 /// 到永远发现不了它变快。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
-    let mut g = conn_pool().lock().unwrap();
+    let mut g = pool::lock(conn_pool());
     let h = g.get_mut(host)?;
     let n = h.conns.len();
     if n == 0 {
@@ -145,7 +145,7 @@ pub fn cached_h2(host: &str) -> Option<H2Upstream> {
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
 pub fn note_latency(host: &str, id: u64, ms: u64) {
-    let mut g = conn_pool().lock().unwrap();
+    let mut g = pool::lock(conn_pool());
     let Some(h) = g.get_mut(host) else { return };
     let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) else {
         return;
@@ -156,7 +156,7 @@ pub fn note_latency(host: &str, id: u64, ms: u64) {
 }
 
 pub fn store_h2(host: &str, up: H2Upstream) {
-    let mut g = conn_pool().lock().unwrap();
+    let mut g = pool::lock(conn_pool());
     let h = g.entry(host.to_string()).or_default();
     h.filling = false;
     // 同 IP 也允许并存：服务端并发上限是按连接算的，两条同 IP 的 TCP 同样能摊开。
@@ -169,7 +169,7 @@ pub fn store_h2(host: &str, up: H2Upstream) {
 /// 按连接 id 精确摘除（keepalive / 复用失败都走这里）。
 /// 两条同 IP 的连接靠 IP 是分不开的，删错就会把健康的摘掉、坏的留着反复被轮转。
 pub fn drop_h2_id(host: &str, id: u64) {
-    let mut g = conn_pool().lock().unwrap();
+    let mut g = pool::lock(conn_pool());
     let empty = match g.get_mut(host) {
         Some(h) => {
             if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
@@ -186,7 +186,7 @@ pub fn drop_h2_id(host: &str, id: u64) {
 
 /// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：摘第一条匹配的。
 pub fn drop_h2(host: &str, ip: &str) {
-    let mut g = conn_pool().lock().unwrap();
+    let mut g = pool::lock(conn_pool());
     let empty = match g.get_mut(host) {
         Some(h) => {
             if let Some(pos) = h.conns.iter().position(|c| c.up.ip == ip) {
@@ -207,16 +207,14 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         return;
     }
     {
-        let mut g = conn_pool().lock().unwrap();
+        let mut g = pool::lock(conn_pool());
         let Some(h) = g.get_mut(host) else { return };
         if h.conns.len() >= MAX_CONNS_PER_HOST || h.filling {
             return;
         }
         h.filling = true;
     }
-    let skip = conn_pool()
-        .lock()
-        .unwrap()
+    let skip = pool::lock(conn_pool())
         .get(host)
         .and_then(|h| h.conns.first().map(|c| c.up.ip.clone()));
     let host = host.to_string();
@@ -227,7 +225,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
-                if let Some(h) = conn_pool().lock().unwrap().get_mut(&host) {
+                if let Some(h) = pool::lock(conn_pool()).get_mut(&host) {
                     h.filling = false;
                 }
             }
@@ -436,7 +434,7 @@ pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
     HOST_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .entry(host.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -488,6 +486,16 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
 }
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
+/// 客户端声明接受 gzip。**唯一判定**：上游要不要强制 gzip、缓存要不要分 `-gz`/`-id` 桶
+/// 都调它——两处各写一份时，改一边就会让"压缩体发给没声明 gzip 的客户端"复现。
+pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
+    req.headers()
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("gzip"))
+        .unwrap_or(false)
+}
+
 /// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制 gzip。
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
@@ -518,13 +526,7 @@ pub fn upstream_request<B>(
     }
     if sniffed {
         // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
-        let accepts_gzip = req
-            .headers()
-            .get("accept-encoding")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_ascii_lowercase().contains("gzip"))
-            .unwrap_or(false);
-        if accepts_gzip {
+        if accepts_gzip(req) {
             out = out.header("accept-encoding", "gzip");
         }
     }
@@ -547,6 +549,73 @@ pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上行泵（git push 的请求体通道）：2MB 体必须一字节不差送到对端。
+    /// 这条路径此前没有任何测试——窗口/背压改错不会让别的测试变红，只会让 push 卡住。
+    #[tokio::test]
+    async fn h2_body_pump_delivers_every_byte() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        // 假上游：h2 服务端，收满请求体后把字节数写回响应体。
+        let srv = tokio::spawn(async move {
+            let (sock, _) = ln.accept().await.unwrap();
+            let svc = hyper::service::service_fn(
+                |req: hyper::Request<hyper::body::Incoming>| async move {
+                    let n = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes().len())
+                        .unwrap_or(0);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(BoxBody::new(
+                        http_body_util::Full::new(Bytes::from(n.to_string()))
+                            .map_err(|never| match never {}),
+                    )))
+                },
+            );
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(sock), svc)
+                .await;
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (send, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut send = send.ready().await.unwrap();
+        let head = http::Request::builder()
+            .method("POST")
+            .uri("https://example.test/upload")
+            .body(())
+            .unwrap();
+        let (resp_fut, stream) = send.send_request(head, false).unwrap();
+
+        let len = 2 * 1024 * 1024;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let body = BoxBody::new(
+            http_body_util::Full::new(Bytes::from(payload)).map_err(|never| match never {}),
+        );
+        let log: LogFn = Arc::new(|_: &str| {});
+        let pump = h2_spawn_pump(stream, body, log);
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), resp_fut)
+            .await
+            .expect("10s 内上游没收到完整请求体（泵卡住了）")
+            .unwrap();
+        let mut recv = resp.into_body();
+        let mut echoed = Vec::new();
+        while let Some(chunk) = recv.data().await {
+            echoed.extend_from_slice(&chunk.unwrap());
+        }
+        pump.await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&echoed),
+            len.to_string(),
+            "上游收到的字节数应与发送量一致"
+        );
+        srv.abort();
+    }
 
     #[test]
     fn forced_gzip_gated_on_client_accept() {

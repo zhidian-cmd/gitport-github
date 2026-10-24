@@ -280,6 +280,16 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
     })
 }
 
+/// 校准任务结束标志：Drop 里复位，panic 展开时同样会走到
+/// （否则一次意外 panic 就让校准按钮永久回"已在后台进行中"，只能重启）。
+struct CalibDone;
+
+impl Drop for CalibDone {
+    fn drop(&mut self) {
+        crate::server::mitm::CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn api_calibrate(
     State(st): State<Arc<App>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -305,11 +315,12 @@ async fn api_calibrate(
         crate::server::mitm::CalibMode::Ttfb => "图片链(响应头测速)",
     };
     tokio::spawn(async move {
+        // 护栏：任务 panic / 提前返回也要把"进行中"复位，否则按钮永久回"已在后台进行中"。
+        let _done = CalibDone;
         crate::server::mitm::set_calibrate_report(None);
         let report = crate::server::mitm::calibrate_chains(&log, mode).await;
         (log)(&format!("[校准] 完成\n{report}"));
         crate::server::mitm::set_calibrate_report(Some(report));
-        crate::server::mitm::CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     (
         [
