@@ -215,10 +215,8 @@ impl ProxyServer {
         for l in head_text.lines() {
             let l = l.trim_end_matches('\r');
             let low = l.to_lowercase();
-            // 逐跳头不过上游：与 MITM/h2 路径共用 upstream::is_hop_by_hop 同一份
-            // 名单（connection/keep-alive/transfer-encoding/upgrade/te/proxy-*）。
-            // 曾只剥 proxy-* 与 host：客户端原样转来的 connection: close 会让
-            // 上游收完即关，代理转发语义被逐跳头带偏。
+            // 逐跳头不过上游（与 MITM 路径同一份名单）：客户端转来的
+            // connection: close 会让上游收完即关，转发语义被带偏。
             let name = low.split(':').next().unwrap_or("").trim();
             if name.is_empty()
                 || name == "host"

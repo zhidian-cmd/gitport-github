@@ -1,40 +1,13 @@
-//! 页面缓存（文档导航 GET，单文件存储 + 管家线程）。
-//! 架构：取/存两个路由 + 一个后台管家线程。
-//! - cache_take：命中秒回（对 GitHub 零请求）。单文件直读（pages/<hash>），
-//!   TTL 按 host 分治（github.com 24h / gist 30min / raw 10min，过期 = miss）；
-//! - cache_put：资格判定（host 白名单 + GET + document 导航 + 无 no-cache）
-//!   + 状态白名单（只缓存 200）+ 正文类型闸门（按 host）+ 收集体（≤2MB）
-//!   + 投递 Save 消息（主路径零磁盘等待）；
-//! - 管家线程（懒启动，专用 OS 线程串行消费任务筐，每条消息独立 panic 护栏）：
-//!   原子写（tmp + rename）、容量管理（增量记账 + 软顶淘汰 + 硬顶全清）、
-//!   命中摸一下（set_times 刷新 mtime，cachedAt 不动）、写后失效。
-//! 存储格式：pages/<fnv1a(key) 16hex> = [4B BE header 长][header JSON][body]。
-//! header JSON 含 key（读时校验，防哈希碰撞 serve 错页）、status、headers、cachedAt。
-//! 不引入 cacache：内容寻址去重/完整性校验/双树索引在单用户页面缓存场景全无
-//! 收益（页面间内容不共享；半页由 rename 原子写杜绝；容量 dirent+stat 即够），
-//! 却带来每次写入全表 list_sync + 孤儿回收的常驻成本（2026-10-24 弃用）。
-//! 新鲜度模型（时钟路由 + 事件路由混合）：
-//! - 时钟路由：条目写入超该 host 的 TTL → 过期 → miss → 上游刷新；TTL 基准是
-//!   header 里的 cached_at（首缓存时刻），命中"摸一下"只刷新 mtime（淘汰热度），
-//!   不动 cached_at——两者分离，互不打架；
-//! - 事件路由：POST/PUT/DELETE/PATCH 成功 → 同路径前缀条目即删（写失效）；
-//! - 会话死亡防污染：请求带会话 cookie 但响应是未登录页（body 含
-//!   logged-out 标记）→ 不缓存（防 -cauthed 键空间被营销页污染）。
-//! TTL 定值依据（2026-10-24）：HTML 文档 97% 是应用框架（实证可见文本仅 3%），
-//! 动态数据走 XHR 实时拉；浏览器 F5（max-age=0）被准入排除，想换新有直达出口，
-//! 故框架给 24h 长兜底；raw 是分支寻址的直变文本，给 10min 短窗口。
-//! SWR/后台 ETag 验证明确否决：_gh_sess 轮换，后台验证只能带上一时刻的旧
-//! cookie，GitHub 侧将废弃会话重用判定为账号泄露（详见 mitm/mod.rs 调用点注释）。
-//! cookie 语义：单用户本地代理，cookie 全量转发 GitHub（等同浏览器行为）；
-//! Set-Cookie 原样到达浏览器（GitHub 靠它做会话轮换/续期，剥离 = 会话冻结）；
-//! 仅镜像腿剥离 cookie（镜像站是第三方，不认识会话，剥离防凭证泄露）。
-//! 状态白名单（只缓存 200）：403/400 风控拦截页进缓存 = 封锁窗口过后仍回放
-//! 旧拦截页（defuse 的 IP 轮换被缓存短路，请求根本到不了上游）；304 是空体
-//! 条件响应，回放给没有自身浏览器缓存的客户端（curl/隐身窗）= 空体 304。
-//! 旧条目里的非 200 一律当 miss（读 header 即判，不再服务）。
-//! 容量策略（2026-10-24 定）：增量记账——累计写入超 8MB 才查一次容量；
-//! 软顶 200MB 按 mtime 删最旧回到上限；硬顶 250MB 整个 pages 清空重来
-//! （网页缓存而已，清了重拉，好过每次写入全表扫描）。
+//! 页面缓存：GitHub 文档导航 GET 的本地秒回层（单文件存储 + 管家线程）。
+//! 取：cache_take 直读 pages/<hash>，命中秒回、过 TTL 当 miss。
+//! 存：cache_put 过闸（host 白名单 / 仅 200 / 正文类型 / ≤2MB / 会话污染）后投递 Save。
+//! 存储：pages/<hash> = [4B BE 头长][header JSON][body]，tmp + rename 原子落盘。
+//! 管家线程（串行、单条 panic 护栏）：落盘、Touch 刷 mtime、按前缀失效、容量管理。
+//! 新鲜度：TTL 按 host 分治（绝对时钟，命中不续期）+ POST 成功即删 + F5 绕过。
+//! 容量：每累计 8MB 查一次；软顶 200MB 按 mtime 淘汰，硬顶 250MB 全清重来。
+//! 红线：不做 SWR/后台 ETag 验证——_gh_sess 轮换，旧 cookie 重用被 GitHub
+//!   判定账号泄露（详见 mitm/mod.rs 调用点）；也不用 cacache（去重/校验用不上，
+//!   每次写入却要付全表扫描）。
 use super::BoxBody;
 use crate::pool::{now_ms, LogFn};
 use crate::server::upstream::Incoming;
@@ -49,26 +22,19 @@ const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024; // 软顶：按 mtime 淘�
 const PAGE_CACHE_HARD_BYTES: u64 = 250 * 1024 * 1024; // 硬顶：整个 pages 清空重来
 const PAGE_CACHE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const WORKER_CHANNEL_CAP: usize = 64; // 任务筐上限：满了丢弃（缓存写是 best-effort）
-/// 增量记账步长：累计写入超此值才做一次容量检查（dirent+stat，不读文件内容），
-/// 把全表扫描从"每次写"降为"每 8MB 一次"（管家线程单线程消费，无并发累加竞态）。
+/// 增量记账步长：累计写入超此值才查一次容量（dirent+stat，不读内容）。
 const CAPACITY_CHECK_STRIDE: u64 = 8 * 1024 * 1024;
 
-/// 可缓存 host 白名单：仅文档导航类页面/文本。
-/// - github.com：主站 document 页面（HTML 框架）
-/// - gist.githubusercontent.com：gist 页面 + gist raw 文本（document 语义同主站）
-/// - raw.githubusercontent.com：浏览器直开的文本文件
-/// 其余内容域不进：图片/脚本/API 被 sec-fetch-dest 闸门天然挡着（加了也接不到），
-/// 大文件下载走流式路径到不了缓存写入点，不可变内容浏览器缓存已最优。
+/// 可缓存 host：三个文档导航域。其余内容域要么被 sec-fetch-dest 闸门挡掉，
+/// 要么走流式路径到不了写入点。
 const PAGE_CACHE_HOSTS: &[&str] = &[
     "github.com",
     "gist.githubusercontent.com",
     "raw.githubusercontent.com",
 ];
 
-/// 时钟路由 TTL（按 host 分治，2026-10-24 定）：条目写入（cached_at）超过此时长
-/// → 视为过期（miss → 上游刷新）。定值依据：HTML 文档 97% 是应用框架（实证可见
-/// 文本仅占 3%），动态数据走 XHR 实时拉；浏览器 F5（max-age=0）被准入排除，
-/// 想换新有直达出口，故框架给长兜底。raw 是分支寻址的直变文本，给短窗口。
+/// TTL 按 host 分治。主站给长兜底（HTML 97% 是框架壳，动态数据走 XHR；
+/// 要看最新按 F5 即直达上游）；raw 是分支寻址的直变文本，给短窗口。
 const TTL_MS_GITHUB: u64 = 24 * 60 * 60 * 1000; // 24 小时：主站框架
 const TTL_MS_GIST: u64 = 30 * 60 * 1000; // 30 分钟：gist 页面
 const TTL_MS_RAW: u64 = 10 * 60 * 1000; // 10 分钟：raw 文本文件
@@ -84,8 +50,7 @@ fn ttl_for_host(host: &str) -> u64 {
     }
 }
 
-/// 管家线程的任务消息：写盘（含容量淘汰与孤儿回收）、命中摸一下（刷新淘汰热度）、
-/// 或写后失效（删同路径前缀条目）。
+/// 管家线程的任务消息：落盘 / 摸热度 / 按前缀失效。
 enum CacheMsg {
     Save {
         key: String,
@@ -97,18 +62,14 @@ enum CacheMsg {
     Touch {
         key: String,
     },
-    /// 写操作（POST/PUT/DELETE/PATCH 成功）后的缓存失效。全表 list_sync +
-    /// 孤儿回收是磁盘重活：投递管家线程异步做，POST 响应路径不等它
-    /// （同步版曾让每次写操作白吃一次全表扫描）。
+    /// 写操作成功后的缓存失效（异步，POST 响应路径不等它）。
     Invalidate {
         host: String,
         path: String,
     },
 }
 
-// ---------- 对外唯二入口：取 / 存 ----------
-// 知识收拢：可缓存判定、键构造（含会话指纹）、时钟 TTL、元数据与索引、
-// 容量淘汰全部在本模块内；调用方只见 cache_take / cache_put 两个路由。
+// ---------- 对外唯二入口 ----------
 
 /// 取/存共用的可缓存判定。
 fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
@@ -132,9 +93,7 @@ fn ttl_expired(ttl_ms: u64, cached_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(cached_at_ms) > ttl_ms
 }
 
-/// 取路由：主调用路径唯一入口。命中 = 纯本地读（对 GitHub 零请求）：
-/// 单文件直读（4B 头长 + header JSON + body）。TTL 过期或未命中 = None，
-/// 主路走上游（拿最新内容并重缓存）。
+/// 取路由：命中 = 纯本地读（对 GitHub 零请求）；过期或未命中 = None，走上游。
 pub(super) fn cache_take(
     log: &LogFn,
     req: &hyper::Request<Incoming>,
@@ -152,8 +111,7 @@ pub(super) fn cache_take(
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
-/// 存路由：上游响应唯一入口。内部复判可缓存性、构造键（含会话指纹）、
-/// 收集体并投递 Save 消息；不可缓存原样透传。主路径零磁盘等待。
+/// 存路由：不可缓存原样透传；可缓存收集体后投递 Save（主路径零磁盘等待）。
 pub(super) async fn cache_put(
     log: &LogFn,
     req: &hyper::Request<Incoming>,
@@ -163,15 +121,12 @@ pub(super) async fn cache_put(
     if !cache_eligible(req, host) {
         return resp;
     }
-    // 状态白名单：只缓存 200。GitHub 风控拦截页(403 restricted / 400 Whoa)与
-    // 304 条件响应都曾被原样缓存：拦截页进缓存 = 封锁窗口过后仍回放旧拦截页
-    // （defuse 的 IP 轮换被缓存短路，请求根本到不了上游）；304 是空体响应，
-    // 回放给没有自身浏览器缓存的客户端(curl/隐身窗/第二浏览器)= 空体 304。
+    // 只缓存 200：拦截页回放（封锁窗口过后仍是旧拦截页）与 304 空体回放
+    // 都是实际踩过的坑。
     if resp.status() != StatusCode::OK {
         return resp;
     }
-    // Content-Length 粗筛（压缩后大小）：超限直接放行不缓存，collect 前先挡一道。
-    // chunked 无该头则放行进 collect（解压后仍有 2MB 上限二次保护）。
+    // Content-Length 粗筛（压缩后大小）；chunked 无该头靠 collect 后的 2MB 上限兜底。
     if let Some(cl) = resp.headers().get("content-length").and_then(|v| v.to_str().ok()) {
         if let Ok(n) = cl.parse::<u64>() {
             if n > PAGE_CACHE_MAX_BODY_BYTES as u64 {
@@ -210,8 +165,8 @@ fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     }
 }
 
-/// 管家循环：专用 OS 线程串行消费任务筐。磁盘写在这个线程上做（阻塞无害）。
-/// 每条消息独立 panic 护栏：单条 panic 不带崩管家线程（缓存无声停摆极难排查）。
+/// 管家循环：串行消费任务筐，磁盘活都在这个线程上做（阻塞无害）。
+/// 每条消息独立 panic 护栏——缓存无声停摆极难排查。
 fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheMsg>) {
     while let Ok(msg) = rx.recv() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -281,10 +236,8 @@ fn page_cache_dir() -> std::path::PathBuf {
 
 static CACHE_ACL_APPLIED: OnceLock<()> = OnceLock::new();
 
-/// 确保 .cache 目录存在；本进程首次触达时套一次 Windows ACL
-/// （icacls 断继承 + 只授当前用户与 SYSTEM，与 ca.key/settings.json 同款手段）。
-/// 页面 HTML 含个人信息（仪表盘/动态流/用户名），不给同机其他账户留读取面。
-/// ACL 随目录持久化，跨重启仍有效；icacls 是进程 spawn，OnceLock 保证只跑一次。
+/// 确保 .cache 存在；本进程首次触达套一次 ACL（仅当前用户+SYSTEM）——
+/// 页面含个人信息，不给同机其他账户留读取面。
 fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
@@ -295,23 +248,16 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
-/// 页面可缓存判定（全量缓存，唯一禁区=登录态翻转三件套）。
-/// 通知页同权：内容陈旧由 TTL 或用户自行刷新（Ctrl+F5 绕过缓存取最新）；
-/// 搜索碎片（count/blackbird/warm）是 XHR 碎片，已被
-/// sec-fetch-dest=document 闸门排除，无需路径名单。
-/// 保留 /login /logout /session：登录表单的 CSRF token 绑定匿名会话
-/// _gh_sess（每请求轮换），缓存页的旧 token 提交必被拒 → 锁死登录页；
-/// 登出被截胡 = 假登出。这是功能边界，不是缓存策略。
+/// 唯一路径禁区 = 登录态翻转三件套。登录表单的 CSRF token 绑定每请求轮换的
+/// _gh_sess，旧 token 提交必被拒 = 锁死登录页；登出被截胡 = 假登出。
 fn page_cache_allowed(path: &str) -> bool {
     !path.starts_with("/login")
         && !path.starts_with("/logout")
         && !path.starts_with("/session")
 }
 
-/// 会话指纹：单用户代理只需区分「已登录」和「未登录」两个状态。
-/// 不哈希 user_session 的值——GitHub 会安全轮换 user_session（值变化），
-/// 值哈希会导致每次轮换后全部缓存键失效。二态指纹永远稳定：
-/// 有 user_session = 已登录 → "-cauthed"；无 = 未登录 → "-cloggedout"。
+/// 会话指纹二态：有 user_session = "-cauthed"，无 = "-cloggedout"。
+/// 不哈希值——GitHub 轮换 user_session 时值变，值哈希会让全部缓存键失效。
 fn session_fingerprint(cookies: Option<&str>) -> String {
     let has_session = cookies
         .map(|c| {
@@ -336,16 +282,14 @@ fn page_cache_key(req: &hyper::Request<Incoming>, host: &str) -> String {
     format!("GET {host}{}{q}{cookie_tag}", uri.path())
 }
 
-/// 检测 body 是否为未登录页面（GitHub 未登录时 body 带 logged-out class 标记）。
-/// 请求带会话 cookie 但响应是未登录页 = 会话已死 → 不缓存/不当命中（防污染）。
+/// 未登录页检测：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
 fn is_logged_out_body(bytes: &[u8]) -> bool {
     let check_len = bytes.len().min(4096);
     let chunk = String::from_utf8_lossy(&bytes[..check_len]);
     chunk.contains("logged-out env-") || chunk.contains("class=\"logged-out")
 }
 
-/// key → 文件名：FNV-1a 64 位散列的 16 hex。确定性（跨进程/重启稳定）、零依赖；
-/// 碰撞由读时 header 里的 key 校验兜底（不符 = miss，丢一页不串页）。
+/// key → 文件名：FNV-1a 64 位散列的 16 hex。碰撞由读时 key 校验兜底。
 fn page_file_name(key: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.as_bytes() {
@@ -355,10 +299,8 @@ fn page_file_name(key: &str) -> String {
     format!("{h:016x}")
 }
 
-/// 读磁盘条目：单文件 = [4B BE header 长][header JSON][body]。
-/// 返回 (status, 已解析头对, 体, cached_at)。任何一环缺失/损坏 = None（miss，
-/// 截断文件自愈：下次同 URL 访问重写覆盖）。非 200 一律当 miss——旧版曾把
-/// 403/400 拦截页与 304 空体响应写进缓存，自愈路径就是不再服务它们。
+/// 读单文件条目 → (status, 头对, 体, cached_at)。缺环/损坏/截断/非 200 = None
+/// （miss 自愈，下次访问重写覆盖）。
 fn load_disk_entry(
     key: &str,
 ) -> Option<(
@@ -382,7 +324,7 @@ fn load_disk_entry(
     }
     let status = u16::try_from(header.get("status")?.as_u64()?).ok()?;
     if status != 200 {
-        return None; // 非 200 旧条目（拦截页/304）：当 miss，不服务
+        return None; // 非 200（拦截页/304）：当 miss
     }
     let body = &raw[end..];
     if is_logged_out_body(body) {
@@ -402,14 +344,12 @@ fn load_disk_entry(
             hdrs.push((name, val));
         }
     }
-    // cached_at 取 header 里的首缓存时刻（touch 不改它）；无此字段视为远古
-    // （过期 = miss，被上游刷新重写覆盖）。
+    // 无此字段视为远古：过期 = miss，被重写覆盖。
     let cached_at_ms = header.get("cachedAt").and_then(|v| v.as_u64()).unwrap_or(0);
     Some((status, hdrs, Bytes::copy_from_slice(body), cached_at_ms))
 }
 
-/// 命中缓存：返回重建的响应 + 条目的 cached_at（毫秒历元，TTL 判定用）。
-/// 仅测试用：线上命中走 cache_take，这里直读磁盘。
+/// 测试专用：绕开准入直读磁盘，返回重建响应 + cached_at。
 #[cfg(test)]
 fn page_cache_get(
     key: &str,
@@ -420,8 +360,7 @@ fn page_cache_get(
 
 // ---------- 内部：容量管理（单文件存储，无孤儿概念） ----------
 
-/// 增量记账：累计写入超步长才查一次容量。管家线程单线程消费，无并发累加竞态；
-/// 全表扫描从 cacache 时代的"每次写"降为"每 8MB 一次"。
+/// 增量记账（管家线程单线程消费，无并发竞态）。
 static BYTES_SINCE_CHECK: AtomicU64 = AtomicU64::new(0);
 
 fn maybe_enforce_capacity(dir: &std::path::Path, incoming: usize) {
@@ -433,10 +372,8 @@ fn maybe_enforce_capacity(dir: &std::path::Path, incoming: usize) {
     }
 }
 
-/// 容量管理（管家线程内执行）：dirent + stat，不读任何文件内容。
-/// - 硬顶（250MB）：整个 pages 清空重来——网页缓存而已，清了重拉；
-/// - 软顶（200MB）：按 mtime 升序删最旧，直到回到上限内；
-/// - 顺手清 tmp 垃圾（进程曾被杀时的 rename 残留）。
+/// 容量管理：dirent + stat，不读内容。硬顶全清 > 软顶按 mtime 删最旧；
+/// 顺手清 tmp 残留（进程被杀时的 rename 垃圾）。
 fn enforce_capacity(dir: &std::path::Path, soft_cap: u64, hard_cap: u64) {
     let _ = std::fs::remove_dir_all(dir.join("tmp"));
     let pages = dir.join("pages");
@@ -461,7 +398,7 @@ fn enforce_capacity(dir: &std::path::Path, soft_cap: u64, hard_cap: u64) {
     if total <= soft_cap {
         return;
     }
-    // mtime 升序 = 最旧先删；同时刻按路径字典序，淘汰顺序确定不漂移
+    // mtime 升序删最旧；同时刻按路径字典序，顺序确定不漂移
     entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     let mut acc = total;
     for (p, _, sz) in entries {
@@ -473,8 +410,7 @@ fn enforce_capacity(dir: &std::path::Path, soft_cap: u64, hard_cap: u64) {
     }
 }
 
-/// 旧版（cacache）残留清理：index-v5/content-v2 两棵树随弃用作废，一次性删掉，
-/// 防旧数据白占磁盘（新存储只认 pages/）。
+/// 旧版 cacache 残留（index-v5/content-v2）一次性清掉，防白占磁盘。
 static LEGACY_CACHE_PURGED: OnceLock<()> = OnceLock::new();
 fn purge_legacy_cache(dir: &std::path::Path) {
     if LEGACY_CACHE_PURGED.set(()).is_ok() {
@@ -484,8 +420,7 @@ fn purge_legacy_cache(dir: &std::path::Path) {
     }
 }
 
-/// 命中缓存"摸一下"（管家线程内执行）：set_times 刷新 mtime（淘汰热度），
-/// header 里的 cached_at（TTL 基准）不动——两者分离，互不打架。
+/// 摸一下：只刷 mtime（淘汰热度），cached_at（TTL 基准）不动。
 fn touch_cache_entry_blocking(dir: &std::path::Path, key: &str) {
     let Ok(f) = std::fs::OpenOptions::new()
         .write(true)
@@ -497,11 +432,8 @@ fn touch_cache_entry_blocking(dir: &std::path::Path, key: &str) {
     let _ = f.set_times(times);
 }
 
-/// 后台半段（管家线程内执行）：建目录（含 ACL）→ 清旧版残留 → 增量容量记账
-/// → tmp 写全量 + rename 原子落页。cached_at 写进 header（TTL 基准，
-/// Touch 刷 mtime 时保留）。std::fs::rename 在 Windows 上即原子覆盖
-/// （底层 MoveFileExW + MOVEFILE_REPLACE_EXISTING，2026-10-24 实测确认；
-/// 曾以为不覆盖而先删旧页再 rename，多一步还引入 miss 窗口，已删）。
+/// 落盘：tmp 写全量 + rename 原子覆盖（Windows 上即原子覆盖，实测确认），
+/// 永远存不出半页。cached_at 写进 header，Touch 只刷 mtime 时它不动。
 fn persist_page_entry_blocking(
     dir: &std::path::Path,
     key: &str,
@@ -530,7 +462,7 @@ fn persist_page_entry_blocking(
     buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(&hbytes);
     buf.extend_from_slice(bytes);
-    // tmp 名带纳秒时钟：管家单线程串行，仅防极端重入
+    // 纳秒时钟防极端重入（管家线程本已串行）
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -544,10 +476,8 @@ fn persist_page_entry_blocking(
     })
 }
 
-/// 正文类型闸门（按 host 放行）：github.com 只收 text/html（页面框架）；
-/// gist 域既有 HTML 页面也有 raw 文本（text/plain），raw 域是浏览器直开的
-/// 文本文件（text/plain / text/markdown）。二进制（octet-stream、图片等）
-/// 一律不收——大文件与不可变内容本就不该进页面缓存。
+/// 正文类型闸门：主站只收 HTML；gist/raw 加纯文本（浏览器直开 raw 是 document
+/// 导航但内容是 text/plain）。二进制一律不收。
 fn body_type_allowed(host: &str, content_type: Option<&str>) -> bool {
     let Some(ct) = content_type else { return false };
     let ct = ct.trim();
@@ -562,8 +492,7 @@ fn body_type_allowed(host: &str, content_type: Option<&str>) -> bool {
     }
 }
 
-/// 收集体并投递 Save 消息；返回重建的响应（克隆体交浏览器，零磁盘等待）。
-/// 会话死亡防污染：请求带会话 cookie 但响应是未登录页 → 不缓存（原样透传）。
+/// 收集体、复判（体积/会话污染）后投递 Save；响应原样或重建交给浏览器。
 async fn collect_and_submit(
     log: &LogFn,
     host: &str,
@@ -579,9 +508,8 @@ async fn collect_and_submit(
     if !allowed {
         return hyper::Response::from_parts(parts, body);
     }
-    // Set-Cookie 必须到达浏览器（GitHub 靠它做会话轮换/续期，剥离 = 浏览器
-    // cookie 冻结 → 轮换后旧值被拒 → 未登录页）。只从缓存元数据中排除
-    // （防缓存命中回灌旧值），响应本身原样透传。
+    // Set-Cookie 只从缓存元数据里剔除（防命中回灌旧值）；响应原样给浏览器，
+    // 剥离会让 cookie jar 冻结、轮换后变未登录页。
     let cache_hdrs: Vec<Vec<String>> = parts
         .headers
         .iter()
@@ -619,7 +547,7 @@ async fn collect_and_submit(
             rebuilt
         }
         Err(_) => {
-            // 收集失败（罕见）：无内容可交付，回 502 兜底
+            // 收集失败：无内容可交付，回 502
             hyper::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(BoxBody::new(
@@ -631,9 +559,8 @@ async fn collect_and_submit(
     }
 }
 
-/// 写后失效（管家线程内执行）：删同路径前缀的页面文件。
-/// 文件名是哈希，前缀匹配需读每个文件的 header 段（只读 4B+header，不读 body）；
-/// 失效是低频事件（POST 成功才触发），管家线程异步做，成本可接受。
+/// 写后失效：删同路径前缀的页面文件。文件名是哈希，只能读每个文件的
+/// header 段做前缀匹配（不读 body）；低频事件，管家线程异步做。
 fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
     let prefix = format!("GET {host}{path}");
     let Ok(rd) = std::fs::read_dir(dir.join("pages")) else {
@@ -660,9 +587,8 @@ fn read_page_key(p: &std::path::Path) -> Option<String> {
     v.get("key")?.as_str().map(str::to_string)
 }
 
-/// 写操作后的缓存失效：POST/PUT/DELETE 成功（2xx/3xx）即删同路径前缀条目——
-/// 否则改完设置/发完评论跳回来看到旧页面（像保存失败）。磁盘删除是管家线程的
-/// 异步活（读全部 header 匹配前缀），POST 响应路径只投递消息，不等。
+/// 写后失效入口：改完设置/发完评论跳回来必须看到新页面（否则像保存失败）。
+/// 只投消息，磁盘删除交给管家线程。
 pub(super) fn invalidate_after_write(log: &LogFn, host: &str, path: &str) {
     worker_send(
         CacheMsg::Invalidate {

@@ -99,11 +99,9 @@ struct PlansFile {
     pools: HashMap<String, Vec<SerialPlan>>,
 }
 
-/// 容错解析 plans.json。整表快路（serde 直接解 PlansFile）失败时，按顶层键
-/// 逐个解析：单个池/单条镜像链写坏只丢那一段（该池按种子补缺重建），其余表
-/// 原样保留——旧行为是整表按种子重建，用户手排的其他池和全部镜像链一夜回到
-/// 解放前。返回 None = 整份没救（不是合法 JSON 对象，调用方按种子重建并备份）；
-/// Some((表, salvaged))，salvaged = true 表示有段落坏被丢弃（调用方备份原文件）。
+/// 容错解析 plans.json：整表解析失败时按顶层键逐个来，单池/单链写坏只丢那一段
+/// （该池按种子补缺），其余原样保留。None = 整份没救；salvaged = 有段落坏被丢弃
+/// （调用方据此备份原文件）。
 fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bool)> {
     if let Ok(pf) = serde_json::from_str::<PlansFile>(raw) {
         return Some((pf, false));
@@ -228,8 +226,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     *SERIAL_LOG.lock().unwrap() = log.clone();
     let path = plans_path();
     let raw = std::fs::read_to_string(&path).ok();
-    // 容错解析：单池/单链写坏只丢那一段（该池按种子补缺），不再整表按种子重建、
-    // 把用户手排的其他池和全部镜像链一夜打回种子。salvaged = 有段落坏被丢弃。
+    // 容错解析：坏段只丢那一段，不连坐整表。
     let parsed = raw
         .as_deref()
         .and_then(|b| parse_plans_tolerant(b, log.as_ref()));
@@ -478,9 +475,7 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
-    // 每请求总耗时预算（config::SERIAL_DIAL_BUDGET_SECS）：圈内候选逐个试，
-    // 最坏整圈 27×(3s TCP + 5s TLS) ≈ 3.6 分钟——预算到期即停，剩余候选留给
-    // 后续请求复测，不逼用户干等几分钟才看到回落。
+    // 每请求总耗时预算：整圈最坏 3.6 分钟，到期即停，剩余候选留给后续请求复测。
     let budget_deadline =
         Instant::now() + Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_hit = false;
@@ -746,8 +741,7 @@ impl Breaker {
         let mut m = self.lock();
         match m.get(host) {
             Some(until) if Instant::now() < *until => true,
-            // 过期条目惰性清除：熔断恢复后再没人查的 host 不会永久沉淀在表里
-            // （host 数有上界、不漏内存，但只进不出是卫生问题）。
+            // 过期即清：只进不出会让表沉淀。
             Some(_) => {
                 m.remove(host);
                 false
@@ -757,8 +751,7 @@ impl Breaker {
     }
     pub fn set(&self, host: &str) {
         let mut m = self.lock();
-        // 容量卫生：极端情况（海量 host 熔断）先扫掉过期条目；仍超硬顶则整表
-        // 重置——丢几条活熔断只是多试一次，远比无界表强。
+        // 硬顶卫生：先扫过期，仍超则整表重置（丢几条活熔断只多试一次）。
         const HARD_CAP: usize = 4096;
         if m.len() >= HARD_CAP {
             let now = Instant::now();
