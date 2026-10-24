@@ -187,6 +187,9 @@ fn has_credential_query(query: &str) -> bool {
     })
 }
 
+/// 校准探测模板：每个域一个长期有效的公开资源。改动前必须先手测直连 200——
+/// 失效模板会让所有镜像在该域判"不支持"（2026-10-24 踩过：user-images 老图
+/// 已失效返 403、media 指了非 LFS 文件直连 404，一度误判为镜像不支持）。
 pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
     (
         "github.com",
@@ -206,7 +209,7 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
     ),
     (
         "user-images.githubusercontent.com",
-        "https://user-images.githubusercontent.com/543273/64829357-7d195e00-d5ce-11e9-91f1-e58deb6e7bbf.png",
+        "https://user-images.githubusercontent.com/3098702/171232313-daa606f1-8fd6-4b0f-a20b-2cb93c43d19b.png",
     ),
     (
         "codeload.github.com",
@@ -222,7 +225,7 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
     ),
     (
         "media.githubusercontent.com",
-        "https://media.githubusercontent.com/media/torvalds/linux/master/README",
+        "https://media.githubusercontent.com/media/blooop/bencher/7e3a628e0e2768acb16c9d14630dd389075323bd/docs/evidence_animation_options/a_morph_differences.svg",
     ),
 ];
 // 两模式：Throughput=大文件四链 11 家并发竞速（12s 窗口按实收字节排名）；Ttfb=内容域五链响应头测速。
