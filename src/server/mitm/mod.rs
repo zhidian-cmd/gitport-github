@@ -178,11 +178,7 @@ async fn mitm_http(
         return stream_passthrough(&log, &out, &host, &info, body, reason).await;
     }
     let out_body = match &replay {
-        Some(b) => out.map(|_| {
-            BoxBody::new(
-                http_body_util::Full::new(b.clone()).map_err(|never| std::io::Error::other(never)),
-            )
-        }),
+        Some(b) => out.map(|_| upstream::full_body(b.clone())),
         None => out,
     };
     if is_simple
@@ -291,26 +287,12 @@ fn declared_content_len(req: &hyper::Request<Incoming>) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 fn incoming_to_body(body: Incoming) -> BoxBody {
-    let mut body = body;
-    let stream = futures_util::stream::poll_fn(move |cx| {
-        match hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx) {
-            std::task::Poll::Ready(Some(Ok(f))) => std::task::Poll::Ready(Some(Ok(f))),
-            std::task::Poll::Ready(Some(Err(e))) => {
-                std::task::Poll::Ready(Some(Err(std::io::Error::other(e))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    });
-    BoxBody::new(http_body_util::StreamBody::new(stream))
+    BoxBody::new(body.map_err(std::io::Error::other))
 }
 fn plain_502() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(BoxBody::new(
-            http_body_util::Full::new(Bytes::from_static(b"upstream unavailable"))
-                .map_err(|never| std::io::Error::other(never)),
-        ))
+        .body(upstream::full_body(Bytes::from_static(b"upstream unavailable")))
         .unwrap()
 }
 /// 流式直通：体不进缓冲边收边泵（h2 背压分片），单次尝试不重发。
@@ -337,7 +319,7 @@ async fn stream_passthrough(
                 }
             }
         }
-        match upstream::dial_h2(name, host, CancellationToken::new(), log).await {
+        match upstream::dial_h2_skip(name, host, CancellationToken::new(), log, None).await {
             Ok(up) => match upstream::h2_stream_head(&up, out).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
@@ -400,9 +382,7 @@ fn is_telemetry(host: &str, path: &str) -> bool {
 fn no_content() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
-        ))
+        .body(upstream::empty_body())
         .unwrap()
 }
 
@@ -438,8 +418,7 @@ async fn send_once(
     budget: Duration,
 ) -> Result<(hyper::Response<BoxBody>, u64), String> {
     let t0 = Instant::now();
-    let req = build_request(out, body);
-    match tokio::time::timeout(budget, upstream::h2_send(up, &req, body)).await {
+    match tokio::time::timeout(budget, upstream::h2_send(up, out, body)).await {
         Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
         Err(_) => Err("响应预算超时".to_string()),
     }
@@ -524,7 +503,8 @@ pub(super) async fn get_direct(
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        let up = match upstream::dial_h2(name, host, CancellationToken::new(), log).await {
+        let up = match upstream::dial_h2_skip(name, host, CancellationToken::new(), log, None).await
+        {
             Ok(up) => up,
             Err(e) => {
                 (log)(&format!(
@@ -643,10 +623,7 @@ code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decora
         .status(StatusCode::BAD_GATEWAY)
         .header("content-type", "text/html; charset=utf-8")
         .header("retry-after", "8")
-        .body(BoxBody::new(
-            http_body_util::Full::new(Bytes::from(html))
-                .map_err(|never| std::io::Error::other(never)),
-        ))
+        .body(upstream::full_body(Bytes::from(html)))
         .unwrap()
 }
 /// 串发+镜像全灭后按系统解析真名 SNI 直拨（池表漂移自愈）；仅 GET/HEAD，成功入缓存。
@@ -798,20 +775,4 @@ mod tests {
         assert_eq!(stream_decision(&Method::GET, "/x", Some(u64::MAX)), None);
         assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
     }
-}
-
-fn build_request(out: &hyper::Request<BoxBody>, body: &Option<Bytes>) -> hyper::Request<BoxBody> {
-    let mut builder = hyper::Request::builder()
-        .method(out.method())
-        .uri(out.uri());
-    for (k, v) in out.headers() {
-        builder = builder.header(k, v);
-    }
-    let body = match body {
-        Some(b) => {
-            BoxBody::new(http_body_util::Full::new(b.clone()).map_err(|never| match never {}))
-        }
-        None => BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|never| match never {})),
-    };
-    builder.body(body).expect("请求构造不会失败")
 }

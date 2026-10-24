@@ -411,16 +411,6 @@ pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool) {
 
 /// 单串发(圈式):从记号处沿圈逐个试,失败沿圈前进,成功驻留记号;整圈全灭 → 冷却 30s。
 /// 记号持久化在 settings.last_ip(驻留变更时落盘);ctx 到期只掐当前那条;混合池只试对口条目。
-pub async fn serial_dial(
-    pool_name: &str,
-    host: &str,
-    ctx: CancellationToken,
-    tls_handshake: bool,
-    log: Option<&LogFn>,
-) -> Result<(dial::Dialed, String, String), String> {
-    serial_dial_skip(pool_name, host, ctx, tls_handshake, log, None).await
-}
-
 /// `skip_ip`：本次拨号跳过该 IP（补第二条连接时用，避免两条连接落在同一个边缘 IP 上）。
 /// 全表只有这一个候选时忽略 skip，保证还能拨出去。
 pub async fn serial_dial_skip(
@@ -1334,11 +1324,12 @@ mod tests {
         .unwrap();
         serial_load(&dir, Vec::new(), None);
 
-        let (conn, ip, _) = serial_dial(
+        let (conn, ip, _) = serial_dial_skip(
             "core",
             "github.com",
             CancellationToken::new(),
             false,
+            None,
             None,
         )
         .await
@@ -1360,11 +1351,12 @@ mod tests {
         }
 
         // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
-        let (conn, ip, _) = serial_dial(
+        let (conn, ip, _) = serial_dial_skip(
             "core",
             "github.com",
             CancellationToken::new(),
             false,
+            None,
             None,
         )
         .await

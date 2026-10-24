@@ -346,7 +346,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     let name = pool::pool_for(host);
     if pool::serial_pool(name) {
         let (conn, ip, _shape) =
-            pool::serial_dial(name, host, CancellationToken::new(), false, None).await?;
+            pool::serial_dial_skip(name, host, CancellationToken::new(), false, None, None).await?;
         return Ok((conn, ip));
     }
     let addr = format!("{host}:{port}");

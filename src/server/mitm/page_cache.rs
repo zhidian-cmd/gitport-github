@@ -13,7 +13,6 @@ use crate::pool::{now_ms, LogFn};
 use crate::server::upstream::{self, Incoming};
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use http_body_util::BodyExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -243,9 +242,7 @@ fn rebuild_cached_response(
     }
     let mut resp = hyper::Response::builder()
         .status(status)
-        .body(BoxBody::new(
-            http_body_util::Full::new(body).map_err(std::io::Error::other),
-        ))
+        .body(upstream::full_body(body))
         .unwrap();
     *resp.headers_mut() = hdrmap;
     resp.headers_mut().insert(
@@ -633,9 +630,7 @@ async fn collect_and_submit(
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(bytes).map_err(std::io::Error::other),
-                ))
+                .body(upstream::full_body(bytes))
                 .unwrap();
             *rebuilt.headers_mut() = parts.headers;
             rebuilt
@@ -644,10 +639,7 @@ async fn collect_and_submit(
             // 收集失败：无内容可交付，回 502
             hyper::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from_static(b"page collect failed"))
-                        .map_err(std::io::Error::other),
-                ))
+                .body(upstream::full_body(Bytes::from_static(b"page collect failed")))
                 .unwrap()
         }
     }
@@ -818,10 +810,7 @@ mod page_cache_tests {
         let resp = hyper::Response::builder()
             .status(200)
             .header("content-type", "application/json")
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(b"{}"))
-                    .map_err(std::io::Error::other),
-            ))
+            .body(upstream::full_body(Bytes::from_static(b"{}")))
             .unwrap();
         let _ = collect_and_submit(&log, "github.com", "GET github.com/api/x", false, resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
@@ -892,10 +881,7 @@ mod page_cache_tests {
         let mut sniffed = hyper::Response::builder()
             .status(200)
             .header("content-type", "text/html; charset=utf-8")
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(b"world</html>"))
-                    .map_err(std::io::Error::other),
-            ))
+            .body(upstream::full_body(Bytes::from_static(b"world</html>")))
             .unwrap();
         sniffed
             .extensions_mut()
@@ -1144,12 +1130,9 @@ mod page_cache_tests {
         let poisoned = hyper::Response::builder()
             .status(200)
             .header("content-type", "text/html; charset=utf-8")
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from_static(
-                    b"<html><body class=\"logged-out env-production\">sign in</body></html>",
-                ))
-                .map_err(std::io::Error::other),
-            ))
+            .body(upstream::full_body(Bytes::from_static(
+                b"<html><body class=\"logged-out env-production\">sign in</body></html>",
+            )))
             .unwrap();
         let _ = collect_and_submit(&log, "github.com", "GET github.com/-cauthed-poison", true, poisoned).await;
         assert!(
@@ -1173,9 +1156,7 @@ mod page_cache_tests {
             .status(200)
             .header("content-type", "text/html; charset=utf-8")
             .header("content-encoding", "gzip")
-            .body(BoxBody::new(
-                http_body_util::Full::new(Bytes::from(gzbody)).map_err(std::io::Error::other),
-            ))
+            .body(upstream::full_body(Bytes::from(gzbody)))
             .unwrap();
         let _ = collect_and_submit(
             &log,

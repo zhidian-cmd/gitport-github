@@ -15,6 +15,15 @@ use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
+
+/// BoxBody 构造收口：全仓的 Empty/Full + io 错误映射统一走这两个入口。
+pub fn empty_body() -> BoxBody {
+    BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other))
+}
+
+pub fn full_body(b: Bytes) -> BoxBody {
+    BoxBody::new(http_body_util::Full::new(b).map_err(std::io::Error::other))
+}
 /// 每 host 最多两条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
 /// 一条连接承载该 host 的全部并发，但服务端对单连接的并发流有上限——实测 40 并发时
 /// 两条连接能把 p50 腰斩（2170ms → 1019ms），四条不再改善。只有成功过的连接入槽。
@@ -184,20 +193,16 @@ pub fn drop_h2_id(host: &str, id: u64) {
     }
 }
 
-/// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：摘第一条匹配的。
+/// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：查到 id 交 drop_h2_id 摘除。
 pub fn drop_h2(host: &str, ip: &str) {
-    let mut g = pool::lock(conn_pool());
-    let empty = match g.get_mut(host) {
-        Some(h) => {
-            if let Some(pos) = h.conns.iter().position(|c| c.up.ip == ip) {
-                h.conns.remove(pos);
-            }
-            h.conns.is_empty()
-        }
-        None => false,
+    let id = {
+        let g = pool::lock(conn_pool());
+        g.get(host)
+            .and_then(|h| h.conns.iter().find(|c| c.up.ip == ip))
+            .map(|c| c.up.id)
     };
-    if empty {
-        g.remove(host);
+    if let Some(id) = id {
+        drop_h2_id(host, id);
     }
 }
 
@@ -268,15 +273,6 @@ pub async fn h2_from_dialed(
         ping,
     })
 }
-pub async fn dial_h2(
-    pool_name: &str,
-    host: &str,
-    ctx: CancellationToken,
-    log: &LogFn,
-) -> Result<H2Upstream, String> {
-    dial_h2_skip(pool_name, host, ctx, log, None).await
-}
-
 /// 同 host 补第二条时传 `skip_ip`：两条连接落在同一 IP 上容易被边缘降权（实测一条会
 /// 长时间不响应，落到它上面的请求白等满 8s 预算）。
 pub async fn dial_h2_skip(
@@ -530,9 +526,7 @@ pub fn upstream_request<B>(
             out = out.header("accept-encoding", "gzip");
         }
     }
-    let body =
-        BoxBody::new(http_body_util::Empty::<bytes::Bytes>::new().map_err(|never| match never {}));
-    out.body(body).map_err(|e| e.to_string())
+    out.body(empty_body()).map_err(|e| e.to_string())
 }
 pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
     use futures_util::StreamExt;
@@ -567,9 +561,8 @@ mod tests {
                         .await
                         .map(|c| c.to_bytes().len())
                         .unwrap_or(0);
-                    Ok::<_, std::convert::Infallible>(hyper::Response::new(BoxBody::new(
-                        http_body_util::Full::new(Bytes::from(n.to_string()))
-                            .map_err(|never| match never {}),
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(full_body(
+                        Bytes::from(n.to_string()),
                     )))
                 },
             );
@@ -593,9 +586,7 @@ mod tests {
 
         let len = 2 * 1024 * 1024;
         let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        let body = BoxBody::new(
-            http_body_util::Full::new(Bytes::from(payload)).map_err(|never| match never {}),
-        );
+        let body = full_body(Bytes::from(payload));
         let log: LogFn = Arc::new(|_: &str| {});
         let pump = h2_spawn_pump(stream, body, log);
 

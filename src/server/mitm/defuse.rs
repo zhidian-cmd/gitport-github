@@ -3,8 +3,6 @@ use super::{get_direct, BoxBody, PeekRaw, UpstreamInfo};
 use crate::server::upstream;
 use crate::pool::{self, LogFn};
 use bytes::Bytes;
-#[cfg(test)]
-use http_body_util::BodyExt;
 
 /// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
@@ -171,10 +169,7 @@ mod tests {
         html.extend_from_slice(&vec![b'a'; 2000]);
         html.extend_from_slice(b"</h1><p>Whoa there, pardner!</p></body></html>");
         let compressed = gzip(&html);
-        let body = BoxBody::new(
-            http_body_util::Full::new(Bytes::from(compressed.clone()))
-                .map_err(std::io::Error::other),
-        );
+        let body = upstream::full_body(Bytes::from(compressed.clone()));
         let (parts, _) = hyper::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
             .header("content-encoding", "gzip")
@@ -196,9 +191,7 @@ mod tests {
             "写回前缀必须是原始压缩流的真前缀"
         );
         let normal = gzip(b"<!doctype html><html><body>hello</body></html>");
-        let body2 = BoxBody::new(
-            http_body_util::Full::new(Bytes::from(normal)).map_err(std::io::Error::other),
-        );
+        let body2 = upstream::full_body(Bytes::from(normal));
         let (parts2, _) = hyper::Response::builder()
             .header("content-type", "text/html")
             .header("content-encoding", "gzip")

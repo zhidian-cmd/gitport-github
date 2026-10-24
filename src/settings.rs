@@ -298,12 +298,8 @@ struct SettingsFile {
     mitm: bool,
     #[serde(deserialize_with = "lenient")]
     win_rect: [i32; 4],
-    #[serde(
-        rename = "githubPAC",
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "lenient"
-    )]
-    github_pac: Option<bool>,
+    #[serde(rename = "githubPAC", deserialize_with = "lenient")]
+    github_pac: bool,
     #[serde(deserialize_with = "lenient")]
     proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
@@ -345,11 +341,9 @@ fn apply(v: SettingsFile) {
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
     *state().last_ip.lock().unwrap() = v.last_ip;
-    if let Some(on) = v.github_pac {
-        state()
-            .github_pac
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
+    state()
+        .github_pac
+        .store(v.github_pac, std::sync::atomic::Ordering::Relaxed);
     *state().worker_mirrors.lock().unwrap() = v.worker_mirrors;
 }
 
@@ -365,7 +359,7 @@ fn save() -> Result<(), String> {
         close_to_tray: s.close_to_tray.load(std::sync::atomic::Ordering::Relaxed),
         mitm: s.mitm.load(std::sync::atomic::Ordering::Relaxed),
         win_rect: *s.win_rect.lock().unwrap(),
-        github_pac: Some(s.github_pac.load(std::sync::atomic::Ordering::Relaxed)),
+        github_pac: s.github_pac.load(std::sync::atomic::Ordering::Relaxed),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
         worker_mirrors: s.worker_mirrors.lock().unwrap().clone(),
@@ -544,7 +538,7 @@ mod tests {
                 "lastIp":{"edge/assets":"185.199.108.154","core/all":"20.27.177.114",
                           "edge/content":"185.199.110.133","api/all":"140.82.114.6"}}"#,
         );
-        assert!(v.close_to_tray && v.mitm && v.github_pac == Some(true), "其他字段被连坐");
+        assert!(v.close_to_tray && v.mitm && v.github_pac, "其他字段被连坐");
         assert_eq!(
             v.last_ip.marks().to_vec(),
             vec![
@@ -580,7 +574,7 @@ mod tests {
             close_to_tray: true,
             mitm: false,
             win_rect: [1, 2, 3, 4],
-            github_pac: Some(false),
+            github_pac: false,
             proxy_backup: String::new(),
             last_ip: LastIpTable::from_marks(vec![(
                 "api/all".to_string(),

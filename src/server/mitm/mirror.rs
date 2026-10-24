@@ -3,11 +3,9 @@
 use super::{path_of, BoxBody};
 use crate::pool::{self, LogFn};
 use crate::server::upstream;
-use bytes::Bytes;
 #[cfg(test)]
 use std::sync::Arc;
 use http::Method;
-use http_body_util::BodyExt;
 use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -127,9 +125,7 @@ fn mirror_request(
     // 客户端原 UA 后统一注入，否则 builder.header 是追加会出现两个 UA），
     // 校准/无 UA 客户端也能过；对外特征一致（见 MIRROR_UA 注释）。
     builder = builder.header(http::header::USER_AGENT, http::HeaderValue::from_static(MIRROR_UA));
-    let body =
-        BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(|e| std::io::Error::other(e)));
-    builder.body(body).map_err(|e| e.to_string())
+    builder.body(upstream::empty_body()).map_err(|e| e.to_string())
 }
 /// 镜像腿单发：5s 响应头预算 + 假页拒判（≥400 或 text/html 不算成绩）。
 async fn mirror_do(
@@ -268,9 +264,7 @@ fn mirror_get(uri: http::Uri) -> Result<hyper::Request<BoxBody>, String> {
         .uri(uri)
         .header("user-agent", MIRROR_UA)
         .header("accept", "*/*")
-        .body(BoxBody::new(
-            http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-        ))
+        .body(upstream::empty_body())
         .map_err(|e| e.to_string())
 }
 
@@ -480,9 +474,7 @@ mod tests {
             .header("range", "bytes=0-1023")
             .header("accept-encoding", "gzip")
             .header("user-agent", "UA/1.0")
-            .body(BoxBody::new(
-                http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other),
-            ))
+            .body(upstream::empty_body())
             .unwrap();
         let req = mirror_request(
             &out,
@@ -564,9 +556,7 @@ mod tests {
         let log: LogFn = Arc::new(|_: &str| {});
         let req = hyper::Request::builder()
             .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
-            .body(BoxBody::new(
-                http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
-            ))
+            .body(upstream::empty_body())
             .unwrap();
         let err = chain_fetch(&log, &req, "raw.githubusercontent.com")
             .await

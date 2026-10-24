@@ -3,7 +3,7 @@ use crate::certgen::Authority;
 use crate::config::{self, pooled_domains};
 use crate::logger::Logger;
 use crate::{pool, settings};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -86,26 +86,7 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/", axum::routing::get(index))
         .route("/style.css", axum::routing::get(style))
         .route("/app.js", axum::routing::get(app_js))
-        .route(
-            "/guide/step1.jpg",
-            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[0]).await }),
-        )
-        .route(
-            "/guide/step2.jpg",
-            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[1]).await }),
-        )
-        .route(
-            "/guide/step3.jpg",
-            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[2]).await }),
-        )
-        .route(
-            "/guide/step4.jpg",
-            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[3]).await }),
-        )
-        .route(
-            "/guide/step5.jpg",
-            axum::routing::get(|| async { img_jpeg(GUIDE_JPEGS[4]).await }),
-        )
+        .route("/guide/{file}", axum::routing::get(guide_img))
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
         .route("/api/logs", axum::routing::get(api_logs))
@@ -200,6 +181,19 @@ async fn img_jpeg(bytes: &'static [u8]) -> Response {
         bytes,
     )
         .into_response()
+}
+
+/// /guide/stepN.jpg → GUIDE_JPEGS[n-1]；其余 404。
+async fn guide_img(Path(file): Path<String>) -> Response {
+    let n = file
+        .strip_prefix("step")
+        .and_then(|s| s.strip_suffix(".jpg"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (1..=GUIDE_JPEGS.len()).contains(n));
+    match n {
+        Some(n) => img_jpeg(GUIDE_JPEGS[n - 1]).await,
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 /// 分流 PAC：白名单 DIRECT 短路必须在通配符匹配之前（否则被 *.githubusercontent.com 吞掉）。
 fn pac_script() -> String {
