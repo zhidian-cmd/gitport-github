@@ -162,6 +162,16 @@ async fn mirror_do(
     ));
     Ok(hyper::Response::from_parts(parts, body))
 }
+
+/// 校准日志措辞：镜像站以 3xx/4xx 明确拒绝（路由未开 / 风控）算"不支持"，
+/// 超时与连接错误才是"失败"——混用会让一次正常探测显得像故障。
+fn calib_fail_label(e: &str) -> &'static str {
+    if e.contains("状态 ") {
+        "不支持"
+    } else {
+        "失败"
+    }
+}
 fn has_credential_query(query: &str) -> bool {
     query.split('&').any(|kv| {
         let name = kv.split('=').next().unwrap_or("").to_lowercase();
@@ -332,7 +342,7 @@ async fn throughput_race(
                     ));
                 }
                 Err(e) => {
-                    (log)(&format!("[校准] {host} {m} 失败({e})"));
+                    (log)(&format!("[校准] {host} {m} {}({e})", calib_fail_label(e)));
                 }
             }
             (m, r.map(|(b, _)| b as i64).unwrap_or(-1))
@@ -389,7 +399,10 @@ pub async fn calibrate_chains(log: &LogFn, mode: CalibMode) -> String {
                             rows.push((m.clone(), ms));
                         }
                         Err(e) => {
-                            (log)(&format!("[校准] {host} {m} 失败({e})"));
+                            (log)(&format!(
+                                "[校准] {host} {m} {}({e})",
+                                calib_fail_label(&e)
+                            ));
                             rows.push((m.clone(), -(ms.max(1)))); // 负数 = 失败，沉底
                         }
                     }
