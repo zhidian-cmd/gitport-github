@@ -3,7 +3,7 @@
 //! 存：cache_put 过闸（host 白名单 / 仅 200 / 正文类型 / ≤2MB / 会话污染）后投递 Save。
 //! 存储：pages/<hash> = [4B BE 头长][header JSON][body]，tmp + rename 原子落盘。
 //! 管家线程（串行、单条 panic 护栏）：落盘、Touch 刷 mtime、按前缀失效、容量管理。
-//! 新鲜度：TTL 按 host 分治（绝对时钟，命中不续期）+ POST 成功即删 + F5 绕过。
+//! 新鲜度：TTL 按 host（+动态页）分治，绝对时钟命中不续期 + POST 成功即删 + F5 绕过。
 //! 容量：每累计 8MB 查一次；软顶 200MB 按 mtime 淘汰，硬顶 250MB 全清重来。
 //! 红线：不做 SWR/后台 ETag 验证——_gh_sess 轮换，旧 cookie 重用被 GitHub
 //!   判定账号泄露（详见 mitm/mod.rs 调用点）；也不用 cacache（去重/校验用不上，
@@ -39,9 +39,25 @@ const TTL_MS_GITHUB: u64 = 24 * 60 * 60 * 1000; // 24 小时：主站框架
 const TTL_MS_GIST: u64 = 30 * 60 * 1000; // 30 分钟：gist 页面
 const TTL_MS_RAW: u64 = 10 * 60 * 1000; // 10 分钟：raw 文本文件
 const TTL_MS_DEFAULT: u64 = 30 * 60 * 1000; // 兜底（白名单外 host 本就走不到缓存）
+/// 搜索/列表类动态页：SSR 内联的列表会变（新仓库、排序、个性化）。结果过时
+/// 比慢更伤信任——用户反复刷新重搜，反而多打 GitHub。
+const TTL_MS_DYNAMIC: u64 = 5 * 60 * 1000;
+/// 动态页路径段：任一出现即短 TTL（搜索、列表、时间线）。
+const DYNAMIC_SEGMENTS: &[&str] = &[
+    "search", "issues", "pulls", "commits", "releases", "discussions",
+    "notifications", "feed", "trending", "explore", "topics",
+];
 
-/// 按 host 取 TTL（纯函数，便于测试）。
-fn ttl_for_host(host: &str) -> u64 {
+/// 动态页判定：带 query（?q= / ?page= / ?sort= …）或路径含动态段。
+fn is_dynamic_page(path: &str, has_query: bool) -> bool {
+    has_query || path.split('/').any(|seg| DYNAMIC_SEGMENTS.contains(&seg))
+}
+
+/// 按 host（+ 动态页判定）取 TTL（纯函数，便于测试）。
+fn ttl_for(host: &str, path: &str, has_query: bool) -> u64 {
+    if host == "github.com" && is_dynamic_page(path, has_query) {
+        return TTL_MS_DYNAMIC;
+    }
     match host {
         "github.com" => TTL_MS_GITHUB,
         "gist.githubusercontent.com" => TTL_MS_GIST,
@@ -104,8 +120,9 @@ pub(super) fn cache_take(
     }
     let key = page_cache_key(req, host);
     let (status, hdrs, body, cached_at_ms) = load_disk_entry(&key)?;
-    if ttl_expired(ttl_for_host(host), cached_at_ms, now_ms()) {
-        return None; // 时钟路由：过期 → 上游刷新
+    let ttl = ttl_for(host, req.uri().path(), req.uri().query().is_some());
+    if ttl_expired(ttl, cached_at_ms, now_ms()) {
+        return None; // 过期 → 上游刷新
     }
     worker_send(CacheMsg::Touch { key }, log);
     Some(rebuild_cached_response(status, &hdrs, body))
@@ -741,30 +758,60 @@ mod page_cache_tests {
         assert!(!ttl_expired(TTL_MS_DEFAULT, now_ms() - 29 * 60 * 1000, now_ms()));
         assert!(ttl_expired(TTL_MS_DEFAULT, now_ms() - 31 * 60 * 1000, now_ms()));
         assert!(ttl_expired(TTL_MS_DEFAULT, 0, now_ms()), "_epoch 视为远古条目: 过期");
-        // per-host TTL 表：github.com 框架 24h / gist 30min / raw 10min / 兜底 30min
-        assert_eq!(ttl_for_host("github.com"), 24 * 60 * 60 * 1000);
-        assert_eq!(ttl_for_host("gist.githubusercontent.com"), 30 * 60 * 1000);
-        assert_eq!(ttl_for_host("raw.githubusercontent.com"), 10 * 60 * 1000);
-        assert_eq!(ttl_for_host("example.com"), TTL_MS_DEFAULT, "名单外走兜底");
+        // per-host TTL：主站框架 24h / gist 30min / raw 10min / 兜底 30min
+        assert_eq!(ttl_for("github.com", "/", false), 24 * 60 * 60 * 1000);
+        assert_eq!(ttl_for("gist.githubusercontent.com", "/u/abc", false), 30 * 60 * 1000);
+        assert_eq!(ttl_for("raw.githubusercontent.com", "/u/r/main/f.txt", false), 10 * 60 * 1000);
+        assert_eq!(ttl_for("example.com", "/", false), TTL_MS_DEFAULT, "名单外走兜底");
+        // 动态页短窗口：搜索/列表/带 query 一律 5min（结果会变，过时比慢更伤）
+        assert_eq!(ttl_for("github.com", "/search", false), TTL_MS_DYNAMIC);
+        assert_eq!(ttl_for("github.com", "/search", true), TTL_MS_DYNAMIC);
+        assert_eq!(ttl_for("github.com", "/dotnetcore/CAP/issues", false), TTL_MS_DYNAMIC);
+        assert_eq!(ttl_for("github.com", "/dotnetcore/CAP/commits/main", false), TTL_MS_DYNAMIC);
+        assert_eq!(ttl_for("github.com", "/feed", false), TTL_MS_DYNAMIC);
+        assert_eq!(
+            ttl_for("github.com", "/dotnetcore/CAP", true),
+            TTL_MS_DYNAMIC,
+            "带 query 的仓库页也算动态视图"
+        );
+        assert_eq!(
+            ttl_for("github.com", "/dotnetcore/CAP", false),
+            24 * 60 * 60 * 1000,
+            "仓库首帧仍吃长桶"
+        );
+        // gist/raw 不参与动态页规则
+        assert_eq!(ttl_for("gist.githubusercontent.com", "/u/abc", true), 30 * 60 * 1000);
+        assert_eq!(ttl_for("raw.githubusercontent.com", "/u/r/main/f.txt", true), 10 * 60 * 1000);
         // 24h 窗口：23h 前写入不过期，25h 前过期
         assert!(!ttl_expired(
-            ttl_for_host("github.com"),
+            ttl_for("github.com", "/", false),
             now_ms() - 23 * 60 * 60 * 1000,
             now_ms()
         ));
         assert!(ttl_expired(
-            ttl_for_host("github.com"),
+            ttl_for("github.com", "/", false),
             now_ms() - 25 * 60 * 60 * 1000,
+            now_ms()
+        ));
+        // 动态页 5min 窗口：3min 不过期，6min 过期
+        assert!(!ttl_expired(
+            ttl_for("github.com", "/search", false),
+            now_ms() - 3 * 60 * 1000,
+            now_ms()
+        ));
+        assert!(ttl_expired(
+            ttl_for("github.com", "/search", false),
+            now_ms() - 6 * 60 * 1000,
             now_ms()
         ));
         // raw 10min 窗口：9min 不过期，11min 过期
         assert!(!ttl_expired(
-            ttl_for_host("raw.githubusercontent.com"),
+            ttl_for("raw.githubusercontent.com", "/u/r/main/f.txt", false),
             now_ms() - 9 * 60 * 1000,
             now_ms()
         ));
         assert!(ttl_expired(
-            ttl_for_host("raw.githubusercontent.com"),
+            ttl_for("raw.githubusercontent.com", "/u/r/main/f.txt", false),
             now_ms() - 11 * 60 * 1000,
             now_ms()
         ));
