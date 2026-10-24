@@ -11,9 +11,8 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// 写系统剪贴板(CF_UNICODETEXT)。WebView2 默认拒 JS 剪贴板 API，这里是复制的最终兜底。
-/// 句柄所有权规则: SetClipboardData 失败则句柄仍归调用方, 必须 GlobalFree;
-/// 成功则系统接管, 禁释放(双 free 会破坏他人剪贴板数据)。
+/// 写系统剪贴板（WebView2 拒 JS 剪贴板 API 时的兜底）。
+/// 句柄所有权：SetClipboardData 失败仍归调用方（须 GlobalFree），成功则系统接管（禁释放）。
 #[cfg(target_os = "windows")]
 fn write_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::{GlobalFree, HANDLE};

@@ -128,12 +128,9 @@ async fn mitm_http(
     }
 
     let info = UpstreamInfo::default();
-    // 页面缓存：取/存两个路由，判定/键/元数据/索引知识收拢在 page_cache 模块内。
-    // 新鲜度模型：用户点击行为驱动（命中秒回 + 写失效即时刷新）。
-    // 明确否决 SWR/后台 ETag 验证（2026-10-24 定案，勿"优化"回来）：
-    // _gh_sess 每请求轮换，后台验证只能带上一时刻的旧 cookie，GitHub 侧
-    // 将废弃会话重用判定为账号泄露——与 /login /session 缓存排除同源的
-    // 安全边界。想要新鲜内容由浏览器 F5（max-age=0，被缓存准入排除）直达上游。
+    // 页面缓存命中即秒回；细节全在 page_cache 模块。
+    // 勿加 SWR/后台 ETag 验证：_gh_sess 轮换，旧 cookie 重用被 GitHub 判定
+    // 账号泄露（与 /login 排除同源的安全边界）。要看最新按 F5 直达上游。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
     }

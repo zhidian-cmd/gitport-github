@@ -364,8 +364,7 @@ fn apply(v: SettingsFile) {
 
 /// settings.json 保存互斥：快照 + 写盘必须整段原子完成。
 /// WebUI 改设置与拨号路径写游标（set_last_ips）是两条并发路径，无锁时互相拿
-/// 旧快照覆写 = 丢更新（用户刚在 WebUI 关掉的开关，被一次 IP 轮换冲回去）。
-/// 锁内只做内存快照 + 序列化 + 原子写，临界区短（保存是窗口级罕见事件）。
+/// 快照+写盘全程持锁，防旧快照覆写丢更新（保存是罕见事件，临界区短）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 fn save() -> Result<(), String> {
