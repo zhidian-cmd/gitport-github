@@ -58,6 +58,9 @@ const TTL_MS_DYNAMIC: u64 = 5 * 60 * 1000;
 const DYNAMIC_SEGMENTS: &[&str] = &[
     "search", "issues", "pulls", "commits", "releases", "discussions",
     "notifications", "feed", "trending", "explore", "topics", "settings",
+    // PR 详情是单数（/o/r/pull/123），issue 详情是复数（/issues/5）。
+    // 别人在你打开后新发的评论要等 24 小时才看得到，等于坏掉。
+    "pull",
 ];
 
 /// 动态页判定：带 query（?q= / ?page= / ?sort= …）或路径含动态段。
@@ -1056,6 +1059,20 @@ mod page_cache_tests {
         assert_eq!(
             ttl_for("github.com", "/settings/tokens/new", false),
             TTL_MS_DYNAMIC
+        );
+        // PR 详情（单数 pull）必须短窗：别人新发的评论不能等 24 小时
+        assert_eq!(
+            ttl_for("github.com", "/o/r/pull/123", false),
+            TTL_MS_DYNAMIC
+        );
+        assert_eq!(
+            ttl_for("github.com", "/o/r/pull/123/files", false),
+            TTL_MS_DYNAMIC
+        );
+        // 单条 commit 不可变，仍吃长窗（别误伤）
+        assert_eq!(
+            ttl_for("github.com", "/o/r/commit/abc123", false),
+            24 * 60 * 60 * 1000
         );
         assert!(ttl_expired(
             ttl_for("github.com", "/", false),
