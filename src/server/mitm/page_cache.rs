@@ -344,16 +344,39 @@ fn is_gzip_encoding(v: &str) -> bool {
     v.trim().eq_ignore_ascii_case("gzip")
 }
 
-/// 未登录页检测：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
-/// 必须先按编码解一段再扫——主站正文恒 gzip，直接扫压缩字节永远扫不到这几个字面量。
-fn is_logged_out_body(bytes: &[u8], gzip: bool) -> bool {
+/// 正文前缀（解压后 8KB，转小写）：未登录页与闸门页的判定都在这上面做。
+/// 必须先按编码解压——主站正文恒 gzip，直接扫压缩字节永远扫不到字面量。
+fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
     let plain = if gzip {
         super::defuse::gunzip_partial(bytes, 8192)
     } else {
         bytes[..bytes.len().min(4096)].to_vec()
     };
-    let chunk = String::from_utf8_lossy(&plain);
-    chunk.contains("logged-out env-") || chunk.contains("class=\"logged-out")
+    String::from_utf8_lossy(&plain).to_lowercase()
+}
+
+/// 未登录页：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
+fn is_logged_out_body(plain: &str) -> bool {
+    plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
+}
+
+/// 闸门页标记：GitHub 用这些页面**顶替**你请求的真实内容（验证 2FA、认新设备、
+/// 密码二次确认、限流、停用），且是按被请求的 URL 返回 200。
+/// 存下来就会在那个 URL 的整个缓存窗口里一直显示（仓库页 24h；登录态没变，
+/// 重新登录照样命中），只能靠 F5 绕。宁可不缓存，也不能缓存它们。
+/// 新增闸门页往这里加一条即可（命中的代价只是少一次缓存，不会错内容）。
+const GATE_MARKERS: &[&str] = &[
+    "verify your two-factor authentication",
+    "one-time verification of your recently configured 2fa",
+    "two_factor_verification",
+    "sessions/verified-device",
+    "confirm your password",
+    "your account has been suspended",
+    "you have exceeded a secondary rate limit",
+];
+
+fn is_gate_page(plain: &str) -> bool {
+    GATE_MARKERS.iter().any(|m| plain.contains(m))
 }
 
 /// key → 文件名：FNV-1a 64 位散列的 16 hex。碰撞由读时 key 校验兜底。
@@ -415,8 +438,9 @@ fn load_disk_entry(
         k.as_str() == "content-encoding" && v.to_str().map(is_gzip_encoding).unwrap_or(false)
     });
     let body = &raw[end..];
-    if is_logged_out_body(body, gzip) {
-        return None; // 未登录污染条目：当作 miss
+    let plain = plain_prefix(body, gzip);
+    if is_logged_out_body(&plain) || is_gate_page(&plain) {
+        return None; // 未登录页 / 闸门页：当作 miss（旧版存下的也在这里自愈）
     }
     // 无此字段视为远古：过期 = miss，被重写覆盖。
     let cached_at_ms = header.get("cachedAt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -612,9 +636,13 @@ async fn collect_and_submit(
                 full.extend_from_slice(&bytes);
                 bytes = Bytes::from(full);
             }
-            // 可缓存 = 体积达标 且 非"带会话却拿到未登录页"（会话死亡防污染）
+            // 可缓存 = 体积达标 且 不是"顶替真实内容的页面"：
+            // 带会话却拿到未登录页（会话死亡）、或拿到各类闸门页（2FA 验证等）。
+            // 闸门页与登录态无关，一律不缓存。
+            let plain = plain_prefix(&bytes, gzip);
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
-                && !(has_session && is_logged_out_body(&bytes, gzip));
+                && !(has_session && is_logged_out_body(&plain))
+                && !is_gate_page(&plain);
             if cacheable {
                 let status = parts.status.as_u16();
                 worker_send(
@@ -1148,10 +1176,13 @@ mod page_cache_tests {
         std::io::Write::write_all(&mut enc, &html).unwrap();
         let gzbody = enc.finish().unwrap();
         assert!(
-            !is_logged_out_body(&gzbody, false),
+            !is_logged_out_body(&plain_prefix(&gzbody, false)),
             "压缩体裸扫扫不到——这就是旧版失效的原因"
         );
-        assert!(is_logged_out_body(&gzbody, true), "解压后必须认出未登录页");
+        assert!(
+            is_logged_out_body(&plain_prefix(&gzbody, true)),
+            "解压后必须认出未登录页"
+        );
         let poisoned_gz = hyper::Response::builder()
             .status(200)
             .header("content-type", "text/html; charset=utf-8")
@@ -1169,6 +1200,46 @@ mod page_cache_tests {
         assert!(
             page_cache_get("GET github.com/-cauthed-gz-poison").is_none(),
             "gzip 未登录页同样不得入缓存"
+        );
+
+        // ⑪c 闸门页（2FA 验证 / 认设备 / 密码确认 / 停用 / 限流）：GitHub 把这类页面
+        // 按"被请求的 URL"返回 200，存下来就会在那个 URL 的整个窗口里顶替真实内容
+        // （仓库页 24h，登录态没变所以重登也命中）。写入侧与读侧都必须拦。
+        let gate_html = b"<html><head><title>Verify your two-factor authentication (2FA) settings</title></head><body><h1>Verify your two-factor authentication (2FA) settings</h1><p>This is a one-time verification of your recently configured 2FA credentials.</p></body></html>";
+        assert!(
+            is_gate_page(&plain_prefix(gate_html, false)),
+            "2FA 验证页必须识别"
+        );
+        assert!(
+            !is_gate_page(&plain_prefix(
+                b"<html><body class=\"logged-in env-production\">repo</body></html>",
+                false
+            )),
+            "普通页面不得误判"
+        );
+        // 写入侧：闸门页与登录态无关（SSO/停用页对未登录用户也会出现），一律不存
+        let gate = hyper::Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(upstream::full_body(Bytes::from_static(gate_html)))
+            .unwrap();
+        let _ = collect_and_submit(&log, "github.com", "GET github.com/o/r-gate", false, gate).await;
+        assert!(
+            page_cache_get("GET github.com/o/r-gate").is_none(),
+            "闸门页不得入缓存"
+        );
+        // 读侧：修复前已经存下的闸门页，命中时也要判 miss（自愈）
+        let _ = persist_page_entry_blocking(
+            &dir,
+            "GET github.com/o/r-old-gate",
+            gate_html,
+            200,
+            &test_hdrs(),
+            now_ms(),
+        );
+        assert!(
+            page_cache_get("GET github.com/o/r-old-gate").is_none(),
+            "旧的闸门页条目必须当 miss"
         );
 
         // ⑫ Touch 保留 cachedAt（TTL 基准不被摸掉）：写入带 cachedAt=旧值 →
