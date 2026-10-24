@@ -1215,6 +1215,9 @@ mod tests {
     #[test]
     fn mirror_chain_load_and_topup() {
         let _guard = TEST_LOCK.lock().unwrap();
+        // 隔离：自定义镜像注册表经 settings.json 跨进程持久化（上一轮 serial_load 收养的
+        // 自建镜像会留在里面），不清空的话 sync_custom_mirrors 会把它们追加进本测试的链。
+        crate::settings::save_worker_mirrors(Vec::new());
         let dir = tmpdir();
         std::fs::write(
             &dir.join("plans.json"),
