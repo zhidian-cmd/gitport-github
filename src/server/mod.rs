@@ -215,9 +215,16 @@ impl ProxyServer {
         for l in head_text.lines() {
             let l = l.trim_end_matches('\r');
             let low = l.to_lowercase();
-            if low.starts_with("proxy-connection:")
-                || low.starts_with("proxy-authorization:")
-                || low.starts_with("host:")
+            // 逐跳头不过上游：与 MITM/h2 路径共用 upstream::is_hop_by_hop 同一份
+            // 名单（connection/keep-alive/transfer-encoding/upgrade/te/proxy-*）。
+            // 曾只剥 proxy-* 与 host：客户端原样转来的 connection: close 会让
+            // 上游收完即关，代理转发语义被逐跳头带偏。
+            let name = low.split(':').next().unwrap_or("").trim();
+            if name.is_empty()
+                || name == "host"
+                || name == "proxy-connection"
+                || name == "proxy-authorization"
+                || upstream::is_hop_by_hop(name)
             {
                 continue;
             }
@@ -532,6 +539,12 @@ mod tests {
                 1,
                 "Content-Length 不应重复: {head_text}"
             );
+            // 逐跳头不过上游：客户端发来的 connection 必须在转发前剥掉
+            // （connection 白名单里的逐跳头与 proxy-*/host 一并在此兜底）。
+            assert!(
+                !head_text.to_lowercase().contains("connection:"),
+                "connection 逐跳头泄漏到上游: {head_text}"
+            );
             sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
                 .unwrap();
@@ -551,9 +564,11 @@ mod tests {
         let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
             .await
             .unwrap();
-        // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI
+        // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI。
+        // 顺带带 Connection/Keep-Alive 逐跳头：假上游断言它们被剥除（曾原样泄漏，
+        // 上游收完即关导致代理转发语义被逐跳头带偏）。
         let req = format!(
-            "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nContent-Length: 5\r\n\r\nhello"
+            "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
         );
         cli.write_all(req.as_bytes()).await.unwrap();
 

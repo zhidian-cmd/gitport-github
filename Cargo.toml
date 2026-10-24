@@ -53,7 +53,6 @@ tray-icon = "0.24"
 # 一个依赖图只允许一份 BoringSSL native，勿引入第二份。
 boring = "4"
 tokio-boring = "4"
-cacache = "13.1.0"
 
 [build-dependencies]
 embed-resource = "3.0"

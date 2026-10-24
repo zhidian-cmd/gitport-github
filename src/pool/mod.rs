@@ -99,6 +99,62 @@ struct PlansFile {
     pools: HashMap<String, Vec<SerialPlan>>,
 }
 
+/// 容错解析 plans.json。整表快路（serde 直接解 PlansFile）失败时，按顶层键
+/// 逐个解析：单个池/单条镜像链写坏只丢那一段（该池按种子补缺重建），其余表
+/// 原样保留——旧行为是整表按种子重建，用户手排的其他池和全部镜像链一夜回到
+/// 解放前。返回 None = 整份没救（不是合法 JSON 对象，调用方按种子重建并备份）；
+/// Some((表, salvaged))，salvaged = true 表示有段落坏被丢弃（调用方备份原文件）。
+fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bool)> {
+    if let Ok(pf) = serde_json::from_str::<PlansFile>(raw) {
+        return Some((pf, false));
+    }
+    // 快路失败：连合法 JSON 对象都不是 → 真没救
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = root.as_object()?;
+    let mut mirrors: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pools: HashMap<String, Vec<SerialPlan>> = HashMap::new();
+    let mut salvaged = false;
+    for (k, v) in obj {
+        if k == "mirrors" {
+            let Some(m) = v.as_object() else {
+                salvaged = true;
+                if let Some(l) = log {
+                    l("[串发] plans.json mirrors 段不是对象, 该段丢弃(镜像链按注册表重建)");
+                }
+                continue;
+            };
+            for (host, chain) in m {
+                match serde_json::from_value::<Vec<String>>(chain.clone()) {
+                    Ok(c) => {
+                        mirrors.insert(host.clone(), c);
+                    }
+                    Err(e) => {
+                        salvaged = true;
+                        if let Some(l) = log {
+                            l(&format!("[串发] plans.json 镜像链 {host} 写坏({e}), 该链丢弃"));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        match serde_json::from_value::<Vec<SerialPlan>>(v.clone()) {
+            Ok(p) => {
+                pools.insert(k.clone(), p);
+            }
+            Err(e) => {
+                salvaged = true;
+                if let Some(l) = log {
+                    l(&format!(
+                        "[串发] plans.json 池 {k} 写坏({e}), 该池按种子重建(其余表保留)"
+                    ));
+                }
+            }
+        }
+    }
+    Some((PlansFile { mirrors, pools }, salvaged))
+}
+
 pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     let g = SERIAL.lock().unwrap();
     let tab = g.as_ref().unwrap();
@@ -172,19 +228,34 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     *SERIAL_LOG.lock().unwrap() = log.clone();
     let path = plans_path();
     let raw = std::fs::read_to_string(&path).ok();
-    let parsed = raw.as_deref().and_then(|b| serde_json::from_str::<PlansFile>(b).ok());
+    // 容错解析：单池/单链写坏只丢那一段（该池按种子补缺），不再整表按种子重建、
+    // 把用户手排的其他池和全部镜像链一夜打回种子。salvaged = 有段落坏被丢弃。
+    let parsed = raw
+        .as_deref()
+        .and_then(|b| parse_plans_tolerant(b, log.as_ref()));
     if let (Some(_raw), None) = (&raw, &parsed) {
-        // 解析失败：先备份原文件再按种子重建，不静默覆丢用户手排表。
+        // 整份读不了（非 JSON 垃圾）：先备份原文件再按种子重建，不静默覆丢用户手排表。
         let bak = path.with_extension("json.bak");
         if std::fs::copy(&path, &bak).is_ok() {
             if let Some(l) = log.as_ref() {
                 l("[串发] plans.json 解析失败, 原文件已备份为 plans.json.bak, 本次按种子重建");
             }
         }
+    } else if matches!(&parsed, Some((_, true))) {
+        // 有段落坏被丢弃：也备份原文件——serial_load 收尾会按种子补缺重写
+        // plans.json，不备份用户手排的坏段就真没了（可从 .bak 捡回）。
+        let bak = path.with_extension("json.bak");
+        if std::fs::copy(&path, &bak).is_ok() {
+            if let Some(l) = log.as_ref() {
+                l("[串发] plans.json 有段落坏已按种子重建, 原文件已备份为 plans.json.bak");
+            }
+        }
     }
     // plans.json 缺失（全新安装）时按种子快照引导：池由补缺填充，镜像链随快照。
     let seeds = seed_db();
-    let loaded: PlansFile = parsed.unwrap_or_else(|| seeds.clone());
+    let loaded: PlansFile = parsed
+        .map(|(pf, _)| pf)
+        .unwrap_or_else(|| seeds.clone());
     let plans_map = loaded.pools;
     let loaded_chains = loaded.mirrors;
 
@@ -407,7 +478,17 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
+    // 每请求总耗时预算（config::SERIAL_DIAL_BUDGET_SECS）：圈内候选逐个试，
+    // 最坏整圈 27×(3s TCP + 5s TLS) ≈ 3.6 分钟——预算到期即停，剩余候选留给
+    // 后续请求复测，不逼用户干等几分钟才看到回落。
+    let budget_deadline =
+        Instant::now() + Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
+    let mut budget_hit = false;
     for i in 0..circle.len() {
+        if Instant::now() >= budget_deadline {
+            budget_hit = true;
+            break;
+        }
         let p = circle[(start + i) % circle.len()];
         {
             let g = SERIAL.lock().unwrap();
@@ -489,6 +570,24 @@ pub async fn serial_dial_skip(
 
     if ctx.is_cancelled() {
         return Err("请求预算到期".to_string());
+    }
+    if budget_hit {
+        // 与"全灭"同等退避：刚烧掉整整一个预算时长仍未成功，按 host 冷却 30s，
+        // 防 get_direct 的多次重试每次再烧一遍（无冷却时最坏 = 重试次数 × 预算）。
+        // 有镜像兜底的 host 同样豁免（镜像腿不受池冷却影响）。
+        if mirror_chain(host).is_empty() {
+            SERIAL_COOL.set(host);
+        }
+        if let Some(log) = log {
+            log(&format!(
+                "[串发] {host} {pool_name}/{family_name} 耗时预算({}s)到期(试 {tried} 个), 冷却退避, 剩余候选稍后复测",
+                crate::config::SERIAL_DIAL_BUDGET_SECS
+            ));
+        }
+        return Err(format!(
+            "串发耗时预算到期({}s)",
+            crate::config::SERIAL_DIAL_BUDGET_SECS
+        ));
     }
     if tried == 0 {
         return Err(format!(
@@ -644,14 +743,31 @@ impl Breaker {
             .unwrap()
     }
     pub fn open(&self, host: &str) -> bool {
-        self.lock()
-            .get(host)
-            .map(|until| Instant::now() < *until)
-            .unwrap_or(false)
+        let mut m = self.lock();
+        match m.get(host) {
+            Some(until) if Instant::now() < *until => true,
+            // 过期条目惰性清除：熔断恢复后再没人查的 host 不会永久沉淀在表里
+            // （host 数有上界、不漏内存，但只进不出是卫生问题）。
+            Some(_) => {
+                m.remove(host);
+                false
+            }
+            None => false,
+        }
     }
     pub fn set(&self, host: &str) {
-        self.lock()
-            .insert(host.to_string(), Instant::now() + Duration::from_secs(self.ttl_secs));
+        let mut m = self.lock();
+        // 容量卫生：极端情况（海量 host 熔断）先扫掉过期条目；仍超硬顶则整表
+        // 重置——丢几条活熔断只是多试一次，远比无界表强。
+        const HARD_CAP: usize = 4096;
+        if m.len() >= HARD_CAP {
+            let now = Instant::now();
+            m.retain(|_, until| now < *until);
+            if m.len() >= HARD_CAP {
+                m.clear();
+            }
+        }
+        m.insert(host.to_string(), Instant::now() + Duration::from_secs(self.ttl_secs));
     }
     pub fn clear(&self, host: &str) {
         self.lock().remove(host);
@@ -705,6 +821,82 @@ mod tests {
         assert!(MIRROR_BREAKER.open(camo));
         MIRROR_BREAKER.clear(camo);
         assert!(!MIRROR_BREAKER.open(camo));
+    }
+
+    #[test]
+    fn breaker_expired_entry_lazily_removed() {
+        // ttl=0：set 后立即过期。open 必须判 false 并把条目清掉——
+        // 过期条目沉淀在表里只进不出（修复前 open 只读不删）。
+        let b = Breaker::new(0);
+        b.set("expired.example");
+        assert!(!b.open("expired.example"), "过期条目不得判熔断中");
+        assert!(b.lock().is_empty(), "过期条目应被惰性清除");
+        // 活条目不受影响：open 通过且仍留在表里
+        let live = Breaker::new(600);
+        live.set("live.example");
+        assert!(live.open("live.example"));
+        assert!(
+            live.lock().contains_key("live.example"),
+            "活条目应保留在表里"
+        );
+        live.clear("live.example");
+        assert!(!live.open("live.example"));
+    }
+
+    #[test]
+    fn plans_json_single_bad_pool_does_not_wipe_table() {
+        // 单池写坏只丢该池（按种子补缺），其余池与镜像链原样保留——
+        // 旧行为是 flatten 全有或全无：一处笔误 → 整表按种子重建。
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tmpdir();
+        // 隔离：自定义镜像注册表经 settings.json 跨测试/跨轮次持久化，别处收养的
+        // 自建镜像会被 sync_custom_mirrors 追加回既有链——先清空，本断言只验
+        // plans.json 里的链是否原样保留，不掺注册表状态。
+        crate::settings::save_worker_mirrors(Vec::new());
+        std::fs::write(
+            &dir.join("plans.json"),
+            r#"{
+  "core": [{"ip": "1.2.3.4", "sni": "baidu.com"}],
+  "edge": "写坏了-不是数组",
+  "mirrors": {
+    "raw.githubusercontent.com": ["https://v4.gh-proxy.org"]
+  }
+}"#,
+        )
+        .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        serial_load(&dir, Vec::new(), Some(log));
+        // 好池的用户条目保留（+ 种子补缺）
+        let core = {
+            let g = SERIAL.lock().unwrap();
+            g.as_ref().unwrap().pools.get("core").unwrap().clone()
+        };
+        assert_eq!(core[0].ip, "1.2.3.4", "好池必须保留: {core:?}");
+        assert!(core.len() > 1, "好池应叠加种子补缺: {core:?}");
+        // 整个写坏的池 → 按种子重建（不连坐）
+        let edge_n = {
+            let g = SERIAL.lock().unwrap();
+            g.as_ref().unwrap().pools.get("edge").unwrap().len()
+        };
+        assert!(edge_n > 0, "坏池应按种子重建: {edge_n}");
+        // 镜像链保留
+        assert_eq!(
+            mirror_chain("raw.githubusercontent.com"),
+            vec!["https://v4.gh-proxy.org".to_string()],
+            "镜像链必须保留"
+        );
+        // 日志指明哪个池坏了；原文件备份（坏段可从 .bak 捡回）
+        assert!(
+            seen.lock().unwrap().iter().any(|l| l.contains("池 edge 写坏")),
+            "应记录坏池名: {:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            dir.join("plans.json.bak").exists(),
+            "有段落坏应备份原文件"
+        );
     }
 
     #[test]

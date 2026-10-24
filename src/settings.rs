@@ -362,7 +362,14 @@ fn apply(v: SettingsFile) {
     *state().worker_mirrors.lock().unwrap() = v.worker_mirrors;
 }
 
+/// settings.json 保存互斥：快照 + 写盘必须整段原子完成。
+/// WebUI 改设置与拨号路径写游标（set_last_ips）是两条并发路径，无锁时互相拿
+/// 旧快照覆写 = 丢更新（用户刚在 WebUI 关掉的开关，被一次 IP 轮换冲回去）。
+/// 锁内只做内存快照 + 序列化 + 原子写，临界区短（保存是窗口级罕见事件）。
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
 fn save() -> Result<(), String> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let s = state();
     let data = SettingsFile {
         close_to_tray: s.close_to_tray.load(std::sync::atomic::Ordering::Relaxed),

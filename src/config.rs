@@ -32,6 +32,12 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 3;
 /// per-host 拨号锁，把该域名所有缓存未命中的请求一起拖死。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
+/// 串发拨号每请求总耗时预算：冷启动整圈逐个试最坏 27×(3s TCP + 5s TLS) ≈ 3.6 分钟，
+/// 用户第一个请求干等几分钟才等到回落。预算到期即停（剩余候选留给后续请求复测），
+/// 并按 host 冷却 30s 防重试循环每次再烧一遍。与 ctx 取消语义分开：
+/// ctx = 调用方整个请求的预算，这是串发圈内部的轮换预算。
+pub const SERIAL_DIAL_BUDGET_SECS: u64 = 20;
+
 /// h2 连接空闲 50-65s 被边缘回收，30s 探测可稳定续命。
 pub const KEEPALIVE_PROBE_SECS: u64 = 30;
 pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
