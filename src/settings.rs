@@ -24,20 +24,11 @@ struct SettingsState {
 }
 
 /// 一条自定义镜像：url = Worker 反代地址（拼接格式），on = 是否已启用进镜像链。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
     pub url: String,
     pub on: bool,
-}
-
-impl Default for WorkerMirror {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            on: false,
-        }
-    }
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();

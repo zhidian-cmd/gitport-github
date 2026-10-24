@@ -245,6 +245,30 @@ async fn gate_acquire() -> tokio::sync::SemaphorePermit<'static> {
     gate.acquire().await.expect("信号量未关闭")
 }
 
+/// 拨号端口：生产恒 443。串发重试引擎要能在本地监听上跑测试，才留这个可覆盖的出口——
+/// 否则只能抢占本机 443，等于核心重试逻辑没法测。
+#[cfg(not(test))]
+fn dial_port() -> u16 {
+    443
+}
+
+#[cfg(test)]
+static TEST_DIAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+#[cfg(test)]
+fn dial_port() -> u16 {
+    match TEST_DIAL_PORT.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => 443,
+        p => p,
+    }
+}
+
+/// 测试专用：0 = 复位为 443。
+#[cfg(test)]
+pub fn set_dial_port(p: u16) {
+    TEST_DIAL_PORT.store(p, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub async fn dial_one(
     host: &str,
     ip: &str,
@@ -252,7 +276,7 @@ pub async fn dial_one(
     tls_handshake: bool,
 ) -> std::io::Result<Dialed> {
     let _permit = gate_acquire().await;
-    let addr = format!("{ip}:443");
+    let addr = format!("{ip}:{}", dial_port());
     let tcp = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         TcpStream::connect(&addr),

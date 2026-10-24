@@ -103,7 +103,7 @@ impl ProxyServer {
         let head = read_head(&mut client).await?;
         // 头块以 \r\n\r\n 收尾；之后的字节是同包到达的请求体首段，必须原样续传。
         // 明文 HTTP 分发前先切开：体混进头重拼会把体当头行转发、真体丢失。
-        let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+        let Some(end) = find_head_end(&head) else {
             return Ok(()); // 头块不完整(超时/EOF 截断): 成不了包, 直接断开
         };
         let Some(idx) = find_crlf(&head[..end]) else {
@@ -167,13 +167,9 @@ impl ProxyServer {
                 }
                 _ => {}
             }
-            // github.com 网页风控逃生（透传看不见状态码，用流量指纹记账）
-            if host == "github.com" && sent > 0 && sent < 8192 && recv > 0 && recv < 8192 {
-                pool::cursor_note(name, &host, &ip, false);
-                (self.log)(&format!(
-                    "[串发] {host} 疑似风控小响应(↑{sent}↓{recv}B), 垫底换 IP"
-                ));
-            }
+            // 曾经这里按"双向都 <8KB"猜风控小响应并垫底换 IP——304 与任意小响应都符合，
+            // 每开一个页面就把驻留记号挪一格（还带一次 settings 落盘）。透传看不见状态码，
+            // 这种猜测注定误判；风控页化解只在 MITM 下做。
         }
     }
 
@@ -199,6 +195,15 @@ impl ProxyServer {
         if host.is_empty() {
             let _ = client
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+        // 分块体过不去：transfer-encoding 是逐跳头，转发前就被剥掉，
+        // 块长度行会被上游当成正文——宁可 501 也不静默改坏数据。
+        if headers_have_chunked(headers) {
+            (self.log)(&format!("[拒绝] {host} 明文 HTTP 分块请求体不支持, 回 501"));
+            let _ = client
+                .write_all(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n")
                 .await;
             return;
         }
@@ -261,7 +266,7 @@ async fn read_head(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut chunk = [0u8; 8192];
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(HEAD_TIMEOUT_SECS);
     loop {
-        if buf.len() >= 65536 || contains_head_end(&buf) {
+        if buf.len() >= 65536 || find_head_end(&buf).is_some() {
             break;
         }
         let read = tokio::time::timeout_at(deadline, client.read(&mut chunk)).await;
@@ -294,8 +299,17 @@ async fn read_head(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn contains_head_end(buf: &[u8]) -> bool {
-    buf.windows(4).any(|w| w == b"\r\n\r\n")
+/// 头块结束位置（\r\n\r\n 的起点）：读头和拆头共用同一份查找。
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// 明文 HTTP 请求头里是否声明了分块体（该编码在本路径无法原样转发）。
+fn headers_have_chunked(headers: &[u8]) -> bool {
+    String::from_utf8_lossy(headers).lines().any(|l| {
+        let low = l.to_ascii_lowercase();
+        low.starts_with("transfer-encoding:") && low.contains("chunked")
+    })
 }
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
@@ -438,10 +452,14 @@ where
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let do_split = first && split_tls_hello && hello_split_ranges(&buf[..n]).is_some();
+        // 只对第一条流做判定：后再读到的都是数据段，不该拆。
+        let ranges = if first && split_tls_hello {
+            hello_split_ranges(&buf[..n])
+        } else {
+            None
+        };
         first = false;
-        if do_split {
-            let ranges = hello_split_ranges(&buf[..n]).expect("上面刚判过 Some");
+        if let Some(ranges) = ranges {
             let mut ok = true;
             let mut added = 0u64;
             for (idx, seg) in ranges.iter().enumerate() {
@@ -586,6 +604,19 @@ mod tests {
         up_task.await.unwrap();
         ctx.cancel();
         let _ = serve_task.await;
+    }
+
+    /// 明文 HTTP 分块体：识别出来就走 501，不把块长度行当正文喂给上游。
+    #[test]
+    fn chunked_request_body_is_refused() {
+        assert!(headers_have_chunked(
+            b"Host: a\r\nTransfer-Encoding: chunked\r\n"
+        ));
+        assert!(headers_have_chunked(b"transfer-encoding: gzip, chunked\r\n"));
+        assert!(!headers_have_chunked(
+            b"Content-Length: 5\r\nConnection: close\r\n"
+        ));
+        assert!(!headers_have_chunked(b""));
     }
 
     /// 分片门槛：TLS 握手(0x16)且够长才拆；SSH/HTTP/过短流不拆。

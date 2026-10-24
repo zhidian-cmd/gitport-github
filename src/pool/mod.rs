@@ -22,6 +22,12 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 锁中毒自愈：一次 panic 不该变成此后每次拨号都 panic（那等于代理永久死亡）。
+/// 这些表只有"内容"语义、没有半写坏的中间态，取出内层值继续用是安全的。
+pub(crate) fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SerialPlan {
     pub ip: String,
@@ -154,7 +160,7 @@ fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bo
 }
 
 pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
-    let g = SERIAL.lock().unwrap();
+    let g = lock(&SERIAL);
     let tab = g.as_ref().unwrap();
     let mut out = HashMap::new();
     for name in SERIAL_POOLS {
@@ -213,17 +219,15 @@ fn write_plans_file(
 }
 
 fn plans_path() -> PathBuf {
-    let dir = SERIAL_DIR
-        .lock()
-        .unwrap()
+    let dir = lock(&SERIAL_DIR)
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     dir.join("plans.json")
 }
 
 pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<LogFn>) {
-    *SERIAL_DIR.lock().unwrap() = Some(data_dir.to_path_buf());
-    *SERIAL_LOG.lock().unwrap() = log.clone();
+    *lock(&SERIAL_DIR) = Some(data_dir.to_path_buf());
+    *lock(&SERIAL_LOG) = log.clone();
     let path = plans_path();
     let raw = std::fs::read_to_string(&path).ok();
     // 容错解析：坏段只丢那一段，不连坐整表。
@@ -325,6 +329,12 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     }
     for (host, chain) in loaded_chains {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
+            // 手写进 plans.json 的未知 host 会被丢掉：留一行日志，别让配置"自己没了"
+            if let Some(l) = log.as_ref() {
+                l(&format!(
+                    "[串发] plans.json 镜像链 {host} 不在支持列表, 已丢弃(其余链保留)"
+                ));
+            }
             continue;
         }
         // 镜像链数据权威：不设白名单，自部署镜像照样可用；坏镜像运行期自然失败沉底。
@@ -365,7 +375,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             crate::settings::save_worker_mirrors(registry);
         }
     }
-    *SERIAL.lock().unwrap_or_else(|p| p.into_inner()) = Some(tab);
+    *lock(&SERIAL) = Some(tab);
     sync_custom_mirrors(&[]); // 自定义镜像注册表对齐：启用中的自建节点确保在链中（幂等）
     let snap = plans_snapshot();
     let chains = mirror_chains_snapshot();
@@ -377,7 +387,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
 pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool) {
     let family = route::serial_family(pool_name, host);
     let key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
-    let mut g = SERIAL.lock().unwrap();
+    let mut g = lock(&SERIAL);
     let Some(t) = g.as_mut() else { return };
     let Some(ps) = t.pools.get(pool_name) else { return };
     let circle: Vec<&SerialPlan> = ps
@@ -422,7 +432,7 @@ pub async fn serial_dial_skip(
     skip_ip: Option<&str>,
 ) -> Result<(dial::Dialed, String, String), String> {
     {
-        let g = SERIAL.lock().unwrap();
+        let g = lock(&SERIAL);
         let tab = g.as_ref().unwrap();
         if SERIAL_COOL.open(host) {
             return Err("串发冷却中(全灭后 30s 内), 快速失败".to_string());
@@ -438,7 +448,7 @@ pub async fn serial_dial_skip(
     }
 
     let snapshot = {
-        let g = SERIAL.lock().unwrap();
+        let g = lock(&SERIAL);
         g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
@@ -463,7 +473,7 @@ pub async fn serial_dial_skip(
 
     // 起点 = 记号(上次驻留/尝试的 IP);找不到则从 0 号位起步。
     let start = {
-        let g = SERIAL.lock().unwrap();
+        let g = lock(&SERIAL);
         g.as_ref()
             .unwrap()
             .cursor
@@ -486,7 +496,7 @@ pub async fn serial_dial_skip(
         }
         let p = circle[(start + i) % circle.len()];
         {
-            let g = SERIAL.lock().unwrap();
+            let g = lock(&SERIAL);
             if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
                 if Instant::now() < *until {
                     dead_skipped += 1;
@@ -507,7 +517,7 @@ pub async fn serial_dial_skip(
                 // 驻留变更 → settings.last_ip(故障转移级,罕见;set_last_ips 未变化时内部 no-op)。
                 // 键序由 settings 侧统一归一,这里只交出内存记号。
                 let snap = {
-                    let mut g = SERIAL.lock().unwrap();
+                    let mut g = lock(&SERIAL);
                     let t = g.as_mut().unwrap();
                     t.cursor.insert(cursor_key.clone(), p.ip.clone());
                     t.cursor
@@ -524,13 +534,13 @@ pub async fn serial_dial_skip(
                     break; // 请求预算到期：这条没试完，不算失败；没试完 ≠ 全灭，不冷却
                 }
                 // 记号前移到圈中下一候选:下一请求从它起步;物理顺序不动,零写盘。
-                if let Ok(mut g) = SERIAL.lock() {
+                {
+                    let mut g = lock(&SERIAL);
                     let n = circle.len();
                     let next = &circle[(start + i + 1) % n];
-                    g.as_mut()
-                        .unwrap()
-                        .cursor
-                        .insert(cursor_key.clone(), next.ip.clone());
+                    if let Some(t) = g.as_mut() {
+                        t.cursor.insert(cursor_key.clone(), next.ip.clone());
+                    }
                 }
                 // TCP 层失败 = IP 对谁都达不通:死亡退避表跳过(60s → 5min → 30min 封顶)。
                 // TLS 层失败(raw 真名被 RST)是按域干扰:只前移记号,整圈后自然复测。
@@ -543,7 +553,8 @@ pub async fn serial_dial_skip(
                             | std::io::ErrorKind::ConnectionAborted
                     );
                 if tcp_level {
-                    if let Ok(mut g) = SERIAL.lock() {
+                    {
+                        let mut g = lock(&SERIAL);
                         if let Some(t) = g.as_mut() {
                             let n = t.dead.get(&p.ip).map(|(_, n)| *n).unwrap_or(0) + 1;
                             let secs = match n {
@@ -662,7 +673,7 @@ pub fn sync_custom_mirrors(removed: &[String]) {
         .map(|w| w.url.clone())
         .collect();
     disabled.extend(removed.iter().cloned());
-    let mut g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = lock(&SERIAL);
     let tab = match g.as_mut() {
         Some(t) => t,
         None => return,
@@ -675,7 +686,7 @@ pub fn sync_custom_mirrors(removed: &[String]) {
 }
 
 pub fn mirror_chain(host: &str) -> Vec<String> {
-    let g = SERIAL.lock().unwrap();
+    let g = lock(&SERIAL);
     g.as_ref()
         .unwrap()
         .mirrors
@@ -697,7 +708,7 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
         return false;
     }
     {
-        let mut g = SERIAL.lock().unwrap();
+        let mut g = lock(&SERIAL);
         let tab = g.as_mut().unwrap();
         if tab.mirrors.get(host).map(|c| c == &vc).unwrap_or(false) {
             return false;
@@ -706,14 +717,14 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
     }
     // 写者唯一（手动校准）：先放锁再同步落盘，写盘期间不挡拨号。
     write_plans_file(&plans_path(), &plans_snapshot(), &mirror_chains_snapshot());
-    if let Some(log) = SERIAL_LOG.lock().unwrap().as_ref() {
+    if let Some(log) = lock(&SERIAL_LOG).as_ref() {
         log(&format!("[镜像] {host} 链序更新({why})"));
     }
     true
 }
 
 pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
-    let g = SERIAL.lock().unwrap();
+    let g = lock(&SERIAL);
     g.as_ref().unwrap().mirrors.clone()
 }
 
@@ -1300,5 +1311,66 @@ mod tests {
             let order_unchanged = ps.iter().zip(base.iter()).all(|(a, b)| a.ip == b.ip);
             assert!(order_unchanged, "表序应冻结(游标不重排)");
         }
+    }
+
+    /// 串发重试引擎（此前只有纯函数 cursor_note 被测）：首个候选 TCP 拨不通 → 沿圈走到
+    /// 第二个候选、成功即驻留、失败候选进死亡退避表。127.0.0.2 是本机回环 /8 的另一个
+    /// 地址，用来当"活着的那条"；拨号端口经 dial::set_dial_port 临时指过去。
+    #[tokio::test]
+    async fn serial_dial_rotates_on_failure_and_parks_on_success() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // 只有 127.0.0.2 在监听；127.0.0.1 的同端口连接会被立刻拒绝。
+        let Ok(ln) = tokio::net::TcpListener::bind("127.0.0.2:0").await else {
+            eprintln!("跳过: 本机绑不了 127.0.0.2(回环 /8 行为不同), 串发实测留给真机");
+            return;
+        };
+        let port = ln.local_addr().unwrap().port();
+        dial::set_dial_port(port);
+        let dir = tmpdir();
+        std::fs::write(
+            &dir.join("plans.json"),
+            r#"{"core":[{"ip":"127.0.0.1","sni":"a.example"},{"ip":"127.0.0.2","sni":"a.example"}]}"#,
+        )
+        .unwrap();
+        serial_load(&dir, Vec::new(), None);
+
+        let (conn, ip, _) = serial_dial(
+            "core",
+            "github.com",
+            CancellationToken::new(),
+            false,
+            None,
+        )
+        .await
+        .expect("第二个候选能拨通");
+        drop(conn);
+        assert_eq!(ip, "127.0.0.2", "被拒的候选应垫底, 活着的那条胜出");
+        {
+            let g = SERIAL.lock().unwrap();
+            let t = g.as_ref().unwrap();
+            assert_eq!(
+                t.cursor.get("core/all").map(String::as_str),
+                Some("127.0.0.2"),
+                "成功必须驻留记号(下次从它起步)"
+            );
+            assert!(
+                t.dead.contains_key("127.0.0.1"),
+                "TCP 层失败应进死亡退避表"
+            );
+        }
+
+        // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
+        let (conn, ip, _) = serial_dial(
+            "core",
+            "github.com",
+            CancellationToken::new(),
+            false,
+            None,
+        )
+        .await
+        .expect("驻留后应直接命中");
+        drop(conn);
+        assert_eq!(ip, "127.0.0.2");
+        dial::set_dial_port(0); // 复位，别影响别的测试
     }
 }

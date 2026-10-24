@@ -1,4 +1,4 @@
-//! 路由唯一真相：master_route（System→Mirror→Pool{池,族}→Tunnel）+ POOL_ROUTES 每池族表。
+//! 路由唯一真相：master_route（System→Mirror→Pool→Tunnel）+ POOL_ROUTES 每池族表。
 //! 冷却/健康按 host 或 IP 记账不按池——池级冷却会让一个域的全灭毒倒同池其他族。
 
 use super::SerialPlan;
@@ -9,7 +9,7 @@ use crate::config;
 pub enum Route {
     System,
     Mirror,
-    Pool { pool: &'static str },
+    Pool,
     Tunnel,
 }
 
@@ -72,11 +72,11 @@ pub fn master_route(host: &str, method: &str, path: &str) -> Route {
     {
         return Route::Mirror;
     }
-    let pool = config::pool_for(host);
-    if pool.is_empty() {
+    // 池名由 `config::pool_for` 单一给出：枚举只表达"走池"，不再夹带第二份副本。
+    if config::pool_for(host).is_empty() {
         return Route::Tunnel;
     }
-    Route::Pool { pool }
+    Route::Pool
 }
 
 
@@ -259,23 +259,23 @@ mod tests {
         assert_eq!(master_route("github.com", "GET", "/o/r/archive/x.zip"), Mirror);
         assert_eq!(
             master_route("github.com", "POST", "/o/r/releases/download/x"),
-            Pool { pool: "core" }
+            Pool
         );
         assert_eq!(
             master_route("github.com", "GET", "/o/r/releases"),
-            Pool { pool: "core" }
+            Pool
         );
         assert_eq!(
             master_route("github.com", "GET", "/"),
-            Pool { pool: "core" }
+            Pool
         );
         assert_eq!(
             master_route("gist.github.com", "GET", "/"),
-            Pool { pool: "core" }
+            Pool
         );
         assert_eq!(
             master_route("api.github.com", "GET", "/"),
-            Pool { pool: "api" }
+            Pool
         );
         assert_eq!(master_route("example.com", "GET", "/"), Tunnel);
         assert_eq!(master_route("githubstatus.com", "GET", "/"), Tunnel);
@@ -300,7 +300,7 @@ mod tests {
         ] {
             assert_eq!(
                 master_route(host, "GET", "/x"),
-                Pool { pool: "edge" },
+                Pool,
                 "{host} 应归 edge 池"
             );
             assert_eq!(
