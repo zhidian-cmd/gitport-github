@@ -162,7 +162,9 @@ $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked
    启动/关闭只增删 plans.json 镜像链成员，注册表不受影响。 */
 let MIRRORS = [];
 const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
-const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'&#39;'}[c]));
+// HTML 属性转义：五个预定义字符实体一个都不能少——少一个就是一条注入面
+// （曾把 & < > " 原样返回，镜像 URL 里的 "><script> 直接逃逸 value="" 属性执行）。
+const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 async function refreshMirrors() {
   let s;

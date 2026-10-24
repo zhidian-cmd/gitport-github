@@ -12,9 +12,11 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// 写系统剪贴板(CF_UNICODETEXT)。WebView2 默认拒 JS 剪贴板 API，这里是复制的最终兜底。
+/// 句柄所有权规则: SetClipboardData 失败则句柄仍归调用方, 必须 GlobalFree;
+/// 成功则系统接管, 禁释放(双 free 会破坏他人剪贴板数据)。
 #[cfg(target_os = "windows")]
 fn write_clipboard(text: &str) -> bool {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, OpenClipboard, SetClipboardData,
     };
@@ -30,20 +32,22 @@ fn write_clipboard(text: &str) -> bool {
             let hglobal = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).ok()?;
             let dst = GlobalLock(hglobal);
             if dst.is_null() {
+                // 锁失败: 句柄没交出去, 还回去, 否则泄漏一个全局堆块
+                let _ = GlobalFree(Some(hglobal));
                 return None;
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), dst as *mut u16, wide.len());
             let _ = GlobalUnlock(hglobal);
-            Some(SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0))).is_ok())
+            let set = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hglobal.0))).is_ok();
+            if !set {
+                // 系统没接管: 句柄仍归我们, 必须释放
+                let _ = GlobalFree(Some(hglobal));
+            }
+            Some(set)
         })();
         let _ = CloseClipboard();
         ok.unwrap_or(false)
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn write_clipboard(_text: &str) -> bool {
-    false
 }
 
 pub enum AppEvent {

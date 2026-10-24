@@ -129,8 +129,11 @@ async fn mitm_http(
 
     let info = UpstreamInfo::default();
     // 页面缓存：取/存两个路由，判定/键/元数据/索引知识收拢在 page_cache 模块内。
-    // 新鲜度模型：用户点击行为驱动（命中秒回 + 写失效即时刷新），
-    // SWR 后台 ETag 验证保鲜（回放命中请求的完整 cookie 头 = 与浏览器相同身份）。
+    // 新鲜度模型：用户点击行为驱动（命中秒回 + 写失效即时刷新）。
+    // 明确否决 SWR/后台 ETag 验证（2026-10-24 定案，勿"优化"回来）：
+    // _gh_sess 每请求轮换，后台验证只能带上一时刻的旧 cookie，GitHub 侧
+    // 将废弃会话重用判定为账号泄露——与 /login /session 缓存排除同源的
+    // 安全边界。想要新鲜内容由浏览器 F5（max-age=0，被缓存准入排除）直达上游。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
     }
@@ -194,8 +197,18 @@ async fn mitm_http(
         if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
             return write_upstream(resp, "mirror", &info);
         }
-        (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
-        return mitm_unavailable(&req, &host);
+        // 链为空（全新安装未配任何镜像）= 没有镜像腿可走：回落直连串发池。
+        // 透传(非 MITM)模式下这些大文件域本来就走池，开了核心功能不该更差。
+        // 链非空但全灭保持原设计：大文件域直连必被限速/封锁，不回落到池。
+        let chain_host = pool::route::mirror_chain_host(&host, &path);
+        if pool::mirror_chain(&chain_host).is_empty() {
+            (log)(&format!(
+                "[MITM] {host}{path} 无镜像链(未配置), 回落直连串发"
+            ));
+        } else {
+            (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
+            return mitm_unavailable(&req, &host);
+        }
     }
     let name = pool::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
@@ -242,6 +255,7 @@ async fn mitm_http(
         }
     }
     // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
+    // （内存热点同步清 + 磁盘半场投递管家线程，见 page_cache 模块）
     if host == "github.com"
         && matches!(
             req.method(),
@@ -249,7 +263,7 @@ async fn mitm_http(
         )
         && (resp.status().is_success() || resp.status().is_redirection())
     {
-        page_cache::invalidate_after_write(&host, req.uri().path());
+        page_cache::invalidate_after_write(&log, &host, req.uri().path());
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
     let resp = page_cache::cache_put(&log, &req, &host, resp).await;
