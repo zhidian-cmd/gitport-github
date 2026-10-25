@@ -148,6 +148,22 @@ const FAMILY_CONTENT: FamilyRoute = FamilyRoute {
     fallback: Fallback::MirrorDns,
 };
 
+/// content 透传(真名)腿：额外放行 .154/.215。这三组都能出内容(2026-10-25 全表试探实测)，
+/// 但只有 .133 的默认证书 SAN 覆盖 *.githubusercontent.com——MITM 假名腿验得过，.154/.215
+/// 只剩 *.githubassets.com 验不过，混进假名池只会白拨+池序抖动；真名腿浏览器按 SNI 拿对
+/// 证书，好窗口白捡 8 个候选，坏窗口(SNI 点名)反正全灭，无损。
+const FAMILY_CONTENT_PASSTHROUGH: FamilyRoute = FamilyRoute {
+    name: "content",
+    host_of: host_is_content,
+    serves: |_host, p| {
+        matches!(
+            fastly_last_octet(&p.ip),
+            Some("133") | Some("154") | Some("215")
+        )
+    },
+    fallback: Fallback::MirrorDns,
+};
+
 /// assets：.154/.215 伪装（抗 SNI 阻断）。
 const FAMILY_ASSETS: FamilyRoute = FamilyRoute {
     name: "assets",
@@ -192,9 +208,11 @@ pub fn pool_route(pool: &str) -> Option<&'static PoolRoute> {
 }
 
 /// 串发族筛选：池内按 host 选族，未列族 host 归末族兜底（edge 即 auth）。
-pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
+/// passthrough = 真名腿（CONNECT 隧道 / 明文转发），content 族放宽到 .154/.215。
+pub fn serial_family(pool: &str, host: &str, passthrough: bool) -> Option<&'static FamilyRoute> {
     let pr = pool_route(pool)?;
-    pr.families
+    let fam = pr
+        .families
         .iter()
         .find(|f| (f.host_of)(host))
         .or_else(|| {
@@ -203,12 +221,16 @@ pub fn serial_family(pool: &str, host: &str) -> Option<&'static FamilyRoute> {
             } else {
                 None
             }
-        })
+        })?;
+    if passthrough && fam.name == "content" {
+        return Some(&FAMILY_CONTENT_PASSTHROUGH);
+    }
+    Some(fam)
 }
 
-/// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。
+/// host 的兜底策略（族全灭后怎么走）；族语义与 serial_family 单点一致。仅 MITM 消费。
 pub fn fallback_for(pool: &str, host: &str) -> Fallback {
-    serial_family(pool, host).map_or(Fallback::Dns, |f| f.fallback)
+    serial_family(pool, host, false).map_or(Fallback::Dns, |f| f.fallback)
 }
 
 #[cfg(test)]
@@ -304,7 +326,7 @@ mod tests {
                 "{host} 应归 edge 池"
             );
             assert_eq!(
-                serial_family("edge", host).map(|f| f.name),
+                serial_family("edge", host, false).map(|f| f.name),
                 Some(fam),
                 "{host} 的族应为 {fam}"
             );
@@ -337,7 +359,7 @@ mod tests {
     }
 
     fn fam(pool: &str, host: &str) -> &'static str {
-        serial_family(pool, host).map_or("", |f| f.name)
+        serial_family(pool, host, false).map_or("", |f| f.name)
     }
 
     #[test]
@@ -367,10 +389,34 @@ mod tests {
 
     #[test]
     fn serial_family_edge_fallback() {
-        let f = serial_family("edge", "future.edge.host").unwrap();
+        let f = serial_family("edge", "future.edge.host", false).unwrap();
         assert_eq!(f.name, "auth");
         assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
         assert!(!(f.serves)("x", &mk("185.199.110.133", "real")));
+    }
+
+    #[test]
+    fn content_serves_splits_by_leg() {
+        let mitm = serial_family("edge", "raw.githubusercontent.com", false).unwrap();
+        let pt = serial_family("edge", "raw.githubusercontent.com", true).unwrap();
+        assert_eq!(mitm.name, "content");
+        assert_eq!(pt.name, "content", "游标键不随模式分裂");
+        // MITM 假名腿：只有 .133（默认证书 SAN 覆盖内容族）
+        assert!((mitm.serves)("x", &mk("185.199.110.133", "baidu.com")));
+        // 透传真名腿：.133/.154/.215 全放行，.153(io 组)不放行
+        for last in ["133", "154", "215"] {
+            let ip = format!("185.199.110.{last}");
+            assert!((pt.serves)("x", &mk(&ip, "baidu.com")), "透传应放行 {ip}");
+        }
+        for last in ["154", "215"] {
+            let ip = format!("185.199.110.{last}");
+            assert!(!(mitm.serves)("x", &mk(&ip, "baidu.com")), "MITM 仍拒绝 {ip}");
+        }
+        assert!(!(pt.serves)("x", &mk("185.199.110.153", "baidu.com")));
+        // 非 content 族不受模式影响
+        let assets = serial_family("edge", "github.githubassets.com", true).unwrap();
+        assert_eq!(assets.name, "assets");
+        assert!((assets.serves)("x", &mk("185.199.110.154", "baidu.com")));
     }
 
     #[test]

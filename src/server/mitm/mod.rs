@@ -344,7 +344,7 @@ async fn stream_passthrough(
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true);
+                pool::cursor_note(name, host, &up.ip, true, false);
                 upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             }
             (log)(&format!(
@@ -440,7 +440,7 @@ async fn try_cached(
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true);
+                pool::cursor_note(name, host, &up.ip, true, false);
             }
             upstream::note_latency(host, up.id, ms);
             if is_content {
@@ -527,7 +527,7 @@ pub(super) async fn get_direct(
                 let up_ip = up.ip.clone();
                 *info.lock().unwrap() = up_ip.clone();
                 if !name.is_empty() {
-                    pool::cursor_note(name, host, &up_ip, true); // 数据到手 = 真成功, 置顶
+                    pool::cursor_note(name, host, &up_ip, true, false); // 数据到手 = 真成功, 置顶
                 }
                 upstream::store_h2(host, up);
                 upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
@@ -543,7 +543,7 @@ pub(super) async fn get_direct(
         // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
         // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
         if !name.is_empty() && is_simple && !is_content {
-            pool::cursor_note(name, host, &up.ip, false);
+            pool::cursor_note(name, host, &up.ip, false, false);
         }
         upstream::drop_h2_id(host, up.id);
         (log)(&format!(

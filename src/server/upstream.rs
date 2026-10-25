@@ -283,9 +283,9 @@ pub async fn dial_h2_skip(
     skip_ip: Option<&str>,
 ) -> Result<H2Upstream, String> {
     let (conn_io, ip, shape) =
-        pool::serial_dial_skip(pool_name, host, ctx, true, Some(log), skip_ip)
-        .await
-        .map_err(|e| e.to_string())?;
+        pool::serial_dial_skip(pool_name, host, ctx, true, Some(log), skip_ip, false)
+            .await
+            .map_err(|e| e.to_string())?;
     let form = if shape.is_empty() {
         "无"
     } else if shape == host {

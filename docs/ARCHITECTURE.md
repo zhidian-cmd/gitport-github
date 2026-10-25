@@ -152,10 +152,12 @@ flowchart TD
 
 | host 类型 | 只认哪类条目 | SNI 形态 |
 |---|---|---|
-| `*.githubusercontent.com` 内容域 | Fastly 末段 .133 | 伪装（2026-10-19 切换；Fastly 默认证书 SAN 覆盖全系） |
+| `*.githubusercontent.com` 内容域 | Fastly 末段 .133；**透传(真名)腿额外放行 .154/.215** | 伪装（2026-10-19 切换；Fastly 默认证书 SAN 覆盖全系）/ 透传真名 |
 | `*.githubassets.com` 静态资源 | Fastly 末段 .154 / .215 | 伪装 |
 | `github.io` / `*.github.io` | Fastly 末段 .153 | 伪装 |
 | 主站 / api / auth 主机 | 非 Fastly 段 | 伪装 `baidu.com` |
+
+透传腿放行 .154/.215 的依据（2026-10-25 全表试探，55 IP × 6 host 实测）：三组都能出内容，但默认证书只有 .133 组的 SAN 覆盖 `*.githubusercontent.com`——MITM 假名腿在 .154/.215 验不过证书（混入只会白拨 + 池序抖动），透传真名腿浏览器按 SNI 拿对证书，好窗口多 8 个候选，坏窗口（SNI 点名）反正全灭，无损。
 
 ## 连接复用
 

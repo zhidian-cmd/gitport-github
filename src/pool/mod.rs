@@ -376,8 +376,9 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
 
 /// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
 /// 只动内存游标,不改 plans.json 顺序、零写盘(驻留变更的 settings 落盘由调用方触发)。
-pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool) {
-    let family = route::serial_family(pool_name, host);
+/// passthrough 须与产生该结果的腿一致，否则游标记到对方圈外的 IP 上白记。
+pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough: bool) {
+    let family = route::serial_family(pool_name, host, passthrough);
     let key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
     let mut g = lock(&SERIAL);
     let Some(t) = g.as_mut() else { return };
@@ -412,6 +413,7 @@ pub async fn serial_dial_skip(
     tls_handshake: bool,
     log: Option<&LogFn>,
     skip_ip: Option<&str>,
+    passthrough: bool,
 ) -> Result<(dial::Dialed, String, String), String> {
     {
         let g = lock(&SERIAL);
@@ -435,7 +437,7 @@ pub async fn serial_dial_skip(
     };
 
     // 族圈:对口条目按表序组成一个圈(顺序 = 手排策略,运行时永不重排)。
-    let family = route::serial_family(pool_name, host);
+    let family = route::serial_family(pool_name, host, passthrough);
     let serves = family.map(|f| f.serves);
     let family_name = family.map_or("", |f| f.name);
     let mut circle: Vec<&SerialPlan> = snapshot
@@ -1118,7 +1120,7 @@ mod tests {
         };
         assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
         let file_before = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-        cursor_note("core", "github.com", &target, true);
+        cursor_note("core", "github.com", &target, true, false);
         // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
         assert_eq!(
             SERIAL.lock().unwrap().as_ref().unwrap().pools.get("core").unwrap()[0].ip,
@@ -1272,7 +1274,7 @@ mod tests {
         let next = base[1].ip.clone();
 
         // 失败:记号前移到圈中下一候选
-        cursor_note("core", "github.com", &head, false);
+        cursor_note("core", "github.com", &head, false, false);
         {
             let g = SERIAL.lock().unwrap();
             assert_eq!(
@@ -1283,7 +1285,7 @@ mod tests {
         }
 
         // 成功:记号驻留;表序全程未变
-        cursor_note("core", "github.com", &next, true);
+        cursor_note("core", "github.com", &next, true, false);
         {
             let g = SERIAL.lock().unwrap();
             assert_eq!(
@@ -1324,6 +1326,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .await
         .expect("第二个候选能拨通");
@@ -1351,6 +1354,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .await
         .expect("驻留后应直接命中");

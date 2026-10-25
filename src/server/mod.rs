@@ -158,9 +158,9 @@ impl ProxyServer {
         let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             match (sent, recv) {
-                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true),
+                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true, true),
                 (s, r) if s > 0 && r == 0 => {
-                    pool::cursor_note(name, &host, &ip, false);
+                    pool::cursor_note(name, &host, &ip, false, true);
                     (self.log)(&format!("[串发] {host} 客户端已握手但零回包, 垫底换下一个"));
                 }
                 _ => {}
@@ -245,7 +245,7 @@ impl ProxyServer {
         };
         let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
-            pool::cursor_note(name, &host, &ip, recv > 0);
+            pool::cursor_note(name, &host, &ip, recv > 0, true);
         }
     }
 }
@@ -339,11 +339,20 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 
 /// 上游唯一入口：串发池域名(core/api/edge)按 plans.json 串发（按表重试）；
 /// 非串发池域名(fastly/codeload 等纯镜像池)与非池域名交系统 DNS 直接连接。
+/// 本函数是透传(真名)腿：CONNECT 隧道与明文转发共用，content 族放行 .154/.215。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     let name = config::pool_for(host);
     if pool::SERIAL_POOLS.contains(&name) {
-        let (conn, ip, _shape) =
-            pool::serial_dial_skip(name, host, CancellationToken::new(), false, None, None).await?;
+        let (conn, ip, _shape) = pool::serial_dial_skip(
+            name,
+            host,
+            CancellationToken::new(),
+            false,
+            None,
+            None,
+            true,
+        )
+        .await?;
         return Ok((conn, ip));
     }
     let addr = format!("{host}:{port}");
