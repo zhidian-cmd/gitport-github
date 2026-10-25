@@ -37,10 +37,6 @@ pub struct SerialPlan {
 
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
-pub fn serial_pool(name: &str) -> bool {
-    SERIAL_POOLS.contains(&name)
-}
-
 /// 全部游标圈的规范键序(core/api/edge 四族):settings.last_ip 按此序展示。
 pub fn circle_keys() -> Vec<String> {
     let mut out = Vec::new();

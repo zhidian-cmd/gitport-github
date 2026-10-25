@@ -213,16 +213,26 @@ fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<S
     Ok(ssl)
 }
 
-pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
-    let mut ssl = client_ssl(host, mode, None)?;
-    apply_cached_session(&mut ssl, mode);
-    let tls = tokio::time::timeout(
+/// 限时 TLS 握手共用尾：label 进错误文案（镜像腿与池腿归因可分）。
+async fn tls_handshake(ssl: Ssl, tcp: TcpStream, label: &str) -> std::io::Result<BoringTls> {
+    tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
     )
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS 握手超时"))?
-    .map_err(|e| io_err(format!("TLS 握手失败: {e}")))?;
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{label}TLS 握手超时"),
+        )
+    })?
+    .map_err(|e| io_err(format!("{label}TLS 握手失败: {e}")))
+}
+
+pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
+    let mut ssl = client_ssl(host, mode, None)?;
+    apply_cached_session(&mut ssl, mode);
+    let tls = tls_handshake(ssl, tcp, "").await?;
     let proto = tls.ssl().selected_alpn_protocol().unwrap_or_default();
     if proto != b"h2" {
         return Err(std::io::Error::new(
@@ -303,14 +313,7 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "镜像拨号超时"))??;
     let _ = tcp.set_nodelay(true);
-    let tls = tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "镜像 TLS 握手超时"))?
-    .map_err(|e| io_err(format!("镜像 TLS 握手失败: {e}")))?;
-    Ok(tls)
+    tls_handshake(ssl, tcp, "镜像 ").await
 }
 
 #[cfg(test)]

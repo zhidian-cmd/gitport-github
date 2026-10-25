@@ -1,6 +1,6 @@
 //! 列表页缓存：只缓存 github.com 的列表页（搜索/issue/PR/commit/通知…），其余直通上游。
 //! 存储：pages/<hash> = [4B 头长][header JSON][body]，tmp+rename 原子落盘，管家线程串行做磁盘活。
-//! 寿命按会话算：连续导航一直有效，空闲超阈值整盘清空；F5 与写操作即时失效。
+//! 寿命按会话算：连续导航一直有效，空闲超阈值整盘清空；Ctrl+F5 与写操作即时失效。
 //! 红线：不做后台 SWR（旧 cookie 重用会被判凭据泄露）；闸门页/未登录页/跨账号不缓存。
 use super::BoxBody;
 use crate::pool::{now_ms, LogFn};
@@ -40,6 +40,59 @@ fn is_list_path(path: &str) -> bool {
     }
     let numeric = last.chars().all(|c| c.is_ascii_digit());
     !numeric && segs.len() >= 2 && LIST_SEGMENTS.contains(&segs[segs.len() - 2])
+}
+
+/// 跟班 XHR 前缀：一次搜索页要拖 12 个（10 个 count + 黑鸟计数 + 缓存预热），
+/// 每个 250-600ms，是"退回搜索列表慢"的主因。它们不是文档导航，但同样按会话缓存。
+const XHR_PREFIXES: &[&str] = &[
+    "/search/count",
+    "/search/blackbird_count",
+    "/search/warm_blackbird_caches",
+    "/in-product-messaging/",
+    "/github-copilot/chat/repositories_search",
+    // 首页的跟班：会变的全在这些接口里（见 README 的首页那节）
+    "/dashboard/",
+    "/productivity_dashboard/",
+    "/_filter/",
+    "/_side-panels/",
+    "/notifications/indicator",
+    "/cmc_internal/",
+];
+
+fn is_xhr_path(path: &str) -> bool {
+    XHR_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// 首页：纯骨架（会变的全是 XHR），可以跨会话长寿命缓存。
+fn is_home_path(path: &str) -> bool {
+    path == "/" || path.is_empty()
+}
+
+/// 条目落点：键尾 `-k` = 跨会话长寿命（keep/），其余 = 会话存储（pages/）。
+/// 会话清盘只清 pages/，所以骨架能在多次会话之间一直活着。
+fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+    if key.ends_with("-k") {
+        dir.join("keep")
+    } else {
+        dir.join("pages")
+    }
+}
+
+/// 长寿命条目的保质期：GitHub 改版后旧骨架就是坏的，超期当 miss 重取。
+const KEEP_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// 正文类型闸门：列表页只收 HTML；跟班 XHR 放宽到 JSON/纯文本
+/// （`/search/count` 回的是 HTML 片段，黑鸟计数回 JSON）。
+fn body_type_allowed(content_type: Option<&str>, xhr: bool) -> bool {
+    let Some(ct) = content_type else { return false };
+    let ct = ct.trim();
+    if xhr {
+        ct.starts_with("text/html")
+            || ct.starts_with("application/json")
+            || ct.starts_with("text/plain")
+    } else {
+        ct.starts_with("text/html")
+    }
 }
 
 /// 会话间隔：导航间隔超过它就算离开过 GitHub，下一页面整盘清空。
@@ -102,17 +155,26 @@ fn is_doc_nav(req: &hyper::Request<Incoming>) -> bool {
         }
 }
 
-/// 值不值得缓存：github.com 的列表页，且不是 F5 直通。
+/// 跟班 XHR：可缓存，但不驱动会话寿命（后台轮询不该把缓存一直养着）。
+fn is_xhr_nav(req: &hyper::Request<Incoming>, host: &str) -> bool {
+    host == CACHE_HOST && req.method() == Method::GET && is_xhr_path(req.uri().path())
+}
+
+/// 值不值得缓存：github.com 的列表页（文档导航）+ 跟班 XHR。
+/// Ctrl+F5（`Cache-Control: no-cache`）才直通；`max-age=0` 不拦——浏览器后退/前进
+/// 也带这个头，当成强制刷新会让缓存永远命不中（实测确认过）。
 fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
     host == CACHE_HOST
-        && is_doc_nav(req)
+        && req.method() == Method::GET
         && !req
             .headers()
             .get("cache-control")
             .and_then(|v| v.to_str().ok())
-            .map(|c| c.contains("no-cache") || c.contains("max-age=0"))
+            .map(|c| c.contains("no-cache"))
             .unwrap_or(false)
-        && is_list_path(req.uri().path())
+        && (is_xhr_path(req.uri().path())
+            || (is_doc_nav(req)
+                && (is_list_path(req.uri().path()) || is_home_path(req.uri().path()))))
 }
 
 /// 取路由：命中 = 纯本地读（对 GitHub 零请求）；未命中/空闲后第一页 = None，走上游。
@@ -121,26 +183,40 @@ pub(super) fn cache_take(
     req: &hyper::Request<Incoming>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
-    if !is_doc_nav(req) {
+    let xhr = is_xhr_nav(req, host);
+    if !is_doc_nav(req) && !xhr {
         return None;
     }
     // 新会话：先清上一会话的盘（交给管家，不阻塞本页），这一页必回源。
-    if note_nav() {
+    // 只有文档导航驱动会话——XHR/轮询不算"你还在逛"。
+    if is_doc_nav(req) && note_nav() {
         if !worker_send(CacheMsg::Purge, log) {
             LAST_NAV_MS.store(0, Ordering::Relaxed); // 清盘没投递出去：下次导航重试
         }
-        return None;
+        // 首页骨架存在 keep/，清盘动不到它——这一页照样能命中。
+        if !is_home_path(req.uri().path()) {
+            return None;
+        }
     }
     if !cache_eligible(req, host) {
         return None;
     }
-    let key = live_cache_key(
-        req.uri(),
-        host,
-        req.headers().get("cookie").and_then(|v| v.to_str().ok()),
-        upstream::accepts_gzip(req),
-    );
-    let (status, hdrs, body) = load_disk_entry(&key)?;
+    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req));
+    let (status, hdrs, body) = load_disk_entry(&key, session_value(cookies).is_some())?;
+    // 命中要留痕：写盘是静默的，没有这行用户无从判断"到底用没用缓存"。
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    // 小正文（跟班 XHR 常只有几十字节）按字节显示，别被整数除法抹成 0KB。
+    let size = if body.len() < 1024 {
+        format!("{}B", body.len())
+    } else {
+        format!("{}KB", body.len() / 1024)
+    };
+    (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
@@ -166,10 +242,11 @@ pub(super) async fn cache_put(
             }
         }
     }
+    let xhr = is_xhr_path(req.uri().path());
     let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
     let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req));
     let has_session = session_value(cookies).is_some();
-    collect_and_submit(log, &key, has_session, resp).await
+    collect_and_submit(log, &key, xhr, has_session, resp).await
 }
 
 // ---------- 内部：管家线程 ----------
@@ -180,7 +257,6 @@ struct CacheTask {
 }
 
 static WORKER_SENDER: OnceLock<mpsc::SyncSender<CacheTask>> = OnceLock::new();
-static WORKER_LOG: OnceLock<LogFn> = OnceLock::new();
 
 /// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志（缓存写是 best-effort）。
 fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
@@ -189,12 +265,11 @@ fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
         msg,
     };
     let tx = WORKER_SENDER.get_or_init(|| {
-        let _ = WORKER_LOG.set(log.clone());
         let (tx, rx) = mpsc::sync_channel::<CacheTask>(WORKER_CHANNEL_CAP);
-        let log2 = log.clone();
+        let log = log.clone();
         let _ = std::thread::Builder::new()
             .name("page-cache-worker".into())
-            .spawn(move || worker_loop(log2, rx));
+            .spawn(move || worker_loop(log, rx));
         tx
     });
     match tx.try_send(msg) {
@@ -339,11 +414,12 @@ fn session_fingerprint(cookies: Option<&str>) -> String {
 /// 缓存键 = 方法 + host + 路径/查询 + 身份标签 + 编码标签（纯函数，便于测试）。
 /// 当前会话可用的键：会话号拼在纯键外面，旧会话的条目自然查不到。
 fn live_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
-    format!(
-        "{}-s{}",
-        page_cache_key(uri, host, cookies, gzip),
-        SESSION_EPOCH.load(Ordering::Relaxed)
-    )
+    let base = page_cache_key(uri, host, cookies, gzip);
+    if is_home_path(uri.path()) {
+        format!("{base}-k") // 骨架：不带会话号，跨会话复用
+    } else {
+        format!("{base}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
+    }
 }
 
 fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
@@ -406,12 +482,28 @@ fn page_file_name(key: &str) -> String {
 /// 读单文件条目；损坏/截断/非 200 = None（miss 自愈）。
 fn load_disk_entry(
     key: &str,
+    // 请求方带不带会话：带会话却拿到未登录页 = 会话已死（污染）；匿名浏览存下的
+    // 匿名页必须能正常命中，否则未登录用户的缓存等于全废。
+    logged_in: bool,
 ) -> Option<(
     u16,
     Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     Bytes,
 )> {
-    let raw = std::fs::read(page_cache_dir().join("pages").join(page_file_name(key))).ok()?;
+    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
+    let raw = std::fs::read(&path).ok()?;
+    // 长寿命条目按 mtime 判保质期（GitHub 改版后旧骨架就是坏的）。
+    if key.ends_with("-k") {
+        let age = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if age > KEEP_MAX_AGE_MS {
+            return None;
+        }
+    }
     if raw.len() < 4 {
         return None;
     }
@@ -447,16 +539,30 @@ fn load_disk_entry(
     });
     let body = &raw[end..];
     let plain = plain_prefix(body, gzip);
-    if is_logged_out_body(&plain) || is_gate_page(&plain) {
-        return None; // 未登录页 / 闸门页：当作 miss（旧版存下的也在这里自愈）
+    if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
+        return None; // 会话已死的未登录页 / 闸门页：当作 miss（旧版存下的也自愈）
     }
     Some((status, hdrs, Bytes::copy_from_slice(body)))
 }
 
-/// 测试专用：绕开准入直读磁盘。
+/// 测试专用：绕开准入直读磁盘。`page_cache_get_logged_in` 模拟带会话的请求方
+/// （用来验证"带会话却拿到未登录页"要被当 miss）。
 #[cfg(test)]
 fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
-    let (status, hdrs, body) = load_disk_entry(key)?;
+    read_cached(key, false)
+}
+
+#[cfg(test)]
+fn page_cache_get_logged_in(key: &str) -> Option<axum::response::Response<BoxBody>> {
+    read_cached(key, true)
+}
+
+#[cfg(test)]
+fn read_cached(
+    key: &str,
+    logged_in: bool,
+) -> Option<axum::response::Response<BoxBody>> {
+    let (status, hdrs, body) = load_disk_entry(key, logged_in)?;
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
@@ -501,7 +607,7 @@ fn persist_page_entry_blocking(
         "headers": hdrs,
     });
     let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-    let pages = dir.join("pages");
+    let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&pages).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
@@ -524,20 +630,19 @@ fn persist_page_entry_blocking(
 }
 
 /// 收集体、复判（体积/会话污染）后投递 Save；响应原样或重建交给浏览器。
+/// `xhr` = 跟班请求：正文类型放宽到 HTML 片段 / JSON / 纯文本。
 async fn collect_and_submit(
     log: &LogFn,
     key: &str,
+    xhr: bool,
     has_session: bool,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
     let (mut parts, body) = resp.into_parts();
-    // 只收 HTML：列表页唯一的正文类型。
-    let allowed = parts
-        .headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.trim().starts_with("text/html"))
-        .unwrap_or(false);
+    let allowed = body_type_allowed(
+        parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
+        xhr,
+    );
     if !allowed {
         return hyper::Response::from_parts(parts, body);
     }
@@ -761,8 +866,18 @@ mod page_cache_tests {
             .header("content-type", "application/json")
             .body(upstream::full_body(Bytes::from_static(b"{}")))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/api/x", false, resp).await;
+        let _ = collect_and_submit(&log, "GET github.com/api/x", false, false, resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
+
+        // ②c 正文类型闸门（纯函数，落盘有时序所以不断言命中）
+        assert!(body_type_allowed(Some("text/html; charset=utf-8"), false));
+        assert!(body_type_allowed(Some("application/json; charset=utf-8"), true));
+        assert!(body_type_allowed(Some("text/plain; charset=utf-8"), true));
+        assert!(
+            !body_type_allowed(Some("application/json; charset=utf-8"), false),
+            "列表页不收 JSON"
+        );
+        assert!(!body_type_allowed(None, true), "没有 content-type 不收");
 
         // ③ 覆盖写、截断文件、hash 碰撞都不得串页或报错
         let ck = "GET github.com/cover-me";
@@ -811,7 +926,7 @@ mod page_cache_tests {
                 b"<html>hello ",
             )]));
         let out =
-            collect_and_submit(&log, "GET github.com/peek", false, sniffed).await;
+            collect_and_submit(&log, "GET github.com/peek", false, false, sniffed).await;
         let body = http_body_util::BodyExt::collect(out.into_body())
             .await
             .unwrap()
@@ -820,6 +935,23 @@ mod page_cache_tests {
             body.as_ref(),
             b"<html>hello world</html>",
             "嗅探前缀丢失 = 交付半页"
+        );
+
+        // ⑤b 首页骨架（-k）跨会话存活：会话清盘只清 pages/
+        let home = "GET github.com/-cloggedout-gz-k";
+        let _ = persist_page_entry_blocking(&dir, home, b"<html>home</html>", 200, &test_hdrs());
+        let _ = persist_page_entry_blocking(
+            &dir,
+            "GET github.com/issues-s1",
+            b"<html>i</html>",
+            200,
+            &test_hdrs(),
+        );
+        wipe_pages(&dir);
+        assert!(page_cache_get(home).is_some(), "首页骨架必须跨会话存活");
+        assert!(
+            page_cache_get("GET github.com/issues-s1").is_none(),
+            "会话条目应被清掉"
         );
 
         // ⑤ gzip 条目读回：头/正文仍是压缩态，且读侧的解压判断不瞎
@@ -986,6 +1118,13 @@ mod page_cache_tests {
             page_cache_key(&uri, "github.com", Some(bob), true),
             "同机换账号必须换键"
         );
+        // ⑩a 首页键带 -k（不带会话号，跨会话复用）
+        let home_uri: http::Uri = "https://github.com/".parse().unwrap();
+        assert!(
+            live_cache_key(&home_uri, "github.com", Some(alice), true).ends_with("-k"),
+            "首页骨架键必须带 -k"
+        );
+
         // ⑩b 换会话后旧键必须失效（不依赖清盘是否成功）
         let k_before = live_cache_key(&uri, "github.com", Some(alice), true);
         set_last_nav(0);
@@ -1014,10 +1153,30 @@ mod page_cache_tests {
                 b"<html><body class=\"logged-out env-production\">sign in</body></html>",
             )))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/-cauthed-poison", true, poisoned).await;
+        let _ = collect_and_submit(&log, "GET github.com/-cauthed-poison", false, true, poisoned).await;
         assert!(
-            page_cache_get("GET github.com/-cauthed-poison").is_none(),
+            page_cache_get_logged_in("GET github.com/-cauthed-poison").is_none(),
             "会话死亡期间的未登录页不得进缓存"
+        );
+
+        // ⑪d 匿名页双向判定：未登录浏览存下的页面，匿名请求必须能命中；
+        // 同一份正文被带会话的请求拿到才算污染。少了前者，未登录用户的缓存全废
+        // （线上症状：缓存写进去了却永远不命中）。
+        let anon = b"<html><body class=\"logged-out env-production\">results</body></html>";
+        let _ = persist_page_entry_blocking(
+            &dir,
+            "GET github.com/search-cloggedout-gz",
+            anon,
+            200,
+            &test_hdrs(),
+        );
+        assert!(
+            page_cache_get("GET github.com/search-cloggedout-gz").is_some(),
+            "匿名页必须能命中（否则未登录用户的缓存等于全废）"
+        );
+        assert!(
+            page_cache_get_logged_in("GET github.com/search-cloggedout-gz").is_none(),
+            "带会话却拿到未登录页 = 会话已死，仍要当 miss"
         );
 
         // ⑪b gzip 正文：不解压就永远看不到标记（主站正文恒 gzip，旧版这道守卫等于没有）
@@ -1043,13 +1202,13 @@ mod page_cache_tests {
             .unwrap();
         let _ = collect_and_submit(
             &log,
-            "GET github.com/-cauthed-gz-poison",
+            "GET github.com/-cauthed-gz-poison", false,
             true,
             poisoned_gz,
         )
         .await;
         assert!(
-            page_cache_get("GET github.com/-cauthed-gz-poison").is_none(),
+            page_cache_get_logged_in("GET github.com/-cauthed-gz-poison").is_none(),
             "gzip 未登录页同样不得入缓存"
         );
 
@@ -1072,7 +1231,7 @@ mod page_cache_tests {
             .header("content-type", "text/html; charset=utf-8")
             .body(upstream::full_body(Bytes::from_static(gate_html)))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/o/r-gate", false, gate).await;
+        let _ = collect_and_submit(&log, "GET github.com/o/r-gate", false, false, gate).await;
         assert!(
             page_cache_get("GET github.com/o/r-gate").is_none(),
             "闸门页不得入缓存"
@@ -1086,7 +1245,7 @@ mod page_cache_tests {
             &test_hdrs(),
         );
         assert!(
-            page_cache_get("GET github.com/o/r-old-gate").is_none(),
+            page_cache_get_logged_in("GET github.com/o/r-old-gate").is_none(),
             "旧的闸门页条目必须当 miss"
         );
 
@@ -1143,6 +1302,24 @@ mod page_cache_tests {
         ] {
             assert!(!is_list_path(p), "{p} 不该缓存");
         }
+        // 跟班 XHR 前缀：列表页规则管不着它们，得单独放行
+        for p in [
+            "/search/count",
+            "/search/blackbird_count",
+            "/search/warm_blackbird_caches",
+            "/in-product-messaging/",
+            "/github-copilot/chat/repositories_search",
+        ] {
+            assert!(is_xhr_path(p), "{p} 应判为跟班 XHR");
+        }
+        for p in ["/", "/o/r", "/o/r/issues", "/search"] {
+            assert!(!is_xhr_path(p), "{p} 不该判为跟班 XHR");
+        }
+        // 首页：纯骨架，单独放行
+        assert!(is_home_path("/"));
+        assert!(is_home_path(""));
+        assert!(!is_home_path("/feed"));
+        assert!(!is_home_path("/o/r"));
     }
 
 }

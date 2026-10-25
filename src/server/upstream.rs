@@ -341,18 +341,26 @@ pub async fn h2_recv_response(
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
 }
+/// 流前置三步共用（h2_send / h2_stream_head 单点）：等配额 → 剥逐跳头 → 发头帧；
+/// eos = 头帧即请求终点（无体请求 true）。
+async fn h2_open_stream(
+    up: &H2Upstream,
+    out: &hyper::Request<BoxBody>,
+    eos: bool,
+) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
+    let mut send = up.send.clone();
+    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
+    send.send_request(h2_request_head(out)?, eos)
+        .map_err(|e| format!("h2 发送: {e}"))
+}
+
 pub async fn h2_send(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let mut send = up.send.clone();
-    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
-    let request = h2_request_head(out)?;
     let has_body = body.as_ref().map_or(false, |b| !b.is_empty());
-    let (resp_fut, mut send_stream) = send
-        .send_request(request, !has_body)
-        .map_err(|e| format!("h2 发送: {e}"))?;
+    let (resp_fut, mut send_stream) = h2_open_stream(up, out, !has_body).await?;
     if has_body {
         send_stream
             .send_data(body.as_ref().unwrap().clone(), true)
@@ -364,13 +372,7 @@ pub async fn h2_stream_head(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
 ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
-    let mut send = up.send.clone();
-    send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
-    let request = h2_request_head(out)?;
-    let (resp_fut, stream) = send
-        .send_request(request, false)
-        .map_err(|e| format!("h2 发送: {e}"))?;
-    Ok((resp_fut, stream))
+    h2_open_stream(up, out, false).await
 }
 /// 流式直通·请求体泵：按对端窗口分片发送；客户端断开时弃流不补 EOS（pack 尾带校验和）。
 /// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留不回收）。

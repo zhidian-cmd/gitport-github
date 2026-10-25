@@ -344,7 +344,7 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 /// 非串发池域名(fastly/codeload 等纯镜像池)与非池域名交系统 DNS 直接连接。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     let name = pool::pool_for(host);
-    if pool::serial_pool(name) {
+    if pool::SERIAL_POOLS.contains(&name) {
         let (conn, ip, _shape) =
             pool::serial_dial_skip(name, host, CancellationToken::new(), false, None, None).await?;
         return Ok((conn, ip));

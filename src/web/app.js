@@ -48,7 +48,7 @@ async function copyText(t) {
 
 /* hash 路由 */
 function route() {
-  if ((location.hash || '#overview') === '#mirrors') refreshMirrors();
+  if ((location.hash || '#overview') === '#mirrors') refreshSettings();
   const view = (location.hash || '#overview').slice(1);
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   const el = $('view-' + view);
@@ -141,21 +141,30 @@ $('mitmBtn').onclick = () => toggleMitm(!S.mitm);
 // poolRefresh 已移除: 串发模式按 plans.json 演化, 无换血刷新
 
 /* ---------- 设置页 ---------- */
-async function refreshSettings() {
-  let s;
-  try { s = await (await fetch('/api/settings')).json(); } catch (e) { return; }
+function applySettings(s) {
   $('swAutostart').checked = s.autostart;
   $('swTray').checked = s.closeToTray;
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
 }
-async function setSetting(path, on) {
-  const r = await postJSON(path, {on});
-  if (!r.ok) { alert('设置失败: ' + (r.error || '')); }
-  refreshSettings();
+function applyMirrors(s) {
+  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
+  renderMirrors();
 }
-$('swAutostart').onchange = e => setSetting('/api/settings/autostart', e.target.checked);
-$('swTray').onchange = e => setSetting('/api/settings/closeToTray', e.target.checked);
-$('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked);
+/* 一次 /api/settings 喂两边：开关回显 + 镜像列表（启动与切页都不再拉两次） */
+async function refreshSettings() {
+  let s;
+  try { s = await (await fetch('/api/settings')).json(); } catch (e) { return; }
+  applySettings(s);
+  applyMirrors(s);
+}
+/* 开关乐观翻转：失败只回滚本开关，不再整页重拉 */
+async function setSetting(path, on, el) {
+  const r = await postJSON(path, {on});
+  if (!r.ok) { el.checked = !on; alert('设置失败: ' + (r.error || '')); }
+}
+$('swAutostart').onchange = e => setSetting('/api/settings/autostart', e.target.checked, e.target);
+$('swTray').onchange = e => setSetting('/api/settings/closeToTray', e.target.checked, e.target);
+$('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked, e.target);
 
 /* ---------- 自定义镜像注册表 ----------
    settings.json 永久记录全部网址（点垃圾桶才彻底消失）；
@@ -165,13 +174,6 @@ const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" s
 // HTML 属性转义：五个预定义字符实体一个都不能少——少一个就是一条注入面
 // （曾把 & < > " 原样返回，镜像 URL 里的 "><script> 直接逃逸 value="" 属性执行）。
 const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-async function refreshMirrors() {
-  let s;
-  try { s = await (await fetch('/api/settings')).json(); } catch (e) { return; }
-  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
-  renderMirrors();
-}
 
 function renderMirrors() {
   $('mirrorRows').innerHTML = MIRRORS.length
@@ -266,7 +268,7 @@ $('calBigBtn').onclick = () => runCal('throughput', $('calBigBtn'), '大文件�
 $('calImgBtn').onclick = () => runCal('ttfb', $('calImgBtn'), '图片链');
 
 /* ---------- 启动 ---------- */
-route(); refreshStatus(); refreshLogs(); refreshSettings(); refreshMirrors();
+route(); refreshStatus(); refreshLogs(); refreshSettings();
 // 页面在后台(挂托盘/切走)时完全停轮询 —— 后台零请求
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 2000);
 setInterval(() => { if (!document.hidden) refreshLogs(); }, 2000);
