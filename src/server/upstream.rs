@@ -341,9 +341,9 @@ pub async fn h2_recv_response(
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
 }
-/// 流前置三步共用（h2_send / h2_stream_head 单点）：等配额 → 剥逐跳头 → 发头帧；
+/// 流前置三步共用（h2_send 与流式直通单点）：等配额 → 剥逐跳头 → 发头帧；
 /// eos = 头帧即请求终点（无体请求 true）。
-async fn h2_open_stream(
+pub async fn h2_open_stream(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
     eos: bool,
@@ -367,12 +367,6 @@ pub async fn h2_send(
             .map_err(|e| format!("h2 请求体: {e}"))?;
     }
     h2_recv_response(resp_fut).await
-}
-pub async fn h2_stream_head(
-    up: &H2Upstream,
-    out: &hyper::Request<BoxBody>,
-) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
-    h2_open_stream(up, out, false).await
 }
 /// 流式直通·请求体泵：按对端窗口分片发送；客户端断开时弃流不补 EOS（pack 尾带校验和）。
 /// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留不回收）。
@@ -522,11 +516,9 @@ pub fn upstream_request<B>(
         }
         out = out.header(k, v);
     }
-    if sniffed {
-        // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
-        if accepts_gzip(req) {
-            out = out.header("accept-encoding", "gzip");
-        }
+    // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
+    if sniffed && accepts_gzip(req) {
+        out = out.header("accept-encoding", "gzip");
     }
     out.body(empty_body()).map_err(|e| e.to_string())
 }

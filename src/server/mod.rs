@@ -51,18 +51,16 @@ pub fn start_proxy_with(
 }
 
 pub fn stop_proxy(rt: &tokio::runtime::Runtime) {
-    rt.handle().block_on(stop_proxy_async());
-}
-
-pub async fn stop_proxy_async() {
-    let ctx = PROXY_CTX.lock().unwrap().take();
-    if let Some(c) = ctx {
-        c.cancel();
-    }
-    let join = PROXY_JOIN.lock().unwrap().take();
-    if let Some(j) = join {
-        let _ = j.await;
-    }
+    rt.handle().block_on(async {
+        let ctx = PROXY_CTX.lock().unwrap().take();
+        if let Some(c) = ctx {
+            c.cancel();
+        }
+        let join = PROXY_JOIN.lock().unwrap().take();
+        if let Some(j) = join {
+            let _ = j.await;
+        }
+    });
 }
 
 pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToken) {
@@ -157,7 +155,7 @@ impl ProxyServer {
         .await;
         (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
 
-        let name = pool::pool_for(&host);
+        let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             match (sent, recv) {
                 (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true),
@@ -225,7 +223,6 @@ impl ProxyServer {
             let name = low.split(':').next().unwrap_or("").trim();
             if name.is_empty()
                 || name == "host"
-                || name == "proxy-connection"
                 || name == "proxy-authorization"
                 || upstream::is_hop_by_hop(name)
             {
@@ -246,7 +243,7 @@ impl ProxyServer {
         } else {
             0
         };
-        let name = pool::pool_for(&host);
+        let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             pool::cursor_note(name, &host, &ip, recv > 0);
         }
@@ -343,7 +340,7 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 /// 上游唯一入口：串发池域名(core/api/edge)按 plans.json 串发（按表重试）；
 /// 非串发池域名(fastly/codeload 等纯镜像池)与非池域名交系统 DNS 直接连接。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
-    let name = pool::pool_for(host);
+    let name = config::pool_for(host);
     if pool::SERIAL_POOLS.contains(&name) {
         let (conn, ip, _shape) =
             pool::serial_dial_skip(name, host, CancellationToken::new(), false, None, None).await?;

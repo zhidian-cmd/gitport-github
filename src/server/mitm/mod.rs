@@ -28,7 +28,7 @@ pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
     }
-    !pool::pool_for(host).is_empty()
+    !config::pool_for(host).is_empty()
 }
 pub async fn handle_connect_mitm(
     srv: &crate::server::ProxyServer,
@@ -203,7 +203,7 @@ async fn mitm_http(
             return mitm_unavailable(&req, &host);
         }
     }
-    let name = pool::pool_for(&host);
+    let name = config::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
@@ -305,13 +305,13 @@ async fn stream_passthrough(
     body: BoxBody,
     reason: &str,
 ) -> axum::response::Response<BoxBody> {
-    let name = pool::pool_for(host);
+    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
     let (fut, send, up) = 'conn: {
         if let Some(up) = upstream::cached_h2(host) {
-            match upstream::h2_stream_head(&up, out).await {
+            match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
                     upstream::drop_h2_id(host, up.id);
@@ -320,7 +320,7 @@ async fn stream_passthrough(
             }
         }
         match upstream::dial_h2_skip(name, host, CancellationToken::new(), log, None).await {
-            Ok(up) => match upstream::h2_stream_head(&up, out).await {
+            Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
                     upstream::drop_h2_id(host, up.id);
@@ -468,7 +468,7 @@ pub(super) async fn get_direct(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = pool::pool_for(host);
+    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let is_content = pool::route::host_is_content(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {

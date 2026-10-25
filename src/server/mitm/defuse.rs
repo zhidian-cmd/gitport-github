@@ -88,7 +88,7 @@ pub(super) async fn gh_defuse(
     out: &hyper::Request<BoxBody>,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = pool::pool_for(host);
+    let name = crate::config::pool_for(host);
     let is_simple = true;
     let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
     let mut tried = 0; // 已垫底重试候选数(仅日志)

@@ -230,21 +230,17 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let parsed = raw
         .as_deref()
         .and_then(|b| parse_plans_tolerant(b, log.as_ref()));
-    if let (Some(_raw), None) = (&raw, &parsed) {
-        // 整份读不了（非 JSON 垃圾）：先备份原文件再按种子重建，不静默覆丢用户手排表。
-        let bak = path.with_extension("json.bak");
-        if std::fs::copy(&path, &bak).is_ok() {
+    // 整份读不了（非 JSON 垃圾）或有段落坏被丢弃：都先备份原文件再按种子重建——
+    // 收尾的补缺重写不备份用户手排表就真没了（可从 .bak 捡回）。
+    let bak_why = match (&raw, &parsed) {
+        (Some(_), None) => Some("解析失败, 本次按种子重建"),
+        (Some(_), Some((_, true))) => Some("有段落坏已按种子重建"),
+        _ => None,
+    };
+    if let Some(why) = bak_why {
+        if std::fs::copy(&path, path.with_extension("json.bak")).is_ok() {
             if let Some(l) = log.as_ref() {
-                l("[串发] plans.json 解析失败, 原文件已备份为 plans.json.bak, 本次按种子重建");
-            }
-        }
-    } else if matches!(&parsed, Some((_, true))) {
-        // 有段落坏被丢弃：也备份原文件——serial_load 收尾会按种子补缺重写
-        // plans.json，不备份用户手排的坏段就真没了（可从 .bak 捡回）。
-        let bak = path.with_extension("json.bak");
-        if std::fs::copy(&path, &bak).is_ok() {
-            if let Some(l) = log.as_ref() {
-                l("[串发] plans.json 有段落坏已按种子重建, 原文件已备份为 plans.json.bak");
+                l(&format!("[串发] plans.json {why}, 原文件已备份为 plans.json.bak"));
             }
         }
     }
@@ -768,8 +764,6 @@ impl Breaker {
 pub static CONTENT_BREAKER: Breaker = Breaker::new(120);
 /// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
 pub static MIRROR_BREAKER: Breaker = Breaker::new(60);
-
-pub use crate::config::pool_for;
 
 #[cfg(test)]
 mod tests {

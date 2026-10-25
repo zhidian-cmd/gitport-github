@@ -25,7 +25,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "
 h2 = "0.4"
 flate2 = "1"
 tower-service = "0.3"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = "0.7"
 bytes = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
