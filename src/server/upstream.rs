@@ -282,6 +282,12 @@ pub async fn dial_h2_skip(
     log: &LogFn,
     skip_ip: Option<&str>,
 ) -> Result<H2Upstream, String> {
+    // 白名单腿：不进池、不镜像 —— 系统 DNS 选 IP + 真名 SNI + ClientHello 分片。
+    // 放在这里而不是 get_direct：首次拨号与 maybe_spawn_second 补的第二条都自动走同一条路。
+    if crate::config::is_whitelist(host) {
+        let (conn_io, ip) = crate::pool::dial::dial_whitelist(host).await?;
+        return h2_from_dialed(host, conn_io, &ip, "真名(分片)", log).await;
+    }
     let (conn_io, ip, shape) =
         pool::serial_dial_skip(pool_name, host, ctx, true, Some(log), skip_ip, false)
             .await

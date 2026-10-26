@@ -468,7 +468,13 @@ pub(super) async fn get_direct(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = config::pool_for(host);
+    // 白名单域名虽然被 `*.github.com` 判成 core，但实际由 dial_h2_skip 分流到真名分片腿。
+    // 这里把池名清空：不往 core 池序记账，也不触发内容域熔断（它们不在 core 的 IP 族里）。
+    let name = if config::is_whitelist(host) {
+        ""
+    } else {
+        config::pool_for(host)
+    };
     let path = path_of(out.uri());
     let is_content = pool::route::host_is_content(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {

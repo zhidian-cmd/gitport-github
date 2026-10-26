@@ -14,10 +14,105 @@ use tokio::net::TcpStream;
 
 
 pub type BoringTls = tokio_boring::SslStream<TcpStream>;
+/// 白名单腿：底层 TCP 套了分片器，ClientHello 分三段发出。
+pub type BoringTlsSplit = tokio_boring::SslStream<SplitHello>;
+
+/// ClientHello 分片器：只拦第一个写（首字节 0x16 = TLS 握手记录），
+/// 按 `WHITELIST_SPLIT_SEGS` 段切开、段间等 `WHITELIST_SPLIT_GAP_MS` 再发下一段。
+/// DPI 要拼出完整 ClientHello 才能读 SNI，段间隔超过它的重组窗口就拼不齐。
+/// 握手完成后（`done`）一律直通，不碰应用数据帧。
+pub struct SplitHello {
+    inner: TcpStream,
+    segs_left: usize,
+    gap: Duration,
+    /// 下一段的放行时刻；None = 立即可发。
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    done: bool,
+}
+
+impl SplitHello {
+    pub fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            segs_left: crate::config::WHITELIST_SPLIT_SEGS.max(1),
+            gap: Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS),
+            timer: None,
+            done: false,
+        }
+    }
+}
+
+impl AsyncRead for SplitHello {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SplitHello {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::future::Future;
+        let me = self.get_mut();
+        // 非首位写、空写、非 TLS 握手、过短：一律直通，分片器退场
+        if me.done || buf.is_empty() || buf.len() < 32 || buf[0] != 0x16 {
+            me.done = true;
+            return std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
+        }
+        // 段间隔未到：挂定时器等唤醒
+        if let Some(mut timer) = me.timer.take() {
+            match timer.as_mut().poll(cx) {
+                std::task::Poll::Pending => {
+                    me.timer = Some(timer);
+                    return std::task::Poll::Pending;
+                }
+                std::task::Poll::Ready(()) => {}
+            }
+        }
+        let segs = me.segs_left.max(1);
+        let n = if segs == 1 {
+            buf.len()
+        } else {
+            (buf.len() / segs).max(1).min(buf.len())
+        };
+        let written = futures_util::ready!(std::pin::Pin::new(&mut me.inner).poll_write(cx, &buf[..n]))?;
+        if written == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        me.segs_left = me.segs_left.saturating_sub(1);
+        if me.segs_left == 0 {
+            me.done = true;
+        } else {
+            me.timer = Some(Box::pin(tokio::time::sleep(me.gap)));
+        }
+        std::task::Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 pub enum Dialed {
     Plain(TcpStream),
     Tls(BoringTls),
+    TlsSplit(BoringTlsSplit),
 }
 
 impl AsyncRead for Dialed {
@@ -29,6 +124,7 @@ impl AsyncRead for Dialed {
         match self.get_mut() {
             Dialed::Plain(t) => std::pin::Pin::new(t).poll_read(cx, buf),
             Dialed::Tls(t) => std::pin::Pin::new(t).poll_read(cx, buf),
+            Dialed::TlsSplit(t) => std::pin::Pin::new(t).poll_read(cx, buf),
         }
     }
 }
@@ -42,6 +138,7 @@ impl AsyncWrite for Dialed {
         match self.get_mut() {
             Dialed::Plain(t) => std::pin::Pin::new(t).poll_write(cx, buf),
             Dialed::Tls(t) => std::pin::Pin::new(t).poll_write(cx, buf),
+            Dialed::TlsSplit(t) => std::pin::Pin::new(t).poll_write(cx, buf),
         }
     }
 
@@ -52,6 +149,7 @@ impl AsyncWrite for Dialed {
         match self.get_mut() {
             Dialed::Plain(t) => std::pin::Pin::new(t).poll_flush(cx),
             Dialed::Tls(t) => std::pin::Pin::new(t).poll_flush(cx),
+            Dialed::TlsSplit(t) => std::pin::Pin::new(t).poll_flush(cx),
         }
     }
 
@@ -62,6 +160,7 @@ impl AsyncWrite for Dialed {
         match self.get_mut() {
             Dialed::Plain(t) => std::pin::Pin::new(t).poll_shutdown(cx),
             Dialed::Tls(t) => std::pin::Pin::new(t).poll_shutdown(cx),
+            Dialed::TlsSplit(t) => std::pin::Pin::new(t).poll_shutdown(cx),
         }
     }
 }
@@ -69,10 +168,13 @@ impl AsyncWrite for Dialed {
 impl hyper_util::client::legacy::connect::Connection for Dialed {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
         let mut c = hyper_util::client::legacy::connect::Connected::new();
-        if let Dialed::Tls(t) = self {
-            if t.ssl().selected_alpn_protocol() == Some(b"h2") {
-                c = c.negotiated_h2();
-            }
+        let alpn = match self {
+            Dialed::Tls(t) => t.ssl().selected_alpn_protocol(),
+            Dialed::TlsSplit(t) => t.ssl().selected_alpn_protocol(),
+            Dialed::Plain(_) => None,
+        };
+        if alpn == Some(b"h2") {
+            c = c.negotiated_h2();
         }
         c
     }
@@ -243,6 +345,43 @@ pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Res
     Ok(tls)
 }
 
+/// 白名单腿拨号：系统 DNS 选 IP → 真名 SNI → ClientHello 分片 → 必须协商 h2。
+/// 不走 plans.json 的池：这批域名托管在 Fastly/Azure，池里的 GLB IP 与伪装 SNI 都不匹配。
+/// 真名 SNI 与分片同生共死——只上真名不加分片等于把域名明文递给 DPI。
+pub async fn dial_whitelist(host: &str) -> Result<(Dialed, String), String> {
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(format!("{host}:443")),
+    )
+    .await
+    .map_err(|_| format!("白名单系统 DNS 拨号超时: {host}"))?
+    .map_err(|e| format!("白名单系统 DNS 拨号失败: {host}: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+    let ip = tcp
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "system-dns".to_string());
+
+    // mode 传 host 本身 = 真名 SNI（校验名本来恒为 host，此处两者一致）
+    let ssl = client_ssl(host, host, None).map_err(|e| e.to_string())?;
+    let tls = tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tokio_boring::SslStreamBuilder::new(ssl, SplitHello::new(tcp)).connect(),
+    )
+    .await
+    .map_err(|_| format!("白名单 TLS 握手超时: {host}"))?
+    .map_err(|e| format!("白名单 TLS 握手失败: {host}: {e}"))?;
+
+    let proto = tls.ssl().selected_alpn_protocol().unwrap_or_default();
+    if proto != b"h2" {
+        return Err(format!(
+            "白名单上游未协商出 h2(得到 {:?})",
+            String::from_utf8_lossy(proto)
+        ));
+    }
+    Ok((Dialed::TlsSplit(tls), ip))
+}
+
 static DIAL_GATE: tokio::sync::OnceCell<Arc<tokio::sync::Semaphore>> =
     tokio::sync::OnceCell::const_new();
 
@@ -327,6 +466,66 @@ pub fn system_roots() -> Arc<rustls::RootCertStore> {
         }
     }
     Arc::new(roots)
+}
+
+/// 分片器单测：分片默认关掉线上验证就只剩"看日志猜"，这里直接量时间差。
+#[cfg(test)]
+mod split_hello_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 300 字节假 ClientHello 必须分三段发出，首末段间隔 ≥ 两个段间隔。
+    /// TCP 可能把小段合并到一次 read，所以断言的是时间差不是段数——
+    /// 合并恰恰说明分片没生效（间隔够大时内核不会攒到一起）。
+    #[tokio::test]
+    async fn sends_segments_with_gap() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = ln.accept().await.unwrap();
+            let mut stamps = Vec::new();
+            let mut total = 0usize;
+            let mut buf = [0u8; 2048];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total += n;
+                        stamps.push(std::time::Instant::now());
+                        if total >= 300 {
+                            break;
+                        }
+                    }
+                }
+            }
+            (total, stamps)
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = tcp.set_nodelay(true);
+        let mut io = SplitHello::new(tcp);
+        // 首字节 0x16 才会触发分片（TLS 握手记录）
+        let hello = vec![0x16u8; 300];
+        let mut written = 0;
+        while written < hello.len() {
+            let n = io.write(&hello[written..]).await.unwrap();
+            assert!(n > 0, "分片器写返回 0，会卡死握手");
+            written += n;
+        }
+        assert_eq!(written, 300, "写入字节数对不上");
+
+        let (total, stamps) = server.await.unwrap();
+        assert_eq!(total, 300, "对端收到的字节数对不上");
+        assert!(stamps.len() >= 2, "只收到一段，分片没生效");
+        let spread = *stamps.last().unwrap() - stamps[0];
+        let want = Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS * 2 - 20);
+        assert!(
+            spread >= want,
+            "首末段间隔 {:?}，不足 {:?}，分片被合并或间隔没生效",
+            spread,
+            want
+        );
+    }
 }
 
 #[cfg(test)]
