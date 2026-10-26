@@ -730,7 +730,9 @@ impl Breaker {
         self.map
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap()
+            // 锁中毒只说明某次持锁期间 panic 过，数据仍是完好的 HashMap：
+            // 照常取用，别让一次 panic 把这个域名的熔断判断永久打死。
+            .unwrap_or_else(|p| p.into_inner())
     }
     pub fn open(&self, host: &str) -> bool {
         let mut m = self.lock();

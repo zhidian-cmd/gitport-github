@@ -114,7 +114,12 @@ fn mirror_request(
         if upstream::is_hop_by_hop(&low)
             || matches!(
                 low.as_str(),
-                "cookie" | "authorization" | "host" | "referer" | "user-agent"
+                "cookie"
+                    | "authorization"
+                    | "proxy-authorization"
+                    | "host"
+                    | "referer"
+                    | "user-agent"
             )
         {
             continue;
@@ -179,6 +184,11 @@ fn has_credential_query(query: &str) -> bool {
             || name == "access_token"
             || name == "session_token"
             || name == "awsaccesskeyid"
+            || name == "key"
+            || name == "api_key"
+            || name == "apikey"
+            || name == "secret"
+            || name == "password"
             || name.starts_with("x-amz-")
     })
 }

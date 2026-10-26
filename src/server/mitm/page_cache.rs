@@ -574,7 +574,14 @@ static BYTES_SINCE_WIPE: AtomicU64 = AtomicU64::new(0);
 fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     let pending = BYTES_SINCE_WIPE.fetch_add(written as u64, Ordering::Relaxed) + written as u64;
     if pending >= PAGE_CACHE_MAX_BYTES {
-        wipe_pages(dir);
+        // 并发写同时越线时只让一个去清：谁把计数从 pending 抢回 0 谁动手，
+        // 没抢到的直接跳过（删目录是幂等的，但没必要每个线程都遍历一遍）。
+        if BYTES_SINCE_WIPE
+            .compare_exchange(pending, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            wipe_pages(dir);
+        }
     }
 }
 

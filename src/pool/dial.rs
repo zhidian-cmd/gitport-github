@@ -28,7 +28,14 @@ pub struct SplitHello {
     /// 下一段的放行时刻；None = 立即可发。
     timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     done: bool,
+    /// 实际发出的段数。握手后读它：>=2 说明分片真的生效了，
+    /// 1（或 0）说明首包太短、分片器直接退场——这是唯一能看出掩体没上成的信号。
+    segs_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// 白名单分片统计：尝试次数 / 实际分片次数。两者长期对不上 = 分片没生效。
+pub static SPLIT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPLIT_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SplitHello {
     pub fn new(inner: TcpStream) -> Self {
@@ -38,7 +45,13 @@ impl SplitHello {
             gap: Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS),
             timer: None,
             done: false,
+            segs_sent: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// 取一份计数句柄；句柄要在这条流被 move 进 TLS 之前拿。
+    pub fn counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.segs_sent.clone()
     }
 }
 
@@ -85,6 +98,8 @@ impl AsyncWrite for SplitHello {
         if written == 0 {
             return std::task::Poll::Ready(Ok(0));
         }
+        me.segs_sent
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         me.segs_left = me.segs_left.saturating_sub(1);
         if me.segs_left == 0 {
             me.done = true;
@@ -345,41 +360,35 @@ pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Res
     Ok(tls)
 }
 
-/// 白名单腿拨号：系统 DNS 选 IP → 真名 SNI → ClientHello 分片 → 必须协商 h2。
-/// 不走 plans.json 的池：这批域名托管在 Fastly/Azure，池里的 GLB IP 与伪装 SNI 都不匹配。
-/// 真名 SNI 与分片同生共死——只上真名不加分片等于把域名明文递给 DPI。
-pub async fn dial_whitelist(host: &str) -> Result<(Dialed, String), String> {
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(format!("{host}:443")),
-    )
-    .await
-    .map_err(|_| format!("白名单系统 DNS 拨号超时: {host}"))?
-    .map_err(|e| format!("白名单系统 DNS 拨号失败: {host}: {e}"))?;
-    let _ = tcp.set_nodelay(true);
-    let ip = tcp
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "system-dns".to_string());
-
-    // mode 传 host 本身 = 真名 SNI（校验名本来恒为 host，此处两者一致）
-    let ssl = client_ssl(host, host, None).map_err(|e| e.to_string())?;
+/// 白名单腿 TLS：真名 SNI（mode 恒为 host）+ ClientHello 分片 + 必须协商 h2。
+/// IP 由 edge 池的白名单族选好，这里不再自己解析。
+async fn tls_connect_split(host: &str, tcp: TcpStream) -> std::io::Result<BoringTlsSplit> {
+    use std::sync::atomic::Ordering;
+    let ssl = client_ssl(host, host, None)?;
+    let io = SplitHello::new(tcp);
+    let counter = io.counter();
     let tls = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        tokio_boring::SslStreamBuilder::new(ssl, SplitHello::new(tcp)).connect(),
+        tokio_boring::SslStreamBuilder::new(ssl, io).connect(),
     )
     .await
-    .map_err(|_| format!("白名单 TLS 握手超时: {host}"))?
-    .map_err(|e| format!("白名单 TLS 握手失败: {host}: {e}"))?;
+    .map_err(|_| io_err(format!("白名单 TLS 握手超时: {host}")))?
+    .map_err(|e| io_err(format!("白名单 TLS 握手失败: {host}: {e}")))?;
+
+    // 记账：分了 2 段以上才算掩体真的上成了。/api/status 里能看到两个数对不对得上。
+    SPLIT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    if counter.load(Ordering::Relaxed) >= 2 {
+        SPLIT_DONE.fetch_add(1, Ordering::Relaxed);
+    }
 
     let proto = tls.ssl().selected_alpn_protocol().unwrap_or_default();
     if proto != b"h2" {
-        return Err(format!(
+        return Err(io_err(format!(
             "白名单上游未协商出 h2(得到 {:?})",
             String::from_utf8_lossy(proto)
-        ));
+        )));
     }
-    Ok((Dialed::TlsSplit(tls), ip))
+    Ok(tls)
 }
 
 static DIAL_GATE: tokio::sync::OnceCell<Arc<tokio::sync::Semaphore>> =
@@ -438,6 +447,13 @@ pub async fn dial_one(
         return Ok(Dialed::Plain(tcp));
     }
 
+    // 白名单：不管条目自带的 sni 是什么，一律真名 + ClientHello 分片。
+    // 这批域名靠真名换正确证书，伪装会被上游判非法（docs 实测 90ms 回 400 Whoa）。
+    if crate::config::is_whitelist(host) {
+        let tls = tls_connect_split(host, tcp).await?;
+        return Ok(Dialed::TlsSplit(tls));
+    }
+
     let tls = tls_connect(host, mode, tcp).await?;
     Ok(Dialed::Tls(tls))
 }
@@ -473,6 +489,27 @@ pub fn system_roots() -> Arc<rustls::RootCertStore> {
 mod split_hello_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 真网端到端：白名单域名必须走 TlsSplit（真名 + 分片），且分片计数真的涨了。
+    /// 默认不跑（要能连 GitHub）：`cargo test -- --ignored whitelist_e2e`
+    /// IP 取 docs 实测的 Fastly .154；若该 IP 失效，换 plans.json 里任一 185.199.x.154。
+    #[tokio::test]
+    #[ignore]
+    async fn whitelist_e2e_through_pool() {
+        use std::sync::atomic::Ordering;
+        let before = SPLIT_DONE.load(Ordering::Relaxed);
+        let d = dial_one("docs.github.com", "185.199.108.154", "docs.github.com", true)
+            .await
+            .expect("白名单拨号应成功");
+        assert!(
+            matches!(d, Dialed::TlsSplit(_)),
+            "白名单域名应走分片腿，实际不是 TlsSplit"
+        );
+        assert!(
+            SPLIT_DONE.load(Ordering::Relaxed) > before,
+            "分片计数没涨：首包太短导致分片器退场了"
+        );
+    }
 
     /// 300 字节假 ClientHello 必须分三段发出，首末段间隔 ≥ 两个段间隔。
     /// TCP 可能把小段合并到一次 read，所以断言的是时间差不是段数——

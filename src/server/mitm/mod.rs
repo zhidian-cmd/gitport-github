@@ -468,15 +468,11 @@ pub(super) async fn get_direct(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 白名单域名虽然被 `*.github.com` 判成 core，但实际由 dial_h2_skip 分流到真名分片腿。
-    // 这里把池名清空：不往 core 池序记账，也不触发内容域熔断（它们不在 core 的 IP 族里）。
-    let name = if config::is_whitelist(host) {
-        ""
-    } else {
-        config::pool_for(host)
-    };
+    let name = config::pool_for(host);
     let path = path_of(out.uri());
-    let is_content = pool::route::host_is_content(host);
+    // copilot-proxy 的后缀是 githubusercontent.com，会误命中内容域熔断；
+    // 它走 edge 的白名单族（Azure 段），不该被内容域的熔断拦住。
+    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
@@ -667,7 +663,10 @@ async fn dns_direct_fetch(
                 continue;
             }
         };
-        match send_once(&up, out, body, request_budget(pool::route::host_is_content(host))).await {
+        // 与 get_direct 的口径一致：白名单域名不算内容域（copilot-proxy 后缀会误命中），
+        // 否则这里只给 4s 预算，Azure 链路扛不住。
+        let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
+        match send_once(&up, out, body, request_budget(budget_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;
                 *info.lock().unwrap() = ip.clone();

@@ -544,6 +544,11 @@ mod tests {
             vec![
                 ("core/all".to_string(), "20.27.177.114".to_string()),
                 ("api/all".to_string(), "140.82.114.6".to_string()),
+                // 白名单四族（edge 族表最前），旧配置没有这些键，读入补空串
+                ("edge/wl154".to_string(), String::new()),
+                ("edge/wl153".to_string(), String::new()),
+                ("edge/wl133".to_string(), String::new()),
+                ("edge/wl_azure".to_string(), String::new()),
                 ("edge/content".to_string(), "185.199.110.133".to_string()),
                 ("edge/assets".to_string(), "185.199.108.154".to_string()),
                 ("edge/io".to_string(), String::new()),
@@ -558,13 +563,24 @@ mod tests {
         let arr = parse(r#"{"lastIp":[["edge/io","1.2.3.4"],["core/all",""]]}"#);
         assert_eq!(
             keys(arr.last_ip.marks()),
-            ["core/all", "api/all", "edge/content", "edge/assets", "edge/io", "edge/auth"]
+            [
+                "core/all",
+                "api/all",
+                "edge/wl154",
+                "edge/wl153",
+                "edge/wl133",
+                "edge/wl_azure",
+                "edge/content",
+                "edge/assets",
+                "edge/io",
+                "edge/auth"
+            ]
         );
-        assert_eq!(arr.last_ip.marks()[4].1, "1.2.3.4");
+        assert_eq!(arr.last_ip.marks()[8].1, "1.2.3.4");
 
         let none = parse(r#"{"mitm":true}"#);
         assert!(none.mitm);
-        assert_eq!(none.last_ip.marks().len(), 6, "整段缺失也要铺满键位");
+        assert_eq!(none.last_ip.marks().len(), 10, "整段缺失也要铺满键位");
         assert!(none.last_ip.marks().iter().all(|(_, v)| v.is_empty()));
     }
 
@@ -589,6 +605,10 @@ mod tests {
         let expect = r#"  "lastIp": {
     "core/all": "",
     "api/all": "140.82.114.6",
+    "edge/wl154": "",
+    "edge/wl153": "",
+    "edge/wl133": "",
+    "edge/wl_azure": "",
     "edge/content": "",
     "edge/assets": "",
     "edge/io": "",

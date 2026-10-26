@@ -127,7 +127,7 @@ async function refreshLogs() {
 
 /* ---------- 开关 ---------- */
 async function postJSON(url, body) {
-  return (await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})})).json();
+  return (await fetch(url, {method:'POST', headers:{'Content-Type':'application/json','X-GitPort-Request':'1'}, body: JSON.stringify(body || {})})).json();
 }
 
 async function toggleMitm(on) {
@@ -243,7 +243,7 @@ async function runCal(mode, btn, label) {
   btn.disabled = true;
   box.style.display = 'block';
   try {
-    const r = await fetch('/api/calibrate?mode=' + mode, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const r = await fetch('/api/calibrate?mode=' + mode, {method: 'POST', headers: {'Content-Type': 'application/json','X-GitPort-Request':'1'}, body: '{}'});
     const text = await r.text();
     box.textContent = text;
     toast(label + '校准已在后台开始');

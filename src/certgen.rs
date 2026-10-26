@@ -29,6 +29,13 @@ fn issuer_of<'a>(
 
 impl Authority {
     fn leaf(&self, host: &str) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+        // 纵深防御：根证书本身是 Unconstrained、10 年有效，按 SNI 现签不受任何约束。
+        // MITM 入口只校验 CONNECT 的目标域，但握手时的 SNI 是客户端自己给的——
+        // 先 CONNECT github.com 再发 SNI=bank.com 就能借这张根证书签走别的域名。
+        // 这里把签发范围锁回受管域名，非受管一律拒绝。
+        if crate::config::pool_for(host).is_empty() {
+            return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
+        }
         {
             let leaves = self.leaves.lock().unwrap();
             if let Some(c) = leaves.get(host) {

@@ -52,7 +52,11 @@ fn local_origin(o: &str) -> bool {
     false
 }
 
-/// 写操作来源校验：Origin 为准，缺失回退 Referer，两者皆无 = curl/git 等本机工具放行。
+/// 写操作来源校验。
+/// - 浏览器一定带 Origin（跨站 POST 也带），校验它是不是本工作台。
+/// - 没有 Origin/Referer 的是本机脚本。**不再直接放行**，要求显式带
+///   `X-GitPort-Request: 1`：浏览器跨站带不了自定义头（会被 CORS 预检拦下），
+///   而本机程序要加这行才算表明意图。curl 用法变为加 `-H "X-GitPort-Request: 1"`。
 fn same_site_write(headers: &HeaderMap) -> bool {
     if let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         return local_origin(o);
@@ -60,7 +64,11 @@ fn same_site_write(headers: &HeaderMap) -> bool {
     if let Some(ref_uri) = headers.get("referer").and_then(|v| v.to_str().ok()) {
         return local_origin(ref_uri);
     }
-    true
+    headers
+        .get("x-gitport-request")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -259,6 +267,9 @@ struct StatusResp {
     domain_count: usize,
     /// 串发候选总数（原 IP 池页删除后并入状态，概览只显示一个数）。
     pool_total: usize,
+    /// 白名单腿握手次数 / 其中真的分成了多段（<2 段 = 首包太短，掩体没上成）。
+    split_attempt: u64,
+    split_done: u64,
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
@@ -271,6 +282,9 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
         mitm: settings::mitm(),
         domain_count,
         pool_total,
+        split_attempt: pool::dial::SPLIT_ATTEMPT
+            .load(std::sync::atomic::Ordering::Relaxed),
+        split_done: pool::dial::SPLIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -394,9 +408,12 @@ mod tests {
     fn same_site_write_rules() {
         let mut h = HeaderMap::new();
         assert!(
-            same_site_write(&h),
-            "无 Origin/Referer = curl/git 等本机工具放行"
+            !same_site_write(&h),
+            "无 Origin/Referer 且没带 X-GitPort-Request：不再默认放行"
         );
+        h.insert("x-gitport-request", HeaderValue::from_static("1"));
+        assert!(same_site_write(&h), "带意图头的本机脚本应放行");
+        h.remove("x-gitport-request");
         let base = format!("http://127.0.0.1:{}", config::webui_port());
         h.insert(
             "origin",

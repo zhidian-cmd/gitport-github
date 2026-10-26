@@ -114,34 +114,52 @@ pub const DIRECT_HOSTS: &[&str] = &[
     "api.mcp.github.com",
 ];
 
-/// 主路由白名单：**进代理**，但不进池、不镜像——由 `dial_whitelist` 走
-/// 「系统 DNS 选 IP + 真名 SNI + ClientHello 分片」。
+/// 主路由白名单：进 edge 池，但**不走老族的筛 IP 规则**——按下面 seg 选段，
+/// 握手用真名 + ClientHello 分片。
 ///
-/// 为什么进代理而不是 PAC 直连：这批域名都靠真名 SNI 换正确证书，裸直连没有分片掩体，
-/// 真名 ClientHello 完整暴露给 DPI；进了代理才能拆包。
-/// 为什么不能进池：它们托管在 Fastly 185.199.10x / Azure，池里的 GLB IP 与伪装 SNI
-/// 双双不匹配——docs 走 core 池实测 90ms 回 400 Whoa（2026-10-26）。
-/// 判据：解析落 185.199.x 或非 GLB 段、且裸连能通但怕 SNI 被点名的，放这里。
-pub const WHITELIST_HOSTS: &[&str] = &[
-    "docs.github.com",           // .154 文档站
-    "support.github.com",        // .133 支持中心
-    "resources.github.com",      // .133 资源站
-    "desktop.github.com",        // .153 客户端下载
-    "pages.github.com",          // .153 Pages 介绍页
-    "skills.github.com",         // .153 培训站
-    "archiveprogram.github.com", // .153 存档计划
-    "socialimpact.github.com",   // .153 社会影响
-    "raw.github.com",            // .133 老域名，仍有脚本在用
-    "copilot-proxy.githubusercontent.com", // Azure 4.249.x，被 *.githubusercontent.com 误吞
+/// 为什么进池：单发拨号连不上就报错，进池后能自动换候选、按实测耗时重排、失败垫底。
+/// 为什么不能落老族：它们托管在 Fastly 185.199.10x / Azure，老族只认 .133/.153/.154/.215
+/// 且按域名后缀挂，这 10 个一个都落不到对的段上——docs 走 core 池实测 90ms 回 400 Whoa。
+/// seg 语义：Fastly 系填末段（154/153/133），Azure 填前缀（4.249），由 route 层区分判断。
+pub struct WhitelistHost {
+    pub host: &'static str,
+    pub seg: &'static str,
+}
+
+pub const WHITELIST_HOSTS: &[WhitelistHost] = &[
+    WhitelistHost { host: "docs.github.com", seg: "154" },
+    WhitelistHost { host: "support.github.com", seg: "133" },
+    WhitelistHost { host: "resources.github.com", seg: "133" },
+    WhitelistHost { host: "desktop.github.com", seg: "153" },
+    WhitelistHost { host: "pages.github.com", seg: "153" },
+    WhitelistHost { host: "skills.github.com", seg: "153" },
+    WhitelistHost { host: "archiveprogram.github.com", seg: "153" },
+    WhitelistHost { host: "socialimpact.github.com", seg: "153" },
+    WhitelistHost { host: "raw.github.com", seg: "133" },
+    WhitelistHost {
+        host: "copilot-proxy.githubusercontent.com",
+        seg: "4.249",
+    },
 ];
 
 /// 白名单腿 ClientHello 分片：段数与段间隔（毫秒）。
 /// 段间留够时间，DPI 的重组窗口拼不齐完整 SNI 就取不到域名。
+///
+/// 与上方 `HELLO_SPLIT_*`（透传腿）是**同一件事的两套参数，故意不同**：
+/// - 透传腿：2~3 段、间隔 20~70ms 随机。历史实测值，靠随机形态躲签名化反制。
+/// - 白名单腿：固定 3 段、间隔 100ms。更保守——这批域名走的是真名 SNI，
+///   一旦被拼齐就是明文暴露，宁可多等 200ms 也要把重组窗口赌死。
+/// 改任一侧前先看另一侧的注释，别只调一处。
 pub const WHITELIST_SPLIT_SEGS: usize = 3;
 pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;
 
 pub fn is_whitelist(host: &str) -> bool {
-    WHITELIST_HOSTS.iter().any(|d| *d == host)
+    whitelist_seg(host).is_some()
+}
+
+/// 白名单域名该落哪段 IP（Fastly 末段 / Azure 前缀）；不在白名单返回 None。
+pub fn whitelist_seg(host: &str) -> Option<&'static str> {
+    WHITELIST_HOSTS.iter().find(|w| w.host == host).map(|w| w.seg)
 }
 
 pub fn is_direct(host: &str) -> bool {
@@ -153,6 +171,10 @@ pub fn pool_for(host: &str) -> &'static str {
     // 白名单必须先于 GROUPS 遍历：objects-origin 会被 edge 通配符吞掉（Fastly 500）。
     if is_direct(host) {
         return "";
+    }
+    // 白名单进 edge 池：池里靠白名单族按 seg 选 IP，握手由 dial_one 切成真名 + 分片。
+    if is_whitelist(host) {
+        return "edge";
     }
     for g in GROUPS {
         for pat in g.patterns {
@@ -204,17 +226,25 @@ mod tests {
         assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
         assert!(is_direct("api.mcp.github.com")); // *.github.com 通配吞它，白名单精确短路
         assert_eq!(pool_for("api.mcp.github.com"), "");
-        // 主路由白名单：PAC 里**故意不出现**——要进代理才能拿到分片；
-        // 进了代理由 dial_h2_skip 分流到真名分片腿，不走池。
-        for h in WHITELIST_HOSTS {
-            assert!(is_whitelist(h), "{h} 应在主路由白名单");
+        // 白名单：PAC 里故意不出现（要进代理才能分片），池名必须是 edge，且带段号。
+        for w in WHITELIST_HOSTS {
+            assert!(is_whitelist(w.host), "{} 应在白名单", w.host);
             assert!(
-                !is_direct(h),
-                "{h} 不能进 DIRECT：那样流量被拦在代理外，拿不到分片"
+                !is_direct(w.host),
+                "{} 不能进 DIRECT：那样流量被拦在代理外，拿不到分片",
+                w.host
             );
+            assert_eq!(pool_for(w.host), "edge", "{} 应判为 edge 池", w.host);
+            assert_eq!(whitelist_seg(w.host), Some(w.seg), "{} 段号读不出", w.host);
         }
-        // 现状：它们仍被 *.github.com 通配判成 core，但 dial_h2_skip 先分流，走不到池
-        assert_eq!(pool_for("docs.github.com"), "core");
+        // 段号必须覆盖四类：.154 / .153 / .133 / Azure 前缀
+        assert_eq!(whitelist_seg("docs.github.com"), Some("154"));
+        assert_eq!(whitelist_seg("pages.github.com"), Some("153"));
+        assert_eq!(whitelist_seg("support.github.com"), Some("133"));
+        assert_eq!(
+            whitelist_seg("copilot-proxy.githubusercontent.com"),
+            Some("4.249")
+        );
         assert_eq!(pool_for("codeload.github.com"), "core");
         assert_eq!(pool_for("raw.githubusercontent.com"), "edge");
         assert_eq!(pool_for("avatars.githubusercontent.com"), "edge");

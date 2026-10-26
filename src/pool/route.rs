@@ -128,8 +128,10 @@ pub fn fastly_last_octet(ip: &str) -> Option<&str> {
 }
 
 /// 非 Fastly 段（族资格只看 IP 段；sni 是透传形态，不参与族判定）。
+/// 排除 Azure 的 4.249：那是白名单专用的 Copilot 代理段，混进 githubapp 的兜底族
+/// 会让 auth 族拿它当候选，连过去必失败（不同服务）。
 fn serves_non_fastly(_host: &str, p: &SerialPlan) -> bool {
-    fastly_last_octet(&p.ip).is_none()
+    fastly_last_octet(&p.ip).is_none() && !p.ip.starts_with("4.249.")
 }
 
 const FAMILY_ALL: FamilyRoute = FamilyRoute {
@@ -188,6 +190,44 @@ const FAMILY_AUTH: FamilyRoute = FamilyRoute {
     fallback: Fallback::Dns,
 };
 
+/// 白名单族：域名该落哪段 IP 由 config::whitelist_seg 定，这里只按段认 IP。
+/// 必须排在各老族之前——copilot-proxy 的后缀是 githubusercontent.com，
+/// 排在后面会被 content 族先认走，而 content 只认 .133，它的 Azure 段对不上。
+/// 分四个族而不是一个：cursor_key 是 `{pool}/{family}`，混成一个会让 docs 的池序
+/// 被 support 的失败带偏。
+fn wl_seg(host: &str) -> Option<&'static str> {
+    config::whitelist_seg(host)
+}
+
+const FAMILY_WL_154: FamilyRoute = FamilyRoute {
+    name: "wl154",
+    host_of: |h| matches!(wl_seg(h), Some("154")),
+    serves: |_h, p| fastly_last_octet(&p.ip) == Some("154"),
+    fallback: Fallback::Dns,
+};
+
+const FAMILY_WL_153: FamilyRoute = FamilyRoute {
+    name: "wl153",
+    host_of: |h| matches!(wl_seg(h), Some("153")),
+    serves: |_h, p| fastly_last_octet(&p.ip) == Some("153"),
+    fallback: Fallback::Dns,
+};
+
+const FAMILY_WL_133: FamilyRoute = FamilyRoute {
+    name: "wl133",
+    host_of: |h| matches!(wl_seg(h), Some("133")),
+    serves: |_h, p| fastly_last_octet(&p.ip) == Some("133"),
+    fallback: Fallback::Dns,
+};
+
+/// Azure 段：不是 Fastly 四段之一，按前缀认（4.249.x）。
+const FAMILY_WL_AZURE: FamilyRoute = FamilyRoute {
+    name: "wl_azure",
+    host_of: |h| matches!(wl_seg(h), Some("4.249")),
+    serves: |_h, p| p.ip.starts_with("4.249."),
+    fallback: Fallback::Dns,
+};
+
 pub const POOL_ROUTES: &[PoolRoute] = &[
     PoolRoute {
         pool: "core",
@@ -199,7 +239,17 @@ pub const POOL_ROUTES: &[PoolRoute] = &[
     },
     PoolRoute {
         pool: "edge",
-        families: &[FAMILY_CONTENT, FAMILY_ASSETS, FAMILY_IO, FAMILY_AUTH],
+        // 白名单族在最前：先按 config 里的 seg 认领，认到了就不进老族。
+        families: &[
+            FAMILY_WL_154,
+            FAMILY_WL_153,
+            FAMILY_WL_133,
+            FAMILY_WL_AZURE,
+            FAMILY_CONTENT,
+            FAMILY_ASSETS,
+            FAMILY_IO,
+            FAMILY_AUTH,
+        ],
     },
 ];
 
@@ -242,6 +292,47 @@ mod tests {
             ip: ip.into(),
             sni: sni.into(),
         }
+    }
+
+    /// 白名单四族：按 seg 认域名、按段认 IP。段号填错或族序排错都会在这里红。
+    #[test]
+    fn whitelist_families_route_by_seg() {
+        for (host, fam, ip) in [
+            ("docs.github.com", "wl154", "185.199.108.154"),
+            ("pages.github.com", "wl153", "185.199.108.153"),
+            ("support.github.com", "wl133", "185.199.108.133"),
+        ] {
+            let f = serial_family("edge", host, false)
+                .unwrap_or_else(|| panic!("{host} 没有命中任何族"));
+            assert_eq!(f.name, fam, "{host} 落错族");
+            assert!((f.serves)(host, &mk(ip, "baidu.com")), "{host} 应认 {ip}");
+        }
+
+        // Azure 段不是 Fastly 四段之一，必须按前缀认
+        let cp = "copilot-proxy.githubusercontent.com";
+        let f = serial_family("edge", cp, false).unwrap();
+        assert_eq!(f.name, "wl_azure", "copilot-proxy 被别的族抢走了");
+        assert!((f.serves)(cp, &mk("4.249.131.160", "baidu.com")));
+
+        // 反例一：githubapp 系的兜底族不能把 Azure 段当候选（连过去是别的服务）
+        let auth = serial_family("edge", "api.githubapp.com", false).unwrap();
+        assert_eq!(auth.name, "auth");
+        assert!(!(auth.serves)(
+            "api.githubapp.com",
+            &mk("4.249.131.160", "baidu.com")
+        ));
+
+        // 反例二：老族行为不变，content 仍只认 .133
+        let content = serial_family("edge", "avatars.githubusercontent.com", false).unwrap();
+        assert_eq!(content.name, "content");
+        assert!((content.serves)(
+            "avatars.githubusercontent.com",
+            &mk("185.199.110.133", "baidu.com")
+        ));
+        assert!(!(content.serves)(
+            "avatars.githubusercontent.com",
+            &mk("185.199.110.154", "baidu.com")
+        ));
     }
 
 
