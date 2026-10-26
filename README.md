@@ -12,16 +12,9 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - **连不上就换**：IP 按表逐个试，坏的垫底，单点故障只慢不掉
 - **TLS 指纹是 Chrome 同款**：BoringSSL + 伪装 SNI，绕过针对明文域名的阻断
 - **隧道握手首包分片**：CONNECT 透传把 ClientHello 拆成 2~3 段（切点/间隔每连接随机）再发，DPI 拼不齐 SNI——真名腿免于 RST 的掩体（byedpi 同款思路，纯用户态，可 A/B 开关）
+- **文档站能开**：`docs` / `support` / `resources` / `desktop` / `pages` 等 10 个 Fastly / Azure 上的子域，原先被当成主站去连、必回 400 Whoa。现在它们走自己的腿：按段选对的边缘 IP、报真名、ClientHello 拆 3 段（间隔 100ms），连不上还能自动换候选
 - **连接复用到极限**：高频 host 双 h2 连接 + 按实测耗时择优，GitHub 前端遥测本地拦掉（一个字节不发往上游）
 - **大文件多一条路**：Release / 源码包走镜像串行链，直连全灭仍能下载
-
-| 方案 | 免插件 | 免服务器/账号 | clone/push | 后台占用 | 只碰 GitHub |
-|---|---|---|---|---|---|
-| **GitPort GitHub** | ✅ PAC 一键 | ✅ | ✅ | ~12MB | ✅ |
-| 改 hosts | ✅ | ✅ | 部分 | — | ✅ 但 IP 失效即瘫 |
-| gh-proxy 网页镜像 | — | 靠第三方 | ✗ | — | — |
-| Watt Toolkit | ✅ | ✅ | 部分 | 较高 | ✅（多站点） |
-| 通用代理/VPN | 视工具 | ✗（需节点） | ✅ | 视工具 | ✗ 全部流量 |
 
 ## 快速上手
 
@@ -44,6 +37,8 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 | raw/头像偶发被掐 | GFW 对 Fastly 内容边缘间歇阻断 | 内容域熔断 + 镜像链自动接管 |
 | 透传遇会话级风控页会持续 | GitHub 对会话（cookie）标记后，垫底轮换会加速"会话-IP 漂移"，放大风控信号 | 切 MITM（连接池驻留、零 IP 漂移）或等风控过期 |
 | schannel 系 CLI 走 MITM | 叶子证书无 OCSP/CRL，Windows 吊销检查硬失败 | `curl --ssl-no-revoke`；git 关 `schannelCheckRevoke`；浏览器无感 |
+| 根证书只签 GitHub 域 | 签发前校验域名在受管表内，其他域名一律拒签 | 既是限制也是保护：装了这个根证书，也只有 GitHub 系域名会被解开 |
+| 管理界面写接口要带标记头 | 防跨站伪造，无 Origin 的请求需带 `X-GitPort-Request: 1` | 浏览器工作台无需处理；curl 调用加一个头即可 |
 
 ## 常见问题
 

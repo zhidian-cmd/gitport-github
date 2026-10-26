@@ -43,4 +43,6 @@
 | 拨号单飞 | 并发冷启动只放一个进串发拨号，其余排队等首拨入槽后锁外并发复用 |
 | 择优（EWMA） | 两条连接按实测耗时指数加权平均选快的用，每 8 次留 1 次探索防假死 |
 | 遥测拦截 | GitHub 前端上报（`/_private/browser/*`、alive、collector）本地读掉回 204，不发往上游 |
-| 直连白名单 | 池内的 IP 服务不了的域（objects-origin / uploads / viewscreen / api.mcp），浏览器 DIRECT 绕开代理 |
+| 直连白名单 | 池内 IP 服务不了、但直连能通的域（objects-origin / uploads / viewscreen / api.mcp）。PAC 返回 DIRECT，浏览器绕开代理 |
+| 主路由白名单 | 托管在 Fastly / Azure 的域（docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com / copilot-proxy）。进 edge 池，但用真名 SNI + ClientHello 分片 |
+| ClientHello 分片 | 把 TLS 握手的第一个包切几段、段间停一会儿再发。DPI 要拼出完整包才能读 SNI，拼不齐就抓不到访问的域名 |

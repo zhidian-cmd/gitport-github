@@ -1,7 +1,7 @@
 # GitPort GitHub 路由表（实测版）
 
-> 2026-10-19 实测。方法与原始数据见文末「实测方法与局限」。
-> 代码唯一真相：`src/pool/route.rs`（总路由 + 池内族表）、`src/config.rs`（GROUPS / DIRECT_HOSTS）、`src/webui.rs`（PAC 生成）。
+> 2026-10-19 实测，2026-10-27 补白名单腿。
+> 代码唯一真相：`src/pool/route.rs`（总路由 + 池内族表）、`src/config.rs`（GROUPS / DIRECT_HOSTS / WHITELIST_HOSTS）、`src/webui.rs`（PAC 生成）。
 > 本文每行「实测」列均为当日对**运行中的代理**（127.0.0.1:7810，新二进制，MITM 开）的真实请求结果，日志佐证取自 `/api/logs`。
 
 ---
@@ -10,12 +10,13 @@
 
 ```
 浏览器
-  │  ① PAC（webui.rs pac_script）——池内域名 → PROXY 127.0.0.1:7810；白名单/其余 → DIRECT
+  │  ① PAC（webui.rs pac_script）——池内域名 + 主路由白名单 → PROXY 127.0.0.1:7810；直连白名单/其余 → DIRECT
   ▼
 代理 7810
   │  ② master_route（route.rs）——System / Mirror / Pool{池,族} / Tunnel
   ▼
-  │  ③ 池内族路由（route.rs POOL_ROUTES）——按 host 选族，按 IP 末段 + SNI 形态筛条目
+  │  ③ 池内族路由（route.rs POOL_ROUTES）——按 host 选族，按 IP 末段 + SNI 形态筛条目；
+  │     主路由白名单落 edge 的 wl* 族，改用真名 SNI + ClientHello 分 3 片
   ▼
   │  ④ 兜底（Fallback）——族全灭后：content → 镜像链 → 系统 DNS 腿；其余 → 系统 DNS 腿
   ▼
@@ -28,7 +29,12 @@
 
 ## 1. 第一层：PAC（浏览器 → 代理 or 直连）
 
-PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**直连白名单先行**（会被 `*.githubusercontent.com` 通配符误吞，必须最先短路）→ 池内域名 → 其余 DIRECT。
+PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**直连白名单先行**（会被 `*.githubusercontent.com` 通配符误吞，必须最先短路）→ 池内域名（含主路由白名单）→ 其余 DIRECT。
+
+两种白名单在 PAC 里的位置正好相反：
+
+- **直连白名单**（4 个）出现在 PAC 的 `dl` 列表里 → 返回 DIRECT，流量不进代理
+- **主路由白名单**（10 个）**故意不出现在 PAC 里** → 落到 `*.github.com` / `*.githubusercontent.com` 通配 → PROXY，进代理后由族路由接管
 
 | 域名形态 | PAC 决策 | 实测（node 跑线上真实 PAC，26 个主机） |
 |---|---|---|
@@ -43,13 +49,17 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 
 > 注：池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连的保险链（2026-10-19 晚复核确认，不应视为路由偏差）。
 
+**主路由白名单（2026-10-27 新增）**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy` 这 10 个域名**不再返回 DIRECT**，而是走通配进代理。原因：它们托管在 Fastly `185.199.10x` / Azure，伪装 SNI 对这批无效（docs 走 core 池 90ms 回 400 Whoa），裸直连又没有分片掩体。进代理后用真名 + 首包分片，族路由见第 3 节 `wl*` 四族。
+
 **白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `*.github.com` 通配吞进 core 池，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
 
 ---
 
 ## 2. 第二层：总路由 master_route（进代理之后）
 
-判定顺序同样有硬约束：**白名单 → 镜像 only（GET/HEAD）→ 池 → 非池（Tunnel）**。
+判定顺序同样有硬约束：**直连白名单 → 镜像 only（GET/HEAD）→ 池 → 非池（Tunnel）**。
+
+这里只认**直连白名单**（4 个，返回 `System`）。主路由白名单不在这短路——它们的 `pool_for` 返回 `edge`，落到下面的 `Pool` 分支。
 
 | host | 方法+路径 | 路由 | 实测结果 |
 |---|---|---|---|
@@ -74,16 +84,22 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 
 ## 3. 第三层：池内族路由（edge 是重点）
 
-core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 归哪族）+ **条目判据**（哪些 IP 条目有资格服务它）。不对口不试不垫底——否则每类请求都把另一族 IP 试败沉底。
+core/api 各一个通配族；edge 八族（四个原有 + 四个白名单）。族 = **host 判据**（这个 host 归哪族）+ **条目判据**（哪些 IP 条目有资格服务它）。不对口不试不垫底——否则每类请求都把另一族 IP 试败沉底。
+
+白名单四族**排在族表最前**：copilot-proxy 的后缀是 `githubusercontent.com`，排在后面会被 content 族先认走，而 content 只认 `.133`，它的 Azure 段对不上。
 
 | 池 | 族 | host 判据 | 条目判据（IP 末段 / SNI 形态） | 全灭兜底 | 实测佐证 |
 |---|---|---|---|---|---|
 | core | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ github.com/ → 140.82.121.3（core 网站边缘） |
 | api | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ api.github.com/ → 140.82.114.6 |
+| edge | **wl154** | `docs.github.com` | Fastly `.154` + **真名 SNI + 首包分片** | Dns | ✅ 2026-10-26 实测：185.199.108.154，h2 握手成功，JS/字体全量拉通 |
+| edge | **wl153** | desktop / pages / skills / archiveprogram / socialimpact | Fastly `.153` + 真名 + 分片 | Dns | ✅ 直连实测 0.8~3.5s 可通 |
+| edge | **wl133** | support / resources / raw.github.com | Fastly `.133` + 真名 + 分片 | Dns | ✅ 直连实测 10.9~16.6s 可通 |
+| edge | **wl_azure** | `copilot-proxy.githubusercontent.com` | `4.249.x` 前缀 + 真名 + 分片 | Dns | ✅ 直连 0.8s 回 404（规范响应） |
 | edge | **content** | `*.githubusercontent.com` | **Fastly `.133` + 伪装 SNI**（2026-10-19 晚切换，默认证书 SAN 覆盖全系） | **MirrorDns**（先镜像链后 DNS 腿） | ✅ avatars → 185.199.110.133；raw 直连被 GFW RST 后走镜像（见第 4 节） |
 | edge | **assets** | `*.githubassets.com` | Fastly `.154` / `.215` + 伪装 SNI | Dns | ✅ githubassets → 185.199.**108.154**（CSS/JS 200，root 404） |
 | edge | **io** | `*.github.io` | Fastly `.153` + 伪装 SNI | Dns | ✅ octocat.github.io → 185.199.**108.153**，200 |
-| edge | **auth** | `githubapp.com` 系；**兼 edge 未列族 host 的兜底族** | 非 Fastly 段 + 伪装 SNI | Dns | ✅ githubapp.com → **140.82.112.29**（非 Fastly），200 |
+| edge | **auth** | `githubapp.com` 系；兼未列族 host 的兜底族 | 非 Fastly 段 + 伪装 SNI（**排除 4.249.x**，那是 Azure 白名单专段） | Dns | ✅ githubapp.com → **140.82.112.29**（非 Fastly），200 |
 
 **实表快照**（当日 `/api/pools`，plans.json 演化值）：
 
@@ -91,7 +107,7 @@ core/api 各一个通配族；edge 四族。族 = **host 判据**（这个 host 
 |---|---|---|
 | core | 25 | 140.82.11x 网站边缘（.3/.4）+ Azure 20.x / 4.x / 172.x GLB 族 |
 | api | 6 | 140.82.112-114 的 .5/.6（API 专用边缘） |
-| edge | 19 | Fastly 12 条（.133×1 独苗 110.133 真名；.153×4、.154×4、.215×4 伪装）+ 非 Fastly 6 条（140.82.112-114.29/.30，auth 族） |
+| edge | 23 | Fastly 16 条（`.133` / `.153` / `.154` / `.215` 各 4）+ 非 Fastly 6 条（140.82.112-114.29/.30，auth 族）+ Azure 1 条（`4.249.131.160`，wl_azure 族）。白名单四族与原有四族共用这批 IP，各按自己的判据筛 |
 
 > 13 个实测死 IP 已退役不在表内（core 115/117-120 段 .3/.4；edge 108/109/111.133）。110.133 时通时断，留作 content 独苗。
 

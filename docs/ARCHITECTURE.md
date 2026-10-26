@@ -10,14 +10,14 @@ flowchart TB
     end
     subgraph L2["② 系统代理接管（PAC，可在 WebUI 关闭）"]
         P1{"域名判定"}
-        WL["直连白名单：不入池、不过代理<br/>objects-origin · uploads.github.com · viewscreen"]
+        WL["真直连白名单：不入池、不进代理<br/>objects-origin · uploads · viewscreen · api.mcp"]
         PX["PROXY 127.0.0.1:7810"]
         OD["其余站点：直连"]
     end
     B --> P1
     G --> P1
-    P1 -->|"白名单"| WL
-    P1 -->|"池内域名（core / api / edge 三池）"| PX
+    P1 -->|"直连白名单（4 个）"| WL
+    P1 -->|"池内域名 + 主路由白名单（docs 等 10 个）"| PX
     P1 -->|"其他"| OD
     subgraph L3["③ 本地代理 127.0.0.1:7810"]
         C1["CONNECT / 明请求"]
@@ -27,7 +27,7 @@ flowchart TB
     end
     PX --> C1
     C1 --> M1
-    M1 -->|"否（白名单 / 非池）"| PASS
+    M1 -->|"否（非池域名）"| PASS
     M1 -->|"是"| MITM
     PASS --> SD["系统 DNS 直拨<br/>上传 PUT 与 mermaid 渲染走这里"]
     subgraph L4["④ 明文分流"]
@@ -44,7 +44,7 @@ flowchart TB
     Q --> S4
     subgraph L5["⑤ 上游拨号（所有直连腿共用）"]
         D1["串发：三池一个 IP 一个试"]
-        T1["boring Chrome TLS 指纹<br/>全族 = 伪装 SNI（.133 于 2026-10-19 切换）"]
+        T1["boring Chrome TLS 指纹<br/>老族 = 伪装 SNI（.133 于 2026-10-19 切换）<br/>白名单四族 = 真名 SNI + ClientHello 分 3 片"]
         H1["h2 多路复用 + 每 host ≤2 连接<br/>EWMA 择优 + 活跃窗口每 30s PING 保活（静默 5 分钟停）"]
     end
     S1 --> D1
@@ -89,25 +89,42 @@ flowchart TB
     WUI -.->|"校准重排镜像链"| PLAN
 ```
 
-## 直连白名单
+## 两层白名单
 
-三个域名 PAC 直接返回 `DIRECT`，代理完全不参与：
+名单都在 `src/config.rs`，但作用点完全不同——一个拦在代理外面，一个在代理里面分流。
+
+### 直连白名单（4 个）：PAC 返回 `DIRECT`，流量根本不进代理
 
 - **objects-origin.githubusercontent.com**（网页上传 Release 落点）：该 vhost 只由 GLB 族（140.82.11x.21/.22）服务，主站边缘对它一律 301 且无 CORS 头——浏览器跨域预检直接失败，上传必败
 - **uploads.github.com**（API 式上传源站）：DNS 交给源站本尊，等价 gh CLI 已知可用路径
 - **viewscreen.githubusercontent.com**（mermaid 渲染）：代理腿真名 SNI 被间歇掐断且无镜像兜底；浏览器直连时通时断，实测一进仓库即出图（GitHub 不发布 HTTPS RR，非 ECH）
+- **api.mcp.github.com**（Copilot MCP 端点）：池内 IP 的证书 SAN 不覆盖它，走池 27 连败全是 Hostname mismatch
 
-**进白名单的硬前提**：① 系统 DNS 未被污染；② 真名 SNI 不被 GFW 重置。经验规律：解析到主站 GLB / 源站家族 → 可直连；落在 Fastly 内容边缘 .133 → 真名 SNI 被 RST（`10054`）→ 必须走代理。
+### 主路由白名单（10 个）：进代理，但不进老族——真名 SNI + 首包分片
 
-| 域名 | 系统 DNS | 真名 SNI | 结论 |
+`docs` / `support` / `resources` / `desktop` / `pages` / `skills` /
+`archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy`。
+
+这批托管在 Fastly `185.199.10x` 或 Azure `4.249.x`，被 `*.github.com` 通配送进 core 池后拿主站 IP + 伪装 SNI，上游直接判非法——docs 实测 90ms 回 400 Whoa。
+
+它们进 **edge 池**，由四个族按段选 IP（`.154` / `.153` / `.133` / Azure），握手用真名、ClientHello 拆 3 段、段间隔 100ms。进池的额外好处是一个 IP 连不上会自动换下一个候选，全灭才退回系统 DNS。
+
+两条别的路都行不通：
+
+- **不能直连**：真名 SNI 完整发出就是明文暴露，没有分片掩体
+- **不能伪装**：这批边缘的默认证书 SAN 只覆盖自己那一组，伪装必被拒
+
+### 实测依据
+
+| 域名 | 系统 DNS | 完整 ClientHello | 处置 |
 |---|---|---|---|
 | objects-origin | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
 | viewscreen | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
 | uploads.github.com | 无污染（→ alambic .161） | 无阻断 | 直连 ✅ |
-| raw | 无污染（→ 185.199.110.133） | **被 RST** | 走代理 |
-| camo | 无污染（同一 IP） | 间歇黑洞 | 走代理 |
+| docs.github.com | 无污染（→ 185.199.110.154） | 走 core 池 90ms 回 400 Whoa | 进代理 + 分片 ✅ |
+| raw.github.com | 无污染（→ 185.199.108.133） | 直连 16.6s，真名易被 RST | 进代理 + 分片 ✅ |
 
-判定原则：vhost → 边缘的映射只有 GitHub 的 DNS 知道，代理只接管"表能可靠覆盖"的域名（主站 / API / Fastly 三族），其余交给系统 DNS。
+判定原则：vhost → 边缘的映射只有 GitHub 的 DNS 知道。代理只接管"表能可靠覆盖"的域名（主站 / API / Fastly 三族），其余交给系统 DNS——能开就行，慢一点也好过打不开。
 
 ## 串发拨号与 IP 轮换
 
@@ -123,7 +140,7 @@ flowchart TD
     V -->|"否, 试过一圈"| W1["绕表全灭: 内容域不冷却<br/>其他池冷却 30s"]
     V -->|"是"| X["TCP 连 ip:443, 预算 3s"]
     X -->|"超时/拒绝"| Y["【拨号失败】该条目沉表尾<br/>试下一条"]
-    X -->|"通"| Z["TLS 握手: boring 伪装SNI<br/>GREASE + ALPN, 必须协商出 h2, 预算 3s"]
+    X -->|"通"| Z["TLS 握手: boring<br/>老族伪装 SNI / 白名单真名 + 首包分片<br/>GREASE + ALPN, 必须协商出 h2, 预算 3s"]
     Z -->|"失败/被RST"| Y
     Z -->|"成功"| AA["发完整 HTTP 请求, 总预算 8s"]
     AA -->|"预算超时 或 零回包"| AB["【noreply】IP 垫底<br/>仅 GET/HEAD 记账; POST 不重发直接报错"]
@@ -152,6 +169,10 @@ flowchart TD
 
 | host 类型 | 只认哪类条目 | SNI 形态 |
 |---|---|---|
+| `docs.github.com` | Fastly 末段 `.154` | **真名 + 首包分片**（wl154，排族表最前） |
+| desktop / pages / skills / archiveprogram / socialimpact | Fastly 末段 `.153` | 真名 + 分片（wl153） |
+| support / resources / raw.github.com | Fastly 末段 `.133` | 真名 + 分片（wl133） |
+| `copilot-proxy.githubusercontent.com` | Azure 前缀 `4.249.` | 真名 + 分片（wl_azure）；auth 族已排除该段 |
 | `*.githubusercontent.com` 内容域 | Fastly 末段 .133；**透传(真名)腿额外放行 .154/.215** | 伪装（2026-10-19 切换；Fastly 默认证书 SAN 覆盖全系）/ 透传真名 |
 | `*.githubassets.com` 静态资源 | Fastly 末段 .154 / .215 | 伪装 |
 | `github.io` / `*.github.io` | Fastly 末段 .153 | 伪装 |

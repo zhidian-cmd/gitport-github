@@ -66,6 +66,9 @@
 | `185.199.x.154` | Fastly 静态边缘（旧代，状态波动以实测为准） | 同上 | 伪装 |
 | `185.199.x.153` | Fastly Pages 边缘 | github.io 站点 | 伪装 |
 | `140.82.x.9`、`20.205.243.165`、`20.27.177.114` | codeload 专用边缘 | 源码包打包服务（GitPort 走镜像，直连腿未启用；2026-10-19 测绘发现） | 伪装 |
+| `4.249.131.160` | Azure（Copilot 代理） | copilot-proxy.githubusercontent.com | **真名 + 分片**（wl_azure 族专用） |
+
+> **白名单域名例外**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` 也落在上面这几个 Fastly 段，但它们**不用伪装**——走真名 SNI + ClientHello 分 3 片，由 edge 的 `wl*` 四族接管（见 [路由表](ROUTING.md) 第 3 节）。同一段 IP 被两组族共用，各按自己判据筛。
 
 即：**末段 .3/.4 = 网页，.5/.6 = API，.29/.30 = 授权，.9 = codeload；185.199 段看末段——.133 = 内容（真名），.215 = 静态（新），.154 = 静态（旧），.153 = Pages**。此分工由边缘行为实测标定，plans.json 里的段位置改变不了它。
 
@@ -84,6 +87,8 @@
 | codeload / objects / release-assets | 镜像 only |
 | github.com 的 `/archive`、`/releases/download`（含 latest） | release-assets / codeload 专属镜像链，全灭 502 |
 | objects-origin.* | **直连白名单**（该 vhost 仅 GLB 族服务，主站边缘对其 301 无 CORS） |
+| docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | **主路由白名单**：进 edge 池，真名 SNI + 首包分片；段内 IP 连不上自动换候选，全灭退回系统 DNS |
+| copilot-proxy.githubusercontent.com | **主路由白名单**：同上，走 Azure `4.249.x` 段 |
 | 其余一切域名 | 系统 DNS 直连，不经任何表 |
 
 详细判据与实测数据见 [路由表](ROUTING.md)。
