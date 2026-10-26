@@ -367,6 +367,8 @@ async fn tls_connect_split(host: &str, tcp: TcpStream) -> std::io::Result<Boring
     let ssl = client_ssl(host, host, None)?;
     let io = SplitHello::new(tcp);
     let counter = io.counter();
+    // 发起即计数：握不上也要算进分母，否则 attempt/done 分不清"没人连"和"连了没分片"。
+    SPLIT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
     let tls = tokio::time::timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         tokio_boring::SslStreamBuilder::new(ssl, io).connect(),
@@ -375,8 +377,7 @@ async fn tls_connect_split(host: &str, tcp: TcpStream) -> std::io::Result<Boring
     .map_err(|_| io_err(format!("白名单 TLS 握手超时: {host}")))?
     .map_err(|e| io_err(format!("白名单 TLS 握手失败: {host}: {e}")))?;
 
-    // 记账：分了 2 段以上才算掩体真的上成了。/api/status 里能看到两个数对不对得上。
-    SPLIT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    // 分了 2 段以上才算掩体真的上成了。
     if counter.load(Ordering::Relaxed) >= 2 {
         SPLIT_DONE.fetch_add(1, Ordering::Relaxed);
     }

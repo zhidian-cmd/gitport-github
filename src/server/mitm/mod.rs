@@ -647,6 +647,9 @@ async fn dns_direct_fetch(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
         addrs.len()
     ));
+    // 与 get_direct 的口径一致：白名单域名不算内容域（copilot-proxy 后缀会误命中）。
+    // 预算跟候选地址无关，循环外算一次。
+    let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
         let conn = match pool::dial::dial_one(host, &ip, host, true).await {
@@ -663,9 +666,6 @@ async fn dns_direct_fetch(
                 continue;
             }
         };
-        // 与 get_direct 的口径一致：白名单域名不算内容域（copilot-proxy 后缀会误命中），
-        // 否则这里只给 4s 预算，Azure 链路扛不住。
-        let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
         match send_once(&up, out, body, request_budget(budget_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;

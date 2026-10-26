@@ -164,17 +164,31 @@ fn is_xhr_nav(req: &hyper::Request<Incoming>, host: &str) -> bool {
 /// Ctrl+F5（`Cache-Control: no-cache`）才直通；`max-age=0` 不拦——浏览器后退/前进
 /// 也带这个头，当成强制刷新会让缓存永远命不中（实测确认过）。
 fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
-    host == CACHE_HOST
-        && req.method() == Method::GET
-        && !req
-            .headers()
+    cache_eligible_rules(
+        host,
+        req.method(),
+        req.uri().path(),
+        req.headers()
             .get("cache-control")
-            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.to_str().ok()),
+        is_doc_nav(req),
+    )
+}
+
+/// 准入规则的纯函数形态：拆出来才测得到「Ctrl+F5 直通」这条分支。
+fn cache_eligible_rules(
+    host: &str,
+    method: &Method,
+    path: &str,
+    cache_control: Option<&str>,
+    doc_nav: bool,
+) -> bool {
+    host == CACHE_HOST
+        && method == Method::GET
+        && !cache_control
             .map(|c| c.contains("no-cache"))
             .unwrap_or(false)
-        && (is_xhr_path(req.uri().path())
-            || (is_doc_nav(req)
-                && (is_list_path(req.uri().path()) || is_home_path(req.uri().path()))))
+        && (is_xhr_path(path) || (doc_nav && (is_list_path(path) || is_home_path(path))))
 }
 
 /// 取路由：命中 = 纯本地读（对 GitHub 零请求）；未命中/空闲后第一页 = None，走上游。
@@ -607,13 +621,15 @@ fn persist_page_entry_blocking(
         return Err("缓存目录创建失败".to_string());
     }
     purge_legacy_cache(dir);
-    maybe_wipe_on_growth(dir, 4 + bytes.len());
     let header = serde_json::json!({
         "key": key,
         "status": status,
         "headers": hdrs,
     });
     let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+    // 记账口径必须等于实际写入量：4 字节长度前缀 + 头部 JSON + 正文。
+    // 只算正文字节会让 200MB 上限实际超出一两 MB。
+    maybe_wipe_on_growth(dir, 4 + hbytes.len() + bytes.len());
     let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&pages).map_err(|e| e.to_string())?;
@@ -784,6 +800,47 @@ fn page_cache_clear() {
 #[cfg(test)]
 mod page_cache_tests {
     use super::*;
+
+    /// Ctrl+F5 直通：带 no-cache 的请求必须回源，哪怕路径是列表页。
+    /// max-age=0 不算——浏览器后退/前进也带它，当成强制刷新会让缓存永远命不中。
+    #[test]
+    fn no_cache_header_bypasses_cache() {
+        let list = "/octocat/repo/issues";
+        assert!(
+            !cache_eligible_rules("github.com", &Method::GET, list, Some("no-cache"), true),
+            "带 no-cache 的列表页不该进缓存"
+        );
+        assert!(
+            cache_eligible_rules("github.com", &Method::GET, list, None, true),
+            "同一条请求去掉 no-cache 就该进"
+        );
+        assert!(
+            cache_eligible_rules("github.com", &Method::GET, list, Some("max-age=0"), true),
+            "max-age=0 不是强制刷新"
+        );
+        // 准入的其他三条边界
+        assert!(!cache_eligible_rules(
+            "gist.github.com",
+            &Method::GET,
+            list,
+            None,
+            true
+        ));
+        assert!(!cache_eligible_rules(
+            "github.com",
+            &Method::POST,
+            list,
+            None,
+            true
+        ));
+        assert!(!cache_eligible_rules(
+            "github.com",
+            &Method::GET,
+            "/octocat/repo",
+            None,
+            true
+        ));
+    }
 
     /// 目录覆盖是进程级单值，用锁串行；每个测试自己的临时目录。
     static DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

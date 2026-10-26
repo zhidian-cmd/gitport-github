@@ -29,18 +29,19 @@ fn issuer_of<'a>(
 
 impl Authority {
     fn leaf(&self, host: &str) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+        // 先查缓存：签过的都已经过了下面那道校验，没必要每个连接重跑一遍域名表。
+        {
+            let leaves = self.leaves.lock().unwrap();
+            if let Some(c) = leaves.get(host) {
+                return Ok(c.clone());
+            }
+        }
         // 纵深防御：根证书本身是 Unconstrained、10 年有效，按 SNI 现签不受任何约束。
         // MITM 入口只校验 CONNECT 的目标域，但握手时的 SNI 是客户端自己给的——
         // 先 CONNECT github.com 再发 SNI=bank.com 就能借这张根证书签走别的域名。
         // 这里把签发范围锁回受管域名，非受管一律拒绝。
         if crate::config::pool_for(host).is_empty() {
             return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
-        }
-        {
-            let leaves = self.leaves.lock().unwrap();
-            if let Some(c) = leaves.get(host) {
-                return Ok(c.clone());
-            }
         }
         let leaf_key = KeyPair::generate().map_err(|e| e.to_string())?;
         let now = OffsetDateTime::now_utc();
@@ -96,8 +97,10 @@ impl rustls::server::ResolvesServerCert for LeafResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let host = client_hello.server_name()?;
-        self.authority.leaf(host).ok()
+        // SNI 在 TLS 里不区分大小写，而下面所有查表都是小写精确匹配——
+        // 客户端发 GitHub.com 也必须能签，否则会被"非受管域名"挡掉。
+        let host = client_hello.server_name()?.to_lowercase();
+        self.authority.leaf(&host).ok()
     }
 }
 
