@@ -103,12 +103,46 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
 /// - viewscreen：mermaid 渲染，代理腿真名 SNI 被间歇掐断且无镜像兜底，浏览器直连反而可用（非 ECH）
 /// - api.mcp：Copilot MCP 端点，core 池 IP 证书 SAN 不覆盖它（27 连败全 Hostname mismatch），
 ///   走池必然全灭，浏览器 DIRECT 即可
+/// - docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw：
+///   都托管在 Fastly 185.199.10x，被 `*.github.com` 通配送进 core 池后拿主站 IP + 伪装 SNI，
+///   上游直接判非法。docs 实测 90ms 回 400 Whoa（2026-10-26），直连 200
+/// - copilot-proxy：Azure 4.249.x，被 `*.githubusercontent.com` 吞进 edge 池，Fastly IP 连不上
 pub const DIRECT_HOSTS: &[&str] = &[
     "objects-origin.githubusercontent.com",
     "uploads.github.com",
     "viewscreen.githubusercontent.com",
     "api.mcp.github.com",
 ];
+
+/// 主路由白名单：**进代理**，但不进池、不镜像——由 `dial_whitelist` 走
+/// 「系统 DNS 选 IP + 真名 SNI + ClientHello 分片」。
+///
+/// 为什么进代理而不是 PAC 直连：这批域名都靠真名 SNI 换正确证书，裸直连没有分片掩体，
+/// 真名 ClientHello 完整暴露给 DPI；进了代理才能拆包。
+/// 为什么不能进池：它们托管在 Fastly 185.199.10x / Azure，池里的 GLB IP 与伪装 SNI
+/// 双双不匹配——docs 走 core 池实测 90ms 回 400 Whoa（2026-10-26）。
+/// 判据：解析落 185.199.x 或非 GLB 段、且裸连能通但怕 SNI 被点名的，放这里。
+pub const WHITELIST_HOSTS: &[&str] = &[
+    "docs.github.com",           // .154 文档站
+    "support.github.com",        // .133 支持中心
+    "resources.github.com",      // .133 资源站
+    "desktop.github.com",        // .153 客户端下载
+    "pages.github.com",          // .153 Pages 介绍页
+    "skills.github.com",         // .153 培训站
+    "archiveprogram.github.com", // .153 存档计划
+    "socialimpact.github.com",   // .153 社会影响
+    "raw.github.com",            // .133 老域名，仍有脚本在用
+    "copilot-proxy.githubusercontent.com", // Azure 4.249.x，被 *.githubusercontent.com 误吞
+];
+
+/// 白名单腿 ClientHello 分片：段数与段间隔（毫秒）。
+/// 段间留够时间，DPI 的重组窗口拼不齐完整 SNI 就取不到域名。
+pub const WHITELIST_SPLIT_SEGS: usize = 3;
+pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;
+
+pub fn is_whitelist(host: &str) -> bool {
+    WHITELIST_HOSTS.iter().any(|d| *d == host)
+}
 
 pub fn is_direct(host: &str) -> bool {
     DIRECT_HOSTS.iter().any(|d| *d == host)
@@ -170,6 +204,17 @@ mod tests {
         assert_eq!(pool_for("viewscreen.githubusercontent.com"), "");
         assert!(is_direct("api.mcp.github.com")); // *.github.com 通配吞它，白名单精确短路
         assert_eq!(pool_for("api.mcp.github.com"), "");
+        // 主路由白名单：PAC 里**故意不出现**——要进代理才能拿到分片；
+        // 进了代理由 dial_h2_skip 分流到真名分片腿，不走池。
+        for h in WHITELIST_HOSTS {
+            assert!(is_whitelist(h), "{h} 应在主路由白名单");
+            assert!(
+                !is_direct(h),
+                "{h} 不能进 DIRECT：那样流量被拦在代理外，拿不到分片"
+            );
+        }
+        // 现状：它们仍被 *.github.com 通配判成 core，但 dial_h2_skip 先分流，走不到池
+        assert_eq!(pool_for("docs.github.com"), "core");
         assert_eq!(pool_for("codeload.github.com"), "core");
         assert_eq!(pool_for("raw.githubusercontent.com"), "edge");
         assert_eq!(pool_for("avatars.githubusercontent.com"), "edge");
