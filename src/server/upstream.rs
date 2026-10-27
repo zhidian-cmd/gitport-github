@@ -133,11 +133,31 @@ async fn keepalive_pass() {
 /// 取一条连接：优先近况最快的那条；每 8 次放一次轮转做探索，避免把慢连接饿死
 /// 到永远发现不了它变快。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
+    cached_h2_in(host, None)
+}
+
+/// 带槽位过滤的取连接:`want_slot = Some(1)` 时只回主通道——搜索接口专用
+/// (GitHub blackbird 反爬对同会话跨 IP 敏感,实测会话在两通道间漂移会被
+/// 降级成无结果骨架页,2026-10-27 实证)。过滤池为空 = 主通道不在,回 None
+/// 交给拨号路径按主键游标重建;非搜索请求传 None 走原有轮转/择优。
+pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     let mut g = pool::lock(conn_pool());
     let h = g.get_mut(host)?;
     let n = h.conns.len();
     if n == 0 {
         return None;
+    }
+    if let Some(want) = want_slot {
+        // 过滤池:主通道优先,EWMA 最快者胜(样本不足取第一条)。不参与轮转计数。
+        let pick = h
+            .conns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.up.slot == want && c.n >= 3)
+            .min_by(|a, b| a.1.ewma.total_cmp(&b.1.ewma))
+            .map(|(i, _)| i)
+            .or_else(|| h.conns.iter().position(|c| c.up.slot == want));
+        return pick.map(|i| h.conns[i].up.clone());
     }
     let mut idx = h.next % n;
     h.next = idx + 1;

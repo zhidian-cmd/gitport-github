@@ -407,6 +407,12 @@ fn request_budget(is_content: bool) -> Duration {
     }
 }
 
+/// GitHub 搜索(blackbird)反爬对同会话跨 IP 敏感:会话在双通道间漂移会被
+/// 降级成"无结果"骨架页(2026-10-27 实证)。搜索系请求固定走主通道。
+fn is_search_path(path: &str) -> bool {
+    path.starts_with("/search")
+}
+
 /// 在给定连接上发一次请求、等响应头，返回 (响应, 耗时ms)。
 /// 三处调用点（复用快路径 / 串发新拨 / 系统 DNS 直连）共用这一份：
 /// 请求必须每次重建（BoxBody 不可克隆），预算与记账口径也只该有一处。
@@ -433,8 +439,9 @@ async fn try_cached(
     is_content: bool,
     path: &str,
     body: &Option<Bytes>,
+    want_slot: Option<u8>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    let up = upstream::cached_h2(host)?;
+    let up = upstream::cached_h2_in(host, want_slot)?;
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
@@ -469,6 +476,7 @@ pub(super) async fn get_direct(
 ) -> Result<hyper::Response<BoxBody>, String> {
     let name = config::pool_for(host);
     let path = path_of(out.uri());
+    let want_slot = if is_search_path(&path) { Some(1) } else { None };
     // copilot-proxy 的后缀是 githubusercontent.com，会误命中内容域熔断；
     // 它走 edge 的白名单族（Azure 段），不该被内容域的熔断拦住。
     let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
@@ -476,7 +484,7 @@ pub(super) async fn get_direct(
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if let Some(r) = try_cached(
-        log, out, host, info, name, is_simple, is_content, &path, body,
+        log, out, host, info, name, is_simple, is_content, &path, body, want_slot,
     )
     .await
     {
@@ -491,10 +499,10 @@ pub(super) async fn get_direct(
     // 必须重查：等锁期间别人可能刚建好连接，直接用就不会一起排队拨号。
     // （曾经为省掉"两条都失效时多烧一个预算"砍掉过这里，结果一条连接收 GOAWAY 时
     //  18 个在途请求各自拨号，单飞锁前排成 10 秒以上的队。）
-    if upstream::cached_h2(host).is_some() {
+    if upstream::cached_h2_in(host, want_slot).is_some() {
         guard.take();
         if let Some(r) = try_cached(
-            log, out, host, info, name, is_simple, is_content, &path, body,
+            log, out, host, info, name, is_simple, is_content, &path, body, want_slot,
         )
         .await
         {
@@ -507,7 +515,7 @@ pub(super) async fn get_direct(
         // 拿到拨号锁后再看一眼池子:等锁期间冷启动竞速的第二个任务可能已经
         // 建成入库——排队者直接复用它,这就是"晚成者把排队的塞进自己这里"。
         // fresh = 连接尚不在池中,发送成功后由这里入库;复用/竞速入库的不再重存。
-        let (up, fresh) = match upstream::cached_h2(host) {
+        let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
             Some(up) => (up, false),
             None => match upstream::dial_upstream(name, host, log).await {
                 Ok((up, fresh)) => (up, fresh),
