@@ -542,11 +542,31 @@ fn live_cache_key(
 }
 
 fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
-    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let q = uri
+        .query()
+        .map(|q| normalize_query(uri.path(), q))
+        .unwrap_or_default();
     let cookie_tag = session_fingerprint(cookies);
     // 编码进键：gzip 那条不能给没声明 gzip 的 curl。
     let enc_tag = if gzip { "-gz" } else { "-id" };
     format!("GET {host}{}{q}{cookie_tag}{enc_tag}", uri.path())
+}
+
+/// /search 查询串归一化：去掉 p=1（与无 p 同页——GitHub 翻页链接两种形态都有，
+/// 实测缓存目录曾同时躺这两个条目）+ 参数按键名排序（防将来重排）。
+/// 只对 /search 生效：其他路径的参数顺序保持原样，个别接口参数顺序有语义。
+fn normalize_query(path: &str, q: &str) -> String {
+    if path != "/search" {
+        return format!("?{q}");
+    }
+    let mut pairs: Vec<&str> = q.split('&').filter(|s| !s.is_empty()).collect();
+    pairs.retain(|s| *s != "p=1");
+    pairs.sort_unstable();
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", pairs.join("&"))
+    }
 }
 
 /// 这段正文是不是 gzip（决定要不要先解压）。
@@ -1073,6 +1093,39 @@ mod page_cache_tests {
             None,
             true
         ));
+    }
+
+    /// /search 查询串归一化：p=1 与无 p 同键、参数重排同键；
+    /// 其他路径的查询串一个字符都不动（参数顺序可能有语义）。
+    #[test]
+    fn search_query_normalization() {
+        let mk = |path: &str, q: Option<&str>| {
+            let uri = http::Uri::builder()
+                .path_and_query(match q {
+                    Some(q) => format!("{path}?{q}"),
+                    None => path.to_string(),
+                })
+                .build()
+                .unwrap();
+            page_cache_key(&uri, "github.com", None, true)
+        };
+        let base = mk("/search", Some("q=rust&type=repositories"));
+        assert_eq!(
+            mk("/search", Some("q=rust&type=repositories&p=1")),
+            base,
+            "p=1 与无 p 必须同键"
+        );
+        assert_eq!(
+            mk("/search", Some("type=repositories&q=rust")),
+            base,
+            "参数重排必须同键"
+        );
+        // 非 /search：原样保留（顺序与 p=1 都不动）
+        let repo = mk("/octocat/repo/issues", Some("q=1&page=2"));
+        assert!(
+            repo.contains("?q=1&page=2"),
+            "其他路径的查询串不能被归一化"
+        );
     }
 
     /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：
