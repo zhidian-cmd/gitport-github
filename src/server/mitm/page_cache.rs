@@ -289,8 +289,10 @@ pub(super) async fn cache_put(
         return resp;
     }
     // 只缓存 200：拦截页回放与 304 空体回放都踩过。
+    // 304 不落日志：那是浏览器条件请求命中了 GitHub 校验器、拿自己本地那份渲染，
+    // 每页十几个计数 XHR 全走这条路——留痕只会刷屏（2026-10-28 实测 21 条拒存 20 条是它）。
     if resp.status() != StatusCode::OK {
-        if search_dbg {
+        if search_dbg && resp.status() != StatusCode::NOT_MODIFIED {
             (log)(&format!(
                 "[缓存] 拒存 {path_q} (上游状态 {})",
                 resp.status().as_u16()
