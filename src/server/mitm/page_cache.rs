@@ -459,6 +459,23 @@ fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
     String::from_utf8_lossy(&plain).to_lowercase()
 }
 
+/// GitHub blackbird 限流降级页:搜索返回"无结果"骨架(26KB 上下,缺结果数据
+/// 载体 embeddedData)。入缓存会被刷新反复命中,把一次性降级固化成"一直坏"
+/// (2026-10-27 实证:dev-sidecar 与 github 两词的条目均无 embeddedData,
+/// 而正常页——含真实零结果页——恒有)。骨架不存,刷新回源,恢复即自愈。
+fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
+    if !key.contains("/search?") {
+        return false;
+    }
+    let plain = if gzip {
+        super::defuse::gunzip_partial(bytes, PAGE_CACHE_MAX_BODY_BYTES)
+    } else {
+        bytes.to_vec()
+    };
+    let text = String::from_utf8_lossy(&plain);
+    !text.contains("react-app.embeddedData")
+}
+
 /// 未登录页：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
 fn is_logged_out_body(plain: &str) -> bool {
     plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
@@ -705,7 +722,8 @@ async fn collect_and_submit(
             let plain = plain_prefix(&bytes, gzip);
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
                 && !(has_session && is_logged_out_body(&plain))
-                && !is_gate_page(&plain);
+                && !is_gate_page(&plain)
+                && !is_search_skeleton(key, &bytes, gzip);
             if cacheable {
                 let status = parts.status.as_u16();
                 worker_send(
