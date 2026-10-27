@@ -227,8 +227,28 @@ pub(super) fn cache_take(
         return None;
     }
     let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
-    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req));
-    let (status, hdrs, body) = load_disk_entry(&key, session_value(cookies).is_some())?;
+    let variant = if search_page {
+        search_variant(req.headers().get("accept").and_then(|v| v.to_str().ok()))
+    } else {
+        ""
+    };
+    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req), variant);
+    let (status, hdrs, body) = match load_disk_entry_reason(&key, session_value(cookies).is_some())
+    {
+        Ok(v) => v,
+        Err(reason) => {
+            // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
+            if search_page && reason != "无此条目" {
+                let path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| req.uri().path().to_string());
+                (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+            }
+            return None;
+        }
+    };
     // 命中要留痕：写盘是静默的，没有这行用户无从判断"到底用没用缓存"。
     let path = req
         .uri()
@@ -252,26 +272,66 @@ pub(super) async fn cache_put(
     host: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
+    // 拒存日志只认主站 /search：全量打会淹没日志（POST/非列表页每请求都走这里）。
+    // 静默拒存曾让"翻页页为什么进不了缓存"排查了一整晚（2026-10-28）。
+    let search_dbg = host == CACHE_HOST
+        && req.method() == Method::GET
+        && req.uri().path().starts_with("/search");
+    let path_q = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
     if !cache_eligible(req, host) {
+        if search_dbg {
+            (log)(&format!("[缓存] 拒存 {path_q} (非准入)"));
+        }
         return resp;
     }
     // 只缓存 200：拦截页回放与 304 空体回放都踩过。
     if resp.status() != StatusCode::OK {
+        if search_dbg {
+            (log)(&format!(
+                "[缓存] 拒存 {path_q} (上游状态 {})",
+                resp.status().as_u16()
+            ));
+        }
         return resp;
     }
     // Content-Length 粗筛（压缩后大小）；chunked 无该头靠 collect 后的 2MB 上限兜底。
     if let Some(cl) = resp.headers().get("content-length").and_then(|v| v.to_str().ok()) {
         if let Ok(n) = cl.parse::<u64>() {
             if n > PAGE_CACHE_MAX_BODY_BYTES as u64 {
+                if search_dbg {
+                    (log)(&format!("[缓存] 拒存 {path_q} (声明体积超上限)"));
+                }
                 return resp;
             }
         }
     }
     let xhr = is_xhr_path(req.uri().path());
     let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
-    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req));
+    let search_page = is_search_page(req.uri().path());
+    // 分钥匙以实际 Content-Type 为准：GitHub 按请求 Accept 回 JSON 或 HTML，
+    // 两种正文同 URL 不同物（存侧不区分会导致 HTML 导航拿到 JSON）。
+    let ct_lower = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let variant = if search_page {
+        if ct_lower.starts_with("application/json") {
+            "-json"
+        } else {
+            "-html"
+        }
+    } else {
+        ""
+    };
+    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req), variant);
     let has_session = session_value(cookies).is_some();
-    collect_and_submit(log, &key, xhr, has_session, resp).await
+    collect_and_submit(log, &key, xhr, search_page, has_session, resp).await
 }
 
 // ---------- 内部：管家线程 ----------
@@ -436,14 +496,46 @@ fn session_fingerprint(cookies: Option<&str>) -> String {
     }
 }
 
+/// 拒存日志用：键去掉 "GET host" 前缀，露出路径+查询。
+fn dbg_path(key: &str) -> &str {
+    key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
+}
+
+/// 请求方要不要 JSON：GitHub 搜索页按 Accept 内容协商——`application/json`
+/// 回 JSON（React 软导航的数据请求），否则回 HTML（2026-10-28 实测）。
+/// 两种正文同 URL 不同物，必须分钥匙存取，否则 HTML 导航会拿到 JSON。
+fn accept_wants_json(accept: Option<&str>) -> bool {
+    let Some(a) = accept else {
+        return false;
+    };
+    let a = a.to_ascii_lowercase();
+    a.contains("application/json") && !a.contains("text/html")
+}
+
+/// 搜索页的内容分钥匙：存侧以实际 Content-Type 为准（-html / -json），
+/// 取侧按请求 Accept 预测——预测错了只是 miss 重取，不会拿错正文。
+fn search_variant(accept: Option<&str>) -> &'static str {
+    if accept_wants_json(accept) {
+        "-json"
+    } else {
+        "-html"
+    }
+}
+
 /// 缓存键 = 方法 + host + 路径/查询 + 身份标签 + 编码标签（纯函数，便于测试）。
 /// 当前会话可用的键：会话号拼在纯键外面，旧会话的条目自然查不到。
-fn live_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
+fn live_cache_key(
+    uri: &http::Uri,
+    host: &str,
+    cookies: Option<&str>,
+    gzip: bool,
+    variant: &str,
+) -> String {
     let base = page_cache_key(uri, host, cookies, gzip);
     if is_home_path(uri.path()) {
         format!("{base}-k") // 骨架：不带会话号，跨会话复用
     } else {
-        format!("{base}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
+        format!("{base}{variant}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
     }
 }
 
@@ -477,6 +569,9 @@ fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
 fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
     if !key.contains("/search?") {
         return false;
+    }
+    if key.contains("-json-") {
+        return false; // JSON 正文本就没有 HTML 结果载体，骨架判定只对 HTML 分支生效
     }
     let plain = if gzip {
         super::defuse::gunzip_partial(bytes, PAGE_CACHE_MAX_BODY_BYTES)
@@ -532,8 +627,21 @@ fn load_disk_entry(
     Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     Bytes,
 )> {
+    load_disk_entry_reason(key, logged_in).ok()
+}
+
+/// 带拒绝原因的读取："存了却命中不了"曾只能靠猜（2026-10-28 排查翻页缓存），
+/// 原因交给命中侧按需落日志。
+fn load_disk_entry_reason(
+    key: &str,
+    logged_in: bool,
+) -> Result<(
+    u16,
+    Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    Bytes,
+), &'static str> {
     let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
-    let raw = std::fs::read(&path).ok()?;
+    let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
     // 长寿命条目按 mtime 判保质期（GitHub 改版后旧骨架就是坏的）。
     if key.ends_with("-k") {
         let age = std::fs::metadata(&path)
@@ -543,30 +651,43 @@ fn load_disk_entry(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         if age > KEEP_MAX_AGE_MS {
-            return None;
+            return Err("长寿命条目过期");
         }
     }
     if raw.len() < 4 {
-        return None;
+        return Err("文件过短");
     }
-    let hlen = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    let end = 4usize.checked_add(hlen)?;
+    let Some(hlen_bytes) = raw.get(0..4) else {
+        return Err("文件过短");
+    };
+    let hlen = u32::from_be_bytes([hlen_bytes[0], hlen_bytes[1], hlen_bytes[2], hlen_bytes[3]])
+        as usize;
+    let end = 4usize.checked_add(hlen).ok_or("头部长度溢出")?;
     if raw.len() < end {
-        return None; // 截断：miss 自愈
+        return Err("条目截断"); // miss 自愈
     }
-    let header: serde_json::Value = serde_json::from_slice(&raw[4..end]).ok()?;
-    if header.get("key")?.as_str()? != key {
-        return None; // 哈希碰撞：不服务错页
+    let header: serde_json::Value =
+        serde_json::from_slice(&raw[4..end]).map_err(|_| "元数据损坏")?;
+    if header.get("key").and_then(|k| k.as_str()) != Some(key) {
+        return Err("哈希碰撞"); // 不服务错页
     }
-    let status = u16::try_from(header.get("status")?.as_u64()?).ok()?;
+    let Some(st) = header.get("status").and_then(|v| v.as_u64()) else {
+        return Err("状态码损坏");
+    };
+    let status = u16::try_from(st).map_err(|_| "状态码损坏")?;
     if status != 200 {
-        return None; // 非 200（拦截页/304）：当 miss
+        return Err("条目非 200"); // 拦截页/304：当 miss
     }
-    let headers = header.get("headers")?.as_array()?;
+    let Some(headers) = header.get("headers").and_then(|v| v.as_array()) else {
+        return Err("头部字段损坏");
+    };
     let mut hdrs: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::with_capacity(headers.len());
     for pair in headers {
-        let (Some(k), Some(v)) = (pair.get(0)?.as_str(), pair.get(1)?.as_str()) else {
+        let (Some(k), Some(v)) = (
+            pair.get(0).and_then(|x| x.as_str()),
+            pair.get(1).and_then(|x| x.as_str()),
+        ) else {
             continue;
         };
         if let (Ok(name), Ok(val)) = (
@@ -582,9 +703,9 @@ fn load_disk_entry(
     let body = &raw[end..];
     let plain = plain_prefix(body, gzip);
     if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
-        return None; // 会话已死的未登录页 / 闸门页：当作 miss（旧版存下的也自愈）
+        return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
     }
-    Some((status, hdrs, Bytes::copy_from_slice(body)))
+    Ok((status, hdrs, Bytes::copy_from_slice(body)))
 }
 
 /// 测试专用：绕开准入直读磁盘。`page_cache_get_logged_in` 模拟带会话的请求方
@@ -686,15 +807,33 @@ async fn collect_and_submit(
     log: &LogFn,
     key: &str,
     xhr: bool,
+    search_page: bool,
     has_session: bool,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
     let (mut parts, body) = resp.into_parts();
-    let allowed = body_type_allowed(
-        parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
-        xhr,
-    );
+    let ct = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut allowed = body_type_allowed(Some(&ct), xhr);
+    if !allowed && search_page
+        && (ct.starts_with("text/html") || ct.starts_with("application/json"))
+    {
+        // 搜索页的软导航按 Accept 协商出 JSON 或 HTML（2026-10-28 实测），
+        // 两者都是正经正文，分钥匙后照存。
+        allowed = true;
+    }
     if !allowed {
+        if key.contains("/search?") {
+            (log)(&format!(
+                "[缓存] 拒存 {} (正文类型不符: {})",
+                dbg_path(key),
+                if ct.is_empty() { "无" } else { &ct }
+            ));
+        }
         return hyper::Response::from_parts(parts, body);
     }
     // 嗅探读走的前几帧要拼回，否则交付并缓存半页。
@@ -746,6 +885,20 @@ async fn collect_and_submit(
                     },
                     log,
                 );
+            } else if key.contains("/search?") {
+                // 拒存要说清是哪条门拦的，否则"翻页页进不了缓存"查不动。
+                let why = if bytes.len() > PAGE_CACHE_MAX_BODY_BYTES {
+                    "超 2MB 上限"
+                } else if has_session && is_logged_out_body(&plain) {
+                    "未登录页(会话已死)"
+                } else if is_gate_page(&plain) {
+                    "闸门页"
+                } else if is_search_skeleton(key, &bytes, gzip) {
+                    "限流骨架"
+                } else {
+                    "未知原因"
+                };
+                (log)(&format!("[缓存] 拒存 {} ({why})", dbg_path(key)));
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -755,6 +908,12 @@ async fn collect_and_submit(
             rebuilt
         }
         Err(_) => {
+            if key.contains("/search?") {
+                (log)(&format!(
+                    "[缓存] 拒存 {} (正文收集失败: 上游流中断)",
+                    dbg_path(key)
+                ));
+            }
             // 收集失败：无内容可交付，回 502
             hyper::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -1035,7 +1194,7 @@ mod page_cache_tests {
             .header("content-type", "application/json")
             .body(upstream::full_body(Bytes::from_static(b"{}")))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/api/x", false, false, resp).await;
+        let _ = collect_and_submit(&log, "GET github.com/api/x", false, false, false, resp).await;
         assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
 
         // ②c 正文类型闸门（纯函数，落盘有时序所以不断言命中）
@@ -1095,7 +1254,7 @@ mod page_cache_tests {
                 b"<html>hello ",
             )]));
         let out =
-            collect_and_submit(&log, "GET github.com/peek", false, false, sniffed).await;
+            collect_and_submit(&log, "GET github.com/peek", false, false, false, sniffed).await;
         let body = http_body_util::BodyExt::collect(out.into_body())
             .await
             .unwrap()
@@ -1290,27 +1449,27 @@ mod page_cache_tests {
         // ⑩a 首页键带 -k（不带会话号，跨会话复用）
         let home_uri: http::Uri = "https://github.com/".parse().unwrap();
         assert!(
-            live_cache_key(&home_uri, "github.com", Some(alice), true).ends_with("-k"),
+            live_cache_key(&home_uri, "github.com", Some(alice), true, "").ends_with("-k"),
             "首页骨架键必须带 -k"
         );
 
         // ⑩b 换会话后旧键必须失效（不依赖清盘是否成功）
-        let k_before = live_cache_key(&uri, "github.com", Some(alice), true);
+        let k_before = live_cache_key(&uri, "github.com", Some(alice), true, "");
         set_last_nav(0);
         assert!(note_nav(), "伪造一次空闲");
-        let k_after = live_cache_key(&uri, "github.com", Some(alice), true);
+        let k_after = live_cache_key(&uri, "github.com", Some(alice), true, "");
         assert_ne!(k_before, k_after, "换会话后同一页面必须是新键");
         // ⑩c 两次"进程首启"的会话号必须不同：否则重启后又拿回 -s2，与上一轮的盘上条目撞号
         let k1 = {
             set_last_nav(0);
             note_nav();
-            live_cache_key(&uri, "github.com", None, true)
+            live_cache_key(&uri, "github.com", None, true, "")
         };
         std::thread::sleep(std::time::Duration::from_millis(3));
         let k2 = {
             set_last_nav(0);
             note_nav();
-            live_cache_key(&uri, "github.com", None, true)
+            live_cache_key(&uri, "github.com", None, true, "")
         };
         assert_ne!(k1, k2, "重启后会话号不得与上一轮相同");
 
@@ -1322,7 +1481,7 @@ mod page_cache_tests {
                 b"<html><body class=\"logged-out env-production\">sign in</body></html>",
             )))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/-cauthed-poison", false, true, poisoned).await;
+        let _ = collect_and_submit(&log, "GET github.com/-cauthed-poison", false, false, true, poisoned).await;
         assert!(
             page_cache_get_logged_in("GET github.com/-cauthed-poison").is_none(),
             "会话死亡期间的未登录页不得进缓存"
@@ -1372,6 +1531,7 @@ mod page_cache_tests {
         let _ = collect_and_submit(
             &log,
             "GET github.com/-cauthed-gz-poison", false,
+            false,
             true,
             poisoned_gz,
         )
@@ -1400,7 +1560,7 @@ mod page_cache_tests {
             .header("content-type", "text/html; charset=utf-8")
             .body(upstream::full_body(Bytes::from_static(gate_html)))
             .unwrap();
-        let _ = collect_and_submit(&log, "GET github.com/o/r-gate", false, false, gate).await;
+        let _ = collect_and_submit(&log, "GET github.com/o/r-gate", false, false, false, gate).await;
         assert!(
             page_cache_get("GET github.com/o/r-gate").is_none(),
             "闸门页不得入缓存"
