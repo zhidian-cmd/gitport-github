@@ -68,6 +68,14 @@ fn is_home_path(path: &str) -> bool {
     path == "/" || path.is_empty()
 }
 
+/// 搜索列表页：GitHub 翻页是 React 软导航（sec-fetch-dest: empty）而非文档
+/// 导航——按导航形态收会导致翻页页永远不入缓存（2026-10-27 对照实验：同 URL
+/// document 入库、empty 被拒），来回翻页、从仓库退回全靠现拉转圈。
+/// 存取两侧同步放行；会话清盘仍只认文档导航（软导航不续命，与 XHR 同待遇）。
+fn is_search_page(path: &str) -> bool {
+    path == "/search"
+}
+
 /// 条目落点：键尾 `-k` = 跨会话长寿命（keep/），其余 = 会话存储（pages/）。
 /// 会话清盘只清 pages/，所以骨架能在多次会话之间一直活着。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
@@ -188,7 +196,9 @@ fn cache_eligible_rules(
         && !cache_control
             .map(|c| c.contains("no-cache"))
             .unwrap_or(false)
-        && (is_xhr_path(path) || (doc_nav && (is_list_path(path) || is_home_path(path))))
+        && (is_xhr_path(path)
+            || is_search_page(path)
+            || (doc_nav && (is_list_path(path) || is_home_path(path))))
 }
 
 /// 取路由：命中 = 纯本地读（对 GitHub 零请求）；未命中/空闲后第一页 = None，走上游。
@@ -198,7 +208,8 @@ pub(super) fn cache_take(
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
     let xhr = is_xhr_nav(req, host);
-    if !is_doc_nav(req) && !xhr {
+    let search_page = is_search_page(req.uri().path());
+    if !is_doc_nav(req) && !xhr && !search_page {
         return None;
     }
     // 新会话：先清上一会话的盘（交给管家，不阻塞本页），这一页必回源。
@@ -901,6 +912,39 @@ mod page_cache_tests {
             None,
             true
         ));
+    }
+
+    /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：
+    /// GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存。
+    /// 非 /search 路径的软导航照旧不收（维持原有防杂收口）。
+    #[test]
+    fn search_page_eligible_regardless_of_nav_kind() {
+        assert!(
+            cache_eligible_rules("github.com", &Method::GET, "/search", None, false),
+            "软导航的搜索页必须能存"
+        );
+        assert!(
+            cache_eligible_rules("github.com", &Method::GET, "/search", None, true),
+            "文档导航的搜索页照常能存"
+        );
+        assert!(
+            cache_eligible_rules("github.com", &Method::GET, "/search/count", None, false),
+            "/search/count 走 XHR 名单，软导航本就能存（既有设计）"
+        );
+        assert!(
+            !cache_eligible_rules(
+                "github.com",
+                &Method::GET,
+                "/octocat/repo/issues",
+                None,
+                false
+            ),
+            "其他列表页的软导航维持原状不收"
+        );
+        assert!(
+            !cache_eligible_rules("github.com", &Method::GET, "/search", Some("no-cache"), false),
+            "Ctrl+F5 直通对搜索页同样生效"
+        );
     }
 
     /// 目录覆盖是进程级单值，用锁串行；每个测试自己的临时目录。
