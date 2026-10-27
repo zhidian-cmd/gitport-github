@@ -538,9 +538,9 @@ pub(super) async fn get_direct(
                 }
                 if fresh {
                     upstream::store_h2(host, up);
-                }
+                    upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
+                } // 竞速路径不补:race 的另一任务就是第二条,补建会与它抢跑
                 upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
-                upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }

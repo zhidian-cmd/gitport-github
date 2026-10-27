@@ -266,8 +266,10 @@ pub async fn h2_from_dialed(
     tokio::spawn(async move {
         let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
     });
+    // 第二通道在行尾标出;主通道与单发保持原样,免日志噪音。
+    let chan = if slot > 1 { format!(", 通道{slot}") } else { String::new() };
     (log)(&format!(
-        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手)"
+        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手{chan})"
     ));
     Ok(H2Upstream {
         ip: ip.to_string(),
@@ -330,7 +332,7 @@ async fn h2_dial_slot(
 async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
-    (log)(&format!("[建连] {host} 冷启动竞速: 双任务发射, 同组认领互避"));
+    (log)(&format!("[建连] {host} 冷启动竞速发射"));
     for slot in [1u8, 2] {
         let tx = tx.clone();
         let name = pool_name.to_string();
@@ -340,29 +342,45 @@ async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upst
         tokio::spawn(async move {
             match h2_dial_slot(&name, &host, &log, &[], slot, Some(&crew)).await {
                 Ok(up) => {
-                    (log)(&format!(
-                        "[上游] {host} 并行通道{slot} 建成({}), 入池上岗",
-                        up.ip
-                    ));
                     store_h2(&host, up.clone());
                     let _ = tx.send(Ok(up)).await;
                 }
                 Err(e) => {
-                    (log)(&format!("[建连] {host} 通道{slot} 失败: {e}"));
-                    let _ = tx.send(Err(e)).await;
+                    let _ = tx.send(Err(e)).await; // 红字由收尾统一接管,不逐任务刷
                 }
             }
         });
     }
     drop(tx);
+    // 等第一个成功;两个全败则整组失败
     let mut last: Option<String> = None;
-    while let Some(r) = rx.recv().await {
-        match r {
-            Ok(up) => return Ok(up),
-            Err(e) => last = Some(e),
+    let won = loop {
+        match rx.recv().await {
+            Some(Ok(up)) => break up,
+            Some(Err(e)) => last = Some(e),
+            None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
         }
-    }
-    Err(last.unwrap_or_else(|| "并行建连全败".into()))
+    };
+    // 收尾移交后台:晚成者建成照常入库上岗;失败则补建一次第二通道
+    // (skip 池中占用,失败静默降级单通道)。竞速败者的空试不再逐条刷红——
+    // 真实的候选超时由串发全灭日志记录。
+    let name = pool_name.to_string();
+    let host = host.to_string();
+    let log = log.clone();
+    tokio::spawn(async move {
+        while let Some(r) = rx.recv().await {
+            match r {
+                Ok(up) => store_h2(&host, up),
+                Err(_) => {
+                    let skip = occupied_ips(&host);
+                    if skip.len() < MAX_CONNS_PER_HOST {
+                        let _ = h2_dial_slot(&name, &host, &log, &skip, 2, None).await;
+                    }
+                }
+            }
+        }
+    });
+    Ok(won)
 }
 
 /// 上游建连统一入口:双通道高频站池空走并行竞速,其余单发。
@@ -373,15 +391,12 @@ pub async fn dial_upstream(
     host: &str,
     log: &LogFn,
 ) -> Result<(H2Upstream, bool), String> {
-    let dual = DUAL_CONN_HOSTS.contains(&host);
-    if dual && occupied_ips(host).is_empty() {
-        (log)(&format!("[建连] {host} 走冷启动竞速"));
+    if DUAL_CONN_HOSTS.contains(&host) && occupied_ips(host).is_empty() {
         let up = dial_h2_race(pool_name, host, log).await?;
         return Ok((up, false)); // 竞速任务内部已入库
     }
     let skip = occupied_ips(host);
     let up = h2_dial_slot(pool_name, host, log, &skip, 1, None).await?;
-    let _ = dual;
     Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
