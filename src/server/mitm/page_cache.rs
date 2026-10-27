@@ -817,6 +817,49 @@ fn page_cache_clear() {
 
 #[cfg(test)]
 mod page_cache_tests {
+    /// 骨架拦截三态:正常结果页与真实零结果页恒含 embeddedData(缓存),
+    /// blackbird 限流骨架恒缺(拦截)。GitHub 改 payload 封装名时这里会红,
+    /// 避免搜索页缓存静默失效。
+    #[test]
+    fn search_skeleton_gate() {
+        let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
+        let full = format!("<html>{{}}react-app.embeddedData{{}}</html>");
+        assert!(
+            !is_search_skeleton(k, full.as_bytes(), false),
+            "含结果载体的正常页应缓存"
+        );
+        assert!(
+            is_search_skeleton(k, b"<html>Your search did not match</html>", false),
+            "无结果载体的骨架应拦截"
+        );
+        // 非 /search? 键不受此判定(count XHR 的骨架照缓存,无害)
+        assert!(!is_search_skeleton(
+            "GET github.com/search/count?q=x-cloggedout",
+            b"{}",
+            false
+        ));
+    }
+
+    /// gzip 分支:全量解压后判定,明文尾部才有的载体标志不漏判。
+    #[test]
+    fn search_skeleton_gate_gzip() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(b"<html>padding</html>react-app.embeddedData<html>/</html>")
+            .unwrap();
+        let gz = enc.finish().unwrap();
+        assert!(
+            !is_search_skeleton(k, &gz, true),
+            "gzip 正常页解压后应命中载体标志"
+        );
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(b"<html>Your search did not match any</html>").unwrap();
+        let gz = enc.finish().unwrap();
+        assert!(is_search_skeleton(k, &gz, true), "gzip 骨架应拦截");
+    }
+
     use super::*;
 
     /// Ctrl+F5 直通：带 no-cache 的请求必须回源，哪怕路径是列表页。
