@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
+use windows::Win32::Networking::WinInet::{
+    PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
+};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "gitport-github";
@@ -123,6 +126,55 @@ fn refresh_wininet() {
     }
 }
 
+/// 连接级代理配置：只写 `AutoConfigURL` 字符串是不够的。
+///
+/// 系统真正读的是连接配置里的 `PROXY_TYPE_AUTO_PROXY_URL` 标志位。这一位不置，
+/// 注册表里写了地址也不会被采用；紧接着的 SETTINGS_CHANGED 刷新还会以旧配置为准
+/// 把它抹回去——表现就是日志说"已同步"、系统里其实一无所有（2026-10-27 实证：
+/// 写完 2 秒即空，`WinHttpGetIEProxyConfigForCurrentUser` 返回全空）。
+///
+/// `flags` 取 `PROXY_TYPE_*` 的组合；`pac` 为 None 表示不带自动配置脚本。
+fn apply_conn_options(flags: u32, pac: Option<&str>) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS,
+        INTERNET_PER_CONN_OPTION_LISTW, INTERNET_PER_CONN_OPTIONW,
+        INTERNET_OPTION_PER_CONNECTION_OPTION,
+    };
+
+    // 字符串在调用期间必须保持有效且可写
+    let mut pac_buf: Vec<u16> = pac
+        .map(|s| s.encode_utf16().chain(std::iter::once(0)).collect())
+        .unwrap_or_default();
+
+    let mut opts: [INTERNET_PER_CONN_OPTIONW; 2] = unsafe { std::mem::zeroed() };
+    opts[0].dwOption = INTERNET_PER_CONN_FLAGS;
+    opts[0].Value.dwValue = flags;
+    let mut n = 1u32;
+    if !pac_buf.is_empty() {
+        opts[1].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+        opts[1].Value.pszValue = PWSTR(pac_buf.as_mut_ptr());
+        n = 2;
+    }
+
+    let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+        dwSize: std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+        pszConnection: PWSTR::null(),
+        dwOptionCount: n,
+        dwOptionError: 0,
+        pOptions: opts.as_mut_ptr(),
+    };
+    unsafe {
+        InternetSetOptionW(
+            None,
+            INTERNET_OPTION_PER_CONNECTION_OPTION,
+            Some(&mut list as *mut _ as *const std::ffi::c_void),
+            std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+        )
+        .is_ok()
+    }
+}
+
 /// 按开关接管/还原系统代理（幂等）。只备份用户自己的配置——把我们的旧残留当原配置会让自愈还原死 PAC。
 pub fn ensure_system_proxy() {
     let Ok(key) = internet_settings_key() else {
@@ -131,13 +183,14 @@ pub fn ensure_system_proxy() {
     let cur = get_auto_config_url(&key);
     let pac = pac_url();
     if github_pac() {
-        if cur == pac {
-            return; // 已是我们设的（幂等）
-        }
         if !cur.is_empty() && !is_our_pac(&cur) {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
-        if key.set_value("AutoConfigURL", &pac).is_ok() {
+        // 不走 `cur == pac` 的早退：字符串在、标志位没开正是要修的那种状态。
+        // 连接级写入是幂等的，重复设一遍没有副作用。
+        if apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&pac)) {
+            // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
+            let _ = key.set_value("AutoConfigURL", &pac);
             refresh_wininet();
             let _ = save();
         }
@@ -157,14 +210,33 @@ pub fn remove_system_proxy() {
 
 fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
+    let keep_manual = manual_proxy_active(key);
     if !backup.is_empty() && !is_our_pac(&backup) {
+        // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
+        let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
         let _ = key.set_value("AutoConfigURL", &backup);
     } else {
+        // 没有备份：把「启用自动配置脚本」这一位关掉。
+        // 只删字符串会留下「开关还开着、地址没了」的半截状态。
+        let flags = if keep_manual {
+            PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY
+        } else {
+            PROXY_TYPE_DIRECT
+        };
+        let _ = apply_conn_options(flags, None);
         let _ = key.delete_value("AutoConfigURL");
     }
     *state().proxy_backup.lock().unwrap() = String::new();
     refresh_wininet();
     let _ = save();
+}
+
+/// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空）。
+/// 还原时拿它决定要不要保留手动代理那条路。
+fn manual_proxy_active(key: &RegKey) -> bool {
+    let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
+    let server = key.get_value::<String, _>("ProxyServer").unwrap_or_default();
+    enabled && !server.trim().is_empty()
 }
 
 /// 当前 PAC 是我们设置的才还原（还原用户原配置时也排除我们的旧 PAC）。
