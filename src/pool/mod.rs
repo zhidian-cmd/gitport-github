@@ -6,7 +6,7 @@ pub mod dial;
 pub mod route;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,13 +37,17 @@ pub struct SerialPlan {
 
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
-/// 全部游标圈的规范键序(core/api/edge 四族):settings.last_ip 按此序展示。
+/// 全部游标圈的规范键序(core/api/edge 各族):settings.last_ip 按此序展示。
+/// 每族两把钥匙:主键 = 第一通道,`~2` = 第二通道(双通道记忆分离,见 serial_dial_skip)。
+/// 两键恒相邻、恒全量,副键未被双通道族用到时保持空串。
 pub fn circle_keys() -> Vec<String> {
     let mut out = Vec::new();
     for pool in SERIAL_POOLS {
         if let Some(pr) = route::pool_route(pool) {
             for f in pr.families {
-                out.push(format!("{pool}/{}", f.name));
+                let base = format!("{pool}/{}", f.name);
+                out.push(base.clone());
+                out.push(format!("{base}~2"));
             }
         }
     }
@@ -83,7 +87,10 @@ struct SerialTab {
     mirrors: HashMap<String, Vec<String>>,
     /// 游标：每"池/族"一个记号(= 上次尝试/驻留的 IP),顺序固定不重排。
     /// 成功 = 记号驻留该条;失败 = 记号前移一格;整圈转完全灭 → 冷却。
+    /// 双通道后每族两把钥匙:主键给第一通道,`~2` 给第二通道——互不覆盖,
+    /// 否则第二条的记账会把第一通道的最优 IP 记忆冲掉(2026-10-27 实证)。
     cursor: HashMap<String, String>,
+
 }
 
 /// 整圈全灭冷却（按 host 记账 30s）：复用 `Breaker`，不再手写第三份 Instant 表。
@@ -377,9 +384,12 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
 /// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
 /// 只动内存游标,不改 plans.json 顺序、零写盘(驻留变更的 settings 落盘由调用方触发)。
 /// passthrough 须与产生该结果的腿一致，否则游标记到对方圈外的 IP 上白记。
-pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough: bool) {
+pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough: bool, slot: u8) {
     let family = route::serial_family(pool_name, host, passthrough);
-    let key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
+    let mut key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
+    if slot > 1 {
+        key.push_str(&format!("~{slot}"));
+    }
     let mut g = lock(&SERIAL);
     let Some(t) = g.as_mut() else { return };
     let Some(ps) = t.pools.get(pool_name) else { return };
@@ -402,18 +412,43 @@ pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough:
     }
 }
 
+/// 一轮建连小组的共享认领表:同族并行任务的互斥圈(冷启动竞速用)。
+/// 认领后本轮不解除——对方试过/正在试/已建成的 IP 一律绕行;
+/// 组内最后一个任务结束(Arc 归零)整组消亡,无需手动清理。
+/// 失败后的长期避让仍由 dead 表(TCP)与游标前移(TLS)接管。
+pub struct DialCrew {
+    claimed: Mutex<HashSet<String>>,
+}
+impl DialCrew {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { claimed: Mutex::new(HashSet::new()) })
+    }
+    /// true = 认领成功;false = 对方已认领(试过/在试/建成),本任务绕行。
+    pub fn claim(&self, ip: &str) -> bool {
+        self.claimed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(ip.to_string())
+    }
+}
+
 /// 单串发(圈式):从记号处沿圈逐个试,失败沿圈前进,成功驻留记号;整圈全灭 → 冷却 30s。
 /// 记号持久化在 settings.last_ip(驻留变更时落盘);ctx 到期只掐当前那条;混合池只试对口条目。
-/// `skip_ip`：本次拨号跳过该 IP（补第二条连接时用，避免两条连接落在同一个边缘 IP 上）。
-/// 全表只有这一个候选时忽略 skip，保证还能拨出去。
+/// `skip_ips`：本次拨号硬排除的 IP(池中活连接已占用的地址)——起步与沿圈都绕开,
+/// 保证两条通道不落同一个边缘 IP(同 IP 双连实测会被边缘降权,一条长期不响应)。
+/// 全部候选都被排除时忽略 skip,保证还能拨出去。
+/// `slot`：游标钥匙。1 = 主键(`edge/content`),2 = 副键(`edge/content~2`)。
+/// 双通道各自记账——主通道的最优 IP 记忆不再被第二条的拨号覆盖。
 pub async fn serial_dial_skip(
     pool_name: &str,
     host: &str,
     ctx: CancellationToken,
     tls_handshake: bool,
     log: Option<&LogFn>,
-    skip_ip: Option<&str>,
+    skip_ips: &[String],
     passthrough: bool,
+    slot: u8,
+    crew: Option<&DialCrew>,
 ) -> Result<(dial::Dialed, String, String), String> {
     {
         let g = lock(&SERIAL);
@@ -444,8 +479,12 @@ pub async fn serial_dial_skip(
         .iter()
         .filter(|p| serves.map_or(true, |s| s(host, p)))
         .collect();
-    if let Some(skip) = skip_ip {
-        let filtered: Vec<&SerialPlan> = circle.iter().copied().filter(|p| p.ip != skip).collect();
+    if !skip_ips.is_empty() {
+        let filtered: Vec<&SerialPlan> = circle
+            .iter()
+            .copied()
+            .filter(|p| !skip_ips.iter().any(|s| s == &p.ip))
+            .collect();
         if !filtered.is_empty() {
             circle = filtered;
         }
@@ -453,7 +492,10 @@ pub async fn serial_dial_skip(
     if circle.is_empty() {
         return Err(format!("无对口 SNI 形态的候选({pool_name}, {host})"));
     }
-    let cursor_key = format!("{pool_name}/{family_name}");
+    let mut cursor_key = format!("{pool_name}/{family_name}");
+    if slot > 1 {
+        cursor_key.push_str(&format!("~{slot}"));
+    }
 
     // 起点 = 记号(上次驻留/尝试的 IP);找不到则从 0 号位起步。
     let start = {
@@ -486,6 +528,12 @@ pub async fn serial_dial_skip(
                     dead_skipped += 1;
                     continue;
                 }
+            }
+        }
+        // 同组建连任务的互斥认领:对方试过/正在试/已建成的 IP 一律绕行。
+        if let Some(crew) = crew {
+            if !crew.claim(&p.ip) {
+                continue;
             }
         }
         tried += 1;
@@ -1122,7 +1170,7 @@ mod tests {
         };
         assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
         let file_before = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-        cursor_note("core", "github.com", &target, true, false);
+        cursor_note("core", "github.com", &target, true, false, 1);
         // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
         assert_eq!(
             SERIAL.lock().unwrap().as_ref().unwrap().pools.get("core").unwrap()[0].ip,
@@ -1276,7 +1324,7 @@ mod tests {
         let next = base[1].ip.clone();
 
         // 失败:记号前移到圈中下一候选
-        cursor_note("core", "github.com", &head, false, false);
+        cursor_note("core", "github.com", &head, false, false, 1);
         {
             let g = SERIAL.lock().unwrap();
             assert_eq!(
@@ -1287,7 +1335,7 @@ mod tests {
         }
 
         // 成功:记号驻留;表序全程未变
-        cursor_note("core", "github.com", &next, true, false);
+        cursor_note("core", "github.com", &next, true, false, 1);
         {
             let g = SERIAL.lock().unwrap();
             assert_eq!(
@@ -1327,8 +1375,10 @@ mod tests {
             CancellationToken::new(),
             false,
             None,
-            None,
+            &[],
             false,
+            1,
+            None,
         )
         .await
         .expect("第二个候选能拨通");
@@ -1355,8 +1405,10 @@ mod tests {
             CancellationToken::new(),
             false,
             None,
-            None,
+            &[],
             false,
+            1,
+            None,
         )
         .await
         .expect("驻留后应直接命中");

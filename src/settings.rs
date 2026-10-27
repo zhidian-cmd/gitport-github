@@ -615,16 +615,27 @@ mod tests {
             v.last_ip.marks().to_vec(),
             vec![
                 ("core/all".to_string(), "20.27.177.114".to_string()),
+                ("core/all~2".to_string(), String::new()),
                 ("api/all".to_string(), "140.82.114.6".to_string()),
-                // 白名单四族（edge 族表最前），旧配置没有这些键，读入补空串
+                ("api/all~2".to_string(), String::new()),
+                // 白名单四族（edge 族表最前），旧配置没有这些键，读入补空串。
+                // 每族两把钥匙:主键给第一通道,~2 给第二通道,恒相邻。
                 ("edge/wl154".to_string(), String::new()),
+                ("edge/wl154~2".to_string(), String::new()),
                 ("edge/wl153".to_string(), String::new()),
+                ("edge/wl153~2".to_string(), String::new()),
                 ("edge/wl133".to_string(), String::new()),
+                ("edge/wl133~2".to_string(), String::new()),
                 ("edge/wl_azure".to_string(), String::new()),
+                ("edge/wl_azure~2".to_string(), String::new()),
                 ("edge/content".to_string(), "185.199.110.133".to_string()),
+                ("edge/content~2".to_string(), String::new()),
                 ("edge/assets".to_string(), "185.199.108.154".to_string()),
+                ("edge/assets~2".to_string(), String::new()),
                 ("edge/io".to_string(), String::new()),
+                ("edge/io~2".to_string(), String::new()),
                 ("edge/auth".to_string(), String::new()),
+                ("edge/auth~2".to_string(), String::new()),
             ],
             "对象形态必须归一到规范键序，缺位补空串"
         );
@@ -637,22 +648,32 @@ mod tests {
             keys(arr.last_ip.marks()),
             [
                 "core/all",
+                "core/all~2",
                 "api/all",
+                "api/all~2",
                 "edge/wl154",
+                "edge/wl154~2",
                 "edge/wl153",
+                "edge/wl153~2",
                 "edge/wl133",
+                "edge/wl133~2",
                 "edge/wl_azure",
+                "edge/wl_azure~2",
                 "edge/content",
+                "edge/content~2",
                 "edge/assets",
+                "edge/assets~2",
                 "edge/io",
-                "edge/auth"
+                "edge/io~2",
+                "edge/auth",
+                "edge/auth~2"
             ]
         );
-        assert_eq!(arr.last_ip.marks()[8].1, "1.2.3.4");
+        assert_eq!(arr.last_ip.marks()[16].1, "1.2.3.4");
 
         let none = parse(r#"{"mitm":true}"#);
         assert!(none.mitm);
-        assert_eq!(none.last_ip.marks().len(), 10, "整段缺失也要铺满键位");
+        assert_eq!(none.last_ip.marks().len(), 20, "整段缺失也要铺满键位");
         assert!(none.last_ip.marks().iter().all(|(_, v)| v.is_empty()));
     }
 
@@ -676,15 +697,25 @@ mod tests {
         let json = serde_json::to_string_pretty(&f).unwrap();
         let expect = r#"  "lastIp": {
     "core/all": "",
+    "core/all~2": "",
     "api/all": "140.82.114.6",
+    "api/all~2": "",
     "edge/wl154": "",
+    "edge/wl154~2": "",
     "edge/wl153": "",
+    "edge/wl153~2": "",
     "edge/wl133": "",
+    "edge/wl133~2": "",
     "edge/wl_azure": "",
+    "edge/wl_azure~2": "",
     "edge/content": "",
+    "edge/content~2": "",
     "edge/assets": "",
+    "edge/assets~2": "",
     "edge/io": "",
-    "edge/auth": ""
+    "edge/io~2": "",
+    "edge/auth": "",
+    "edge/auth~2": ""
   }"#;
         assert!(json.contains(expect), "落盘 schema 漂移:\n{json}");
         // 落盘 → 再读必须回同值（写读闭环）
@@ -701,7 +732,7 @@ mod tests {
         );
         assert!(v.close_to_tray && v.mitm, "一个字段笔误不得连坐整份配置");
         assert_eq!(v.win_rect, [0; 4]);
-        assert_eq!(v.last_ip.marks()[1], ("api/all".to_string(), "1.1.1.1".to_string()));
+        assert_eq!(v.last_ip.marks()[2], ("api/all".to_string(), "1.1.1.1".to_string()));
         // 非 JSON 垃圾才整体回默认
         assert_eq!(parse("not json").close_to_tray, false);
     }

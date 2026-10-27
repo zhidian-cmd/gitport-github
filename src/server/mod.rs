@@ -158,9 +158,9 @@ impl ProxyServer {
         let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
             match (sent, recv) {
-                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true, true),
+                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true, true, 1),
                 (s, r) if s > 0 && r == 0 => {
-                    pool::cursor_note(name, &host, &ip, false, true);
+                    pool::cursor_note(name, &host, &ip, false, true, 1);
                     (self.log)(&format!("[串发] {host} 客户端已握手但零回包, 垫底换下一个"));
                 }
                 _ => {}
@@ -245,7 +245,7 @@ impl ProxyServer {
         };
         let name = config::pool_for(&host);
         if !name.is_empty() && ip != "system-dns" {
-            pool::cursor_note(name, &host, &ip, recv > 0, true);
+            pool::cursor_note(name, &host, &ip, recv > 0, true, 1);
         }
     }
 }
@@ -349,8 +349,10 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
             CancellationToken::new(),
             false,
             None,
-            None,
+            &[],
             true,
+            1,
+            None,
         )
         .await?;
         return Ok((conn, ip));

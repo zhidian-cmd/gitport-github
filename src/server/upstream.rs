@@ -32,6 +32,9 @@ pub struct H2Upstream {
     pub ip: String,
     /// 进程内唯一：同一 IP 的两条连接也要能精确区分，否则 keepalive 会删错。
     pub id: u64,
+    /// 游标槽位:1 = 主通道(主键游标),2 = 第二通道(`~2` 游标)。
+    /// 数据到手后的置顶/垫底记账跟着连接走,保证各记各的钥匙、互不覆盖。
+    pub slot: u8,
     send: SendRequest<Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
@@ -207,6 +210,7 @@ pub fn drop_h2(host: &str, ip: &str) {
 }
 
 /// 首条连接建好后，后台补第二条（只对高频 host，失败不影响当前请求）。
+/// skip 池中所有活连接占用的 IP;游标用副键(~2),与主通道各记各的。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     if !DUAL_CONN_HOSTS.contains(&host) {
         return;
@@ -219,14 +223,12 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         }
         h.filling = true;
     }
-    let skip = pool::lock(conn_pool())
-        .get(host)
-        .and_then(|h| h.conns.first().map(|c| c.up.ip.clone()));
+    let skip = occupied_ips(host);
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
         let name = crate::config::pool_for(&host);
-        match dial_h2_skip(name, &host, CancellationToken::new(), &log, skip.as_deref()).await {
+        match h2_dial_slot(&name, &host, &log, &skip, 2, None).await {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
@@ -242,6 +244,7 @@ pub async fn h2_from_dialed(
     conn_io: Dialed,
     ip: &str,
     form: &str,
+    slot: u8,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
     // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s），放大为流 1MB/连接 4MB。
@@ -269,25 +272,43 @@ pub async fn h2_from_dialed(
     Ok(H2Upstream {
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        slot,
         send,
         ping,
     })
 }
-/// 同 host 补第二条时传 `skip_ip`：两条连接落在同一 IP 上容易被边缘降权（实测一条会
-/// 长时间不响应，落到它上面的请求白等满 8s 预算）。
-pub async fn dial_h2_skip(
+/// 池中该 host 活连接占用的 IP(供拨号 skip:两条通道不落同一地址)。
+fn occupied_ips(host: &str) -> Vec<String> {
+    pool::lock(conn_pool())
+        .get(host)
+        .map(|h| h.conns.iter().map(|c| c.up.ip.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// 单通道拨号:串发选 IP(slot 游标钥匙) → boring 握手 → h2。
+/// 白名单域名走 edge 池,但握手由 dial_one 强制真名 + 分片,条目自带的 sni 不生效,
+/// 日志按实际形态标注,别被 plans.json 里的 "baidu.com" 骗了。
+async fn h2_dial_slot(
     pool_name: &str,
     host: &str,
-    ctx: CancellationToken,
     log: &LogFn,
-    skip_ip: Option<&str>,
+    skip_ips: &[String],
+    slot: u8,
+    crew: Option<&pool::DialCrew>,
 ) -> Result<H2Upstream, String> {
-    let (conn_io, ip, shape) =
-        pool::serial_dial_skip(pool_name, host, ctx, true, Some(log), skip_ip, false)
-            .await
-            .map_err(|e| e.to_string())?;
-    // 白名单域名走 edge 池，但握手由 dial_one 强制真名 + 分片，条目自带的 sni 不生效，
-    // 日志按实际形态标注，别被 plans.json 里的 "baidu.com" 骗了。
+    let (conn_io, ip, shape) = pool::serial_dial_skip(
+        pool_name,
+        host,
+        CancellationToken::new(),
+        true,
+        Some(log),
+        skip_ips,
+        false,
+        slot,
+        crew,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let form = if crate::config::is_whitelist(host) {
         "真名(分片)"
     } else if shape.is_empty() {
@@ -297,7 +318,71 @@ pub async fn dial_h2_skip(
     } else {
         "伪装"
     };
-    h2_from_dialed(host, conn_io, &ip, form, log).await
+    h2_from_dialed(host, conn_io, &ip, form, slot, log).await
+}
+
+/// 双通道高频站冷启动:两个任务并行竞速建连。
+/// - 各领各的游标钥匙(主键 / ~2 副键),成功各记各的,主通道的最优记忆不再被覆盖
+/// - SERIAL 表内 in-flight 认领:对方正在试的 IP 自动跳过,两个任务不重复劳动
+/// - 先成者立即服务请求;晚成者建完直接入库上岗——拿拨号锁醒来的排队请求
+///   会在循环顶部 cached_h2 复用到它,这就是"把排队的塞进自己这里"
+/// - 两个全败 = 现有全灭语义(冷却 30s)
+async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+    let crew = pool::DialCrew::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
+    (log)(&format!("[建连] {host} 冷启动竞速: 双任务发射, 同组认领互避"));
+    for slot in [1u8, 2] {
+        let tx = tx.clone();
+        let name = pool_name.to_string();
+        let host = host.to_string();
+        let log = log.clone();
+        let crew = crew.clone();
+        tokio::spawn(async move {
+            match h2_dial_slot(&name, &host, &log, &[], slot, Some(&crew)).await {
+                Ok(up) => {
+                    (log)(&format!(
+                        "[上游] {host} 并行通道{slot} 建成({}), 入池上岗",
+                        up.ip
+                    ));
+                    store_h2(&host, up.clone());
+                    let _ = tx.send(Ok(up)).await;
+                }
+                Err(e) => {
+                    (log)(&format!("[建连] {host} 通道{slot} 失败: {e}"));
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut last: Option<String> = None;
+    while let Some(r) = rx.recv().await {
+        match r {
+            Ok(up) => return Ok(up),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| "并行建连全败".into()))
+}
+
+/// 上游建连统一入口:双通道高频站池空走并行竞速,其余单发。
+/// 单发也 skip 池中活连接占用的 IP——修掉旧版"主连接断掉重拨时游标已被
+/// 第二条记账、又不 skip"导致两条通道撞同一 IP 的暗坑。
+pub async fn dial_upstream(
+    pool_name: &str,
+    host: &str,
+    log: &LogFn,
+) -> Result<(H2Upstream, bool), String> {
+    let dual = DUAL_CONN_HOSTS.contains(&host);
+    if dual && occupied_ips(host).is_empty() {
+        (log)(&format!("[建连] {host} 走冷启动竞速"));
+        let up = dial_h2_race(pool_name, host, log).await?;
+        return Ok((up, false)); // 竞速任务内部已入库
+    }
+    let skip = occupied_ips(host);
+    let up = h2_dial_slot(pool_name, host, log, &skip, 1, None).await?;
+    let _ = dual;
+    Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;

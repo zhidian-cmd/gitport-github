@@ -113,7 +113,7 @@ pub(super) async fn gh_defuse(
             };
             continue;
         }
-        pool::cursor_note(name, host, &ip, false, false); // 数据层失败: 记号前移, 重试自动跳过该 IP
+        pool::cursor_note(name, host, &ip, false, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
                                                // 风控页 = 该 IP 的连接不可信(HTTP 层成功所以连接活着) —— 必须同步
                                                // 清复用槽, 否则下一个请求缓存命中又拿到坏连接: 垫底→重拨→再命中→
                                                // 再垫底乒乓死循环(2026-10-15 实锤: 单 IP 重试计数刷到 129, 每个请求

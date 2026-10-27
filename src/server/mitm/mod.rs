@@ -10,7 +10,6 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 
 mod defuse;
 mod mirror;
@@ -319,8 +318,8 @@ async fn stream_passthrough(
                 }
             }
         }
-        match upstream::dial_h2_skip(name, host, CancellationToken::new(), log, None).await {
-            Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
+        match upstream::dial_upstream(name, host, log).await {
+            Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
                     upstream::drop_h2_id(host, up.id);
@@ -344,7 +343,7 @@ async fn stream_passthrough(
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false);
+                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
                 upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             }
             (log)(&format!(
@@ -440,7 +439,7 @@ async fn try_cached(
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false);
+                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
             }
             upstream::note_latency(host, up.id, ms);
             if is_content {
@@ -505,33 +504,41 @@ pub(super) async fn get_direct(
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        let up = match upstream::dial_h2_skip(name, host, CancellationToken::new(), log, None).await
-        {
-            Ok(up) => up,
-            Err(e) => {
-                (log)(&format!(
-                    "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
-                    attempt + 1
-                ));
-                if !is_simple {
-                    return Err(format!("POST 等非简单方法不重发({e})"));
+        // 拿到拨号锁后再看一眼池子:等锁期间冷启动竞速的第二个任务可能已经
+        // 建成入库——排队者直接复用它,这就是"晚成者把排队的塞进自己这里"。
+        // fresh = 连接尚不在池中,发送成功后由这里入库;复用/竞速入库的不再重存。
+        let (up, fresh) = match upstream::cached_h2(host) {
+            Some(up) => (up, false),
+            None => match upstream::dial_upstream(name, host, log).await {
+                Ok((up, fresh)) => (up, fresh),
+                Err(e) => {
+                    (log)(&format!(
+                        "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
+                        attempt + 1
+                    ));
+                    if !is_simple {
+                        return Err(format!("POST 等非简单方法不重发({e})"));
+                    }
+                    if is_content {
+                        pool::CONTENT_BREAKER.set(host);
+                        return Err(format!("内容域直连全灭({e})"));
+                    }
+                    continue;
                 }
-                if is_content {
-                    pool::CONTENT_BREAKER.set(host);
-                    return Err(format!("内容域直连全灭({e})"));
-                }
-                continue;
-            }
+            },
         };
         let e = match send_once(&up, out, body, request_budget(is_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;
+                let up_slot = up.slot;
                 let up_ip = up.ip.clone();
                 *info.lock().unwrap() = up_ip.clone();
                 if !name.is_empty() {
-                    pool::cursor_note(name, host, &up_ip, true, false); // 数据到手 = 真成功, 置顶
+                    pool::cursor_note(name, host, &up_ip, true, false, up_slot); // 数据到手 = 真成功, 置顶
                 }
-                upstream::store_h2(host, up);
+                if fresh {
+                    upstream::store_h2(host, up);
+                }
                 upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
                 upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
                 if is_content {
@@ -545,7 +552,7 @@ pub(super) async fn get_direct(
         // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
         // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
         if !name.is_empty() && is_simple && !is_content {
-            pool::cursor_note(name, host, &up.ip, false, false);
+            pool::cursor_note(name, host, &up.ip, false, false, up.slot);
         }
         upstream::drop_h2_id(host, up.id);
         (log)(&format!(
@@ -659,7 +666,7 @@ async fn dns_direct_fetch(
                 continue;
             }
         };
-        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", log).await {
+        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await {
             Ok(u) => u,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
