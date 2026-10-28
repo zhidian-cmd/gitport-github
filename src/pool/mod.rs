@@ -57,7 +57,6 @@ pub fn circle_keys() -> Vec<String> {
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[
-    "github.com",
     "raw.githubusercontent.com",
     "gist.githubusercontent.com",
     "avatars.githubusercontent.com",
@@ -71,10 +70,7 @@ pub const CONTENT_HOSTS: &[&str] = &[
 /// 种子快照 = plans.json 全量拷贝（池 + 镜像链），由现役表生成，勿手改。
 /// 全新安装引导直接走它（镜像链随快照）；补缺只用 pools 段。
 fn seed_db() -> PlansFile {
-    serde_json::from_str(SEEDS_JSON).unwrap_or_else(|_| PlansFile {
-        pools: HashMap::new(),
-        mirrors: HashMap::new(),
-    })
+    serde_json::from_str(SEEDS_JSON).unwrap_or_default()
 }
 
 const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
@@ -100,12 +96,34 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-#[derive(serde::Deserialize, Clone)]
+/// 镜像链双字典：大文件链与图片(小文件)链分治——两类资源体质不同
+/// (大文件拼持续吞吐, 小文件拼头延迟), 校准与手改各管各的。
+/// 旧版单字典 `mirrors` 仅作升级兼容读：加载时按 host 归类并入，落盘不再写出。
+/// 分类权在 host(静态映射 is_big_file_host)：条目放错字典也会被归位。
+#[derive(serde::Deserialize, Clone, Default)]
 struct PlansFile {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    mirrors_big: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    mirrors_small: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     mirrors: HashMap<String, Vec<String>>,
     #[serde(flatten)]
     pools: HashMap<String, Vec<SerialPlan>>,
+}
+
+impl PlansFile {
+    /// 三段镜像链合并为运行时单表(host → 链)；旧键不覆盖新键已声明的 host。
+    fn merged_chains(&self) -> HashMap<String, Vec<String>> {
+        let mut out = self.mirrors_big.clone();
+        for (h, c) in &self.mirrors_small {
+            out.insert(h.clone(), c.clone());
+        }
+        for (h, c) in &self.mirrors {
+            out.entry(h.clone()).or_insert_with(|| c.clone());
+        }
+        out
+    }
 }
 
 /// 容错解析 plans.json：整表解析失败时按顶层键逐个来，单池/单链写坏只丢那一段
@@ -118,22 +136,29 @@ fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bo
     // 快路失败：连合法 JSON 对象都不是 → 真没救
     let root: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = root.as_object()?;
-    let mut mirrors: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pf = PlansFile::default();
     let mut pools: HashMap<String, Vec<SerialPlan>> = HashMap::new();
     let mut salvaged = false;
     for (k, v) in obj {
-        if k == "mirrors" {
+        if k == "mirrors" || k == "mirrors_big" || k == "mirrors_small" {
             let Some(m) = v.as_object() else {
                 salvaged = true;
                 if let Some(l) = log {
-                    l("[串发] plans.json mirrors 段不是对象, 该段丢弃(镜像链按注册表重建)");
+                    l(&format!(
+                        "[串发] plans.json {k} 段不是对象, 该段丢弃(镜像链按注册表重建)"
+                    ));
                 }
                 continue;
+            };
+            let slot = match k.as_str() {
+                "mirrors_big" => &mut pf.mirrors_big,
+                "mirrors_small" => &mut pf.mirrors_small,
+                _ => &mut pf.mirrors,
             };
             for (host, chain) in m {
                 match serde_json::from_value::<Vec<String>>(chain.clone()) {
                     Ok(c) => {
-                        mirrors.insert(host.clone(), c);
+                        slot.insert(host.clone(), c);
                     }
                     Err(e) => {
                         salvaged = true;
@@ -159,7 +184,8 @@ fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bo
             }
         }
     }
-    Some((PlansFile { mirrors, pools }, salvaged))
+    pf.pools = pools;
+    Some((pf, salvaged))
 }
 
 pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
@@ -194,16 +220,27 @@ fn encode_plans(
             }
         })
         .collect();
-    let chains: Vec<String> = CONTENT_HOSTS
-        .iter()
-        .filter_map(|h| mirrors.get(*h).map(|c| (h, c)))
-        .map(|(host, chain)| {
-            let items: Vec<String> = chain.iter().map(json_of).collect();
-            format!("    {}: [{}]", json_of(host), items.join(", "))
-        })
-        .collect();
-    if !chains.is_empty() {
-        blocks.push(format!("  \"mirrors\": {{\n{}\n  }}", chains.join(",\n")));
+    // 镜像链双字典落盘：按 host 静态归类(大文件/小文件)，顺序恒 CONTENT_HOSTS 序便于 diff。
+    let mut big_rows: Vec<String> = Vec::new();
+    let mut small_rows: Vec<String> = Vec::new();
+    for h in CONTENT_HOSTS {
+        let Some(c) = mirrors.get(*h) else { continue };
+        let items: Vec<String> = c.iter().map(json_of).collect();
+        let row = format!("    {}: [{}]", json_of(h), items.join(", "));
+        if route::is_big_file_host(h) {
+            big_rows.push(row);
+        } else {
+            small_rows.push(row);
+        }
+    }
+    if !big_rows.is_empty() {
+        blocks.push(format!("  \"mirrors_big\": {{\n{}\n  }}", big_rows.join(",\n")));
+    }
+    if !small_rows.is_empty() {
+        blocks.push(format!(
+            "  \"mirrors_small\": {{\n{}\n  }}",
+            small_rows.join(",\n")
+        ));
     }
     format!("{{\n{}\n}}\n", blocks.join(",\n"))
 }
@@ -256,8 +293,8 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let loaded: PlansFile = parsed
         .map(|(pf, _)| pf)
         .unwrap_or_else(|| seeds.clone());
+    let loaded_chains = loaded.merged_chains();
     let plans_map = loaded.pools;
-    let loaded_chains = loaded.mirrors;
 
     let mut tab = SerialTab {
         pools: HashMap::new(),
@@ -1178,17 +1215,17 @@ mod tests {
                 panic!("条目被展开成多行: {line:?}");
             }
         }
-        assert!(b.contains("\"mirrors\""), "镜像链板块应落盘: {b}");
+        assert!(b.contains("\"mirrors_small\""), "镜像链板块应落盘: {b}");
         assert!(b.contains("raw.githubusercontent.com"));
         let back_file: PlansFile = serde_json::from_str(&b).unwrap();
         assert_eq!(
             back_file
-                .mirrors
+                .mirrors_small
                 .get("raw.githubusercontent.com")
                 .map(|c| c.len()),
             Some(2),
-            "镜像链应可读回: {:?}",
-            back_file.mirrors
+            "镜像链应可读回(小文件域落 mirrors_small): {:?}",
+            back_file.mirrors_small
         );
         let back: HashMap<String, Vec<SerialPlan>> = back_file.pools;
         assert_eq!(back["core"].len(), 2);
@@ -1336,7 +1373,7 @@ mod tests {
         );
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
-        assert!(b.contains("\"mirrors\""), "镜像链应落盘");
+        assert!(b.contains("\"mirrors_small\""), "镜像链应落盘(raw 为小文件域): {b}");
         let mut new_chain = raw_chain.clone();
         new_chain.reverse();
         assert!(

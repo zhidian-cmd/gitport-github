@@ -237,5 +237,6 @@
       "sni": "baidu.com"
     }
   ],
-  "mirrors": {}
+  "mirrors_big": {},
+  "mirrors_small": {}
 }
