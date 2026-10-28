@@ -235,27 +235,28 @@ $('mirrorRows').addEventListener('input', e => {
   }
 });
 
-/* ---------- 镜像链校准 ---------- */
-// 半自动: 点击 -> 后端按内置模板对每条镜像链串行实测 TTFB -> 按成绩重排
-// 各资源链序并写盘 -> 返回人读报告。全程约 30~90s, 期间按钮禁用。
-async function runCal(mode, btn, label) {
+/* ---------- 图片链校准 ---------- */
+// 半自动: 点击 -> 后端按内置模板对图片(小文件)链逐镜像串行实测 TTFB -> 按成绩重排
+// 链序并写盘 -> 返回人读报告。全程约 30~90s, 期间按钮禁用。
+// 大文件链不校准: 其速度学习由代理的实时流量调度(ECT)自动完成, 无需手动。
+async function runCal(btn) {
   const box = $('calResult');
   btn.disabled = true;
   box.style.display = 'block';
   try {
-    const r = await fetch('/api/calibrate?mode=' + mode, {method: 'POST', headers: {'Content-Type': 'application/json','X-GitPort-Request':'1'}, body: '{}'});
+    const r = await fetch('/api/calibrate', {method: 'POST', headers: {'Content-Type': 'application/json','X-GitPort-Request':'1'}, body: '{}'});
     const text = await r.text();
     box.textContent = text;
-    toast(label + '校准已在后台开始');
+    toast('图片链校准已在后台开始');
     refreshLogs();
     // 后台任务完成前轮询状态；完成后把排序结果（各镜像实测值）回显出来
     const timer = setInterval(async () => {
       try {
         const st = await (await fetch('/api/calibrate')).json();
-        if (st.running) { box.textContent = label + '校准中…（进度见「运行日志」页）'; return; }
+        if (st.running) { box.textContent = '图片链校准中…（进度见「运行日志」页）'; return; }
         clearInterval(timer);
-        box.textContent = st.report || label + '校准完成（无可校准的链）';
-        toast(label + '校准完成');
+        box.textContent = st.report || '图片链校准完成（无可校准的链）';
+        toast('图片链校准完成');
         refreshLogs();
       } catch (e) { /* 网络抖动继续轮询 */ }
     }, 1500);
@@ -264,8 +265,7 @@ async function runCal(mode, btn, label) {
   }
   btn.disabled = false; // 校准已后台化，按钮立即恢复（防重入在服务端）
 }
-$('calBigBtn').onclick = () => runCal('throughput', $('calBigBtn'), '大文件链');
-$('calImgBtn').onclick = () => runCal('ttfb', $('calImgBtn'), '图片链');
+$('calImgBtn').onclick = () => runCal($('calImgBtn'));
 
 /* ---------- 启动 ---------- */
 route(); refreshStatus(); refreshLogs(); refreshSettings();

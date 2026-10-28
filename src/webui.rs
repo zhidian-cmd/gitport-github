@@ -298,10 +298,7 @@ impl Drop for CalibDone {
     }
 }
 
-async fn api_calibrate(
-    State(st): State<Arc<App>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Response {
+async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
     let logs = st.logs.clone();
     let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
     if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -314,19 +311,11 @@ async fn api_calibrate(
         )
             .into_response();
     }
-    let mode = match q.get("mode").map(|s| s.as_str()) {
-        Some("ttfb") => crate::server::mitm::CalibMode::Ttfb,
-        _ => crate::server::mitm::CalibMode::Throughput,
-    };
-    let mode_name = match mode {
-        crate::server::mitm::CalibMode::Throughput => "大文件链(下载测速)",
-        crate::server::mitm::CalibMode::Ttfb => "图片链(响应头测速)",
-    };
     tokio::spawn(async move {
         // 护栏：任务 panic / 提前返回也要把"进行中"复位，否则按钮永久回"已在后台进行中"。
         let _done = CalibDone;
         crate::server::mitm::set_calibrate_report(None);
-        let report = crate::server::mitm::calibrate_chains(&log, mode).await;
+        let report = crate::server::mitm::calibrate_chains(&log).await;
         (log)(&format!("[校准] 完成\n{report}"));
         crate::server::mitm::set_calibrate_report(Some(report));
     });
@@ -335,10 +324,9 @@ async fn api_calibrate(
             ("content-type", "text/plain; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        format!(
-            "{mode_name}校准已在后台开始：进度与结果见「运行日志」页，完成后新链序自动保存。\
+        "图片链校准已在后台开始：进度与结果见「运行日志」页，完成后新链序自动保存。\
              关闭窗口进托盘不影响任务。"
-        ),
+            .to_string(),
     )
     .into_response()
 }

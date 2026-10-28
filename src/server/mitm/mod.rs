@@ -16,7 +16,7 @@ mod mirror;
 mod page_cache;
 mod redirect_memo;
 
-pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CalibMode, CALIB_RUNNING};
+pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CALIB_RUNNING};
 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
