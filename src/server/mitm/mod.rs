@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 mod defuse;
 mod mirror;
 mod page_cache;
+mod redirect_memo;
 
 pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CalibMode, CALIB_RUNNING};
 
@@ -132,6 +133,23 @@ async fn mitm_http(
     // 账号泄露（与 /login 排除同源的安全边界）。要看最新按 F5 直达上游。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
+    }
+    // 头像入口 302 记忆：github.com/<user>.png 是「302 + no-cache」入口，浏览器
+    // 每次渲染页面都要重问一遍跳转（一个来回 260-310ms × 十几个并行）。跳转目标
+    // 按用户稳定，记住后本地直答——浏览器行为不变，只是来回归零。fast path 无日志。
+    if req.method() == Method::GET {
+        if let Some(loc) =
+            redirect_memo::cached_location(&host, req.uri().path(), req.uri().query())
+        {
+            let _ = http_body_util::BodyExt::collect(req.into_body()).await;
+            let resp = hyper::Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", loc)
+                .header("cache-control", "no-cache")
+                .body(upstream::full_body(Bytes::new()))
+                .unwrap();
+            return write_upstream(resp, "302memo", &info);
+        }
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
         return mitm_unavailable(&req, &host);
@@ -452,6 +470,8 @@ async fn try_cached(
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
             }
+            // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
+            redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
             (log)(&format!("[上游] {host}{path} 复用连接#{}, {ms}ms", up.id));
             Some(Ok(resp))
         }
@@ -552,6 +572,8 @@ pub(super) async fn get_direct(
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }
+                // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
+                redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
                 (log)(&format!("[上游] {host}{path} 新连接 {up_ip}, {ms}ms"));
                 return Ok(resp);
             }
