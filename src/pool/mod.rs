@@ -1,7 +1,4 @@
-//! 串发拨号：plans.json 唯一权威。ok 置顶 / 失败垫底，同 IP 重复置顶 no-op 不写盘。
-//! SNI 形态文件权威（sni 必填，非法剥除），SNI 与校验名解耦；全灭冷却 30s。
-//! 仅顺序真变更才写盘（2s 原子写回）；edge 混合池按 host 族对口选择（见 route.rs）。
-
+//! 串发拨号：plans.json 唯一权威。成功驻留游标、失败前移；SNI 文件权威、与校验名解耦。
 pub mod dial;
 pub mod route;
 
@@ -14,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 全仓统一的毫秒历元时钟（upstream 保活 / page_cache TTL 共用）。
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -22,8 +18,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 锁中毒自愈：一次 panic 不该变成此后每次拨号都 panic（那等于代理永久死亡）。
-/// 这些表只有"内容"语义、没有半写坏的中间态，取出内层值继续用是安全的。
+/// 锁中毒自愈：表只有内容语义，无半写坏中间态，取内层值继续。
 pub(crate) fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -37,9 +32,7 @@ pub struct SerialPlan {
 
 pub const SERIAL_POOLS: &[&str] = &["core", "api", "edge"];
 
-/// 全部游标圈的规范键序(core/api/edge 各族):settings.last_ip 按此序展示。
-/// 每族两把钥匙:主键 = 第一通道,`~2` = 第二通道(双通道记忆分离,见 serial_dial_skip)。
-/// 两键恒相邻、恒全量,副键未被双通道族用到时保持空串。
+/// 游标圈规范键序；每族两把钥匙(主键/`~2` 副键)恒相邻，双通道各记各的。
 pub fn circle_keys() -> Vec<String> {
     let mut out = Vec::new();
     for pool in SERIAL_POOLS {
@@ -67,39 +60,30 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 种子快照 = plans.json 全量拷贝（池 + 镜像链），由现役表生成，勿手改。
-/// 全新安装引导直接走它（镜像链随快照）；补缺只用 pools 段。
+/// 种子快照：全新安装引导 + 池补缺。
 fn seed_db() -> PlansFile {
     serde_json::from_str(SEEDS_JSON).unwrap_or_default()
 }
 
-const SERIAL_MAX_PLANS: usize = 512; // 防表无限膨胀
+const SERIAL_MAX_PLANS: usize = 512;
 
 struct SerialTab {
     pools: HashMap<String, Vec<SerialPlan>>,
-    /// per-IP 死亡冷却：TCP 层失败 = IP 对谁都不通，直接跳过。
-    /// 指数退避 60s → 5min → 30min 封顶；成功拨号清除。
+    /// TCP 层死亡退避 60s→5min→30min，成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
     mirrors: HashMap<String, Vec<String>>,
-    /// 游标：每"池/族"一个记号(= 上次尝试/驻留的 IP),顺序固定不重排。
-    /// 成功 = 记号驻留该条;失败 = 记号前移一格;整圈转完全灭 → 冷却。
-    /// 双通道后每族两把钥匙:主键给第一通道,`~2` 给第二通道——互不覆盖,
-    /// 否则第二条的记账会把第一通道的最优 IP 记忆冲掉(2026-10-27 实证)。
+    /// 每"池/族[/通道]"一个游标记号；表序冻结，不随游标重排。
     cursor: HashMap<String, String>,
-
 }
 
-/// 整圈全灭冷却（按 host 记账 30s）：复用 `Breaker`，不再手写第三份 Instant 表。
 static SERIAL_COOL: Breaker = Breaker::new(30);
 
 static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 镜像链双字典：大文件链与图片(小文件)链分治——两类资源体质不同
-/// (大文件拼持续吞吐, 小文件拼头延迟), 校准与手改各管各的。
-/// 旧版单字典 `mirrors` 仅作升级兼容读：加载时按 host 归类并入，落盘不再写出。
-/// 分类权在 host(静态映射 is_big_file_host)：条目放错字典也会被归位。
+/// 镜像链双字典(大文件/小文件分治)；旧单字典 `mirrors` 仅兼容读。
+/// 分类权在 host(is_big_file_host)，条目放错字典也会被归位。
 #[derive(serde::Deserialize, Clone, Default)]
 struct PlansFile {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -113,7 +97,7 @@ struct PlansFile {
 }
 
 impl PlansFile {
-    /// 三段镜像链合并为运行时单表(host → 链)；旧键不覆盖新键已声明的 host。
+    /// 合并为运行时单表；旧键不覆盖新键已声明的 host。
     fn merged_chains(&self) -> HashMap<String, Vec<String>> {
         let mut out = self.mirrors_big.clone();
         for (h, c) in &self.mirrors_small {
@@ -126,9 +110,7 @@ impl PlansFile {
     }
 }
 
-/// 容错解析 plans.json：整表解析失败时按顶层键逐个来，单池/单链写坏只丢那一段
-/// （该池按种子补缺），其余原样保留。None = 整份没救；salvaged = 有段落坏被丢弃
-/// （调用方据此备份原文件）。
+/// 容错解析：坏段只丢那一段；salvaged = 有段被丢弃，调用方备份原文件。
 fn parse_plans_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(PlansFile, bool)> {
     if let Ok(pf) = serde_json::from_str::<PlansFile>(raw) {
         return Some((pf, false));
@@ -200,8 +182,7 @@ pub fn plans_snapshot() -> HashMap<String, Vec<SerialPlan>> {
     out
 }
 
-/// 落盘形态：条目恒单行（每个 plan 交给 serde 序列化，控制字符转义由它保证）；
-/// 池按 SERIAL_POOLS 序、镜像链按 CONTENT_HOSTS 序，便于人眼 diff。
+/// 落盘：条目单行；池按 SERIAL_POOLS 序、链按 CONTENT_HOSTS 序。
 fn encode_plans(
     tab: &HashMap<String, Vec<SerialPlan>>,
     mirrors: &HashMap<String, Vec<String>>,
@@ -220,7 +201,7 @@ fn encode_plans(
             }
         })
         .collect();
-    // 镜像链双字典落盘：按 host 静态归类(大文件/小文件)，顺序恒 CONTENT_HOSTS 序便于 diff。
+    // 镜像链双字典：按 host 归类。
     let mut big_rows: Vec<String> = Vec::new();
     let mut small_rows: Vec<String> = Vec::new();
     for h in CONTENT_HOSTS {
@@ -274,8 +255,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let parsed = raw
         .as_deref()
         .and_then(|b| parse_plans_tolerant(b, log.as_ref()));
-    // 整份读不了（非 JSON 垃圾）或有段落坏被丢弃：都先备份原文件再按种子重建——
-    // 收尾的补缺重写不备份用户手排表就真没了（可从 .bak 捡回）。
+    // 有段落坏/整份读不了：先备份原文件再重建，用户手排表可从 .bak 捡回。
     let bak_why = match (&raw, &parsed) {
         (Some(_), None) => Some("解析失败, 本次按种子重建"),
         (Some(_), Some((_, true))) => Some("有段落坏已按种子重建"),
@@ -288,7 +268,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             }
         }
     }
-    // plans.json 缺失（全新安装）时按种子快照引导：池由补缺填充，镜像链随快照。
+    // plans.json 缺失：按种子快照引导。
     let seeds = seed_db();
     let loaded: PlansFile = parsed
         .map(|(pf, _)| pf)
@@ -302,7 +282,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         mirrors: HashMap::new(),
         cursor: HashMap::new(),
     };
-    // 全部圈预写空记号(固定键序,值空 = 未驻留);settings.last_ip 的非空记号覆盖其上。
+    // 游标圈预写空记号；settings.last_ip 非空值覆盖。
     for key in circle_keys() {
         tab.cursor.insert(key, String::new());
     }
@@ -318,7 +298,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             if p.ip.parse::<std::net::IpAddr>().is_err() {
                 continue;
             }
-            // sni 原样透传进握手：空串 = 无 SNI 扩展；唯一门槛是字符白名单(防注入)，非法字符该条剥除。
+            // sni 原样透传；空串 = 无 SNI 扩展，字符白名单防注入。
             let bare = p.sni.trim();
             if !bare.is_empty()
                 && !bare
@@ -365,7 +345,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     }
     for (host, chain) in loaded_chains {
         if !CONTENT_HOSTS.contains(&host.as_str()) {
-            // 手写进 plans.json 的未知 host 会被丢掉：留一行日志，别让配置"自己没了"
             if let Some(l) = log.as_ref() {
                 l(&format!(
                     "[串发] plans.json 镜像链 {host} 不在支持列表, 已丢弃(其余链保留)"
@@ -373,7 +352,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             }
             continue;
         }
-        // 镜像链数据权威：不设白名单，自部署镜像照样可用；坏镜像运行期自然失败沉底。
+        // 数据权威：不设白名单，自部署镜像可用；坏镜像运行期自然沉底。
         let vc: Vec<String> = chain
             .into_iter()
             .filter(|m| m.starts_with("https://") && !m.contains(' '))
@@ -382,14 +361,12 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.mirrors.insert(host, vc);
         }
     }
-    // 自定义镜像收编（在表装入全局之前）：链中存在非内置镜像的条目 → 自动进注册表（幂等）。
-    // 手改 plans.json 塞进来的自建节点重启不丢，列表里可见、可停用。
+    // 非内置镜像收编进注册表(幂等)：手改塞进来的自建节点重启不丢。
     {
         let builtin = builtin_mirror_urls();
         let mut registry = crate::settings::worker_mirrors();
         let mut adopted = false;
-        // 按 host 字典序遍历（HashMap 本序随机）——仅为确定性；收编顺序无关紧要，
-        // 启动时追加链尾、校准会重排
+        // host 排序仅为确定性。
         let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
         hosts.sort();
         for h in hosts {
@@ -418,9 +395,8 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     write_plans_file(&path, &snap, &chains);
 }
 
-/// 数据层结果回写游标：成功 = 记号驻留该 IP(并清死亡退避);失败 = 记号前移到圈中下一候选。
-/// 只动内存游标,不改 plans.json 顺序、零写盘(驻留变更的 settings 落盘由调用方触发)。
-/// passthrough 须与产生该结果的腿一致，否则游标记到对方圈外的 IP 上白记。
+/// 数据层结果回写游标：成功驻留该 IP，失败前移一格；零写盘。
+/// passthrough 须与产生结果的腿一致，否则记到对方圈外。
 pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough: bool, slot: u8) {
     let family = route::serial_family(pool_name, host, passthrough);
     let mut key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
@@ -442,17 +418,14 @@ pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough:
         t.cursor.insert(key, ip.to_string());
         return;
     }
-    // 失败:记号前移到圈中该 IP 的下一候选(整圈后自然复测)
+    // 失败：前移到下一候选(整圈后自然复测)。
     if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
         let next = &circle[(pos + 1) % circle.len()];
         t.cursor.insert(key, next.ip.clone());
     }
 }
 
-/// 一轮建连小组的共享认领表:同族并行任务的互斥圈(冷启动竞速用)。
-/// 认领后本轮不解除——对方试过/正在试/已建成的 IP 一律绕行;
-/// 组内最后一个任务结束(Arc 归零)整组消亡,无需手动清理。
-/// 失败后的长期避让仍由 dead 表(TCP)与游标前移(TLS)接管。
+/// 冷启动竞速的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
 pub struct DialCrew {
     claimed: Mutex<HashSet<String>>,
 }
@@ -460,7 +433,6 @@ impl DialCrew {
     pub fn new() -> Arc<Self> {
         Arc::new(Self { claimed: Mutex::new(HashSet::new()) })
     }
-    /// true = 认领成功;false = 对方已认领(试过/在试/建成),本任务绕行。
     pub fn claim(&self, ip: &str) -> bool {
         self.claimed
             .lock()
@@ -469,13 +441,9 @@ impl DialCrew {
     }
 }
 
-/// 单串发(圈式):从记号处沿圈逐个试,失败沿圈前进,成功驻留记号;整圈全灭 → 冷却 30s。
-/// 记号持久化在 settings.last_ip(驻留变更时落盘);ctx 到期只掐当前那条;混合池只试对口条目。
-/// `skip_ips`：本次拨号硬排除的 IP(池中活连接已占用的地址)——起步与沿圈都绕开,
-/// 保证两条通道不落同一个边缘 IP(同 IP 双连实测会被边缘降权,一条长期不响应)。
-/// 全部候选都被排除时忽略 skip,保证还能拨出去。
-/// `slot`：游标钥匙。1 = 主键(`edge/content`),2 = 副键(`edge/content~2`)。
-/// 双通道各自记账——主通道的最优 IP 记忆不再被第二条的拨号覆盖。
+/// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s。
+/// skip_ips = 双通道硬排除(两条通道不落同一 IP)；全被排除时忽略 skip。
+/// slot：1 = 主键游标, 2 = `~2` 副键，双通道各记各的。
 pub async fn serial_dial_skip(
     pool_name: &str,
     host: &str,
@@ -508,7 +476,7 @@ pub async fn serial_dial_skip(
         g.as_ref().unwrap().pools.get(pool_name).unwrap().clone()
     };
 
-    // 族圈:对口条目按表序组成一个圈(顺序 = 手排策略,运行时永不重排)。
+    // 族圈 = 对口条目按表序(运行时永不重排)。
     let family = route::serial_family(pool_name, host, passthrough);
     let serves = family.map(|f| f.serves);
     let family_name = family.map_or("", |f| f.name);
@@ -548,7 +516,6 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
-    // 每请求总耗时预算：整圈最坏 3.6 分钟，到期即停，剩余候选留给后续请求复测。
     let budget_deadline =
         Instant::now() + Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_hit = false;
@@ -567,7 +534,7 @@ pub async fn serial_dial_skip(
                 }
             }
         }
-        // 同组建连任务的互斥认领:对方试过/正在试/已建成的 IP 一律绕行。
+        // 同组互斥：对方试过/在试的 IP 绕行。
         if let Some(crew) = crew {
             if !crew.claim(&p.ip) {
                 continue;
@@ -582,9 +549,7 @@ pub async fn serial_dial_skip(
         };
         match result {
             Ok(conn) => {
-                // 记号驻留:成功即停,下次请求从同一 IP 起步。
-                // 驻留变更 → settings.last_ip(故障转移级,罕见;set_last_ips 未变化时内部 no-op)。
-                // 键序由 settings 侧统一归一,这里只交出内存记号。
+                // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
                 let snap = {
                     let mut g = lock(&SERIAL);
                     let t = g.as_mut().unwrap();
@@ -600,9 +565,9 @@ pub async fn serial_dial_skip(
             Err(e) => {
                 last_err = Some(e.to_string());
                 if ctx.is_cancelled() {
-                    break; // 请求预算到期：这条没试完，不算失败；没试完 ≠ 全灭，不冷却
+                    break; // 预算到期：没试完 ≠ 全灭，不冷却
                 }
-                // 记号前移到圈中下一候选:下一请求从它起步;物理顺序不动,零写盘。
+                // 前移到下一候选；物理顺序不动，零写盘。
                 {
                     let mut g = lock(&SERIAL);
                     let n = circle.len();
@@ -611,8 +576,7 @@ pub async fn serial_dial_skip(
                         t.cursor.insert(cursor_key.clone(), next.ip.clone());
                     }
                 }
-                // TCP 层失败 = IP 对谁都达不通:死亡退避表跳过(60s → 5min → 30min 封顶)。
-                // TLS 层失败(raw 真名被 RST)是按域干扰:只前移记号,整圈后自然复测。
+                // TCP 失败 = IP 对谁都死，进死亡退避；TLS 失败是按域干扰，只前移。
                 let msg = e.to_string();
                 let tcp_level = msg.starts_with("TCP")
                     || matches!(
@@ -647,9 +611,7 @@ pub async fn serial_dial_skip(
         return Err("请求预算到期".to_string());
     }
     if budget_hit {
-        // 与"全灭"同等退避：刚烧掉整整一个预算时长仍未成功，按 host 冷却 30s，
-        // 防 get_direct 的多次重试每次再烧一遍（无冷却时最坏 = 重试次数 × 预算）。
-        // 有镜像兜底的 host 同样豁免（镜像腿不受池冷却影响）。
+        // 预算烧满 = 同等退避，防重试每次再烧一遍；有镜像兜底的 host 豁免。
         if mirror_chain(host).is_empty() {
             SERIAL_COOL.set(host);
         }
@@ -670,8 +632,7 @@ pub async fn serial_dial_skip(
             circle.len()
         ));
     }
-    // 绕表全灭：按 host 冷却 30s，只有确有镜像兜底的 host 豁免
-    // （camo 无链，豁免会让每张徽章重烧整表；池级冷却曾毒倒同池其他族）。
+    // 绕表全灭：无镜像兜底才冷却（camo 无链，豁免会让每张徽章重烧整表）。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
         SERIAL_COOL.set(host);
@@ -691,11 +652,7 @@ pub async fn serial_dial_skip(
 }
 
 
-/// 纯逻辑：按清单对齐单张镜像表（幂等，增量检测）。
-/// enabled 中尚不在链中的地址追加到链尾（顺序无所谓，校准会重排）；
-/// disabled 中仍在链中的地址移除（停用/已删）。
-/// 已在链中的成员位置保持不变——这里只做成员增删，不重排。
-/// 返回是否有变更。
+/// 按清单对齐镜像链（幂等）：enabled 追加链尾，disabled 移除；链内已有成员位置不动。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
     enabled: &[String],
@@ -721,14 +678,12 @@ pub fn align_custom_mirrors(
     changed
 }
 
-/// 内置镜像集合（seeds 快照里的全部镜像地址）：区分"链里的公共镜像"与
-/// "用户自建镜像"——后者自动收编进注册表，重启不丢、列表可见。
+/// seeds 里的内置镜像地址（区分公共镜像与用户自建）。
 fn builtin_mirror_urls() -> std::collections::HashSet<String> {
     seed_db().mirrors.into_values().flatten().collect()
 }
 
-/// 全局同步：按 settings 注册表把自定义镜像对齐到全部镜像链（幂等，有变更才落盘）。
-/// removed = 本次从注册表删除的地址（随停用一并从链中消失）。
+/// 按注册表对齐全部镜像链（幂等）；removed = 本次删除的地址。
 pub fn sync_custom_mirrors(removed: &[String]) {
     let registry = crate::settings::worker_mirrors();
     let enabled: Vec<String> = registry
@@ -798,8 +753,7 @@ pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
 }
 
 
-/// 全灭熔断：set 后 ttl 内 open=true 快速失败，clear 解除；必须按 host 记账——
-/// 全局单值会让"别的域成功"反复清掉 raw 的熔断（内容域直连）/同类 host 快速失败。
+/// 熔断：按 host 记账（全局单值会被别的域反复清掉）；过期惰性清除，硬顶防沉淀。
 pub struct Breaker {
     ttl_secs: u64,
     map: std::sync::OnceLock<Mutex<HashMap<String, Instant>>>,
@@ -815,15 +769,12 @@ impl Breaker {
         self.map
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            // 锁中毒只说明某次持锁期间 panic 过，数据仍是完好的 HashMap：
-            // 照常取用，别让一次 panic 把这个域名的熔断判断永久打死。
             .unwrap_or_else(|p| p.into_inner())
     }
     pub fn open(&self, host: &str) -> bool {
         let mut m = self.lock();
         match m.get(host) {
             Some(until) if Instant::now() < *until => true,
-            // 过期即清：只进不出会让表沉淀。
             Some(_) => {
                 m.remove(host);
                 false
@@ -833,7 +784,6 @@ impl Breaker {
     }
     pub fn set(&self, host: &str) {
         let mut m = self.lock();
-        // 硬顶卫生：先扫过期，仍超则整表重置（丢几条活熔断只多试一次）。
         const HARD_CAP: usize = 4096;
         if m.len() >= HARD_CAP {
             let now = Instant::now();
@@ -849,9 +799,9 @@ impl Breaker {
     }
 }
 
-/// 内容域直连熔断：被按域黑洞时每请求烧满预算，失败一次熔断 120s 走镜像，成功清除。
+/// 内容域直连熔断 120s。
 pub static CONTENT_BREAKER: Breaker = Breaker::new(120);
-/// 镜像链全灭熔断：全灭一次 60s 内同 host 快速失败（多图仓库否则每张图烧完整条链）。
+/// 镜像链全灭熔断 60s。
 pub static MIRROR_BREAKER: Breaker = Breaker::new(60);
 
 #[cfg(test)]
@@ -1334,6 +1284,60 @@ mod tests {
         assert!(!c.iter().any(|x| x.contains("old.worker")));
     }
 
+    /// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；
+    /// 仅旧字典有的 host 照常并入（升级兼容的钉子）。
+    #[test]
+    fn merged_chains_prefers_typed_dictionaries_over_legacy() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // 隔离：.example 自建镜像会被收编进注册表并跨测试持久化，先清空。
+        crate::settings::save_worker_mirrors(Vec::new());
+        let dir = tmpdir();
+        std::fs::write(
+            &dir.join("plans.json"),
+            r#"{
+  "core": [],
+  "mirrors_big":   {"codeload.github.com": ["https://big.example"]},
+  "mirrors_small": {"raw.githubusercontent.com": ["https://small.example"]},
+  "mirrors": {
+    "codeload.github.com": ["https://legacy-wrong.example"],
+    "raw.githubusercontent.com": ["https://legacy-wrong.example"],
+    "gist.githubusercontent.com": ["https://legacy-only.example"]
+  }
+}"#,
+        )
+        .unwrap();
+        serial_load(&dir, Vec::new(), None);
+        // 断言只锁"优先级"这一点：自建镜像收编(sync_custom_mirrors)会把非内置
+        // 镜像追加进所有链尾，属既有设计，不在本测试射程。
+        // ① 旧 mirrors 不得覆盖新字典 → codeload 链里绝不允许出现 legacy-wrong。
+        // ② 新字典成员在前 → 链头必须是 big/small；旧字典独有成员追加在尾。
+        let big = mirror_chain("codeload.github.com");
+        assert_eq!(
+            big.first(),
+            Some(&"https://big.example".to_string()),
+            "mirrors_big 赢, 旧 mirrors 不得覆盖(legacy-wrong 缺席且 big 居首): {big:?}"
+        );
+        assert!(
+            !big.contains(&"https://legacy-wrong.example".to_string()),
+            "旧 mirrors 不得覆盖新字典已声明的 host: {big:?}"
+        );
+        let small = mirror_chain("raw.githubusercontent.com");
+        assert_eq!(
+            small.first(),
+            Some(&"https://small.example".to_string()),
+            "mirrors_small 赢: {small:?}"
+        );
+        assert!(
+            !small.contains(&"https://legacy-wrong.example".to_string()),
+            "旧 mirrors 不得覆盖新字典已声明的 host: {small:?}"
+        );
+        let legacy = mirror_chain("gist.githubusercontent.com");
+        assert!(
+            legacy.contains(&"https://legacy-only.example".to_string()),
+            "仅旧字典有的 host 照常并入: {legacy:?}"
+        );
+    }
+
     #[test]
     fn mirror_chain_load_and_topup() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -1428,9 +1432,7 @@ mod tests {
         }
     }
 
-    /// 串发重试引擎（此前只有纯函数 cursor_note 被测）：首个候选 TCP 拨不通 → 沿圈走到
-    /// 第二个候选、成功即驻留、失败候选进死亡退避表。127.0.0.2 是本机回环 /8 的另一个
-    /// 地址，用来当"活着的那条"；拨号端口经 dial::set_dial_port 临时指过去。
+    /// 串发重试引擎实机圈：TCP 拒 → 沿圈到活条 → 驻留 + 死亡退避。
     #[tokio::test]
     async fn serial_dial_rotates_on_failure_and_parks_on_success() {
         let _guard = TEST_LOCK.lock().unwrap();
