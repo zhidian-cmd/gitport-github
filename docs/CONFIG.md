@@ -37,12 +37,19 @@
   ],
   "api":  [ { "ip": "140.82.112.5", "sni": "baidu.com" } ],
   "edge": [ { "ip": "185.199.108.133", "sni": "sni" } ],
-  "mirrors": {
+  "mirrors_big": {
+    "codeload.github.com": ["https://gh-proxy.com", "https://ghfast.top"],
+    "release-assets.githubusercontent.com": ["https://gh-proxy.com"]
+  },
+  "mirrors_small": {
     "raw.githubusercontent.com": ["https://gh-proxy.com", "https://ghfast.top"]
   }
 }
 ```
 
+- 镜像链分两个字典：`mirrors_big` = 大文件域（codeload / objects / release-assets），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
+- 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
+- 大文件域选谁不按链序硬排：代理按每家镜像的实时下载速度动态分流；链序只决定失败时的顺延次序
 - 条目顺序 = 优先级，第一行是表头；**`sni` 原样透传进 TLS 握手，代理不解释**：带点域名 = 伪装（SNI=所写值，哪怕碰巧写真名）；`""` = 无 SNI（ClientHello 不带扩展）；要真名就把 host 名写进 sni。非法字符（防注入）该条剥除
 - **表序固定、运行时零重排**：串发从 settings.json 记忆的游标（上次驻留 IP）起步，沿表顺序转圈——成功驻留、失败沿圈前进（dead 表跳过死位）；想让某条先被试，把它排到前面即可。运行时唯一写盘 = 故障转移时 settings.json 里几字节的游标更新
 - 手改**重启生效**；运行中的轮换 2 秒内自动写回（手改请先关代理，避免被写回覆盖）
