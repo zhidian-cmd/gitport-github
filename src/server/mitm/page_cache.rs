@@ -639,6 +639,8 @@ fn page_file_name(key: &str) -> String {
 }
 
 /// 读单文件条目；损坏/截断/非 200 = None（miss 自愈）。
+/// 仅测试使用：生产路径走 load_disk_entry_reason（带拒绝原因）。
+#[cfg(test)]
 fn load_disk_entry(
     key: &str,
     // 请求方带不带会话：带会话却拿到未登录页 = 会话已死（污染）；匿名浏览存下的
