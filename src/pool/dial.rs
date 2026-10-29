@@ -79,7 +79,8 @@ impl AsyncWrite for SplitHello {
         // 首写判资格：非 TLS 握手/过短 → 分片器退场。分片已开则不再重判——
         // write_all 续传段的首字节是 0x03(版本号)，重判会把剩余字节一口气
         // 直通、丢掉段间隔，掩体空转(2026-10-29 审计)。
-        if !me.splitting && (buf.len() < 32 || buf[0] != 0x16) {
+        // done = 握手帧发完：之后的帧是应用数据，直通且不再进分段计数。
+        if me.done || (!me.splitting && (buf.len() < 32 || buf[0] != 0x16)) {
             me.done = true;
             return std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
         }
@@ -585,7 +586,7 @@ mod split_hello_tests {
                     Ok(n) => {
                         total += n;
                         stamps.push(std::time::Instant::now());
-                        if total >= 300 {
+                        if total >= 307 {
                             break;
                         }
                     }
@@ -608,8 +609,19 @@ mod split_hello_tests {
         }
         assert_eq!(written, 300, "写入字节数对不上");
 
+        // 握手帧之后的帧是应用数据：done 门应直通，分段计数不得再涨。
+        let counter = io.counter();
+        let sent_before = counter.load(std::sync::atomic::Ordering::Relaxed);
+        io.write_all(b"appdata").await.unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            sent_before,
+            "应用数据帧不得再进分段计数(done 门失效)"
+        );
+        drop(io);
+
         let (total, stamps) = server.await.unwrap();
-        assert_eq!(total, 300, "对端收到的字节数对不上");
+        assert_eq!(total, 307, "对端收到的字节数对不上");
         assert!(stamps.len() >= 2, "续传段被直通吞掉，只发出一段");
         let spread = *stamps.last().unwrap() - stamps[0];
         let want = Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS * 2 - 20);

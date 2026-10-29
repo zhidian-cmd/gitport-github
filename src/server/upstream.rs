@@ -604,15 +604,41 @@ pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
 /// 客户端声明接受 gzip。**唯一判定**：上游要不要强制 gzip、缓存要不要分 `-gz`/`-id` 桶
 /// 都调它——两处各写一份时，改一边就会让"压缩体发给没声明 gzip 的客户端"复现。
 pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
-    req.headers()
+    let Some(v) = req
+        .headers()
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            // gzip;q=0 = 客户端明确拒绝压缩，别强迫(2026-10-29 审计)。
-            v.contains("gzip") && !v.contains("gzip;q=0")
-        })
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    for item in v.split(',') {
+        // 去空白 + 小写：分号/等号两侧的空白都合法("gzip ; q=0")
+        let item: String = item
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let Some(rest) = item.strip_prefix("gzip") else {
+            continue;
+        };
+        if rest.is_empty() {
+            return true; // 裸 "gzip" = 默认接受
+        }
+        let Some(params) = rest.strip_prefix(';') else {
+            continue; // "gzipx" 之类前缀误中，跳过
+        };
+        for kv in params.split(';') {
+            if let Some(q) = kv.strip_prefix("q=") {
+                // q=0 / 0.0 / 0.000 = 明确拒绝
+                let zero = q == "0"
+                    || q.strip_prefix("0.")
+                        .is_some_and(|rest| rest.chars().all(|c| c == '0'));
+                return !zero;
+            }
+        }
+        return true; // 有 gzip 无 q 参数 = 接受
+    }
+    false
 }
 
 /// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制 gzip。
@@ -746,6 +772,10 @@ mod tests {
         assert!(accepts_gzip(&mk("br, gzip;q=1")));
         assert!(!accepts_gzip(&mk("gzip;q=0")));
         assert!(!accepts_gzip(&mk("br")));
+        // 分号/等号两侧的空白合法(HTTP OWS)，照样是明确拒绝
+        assert!(!accepts_gzip(&mk("gzip; q=0")));
+        assert!(!accepts_gzip(&mk("gzip ; q=0")));
+        assert!(!accepts_gzip(&mk("br, gzip;q=0")));
     }
 
     /// 上行泵（git push 的请求体通道）：2MB 体必须一字节不差送到对端。

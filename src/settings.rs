@@ -19,6 +19,8 @@ struct SettingsState {
     github_pac: std::sync::atomic::AtomicBool,
     win_rect: Mutex<[i32; 4]>,
     proxy_backup: Mutex<String>,
+    // 我们最后一次成功写进系统的 PAC URL：接管时区分"自己的残留"与别家同形态
+    last_pac: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
     // 自定义镜像注册表：settings.json 永久记录（删除 = 彻底消失）；
@@ -44,6 +46,7 @@ fn state() -> &'static SettingsState {
         github_pac: std::sync::atomic::AtomicBool::new(false),
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
+        last_pac: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
         worker_mirrors: Mutex::new(Vec::new()),
     })
@@ -115,6 +118,12 @@ pub fn is_our_pac(cur: &str) -> bool {
     &rest[idx..] == "/proxy.pac"
 }
 
+/// 接管时的备份判定：cur 非空、不是正要写的、不是上次写的(last_pac)——
+/// 其余都算用户的配置，必须备份(同形态 ≠ 我们的，端口无关判定会误吞)。
+fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
+    !cur.trim().is_empty() && cur != pac && cur != last_pac
+}
+
 /// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
 fn refresh_wininet() {
     use windows::Win32::Networking::WinInet::{
@@ -183,7 +192,11 @@ pub fn ensure_system_proxy() {
     let cur = get_auto_config_url(&key);
     let pac = pac_url();
     if github_pac() {
-        if !cur.is_empty() && !is_our_pac(&cur) {
+        // 备份判定不看 is_our_pac：它端口无关，别家 127.0.0.1:port/proxy.pac
+        // 同形态会被当"我们的"吞掉(2026-10-29 审计)。以 last_pac(上次写的)
+        // 识别自己的残留——它不用备份，其余一律备份。
+        let last = state().last_pac.lock().unwrap().clone();
+        if should_backup_foreign(&cur, &pac, &last) {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
         // 不走 `cur == pac` 的早退：字符串在、标志位没开正是要修的那种状态。
@@ -191,6 +204,7 @@ pub fn ensure_system_proxy() {
         if apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&pac)) {
             // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
             let _ = key.set_value("AutoConfigURL", &pac);
+            *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
             refresh_wininet();
             let _ = save();
         }
@@ -227,6 +241,7 @@ fn restore_or_clear(key: &RegKey) {
         let _ = key.delete_value("AutoConfigURL");
     }
     *state().proxy_backup.lock().unwrap() = String::new();
+    *state().last_pac.lock().unwrap() = String::new();
     refresh_wininet();
     let _ = save();
 }
@@ -376,6 +391,8 @@ struct SettingsFile {
     #[serde(deserialize_with = "lenient")]
     proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
+    last_pac: String, // 我们最后一次写进系统的 PAC URL——识别自己的残留
+    #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
     /// 自定义镜像注册表：settings.json 永久记录；启停只增删 plans.json 链成员。
     #[serde(deserialize_with = "lenient")]
@@ -413,6 +430,7 @@ fn apply(v: SettingsFile) {
         .store(v.mitm, std::sync::atomic::Ordering::Relaxed);
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
+    *state().last_pac.lock().unwrap() = v.last_pac;
     *state().last_ip.lock().unwrap() = v.last_ip;
     state()
         .github_pac
@@ -434,6 +452,7 @@ fn save() -> Result<(), String> {
         win_rect: *s.win_rect.lock().unwrap(),
         github_pac: s.github_pac.load(std::sync::atomic::Ordering::Relaxed),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
+        last_pac: s.last_pac.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
         worker_mirrors: s.worker_mirrors.lock().unwrap().clone(),
     };
@@ -578,6 +597,25 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
 #[cfg(test)]
 mod tests {
 
+    /// 备份判定: 别家同形态 PAC(127.0.0.1:port/proxy.pac)必须备份, 我们
+    /// 上次写的(last_pac)和正要写的不算。
+    #[test]
+    fn should_backup_foreign_pac_shapes() {
+        let pac = "http://127.0.0.1:7811/proxy.pac";
+        assert!(should_backup_foreign(
+            "http://127.0.0.1:7890/proxy.pac",
+            pac,
+            ""
+        ));
+        assert!(!should_backup_foreign(pac, pac, ""));
+        assert!(!should_backup_foreign(
+            "http://127.0.0.1:9999/proxy.pac",
+            pac,
+            "http://127.0.0.1:9999/proxy.pac"
+        ));
+        assert!(!should_backup_foreign("", pac, ""));
+    }
+
     /// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
     #[test]
     fn heal_gate_spares_foreign_pac() {
@@ -705,6 +743,7 @@ mod tests {
             win_rect: [1, 2, 3, 4],
             github_pac: false,
             proxy_backup: String::new(),
+            last_pac: String::new(),
             last_ip: LastIpTable::from_marks(vec![(
                 "api/all".to_string(),
                 "140.82.114.6".to_string(),

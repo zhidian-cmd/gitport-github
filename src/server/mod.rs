@@ -124,7 +124,9 @@ impl ProxyServer {
 
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
-        if mitm::mitm_scope(self.authority.as_ref(), &host) {
+        // MITM 只拦 443：非 443 是明文协议(git:// 9418 / SSH 22)，TLS 终结必失败；
+        // 交下面的普通 TCP 隧道，端口照用。
+        if port == 443 && mitm::mitm_scope(self.authority.as_ref(), &host) {
             mitm::handle_connect_mitm(self, client, &host).await;
             return;
         }
@@ -342,7 +344,9 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 /// 本函数是透传(真名)腿：CONNECT 隧道与明文转发共用，content 族放行 .154/.215。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     let name = config::pool_for(host);
-    if pool::SERIAL_POOLS.contains(&name) {
+    // 非 443 不走 IP 表：串发恒拨 443(dial_port)，git:// 9418 / SSH 22 会被
+    // 连到 443 上对牛弹琴——按系统 DNS 普通 TCP 直连，端口照用。
+    if port == 443 && pool::SERIAL_POOLS.contains(&name) {
         let (conn, ip, _shape) = pool::serial_dial_skip(
             pool::DialSkip {
                 pool_name: name,
