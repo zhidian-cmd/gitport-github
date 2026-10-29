@@ -209,12 +209,8 @@ async fn mitm_http(
             mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
         // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
         // 直连失败记 60s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
-        let fetch = direct_leg(chain_host, new_bytes, &log, &out_body, &host, &info, &replay);
-        match chain_fetch(&log, &out_body, &host, fetch).await {
-            Ok(resp) => {
-                let route = resp.extensions().get::<&'static str>().copied().unwrap_or("mirror");
-                return write_upstream(resp, route, &info);
-            }
+        match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
+            Ok(resp) => return resp,
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
         }
@@ -236,22 +232,11 @@ async fn mitm_http(
                     );
                     // 直连刚在全灭分支失败过: load 会带 60s 降权, chain_fetch 内
                     // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
-                    let fetch = direct_leg(
-                        chain_host,
-                        new_bytes,
-                        &log,
-                        &out_body,
-                        &host,
-                        &info,
-                        &replay,
-                    );
-                    if let Ok(r) =
-                        chain_fetch(&log, &out_body, &host, fetch).await
+                    match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await
                     {
-                        let route = r.extensions().get::<&'static str>().copied().unwrap_or("mirror");
-                        return write_upstream(r, route, &info);
+                        Ok(resp) => return resp,
+                        Err(_) => (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭")),
                     }
-                    (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
                 }
                 _ => {
                     (log)(&format!(
@@ -502,6 +487,27 @@ fn direct_leg<'a>(
         }
     });
     mirror::DirectLeg { fetch }
+}
+
+/// 主路径/兜底路径共用的镜像链派发：组装直连腿 + chain_fetch + 按实际胜出者
+/// 写诊断头。Err = 候选全灭(原因透传，交 502 日志)。
+async fn mirror_or_direct(
+    log: &LogFn,
+    out_body: &hyper::Request<BoxBody>,
+    host: &str,
+    chain_host: &str,
+    new_bytes: u64,
+    info: &UpstreamInfo,
+    replay: &Option<Bytes>,
+) -> Result<hyper::Response<BoxBody>, String> {
+    let fetch = direct_leg(chain_host, new_bytes, log, out_body, host, info, replay);
+    let resp = chain_fetch(log, out_body, host, fetch).await?;
+    let route = resp
+        .extensions()
+        .get::<&'static str>()
+        .copied()
+        .unwrap_or("mirror");
+    Ok(write_upstream(resp, route, info))
 }
 
 async fn try_cached(

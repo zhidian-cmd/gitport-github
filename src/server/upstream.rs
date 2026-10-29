@@ -607,7 +607,11 @@ pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
     req.headers()
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().contains("gzip"))
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            // gzip;q=0 = 客户端明确拒绝压缩，别强迫(2026-10-29 审计)。
+            v.contains("gzip") && !v.contains("gzip;q=0")
+        })
         .unwrap_or(false)
 }
 
@@ -727,6 +731,22 @@ mod conn_slot_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gzip;q=0 是明确拒绝：别再把压缩体塞给手写客户端(浏览器不受影响)。
+    #[test]
+    fn accepts_gzip_respects_explicit_reject() {
+        let mk = |ae: &str| {
+            hyper::Request::builder()
+                .header("accept-encoding", ae)
+                .body(())
+                .unwrap()
+        };
+        assert!(accepts_gzip(&mk("gzip, deflate")));
+        assert!(accepts_gzip(&mk("GZIP")));
+        assert!(accepts_gzip(&mk("br, gzip;q=1")));
+        assert!(!accepts_gzip(&mk("gzip;q=0")));
+        assert!(!accepts_gzip(&mk("br")));
+    }
 
     /// 上行泵（git push 的请求体通道）：2MB 体必须一字节不差送到对端。
     /// 这条路径此前没有任何测试——窗口/背压改错不会让别的测试变红，只会让 push 卡住。

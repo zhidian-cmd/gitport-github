@@ -446,7 +446,17 @@ fn save() -> Result<(), String> {
 }
 
 /// 陈旧接管自愈（启动时一次）：异常退出残留的 AutoConfigURL 按备份回填或删除；端口无关。
+/// 自愈是否该动手：我们管着 PAC(开关开着)或曾接管过(有备份)才碰注册表。
+/// 开关从没开过、备份也空——AutoConfigURL 哪怕长得像我们的 PAC 也是别的
+/// 工具的，绝不触碰(曾按形态误删他人物品，2026-10-29 审计)。
+fn heal_should_touch(managed: bool, backup: &str) -> bool {
+    managed || !backup.trim().is_empty()
+}
+
 fn heal_stale_proxy() {
+    if !heal_should_touch(github_pac(), &state().proxy_backup.lock().unwrap()) {
+        return;
+    }
     let Ok(key) = internet_settings_key() else {
         return;
     };
@@ -567,6 +577,14 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
 
 #[cfg(test)]
 mod tests {
+
+    /// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
+    #[test]
+    fn heal_gate_spares_foreign_pac() {
+        assert!(!heal_should_touch(false, ""));
+        assert!(heal_should_touch(true, ""));
+        assert!(heal_should_touch(false, "http://127.0.0.1:8080/proxy.pac"));
+    }
     use super::*;
 
     #[test]

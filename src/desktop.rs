@@ -138,7 +138,7 @@ pub fn signal_show(port: u16) -> bool {
         Err(_) => return false,
     };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
-    let req = "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+    let req = "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nX-GitPort-Request: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
     if s.write_all(req.as_bytes()).is_err() {
         return false;
     }

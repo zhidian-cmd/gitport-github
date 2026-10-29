@@ -28,6 +28,8 @@ pub struct SplitHello {
     /// 下一段的放行时刻；None = 立即可发。
     timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     done: bool,
+    /// 分片已开：首写通过资格判定后置位，续传段不再重判首字节(那是 0x03)。
+    splitting: bool,
     /// 实际发出的段数。握手后读它：>=2 说明分片真的生效了，
     /// 1（或 0）说明首包太短、分片器直接退场——这是唯一能看出掩体没上成的信号。
     segs_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -45,6 +47,7 @@ impl SplitHello {
             gap: Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS),
             timer: None,
             done: false,
+            splitting: false,
             segs_sent: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -73,8 +76,10 @@ impl AsyncWrite for SplitHello {
     ) -> std::task::Poll<std::io::Result<usize>> {
         use std::future::Future;
         let me = self.get_mut();
-        // 非首位写、空写、非 TLS 握手、过短：一律直通，分片器退场
-        if me.done || buf.is_empty() || buf.len() < 32 || buf[0] != 0x16 {
+        // 首写判资格：非 TLS 握手/过短 → 分片器退场。分片已开则不再重判——
+        // write_all 续传段的首字节是 0x03(版本号)，重判会把剩余字节一口气
+        // 直通、丢掉段间隔，掩体空转(2026-10-29 审计)。
+        if !me.splitting && (buf.len() < 32 || buf[0] != 0x16) {
             me.done = true;
             return std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
         }
@@ -100,6 +105,7 @@ impl AsyncWrite for SplitHello {
         }
         me.segs_sent
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        me.splitting = true;
         me.segs_left = me.segs_left.saturating_sub(1);
         if me.segs_left == 0 {
             me.done = true;
@@ -561,6 +567,60 @@ mod split_hello_tests {
             want
         );
     }
+    /// 真实 ClientHello 形态：续传段首字节是 0x03(版本号)，不是 0x16——
+    /// 曾因 poll_write 重判首字节，第二刀直接直通、段间隔全丢，掩体空转。
+    /// (旧实现跑这条必红：stamps 只有 1 个。)
+    #[tokio::test]
+    async fn splits_real_clienthello_prefix() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = ln.accept().await.unwrap();
+            let mut stamps = Vec::new();
+            let mut total = 0usize;
+            let mut buf = [0u8; 2048];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total += n;
+                        stamps.push(std::time::Instant::now());
+                        if total >= 300 {
+                            break;
+                        }
+                    }
+                }
+            }
+            (total, stamps)
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = tcp.set_nodelay(true);
+        let mut io = SplitHello::new(tcp);
+        // 真实握手记录形态：0x16 类型 + 0x03 0x01 版本 + 载荷
+        let mut hello = vec![0x16u8, 0x03, 0x01];
+        hello.resize(300, 0xAB);
+        let mut written = 0;
+        while written < hello.len() {
+            let n = io.write(&hello[written..]).await.unwrap();
+            assert!(n > 0, "分片器写返回 0，会卡死握手");
+            written += n;
+        }
+        assert_eq!(written, 300, "写入字节数对不上");
+
+        let (total, stamps) = server.await.unwrap();
+        assert_eq!(total, 300, "对端收到的字节数对不上");
+        assert!(stamps.len() >= 2, "续传段被直通吞掉，只发出一段");
+        let spread = *stamps.last().unwrap() - stamps[0];
+        let want = Duration::from_millis(crate::config::WHITELIST_SPLIT_GAP_MS * 2 - 20);
+        assert!(
+            spread >= want,
+            "首末段间隔 {:?}，不足 {:?}，分片被合并或间隔没生效",
+            spread,
+            want
+        );
+    }
+
 }
 
 #[cfg(test)]
