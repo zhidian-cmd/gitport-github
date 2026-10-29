@@ -209,36 +209,12 @@ async fn mitm_http(
             mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
         // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
         // 直连失败记 60s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
-        let load = mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
-        load.in_flight_bytes
-            .fetch_add(new_bytes, std::sync::atomic::Ordering::Relaxed);
-        let log2 = log.clone();
-        let out2 = &out_body;
-        let host2 = host.clone();
-        let body2 = replay.clone();
-        let info2 = info.clone();
-        let fetch = Box::pin(async move {
-            match get_direct(&log2, out2, &host2, &info2, true, &body2).await {
-                Ok(resp) => {
-                    let (parts, body) = resp.into_parts();
-                    let mut guard = mirror::LoadGuard::resume_charged(load, new_bytes);
-                    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
-                        if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {
-                            guard.on_frame(n);
-                        }
-                        frame
-                    });
-                    Ok(hyper::Response::from_parts(parts, BoxBody::new(body)))
-                }
-                Err(e) => {
-                    load.in_flight_bytes
-                        .fetch_sub(new_bytes, std::sync::atomic::Ordering::Relaxed);
-                    Err(e)
-                }
+        let fetch = direct_leg(chain_host, new_bytes, &log, &out_body, &host, &info, &replay);
+        match chain_fetch(&log, &out_body, &host, fetch).await {
+            Ok(resp) => {
+                let route = resp.extensions().get::<&'static str>().copied().unwrap_or("mirror");
+                return write_upstream(resp, route, &info);
             }
-        });
-        match chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await {
-            Ok(resp) => return write_upstream(resp, "mirror", &info),
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
         }
@@ -260,40 +236,20 @@ async fn mitm_http(
                     );
                     // 直连刚在全灭分支失败过: load 会带 60s 降权, chain_fetch 内
                     // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
-                    let load =
-                        mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
-                    load.in_flight_bytes
-                        .fetch_add(new_bytes, std::sync::atomic::Ordering::Relaxed);
-                    let log2 = log.clone();
-                    let out2 = &out_body;
-                    let host2 = host.clone();
-                    let body2 = replay.clone();
-                    let info2 = info.clone();
-                    let fetch = Box::pin(async move {
-                        match get_direct(&log2, out2, &host2, &info2, true, &body2).await {
-                            Ok(resp) => {
-                                let (parts, body) = resp.into_parts();
-                                let mut guard =
-                                    mirror::LoadGuard::resume_charged(load, new_bytes);
-                                let body = http_body_util::BodyExt::map_frame(body, move |frame| {
-                                    if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {
-                                        guard.on_frame(n);
-                                    }
-                                    frame
-                                });
-                                Ok(hyper::Response::from_parts(parts, BoxBody::new(body)))
-                            }
-                            Err(e) => {
-                                load.in_flight_bytes
-                                    .fetch_sub(new_bytes, std::sync::atomic::Ordering::Relaxed);
-                                Err(e)
-                            }
-                        }
-                    });
+                    let fetch = direct_leg(
+                        chain_host,
+                        new_bytes,
+                        &log,
+                        &out_body,
+                        &host,
+                        &info,
+                        &replay,
+                    );
                     if let Ok(r) =
-                        chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await
+                        chain_fetch(&log, &out_body, &host, fetch).await
                     {
-                        return write_upstream(r, "mirror", &info);
+                        let route = r.extensions().get::<&'static str>().copied().unwrap_or("mirror");
+                        return write_upstream(r, route, &info);
                     }
                     (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
                 }
@@ -511,6 +467,41 @@ async fn send_once(
         Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
         Err(_) => Err("响应预算超时".to_string()),
     }
+}
+
+/// 直连腿组装(主路径与兜底路径共用一份)：charge 在 future 首行——镜像胜出
+/// 丢弃本 future 时零残留, Err/取消靠 guard Drop 归还(字节+流数)。
+fn direct_leg<'a>(
+    chain_host: &str,
+    new_bytes: u64,
+    log: &LogFn,
+    out: &'a hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    body: &Option<Bytes>,
+) -> mirror::DirectLeg<'a> {
+    let load = mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
+    let log2 = log.clone();
+    let host2 = host.to_string();
+    let body2 = body.clone();
+    let info2 = info.clone();
+    let fetch = Box::pin(async move {
+        let mut guard = mirror::LoadGuard::charge(load, new_bytes);
+        match get_direct(&log2, out, &host2, &info2, true, &body2).await {
+            Ok(resp) => {
+                let (parts, body) = resp.into_parts();
+                let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+                    if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {
+                        guard.on_frame(n);
+                    }
+                    frame
+                });
+                Ok(hyper::Response::from_parts(parts, BoxBody::new(body)))
+            }
+            Err(e) => Err(e),
+        }
+    });
+    mirror::DirectLeg { fetch }
 }
 
 async fn try_cached(
@@ -791,6 +782,33 @@ async fn dns_direct_fetch(
 
 #[cfg(test)]
 mod tests {
+    /// 审计 #1 回归: 镜像胜出时直连 future 未钧即弃——charge 在 future 内,
+    /// 零残留, 账面不得出现幽灵在途字节/流数。
+    #[test]
+    fn direct_leg_unpolled_leaves_zero_debt() {
+        let key = mirror::direct_load_key("debt.test");
+        let load = mirror::mirror_load_for(&key);
+        load.in_flight_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+        load.in_flight_streams.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = hyper::Request::builder()
+            .uri("https://debt.test/f")
+            .body(upstream::empty_body())
+            .unwrap();
+        let log: LogFn = Arc::new(|_: &str| {});
+        let info = UpstreamInfo::default();
+        let leg = direct_leg("debt.test", 8 * 1024 * 1024, &log, &out, "debt.test", &info, &None);
+        drop(leg);
+        assert_eq!(
+            load.in_flight_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "未钧即弃不得留下幽灵在途字节"
+        );
+        assert_eq!(
+            load.in_flight_streams.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "流数同样不得泄漏"
+        );
+    }
     use super::*;
 
 

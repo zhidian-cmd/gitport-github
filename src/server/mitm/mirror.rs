@@ -97,7 +97,7 @@ pub(super) struct LoadGuard {
 }
 
 impl LoadGuard {
-    fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
+    pub(super) fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
         load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
         let is_probe = load.speed_ewma.load(Ordering::Relaxed) == 0;
@@ -112,20 +112,6 @@ impl LoadGuard {
         }
     }
 
-    /// 直连腿专用：调用方已自行 charge(含流数),守卫只接手"逐帧归还 + Drop 收尾"。
-    pub(super) fn resume_charged(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
-        load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
-        let is_probe = load.speed_ewma.load(Ordering::Relaxed) == 0;
-        LoadGuard {
-            load,
-            charged: new_bytes,
-            delivered: 0,
-            raw_delivered: 0,
-            mark_at: Instant::now(),
-            mark_bytes: 0,
-            is_probe,
-        }
-    }
 
     /// 交付一帧：记账按记账额归还(封顶于 charged，防镜像无视 Range 回全量把
     /// 计数打成负)；原始累计照走。满一个采样间隔刷新一次速率。
@@ -246,6 +232,23 @@ fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
         .take(limit)
         .collect()
 }
+/// cap 窗口吃掉直连位时的末位兜底：直连已在窗内不动；刚失败(失败窗内)不追加
+/// (别急着重拨)；否则追加为最后一棒——镜像 cap 之外仍有本地腿。
+fn append_direct_if_missed(
+    order: &mut Vec<usize>,
+    direct_idx: usize,
+    last_fail_ms: u64,
+    now_ms: u64,
+) {
+    if order.contains(&direct_idx) {
+        return;
+    }
+    if last_fail_ms != 0 && now_ms.saturating_sub(last_fail_ms) < MIRROR_FAIL_WINDOW_MS {
+        return;
+    }
+    order.push(direct_idx);
+}
+
 
 /// bytes=a-b → b-a+1；开放区间/无头/畸形按假设值。
 fn range_bytes(range: Option<&str>) -> u64 {
@@ -506,7 +509,8 @@ pub(super) async fn chain_fetch(
     let direct_key = format!("direct/{chain_host}");
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
-    if pool::MIRROR_BREAKER.open(chain_host) {
+    // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
+    if !chain.is_empty() && pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
     let limit = mirror_chain_cap(chain_host)
@@ -515,13 +519,21 @@ pub(super) async fn chain_fetch(
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
     let start = pick_mirror(&candidates, new_bytes);
     let mut direct = direct;
-    for i in walk_order(candidates.len(), start, limit) {
+    let mut order = walk_order(candidates.len(), start, limit);
+    append_direct_if_missed(
+        &mut order,
+        candidates.len() - 1,
+        mirror_load(&direct_key).last_fail_ms.load(Ordering::Relaxed),
+        pool::now_ms(),
+    );
+    for i in order {
         let m = candidates[i].as_str();
         // 直连候选：拨号/游标/连接池/记账包装全在 fetch future 内(mod.rs 组装)。
         if m == direct_key {
             let t0 = Instant::now();
             match direct.fetch.as_mut().await {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    resp.extensions_mut().insert("direct");
                     mirror_load(&direct_key).last_fail_ms.store(0, Ordering::Relaxed);
                     (log)(&format!(
                         "[直连] {host}{path} ECT 胜出({}ms), 候选 {}/{}",
@@ -565,7 +577,8 @@ pub(super) async fn chain_fetch(
                 ));
                 pool::MIRROR_BREAKER.clear(chain_host);
                 // 带 Range 挂掐断监视；无 Range 只记账不掐（浏览器下载掐了是用户可见失败）。
-                let (parts, body) = resp.into_parts();
+                let (mut parts, body) = resp.into_parts();
+                parts.extensions.insert("mirror");
                 let body = if range.is_some() {
                     let peers: Vec<Arc<MirrorLoad>> = chain
                         .iter()
@@ -990,6 +1003,41 @@ mod tests {
             !pool::MIRROR_BREAKER.open(host),
             "直连独走耗尽不得触发镜像链熔断"
         );
+    }
+
+    /// 审计 #3 回归: 熔断只拦有镜像候选的请求——凭据串剥空镜像后直连独走,
+    /// 不得撞为镜像设的熔断(哪怕熔断正开着)。
+    #[tokio::test]
+    async fn breaker_spares_direct_only_requests() {
+        let log: LogFn = Arc::new(|_: &str| {});
+        let host = "brk-cred.test";
+        pool::MIRROR_BREAKER.clear(host);
+        pool::MIRROR_BREAKER.set(host);
+        let req = hyper::Request::builder()
+            .uri("https://brk-cred.test/f?sig=abc")
+            .body(upstream::empty_body())
+            .unwrap();
+        let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
+            .await
+            .unwrap_err();
+        assert!(!err.contains("熔断"), "直连独走不得撞镜像熔断: {err}");
+        assert!(err.contains("仅直连"), "应照常仅派直连: {err}");
+        pool::MIRROR_BREAKER.clear(host);
+    }
+
+    /// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 刚失败的不追加;
+    /// 已在窗内不重复。
+    #[test]
+    fn append_direct_gated_by_health_and_presence() {
+        let mut order = vec![0usize, 1, 2, 3, 4];
+        append_direct_if_missed(&mut order, 8, 0, 1_000);
+        assert_eq!(order.last(), Some(&8), "健康直连在窗外应追加为末位");
+        let mut order = vec![0usize, 1, 2, 3, 4];
+        append_direct_if_missed(&mut order, 8, 1_000, 1_500);
+        assert!(!order.contains(&8), "刚失败(失败窗内)不追加, 别急着重拨");
+        let mut order = vec![0usize, 4, 8];
+        append_direct_if_missed(&mut order, 8, 0, 1_000);
+        assert_eq!(order, vec![0, 4, 8], "已在窗内不重复追加");
     }
 
     /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。

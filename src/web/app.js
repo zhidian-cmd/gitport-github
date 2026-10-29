@@ -191,14 +191,16 @@ function mirrorRow(m, i) {
     '</div>';
 }
 
-async function commitMirrors(merge = true) {
-  // 合并模式(启停/编辑):先拉最新清单,服务端新增条目并入本地,防旧页面
-  // 覆盖新收编条目。删除路径传 merge=false:本地已 splice,合并会把刚删的
-  // 条目从服务端补回来,删除就失效了。
+async function commitMirrors(opts = {}) {
+  // 合并模式(启停/编辑/删除):先拉最新清单,服务端新增条目并入本地,防旧页面
+  // 覆盖新收编条目。drop = 本次被删的 URL:合并时跳过,刚删的不会被补回,
+  // 双窗口下别家新增的条目也保得住。
+  const { merge = true, drop = null } = opts;
   if (merge) {
     try {
       const s = await (await fetch('/api/settings')).json();
       for (const l of (s.workerMirrors || [])) {
+        if (drop && l.url === drop) continue;
         if (!MIRRORS.some(m => m.url === l.url)) MIRRORS.push({url: l.url, on: !!l.on});
       }
     } catch (e) { /* 拉取失败按本地状态提交 */ }
@@ -233,8 +235,9 @@ $('mirrorRows').addEventListener('click', async e => {
     row.on = !row.on;
     await commitMirrors();
   } else if (btn.dataset.act === 'del') {
+    const url = row.url;
     MIRRORS.splice(idx, 1);
-    await commitMirrors(false);
+    await commitMirrors({ merge: true, drop: url });
     toast('已彻底删除');
   }
 });
