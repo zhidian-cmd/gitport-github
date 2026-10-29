@@ -140,17 +140,23 @@
     headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
     const target = new URL(rest);
-    // GET/HEAD 无 Range 的请求走 CF 边缘缓存：命中即免回源（速度与公共镜像同级），
-    // 未命中回源一次后入缓存。带 Range 的下载流直通（缓存副本无法 206 切片）。
-    const cacheable = (request.method === "GET" || request.method === "HEAD")
+    // GET/HEAD 无 Range 的请求走 CF 边缘缓存：命中即免回源，未命中回源一次后入缓存。
+    // 带凭据的请求绝不入缓存(私有响应以公共 URL 为键会被任何人取走)；也不读缓存
+    // (他人可能以同 URL 存过脏数据)。带 Range 的下载流直通(缓存副本无法 206 切片)。
+    const hasCreds = request.headers.has("authorization") || request.headers.has("cookie");
+    const cacheable = !hasCreds && (request.method === "GET" || request.method === "HEAD")
       && !request.headers.get("range");
     if (cacheable) {
-      const cached = await caches.default.match(target.toString());
+      const cached = await caches.default.match(request.method + " " + target.toString());
       if (cached) return cached;
     }
     const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
-    if (cacheable && upstream.ok) {
-      ctx.waitUntil(caches.default.put(target.toString(), upstream.clone()));
+    if (cacheable && upstream.ok && upstream.status === 200) {
+      // put 对 206/304/Vary:* 会 reject, 限 200 且 catch 掉防未处理拒绝刷屏。
+      ctx.waitUntil(
+        caches.default.put(request.method + " " + target.toString(), upstream.clone())
+          .catch(() => {})
+      );
     }
     return upstream;
   }
@@ -166,7 +172,7 @@
           </div>
           <p class="hint" style="margin-top:6px;line-height:1.9">
             ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
-            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存：首次回源后同一资源免回源，速度与公共镜像同级）；<br>
+            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存 + 凭据防护；2026-10-29 前部署的老代码请重新粘贴覆盖一次）；<br>
             ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
             ④ 把地址粘贴到上方「我的镜像」→ 点「启动」。之后「启动/关闭」只增删 plans.json 链成员，地址注册表原位保留；<br>
             ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。

@@ -120,62 +120,45 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 最小者胜；并列(相差 ≤5%, 用 ect*100 ≤ best*105 无地板比较)轮转均摊。
+/// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)轮转均摊。
 /// 失败窗内的镜像跳过，全军都在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
+    // 单点实现：速度(冷启动按链位 -4%/家, 封底 80%) 与 ECT 毫秒。
+    // 梯度必须 <5% 容差：-5%/家会使 ECT 差 +5.26% 越线，铺开失效。
+    let ect_of = |ld: &MirrorLoad, i: usize| -> u64 {
+        let speed = {
+            let s = ld.speed_ewma.load(Ordering::Relaxed);
+            if s == 0 {
+                DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 25 * (i as u64).min(5)
+            } else {
+                s
+            }
+        };
+        ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed
+    };
+    let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
+        allow_recent_failures || {
+            let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+            lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
+        }
+    };
     for allow_recent_failures in [false, true] {
         let mut best_ect = u64::MAX;
         for (i, ld) in loads.iter().enumerate() {
-            if !allow_recent_failures {
-                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
-                if lf != 0 && now.saturating_sub(lf) < MIRROR_FAIL_WINDOW_MS {
-                    continue;
-                }
-            }
-            let speed = {
-                let s = ld.speed_ewma.load(Ordering::Relaxed);
-                if s == 0 {
-                    // 冷启动梯度：链位越后假设越慢(封底 75%)，连发自然沿链铺开。
-                    DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 20 * (i as u64).min(5)
-                } else {
-                    s
-                }
-            };
-            // ECT 毫秒：字节 / (B/s) × 1000。秒级整数在 MB/s × MB 域只剩个位数,
-            // 5% 容差不足一步, 并列判定全靠它有毫秒分辨率。
-            let ect = ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed;
-            if ect < best_ect {
-                best_ect = ect;
+            if healthy(ld, allow_recent_failures) {
+                best_ect = best_ect.min(ect_of(ld, i));
             }
         }
         // 容差内全部入围，轮转均摊；真差距(>5%)仍严格选快者。
-        let mut tied: Vec<usize> = Vec::new();
-        for (i, ld) in loads.iter().enumerate() {
-            if !allow_recent_failures {
-                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
-                if lf != 0 && now.saturating_sub(lf) < MIRROR_FAIL_WINDOW_MS {
-                    continue;
-                }
-            }
-            let speed = {
-                let s = ld.speed_ewma.load(Ordering::Relaxed);
-                if s == 0 {
-                    DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 20 * (i as u64).min(5)
-                } else {
-                    s
-                }
-            };
-            let ect = ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed;
-            // 5% 容差交叉乘法(无整除地板)。
-            if ect * 100 <= best_ect * 105 {
-                tied.push(i);
-            }
-        }
-        if let Some(&i) = tied.first() {
+        let tied: Vec<usize> = (0..loads.len())
+            .filter(|&i| healthy(&loads[i], allow_recent_failures))
+            .filter(|&i| ect_of(&loads[i], i) * 100 <= best_ect * 105)
+            .collect();
+        if let Some(&first) = tied.first() {
             if tied.len() == 1 {
-                return i;
+                return first;
             }
             let n = TIE_ROTATOR.fetch_add(1, Ordering::Relaxed);
             return tied[(n % tied.len() as u64) as usize];
@@ -853,7 +836,7 @@ mod tests {
         a.in_flight_bytes.store(0, Ordering::Relaxed);
         b.in_flight_bytes.store(0, Ordering::Relaxed);
         let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
-        // 梯度: a=2MB/s(位0), b=1.9MB/s(位1) → a 的 ECT 略小但在 5% 容差内 → 轮转。
+        // 梯度(-4%/家): a=2MB/s(位0), b=1.92MB/s(位1) → a 的 ECT 差 +4.17% < 5% 容差 → 轮转。
         let mut seen = std::collections::HashSet::new();
         for _ in 0..20 {
             seen.insert(pick_mirror(&chain, 1024));

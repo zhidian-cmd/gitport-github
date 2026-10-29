@@ -191,15 +191,18 @@ function mirrorRow(m, i) {
     '</div>';
 }
 
-async function commitMirrors() {
-  // 先拉最新清单合并本地编辑：防旧页面状态覆盖服务端新收编的条目
-  // （plans.json 手改重启收编后，旧页面一次保存会把它们无声删光）。
-  try {
-    const s = await (await fetch('/api/settings')).json();
-    for (const l of (s.workerMirrors || [])) {
-      if (!MIRRORS.some(m => m.url === l.url)) MIRRORS.push({url: l.url, on: !!l.on});
-    }
-  } catch (e) { /* 拉取失败按本地状态提交 */ }
+async function commitMirrors(merge = true) {
+  // 合并模式(启停/编辑):先拉最新清单,服务端新增条目并入本地,防旧页面
+  // 覆盖新收编条目。删除路径传 merge=false:本地已 splice,合并会把刚删的
+  // 条目从服务端补回来,删除就失效了。
+  if (merge) {
+    try {
+      const s = await (await fetch('/api/settings')).json();
+      for (const l of (s.workerMirrors || [])) {
+        if (!MIRRORS.some(m => m.url === l.url)) MIRRORS.push({url: l.url, on: !!l.on});
+      }
+    } catch (e) { /* 拉取失败按本地状态提交 */ }
+  }
   const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on}));
   let r;
   try { r = await postJSON('/api/settings/workerMirrors', {mirrors}); }
@@ -231,7 +234,7 @@ $('mirrorRows').addEventListener('click', async e => {
     await commitMirrors();
   } else if (btn.dataset.act === 'del') {
     MIRRORS.splice(idx, 1);
-    await commitMirrors();
+    await commitMirrors(false);
     toast('已彻底删除');
   }
 });
