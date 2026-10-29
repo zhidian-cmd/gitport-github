@@ -237,11 +237,11 @@ async fn mitm_http(
                 }
             }
         });
-        if let Ok(resp) = chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await {
-            return write_upstream(resp, "mirror", &info);
+        match chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await {
+            Ok(resp) => return write_upstream(resp, "mirror", &info),
+            // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
+            Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
         }
-        // 镜像+直连全灭：无更多腿可试。
-        (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用"));
         return mitm_unavailable(
             &req,
             &host,

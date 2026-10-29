@@ -465,12 +465,8 @@ pub(super) async fn chain_fetch(
     host: &str,
     direct: DirectLeg<'_>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 凭据查询串等价 bearer，交第三方镜像即外泄。
-    if let Some(q) = out.uri().query() {
-        if has_credential_query(q) {
-            return Err(format!("{host} 查询串含凭据参数, 拒绝镜像(防外泄)"));
-        }
-    }
+    // 凭据查询串等价 bearer，交第三方镜像即外泄——标记后剥空镜像，仅派直连。
+    let cred_locked = out.uri().query().is_some_and(has_credential_query);
     let orig_url = format!(
         "https://{host}{}",
         out.uri()
@@ -498,7 +494,13 @@ pub(super) async fn chain_fetch(
     if let Some(c) = cond {
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
-    let chain = pool::mirror_chain(chain_host);
+    // 凭据串请求：镜像候选剥空，签名 URL 不落任何第三方。
+    let chain = if cred_locked {
+        (log)(&format!("[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(防外泄)"));
+        Vec::new()
+    } else {
+        pool::mirror_chain(chain_host)
+    };
     // 直连同台：直连是候选池里的普通选手(键 direct/{host})，ECT 一视同仁；
     // 零镜像时候选=仅直连，502 只在"镜像+直连全灭"时发生。
     let direct_key = format!("direct/{chain_host}");
@@ -604,8 +606,16 @@ pub(super) async fn chain_fetch(
             }
         }
     }
-    pool::MIRROR_BREAKER.set(chain_host);
-    Err(format!("{host} 镜像链全灭({chain_host} 链 {limit} 个)"))
+    // 纯直连耗尽(零镜像/凭据串剥空)不给链上熔断——镜像没参与，别连坐。
+    if !chain.is_empty() {
+        pool::MIRROR_BREAKER.set(chain_host);
+    }
+    let why = if cred_locked {
+        "凭据串仅直连, 直连失败"
+    } else {
+        "镜像链全灭"
+    };
+    Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
 fn mirror_request(
     out: &hyper::Request<BoxBody>,
@@ -933,8 +943,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chain_fetch_refuses_credentialed_url() {
-        let log: LogFn = Arc::new(|_: &str| {});
+    async fn chain_fetch_cred_locks_to_direct() {
+        let lines: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let log: LogFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
         let req = hyper::Request::builder()
             .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
             .body(upstream::empty_body())
@@ -947,7 +960,36 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("拒绝镜像"), "签名 URL 不得交给第三方镜像: {err}");
+        assert!(err.contains("仅直连"), "凭据串应剥空镜像仅直连: {err}");
+        let got = lines.lock().unwrap();
+        assert!(
+            got.iter().any(|l| l.contains("仅直连(防外泄)")),
+            "应记录剥空镜像决策: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|l| l.contains(" via ")),
+            "签名 URL 不得交给第三方镜像: {got:?}"
+        );
+    }
+
+    /// 纯直连耗尽(零镜像/凭据串剥空)不给镜像链上熔断——链没参与，别连坐。
+    #[tokio::test]
+    async fn direct_only_exhaustion_spares_chain_breaker() {
+        let log: LogFn = Arc::new(|_: &str| {});
+        let host = "cred-brk.test";
+        pool::MIRROR_BREAKER.clear(host);
+        let req = hyper::Request::builder()
+            .uri("https://cred-brk.test/f?sig=abc")
+            .body(upstream::empty_body())
+            .unwrap();
+        let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
+            .await
+            .unwrap_err();
+        assert!(err.contains("仅直连"), "凭据串请求应仅派直连: {err}");
+        assert!(
+            !pool::MIRROR_BREAKER.open(host),
+            "直连独走耗尽不得触发镜像链熔断"
+        );
     }
 
     /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
