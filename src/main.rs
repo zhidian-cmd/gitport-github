@@ -23,7 +23,7 @@ fn arg_value(args: &[String], name: &str) -> Option<u16> {
 
 fn main() {
     logger::install_panic_hook();
-    logger::guard("main", || run());
+    logger::guard("main", run);
 }
 
 fn run() {

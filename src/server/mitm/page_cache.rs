@@ -1017,7 +1017,7 @@ mod page_cache_tests {
     #[test]
     fn search_skeleton_gate() {
         let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
-        let full = format!("<html>{{}}react-app.embeddedData{{}}</html>");
+        let full = "<html>{}react-app.embeddedData{}</html>".to_string();
         assert!(
             !is_search_skeleton(k, full.as_bytes(), false),
             "含结果载体的正常页应缓存"

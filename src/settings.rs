@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(v.win_rect, [0; 4]);
         assert_eq!(v.last_ip.marks()[2], ("api/all".to_string(), "1.1.1.1".to_string()));
         // 非 JSON 垃圾才整体回默认
-        assert_eq!(parse("not json").close_to_tray, false);
+        assert!(!parse("not json").close_to_tray);
     }
 
     #[test]

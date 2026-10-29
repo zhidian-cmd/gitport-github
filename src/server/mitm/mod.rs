@@ -252,7 +252,7 @@ async fn mitm_http(
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
-            match pool::route::fallback_for(&name, &host) {
+            match pool::route::fallback_for(name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     let chain_host = pool::route::mirror_chain_host(&host, &path);
                     let new_bytes = mirror::range_bytes_of(
@@ -358,7 +358,7 @@ fn stream_decision(
     {
         return Some("git 智能协议");
     }
-    if declared_len.map_or(false, |n| n as usize > upstream::MAX_REPLAY_BODY) {
+    if declared_len.is_some_and(|n| n as usize > upstream::MAX_REPLAY_BODY) {
         return Some("声明超限");
     }
     None
@@ -434,7 +434,7 @@ async fn stream_passthrough(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
             ));
-            write_upstream(resp, "stream", &info)
+            write_upstream(resp, "stream", info)
         }
         Ok(Err(e)) => {
             if let Some(h) = &pump {

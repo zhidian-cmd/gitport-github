@@ -137,9 +137,7 @@ pub fn signal_show(port: u16) -> bool {
         Err(_) => return false,
     };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
-    let req = format!(
-        "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    );
+    let req = "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
     if s.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -246,7 +244,7 @@ fn show_window(slot: &Mutex<WinSlot>) -> bool {
     let g = slot.lock().unwrap();
     let Some(w) = &g.win else { return false };
     w.set_visible(true);
-    let _ = w.set_focus();
+    w.set_focus();
     true
 }
 

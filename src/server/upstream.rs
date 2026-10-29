@@ -161,7 +161,7 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     }
     let mut idx = h.next % n;
     h.next = idx + 1;
-    if n > 1 && EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 != 0 {
+    if n > 1 && !EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
         if let Some((i, _)) = h
             .conns
             .iter()
@@ -248,7 +248,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     let log = log.clone();
     tokio::spawn(async move {
         let name = crate::config::pool_for(&host);
-        match h2_dial_slot(&name, &host, &log, &skip, 2, None).await {
+        match h2_dial_slot(name, &host, &log, &skip, 2, None).await {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
@@ -480,7 +480,7 @@ pub async fn h2_send(
     out: &hyper::Request<BoxBody>,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let has_body = body.as_ref().map_or(false, |b| !b.is_empty());
+    let has_body = body.as_ref().is_some_and(|b| !b.is_empty());
     let (resp_fut, mut send_stream) = h2_open_stream(up, out, !has_body).await?;
     if has_body {
         send_stream

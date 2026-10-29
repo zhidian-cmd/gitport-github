@@ -408,7 +408,7 @@ pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough:
     let Some(ps) = t.pools.get(pool_name) else { return };
     let circle: Vec<&SerialPlan> = ps
         .iter()
-        .filter(|p| family.map_or(true, |f| (f.serves)(host, p)))
+        .filter(|p| family.is_none_or(|f| (f.serves)(host, p)))
         .collect();
     if circle.is_empty() {
         return;
@@ -482,7 +482,7 @@ pub async fn serial_dial_skip(
     let family_name = family.map_or("", |f| f.name);
     let mut circle: Vec<&SerialPlan> = snapshot
         .iter()
-        .filter(|p| serves.map_or(true, |s| s(host, p)))
+        .filter(|p| serves.is_none_or(|s| s(host, p)))
         .collect();
     if !skip_ips.is_empty() {
         let filtered: Vec<&SerialPlan> = circle
@@ -928,7 +928,7 @@ mod tests {
         // plans.json 里的链是否原样保留，不掺注册表状态。
         crate::settings::save_worker_mirrors(Vec::new());
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{
   "core": [{"ip": "1.2.3.4", "sni": "baidu.com"}],
   "edge": "写坏了-不是数组",
@@ -1000,7 +1000,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{
   "core": [
     {"ip": "1.2.3.4", "sni": "ech", "成功次数": "9/9", "分数": 99},
@@ -1088,7 +1088,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tmpdir();
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{ "edge": [{"ip": "140.82.112.29", "sni": "baidu.com"}] }"#,
         )
         .unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
         crate::settings::save_worker_mirrors(Vec::new());
         let dir = tmpdir();
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{
   "core": [],
   "mirrors_big":   {"codeload.github.com": ["https://big.example"]},
@@ -1355,7 +1355,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         crate::settings::save_worker_mirrors(Vec::new());
         let dir = tmpdir();
-        std::fs::write(&dir.join("plans.json"), r#"{"core": []}"#).unwrap();
+        std::fs::write(dir.join("plans.json"), r#"{"core": []}"#).unwrap();
         serial_load(&dir, Vec::new(), None);
         assert!(
             mirror_chain("raw.githubusercontent.com").is_empty(),
@@ -1386,7 +1386,7 @@ mod tests {
         crate::settings::save_worker_mirrors(Vec::new());
         let dir = tmpdir();
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{
   "core": [{"ip": "140.82.112.3", "sni": "baidu.com"}],
   "mirrors": {
@@ -1491,7 +1491,7 @@ mod tests {
         dial::set_dial_port(port);
         let dir = tmpdir();
         std::fs::write(
-            &dir.join("plans.json"),
+            dir.join("plans.json"),
             r#"{"core":[{"ip":"127.0.0.1","sni":"a.example"},{"ip":"127.0.0.2","sni":"a.example"}]}"#,
         )
         .unwrap();

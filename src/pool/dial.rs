@@ -196,7 +196,7 @@ impl hyper_util::client::legacy::connect::Connection for Dialed {
 }
 
 fn io_err(msg: String) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, msg)
+    std::io::Error::other(msg)
 }
 
 /// TLS 会话恢复缓存：键 = SNI 形态（伪装腿统一一个键，真名腿各 host 自键）。

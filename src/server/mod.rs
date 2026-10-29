@@ -412,7 +412,7 @@ fn hello_split_ranges(first_read: &[u8]) -> Option<Vec<std::ops::Range<usize>>> 
     // 首刀：1..=16 字节（覆盖 TLS 记录头一带，具体位置随机）
     let c1 = 1 + (r % config::HELLO_SPLIT_FIRST_MAX as u64) as usize;
     // 约 2/3 概率三段：二刀落在 n 的 1/3 ~ 2/3 处（SNI 通常在这一带）
-    let three = (r >> 8) % 3 != 0;
+    let three = !(r >> 8).is_multiple_of(3);
     if !three {
         return Some(vec![0..c1, c1..n]);
     }
@@ -632,12 +632,12 @@ mod tests {
     #[test]
     fn hello_split_ranges_gate() {
         let tls_long: Vec<u8> = std::iter::once(0x16u8)
-            .chain(std::iter::repeat(0u8).take(300))
+            .chain(std::iter::repeat_n(0u8, 300))
             .collect();
         let ranges = hello_split_ranges(&tls_long).expect("TLS 握手应拆");
         assert!(ranges.len() == 2 || ranges.len() == 3, "段数应在 2~3: {ranges:?}");
         assert_eq!(ranges.first().unwrap().start, 0);
-        assert!(ranges.first().unwrap().len() >= 1);
+        assert!(!ranges.first().unwrap().is_empty());
         assert!(ranges.first().unwrap().len() <= config::HELLO_SPLIT_FIRST_MAX);
         let mut cursor = 0usize;
         for r in &ranges {
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn hello_split_randomizes_cuts() {
         let tls_long: Vec<u8> = std::iter::once(0x16u8)
-            .chain(std::iter::repeat(0u8).take(600))
+            .chain(std::iter::repeat_n(0u8, 600))
             .collect();
         let mut firsts = std::collections::HashSet::new();
         let mut seg_counts = std::collections::HashSet::new();

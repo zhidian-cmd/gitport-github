@@ -92,7 +92,7 @@ pub fn pattern_match(host: &str, pat: &str) -> bool {
     match pat.strip_prefix("*.") {
         Some(suffix) => host
             .strip_suffix(suffix)
-            .map_or(false, |h| h.ends_with('.')),
+            .is_some_and(|h| h.ends_with('.')),
         None => host == pat,
     }
 }
@@ -163,7 +163,7 @@ pub fn whitelist_seg(host: &str) -> Option<&'static str> {
 }
 
 pub fn is_direct(host: &str) -> bool {
-    DIRECT_HOSTS.iter().any(|d| *d == host)
+    DIRECT_HOSTS.contains(&host)
 }
 
 /// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
