@@ -208,7 +208,7 @@ async fn mitm_http(
         let new_bytes =
             mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
         // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
-        // 直连失败记 60s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
+        // 直连失败记 45s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
         match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
             Ok(resp) => return resp,
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
@@ -230,7 +230,7 @@ async fn mitm_http(
                     let new_bytes = mirror::range_bytes_of(
                         req.headers().get("range").and_then(|v| v.to_str().ok()),
                     );
-                    // 直连刚在全灭分支失败过: load 会带 60s 降权, chain_fetch 内
+                    // 直连刚在全灭分支失败过: load 会带 45s 降权, chain_fetch 内
                     // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
                     match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await
                     {

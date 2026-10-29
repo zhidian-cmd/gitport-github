@@ -15,11 +15,11 @@ const MIRROR_CHAIN_CAP: usize = 5;
 /// 无样本时的基准速率；pick_mirror 按链位注入 -5%/家的梯度(封底 75%)。
 const DEFAULT_MIRROR_SPEED: u64 = 2 * 1024 * 1024;
 /// 失败降权窗；全体都在窗内则放开过滤。
-const MIRROR_FAIL_WINDOW_MS: u64 = 60_000;
+const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-const SPEED_SAMPLE_BYTES: u64 = 1024 * 1024;
-const SPEED_SAMPLE_MIN_BYTES: u64 = 256 * 1024;
+const SPEED_SAMPLE_BYTES: u64 = 512 * 1024;
+const SPEED_SAMPLE_MIN_BYTES: u64 = 128 * 1024;
 
 /// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
 /// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者，负载摊开少误掐。
@@ -150,7 +150,7 @@ impl Drop for LoadGuard {
 }
 
 /// 探测轮末位淘汰(纯函数)：镜像首个样本的速率 vs 有样本同伴中位数。
-/// 低于一半 → 探测判定"体质差"，60s 降权。小片熬不到掐断的 2s 窗口，
+/// 低于一半 → 探测判定"体质差"，45s 降权。小片熬不到掐断的 1.2s 窗口，
 /// 靠这里把探测结论变成账本事实。
 fn probe_outlier(own: u64, peer_median: Option<u64>) -> bool {
     peer_median.is_some_and(|m| own < m / 2)
@@ -282,9 +282,9 @@ fn validate_mirror_response(had_range: bool, status: u16, content_type: &str) ->
 
 // ---- 慢镜像掐断：相对差值检验，全军低速零误杀 ----
 
-const CUT_CHECKPOINT_BYTES: u64 = 128 * 1024;
-/// 窗口最短时长：TCP 爬坡期的低速不参评。
-const CUT_MIN_WINDOW_MS: u64 = 2_000;
+const CUT_CHECKPOINT_BYTES: u64 = 96 * 1024;
+
+const CUT_MIN_WINDOW_MS: u64 = 1_200;
 const CUT_PEER_FRESH_MS: u64 = 30_000;
 /// 流速度 < 同伴中位数 / 该值 = 显著离群。
 const CUT_SIGNIFICANCE_DIVISOR: u64 = 20;
@@ -412,8 +412,11 @@ fn cutoff_watched_body(
             Some(Err(e)) => Some((Err(e), st)),
             None => {
                 // EOS = 流正常读完。探测轮末位淘汰：本流是该镜像首个速度样本
-                // (探测片)，速率低于有样本同伴中位数一半 → 记 60s 降权。
-                // 小片熬不到掐断的 2s 窗口，探测结论在这里落账本。
+                // (探测片)，速率低于同伴基准一半 → 记 45s 降权。
+                // 小片熬不到掐断的 1.2s 窗口，探测结论在这里落账本。
+                // 基准两级：有新鲜样本同伴用其中位数；全员无样本(首批并发，
+                // 谁都没考过)用冷启动先验兜底——但只在至少一家交出"达到先验
+                // 70%"成绩时才启用先验判罚，全员都慢(链路本身差)则免检不乱杀。
                 let was_probe =
                     st.guard.is_probe && st.guard.delivered >= SPEED_SAMPLE_MIN_BYTES;
                 let now_ms = pool::now_ms();
@@ -428,13 +431,27 @@ fn cutoff_watched_body(
                     .filter(|s| *s > 0)
                     .collect();
                 let median = peer_median(&fresh);
+                let median = median.or_else(|| {
+                    let floor = DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 25 * 5;
+                    // 至少一家跑出先验七成才算"链路正常，有人真慢"。
+                    if fresh.is_empty()
+                        && st.peers.iter().any(|p| {
+                            let s = p.speed_ewma.load(Ordering::Relaxed);
+                            s * 10 >= floor * 7
+                        })
+                    {
+                        Some(floor)
+                    } else {
+                        None
+                    }
+                });
                 let own = st.guard.delivered * 1000
                     / st.guard.mark_at.elapsed().as_millis().max(1) as u64;
                 if was_probe && probe_outlier(own, median) {
                     st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
                     let base = median.unwrap_or(0) / 1024;
                     (st.log)(&format!(
-                        "[镜像] {} {} 探测片速率 {}KB/s 低于同伴一半(基准 {base}KB/s), 探测出局(60s)",
+                        "[镜像] {} {} 探测片速率 {}KB/s 低于同伴一半(基准 {base}KB/s), 探测出局(45s)",
                         st.label, st.mirror, own / 1024
                     ));
                 }
@@ -1040,6 +1057,82 @@ mod tests {
         assert_eq!(order, vec![0, 4, 8], "已在窗内不重复追加");
     }
 
+    /// EOS 探测的先验基准：全员无新鲜样本时，只要有同伴达先验七成即以先验
+    /// 为基准判罚(首轮大逃杀)；全员都慢(链路差)则免检不乱杀。
+    #[tokio::test]
+    async fn probe_prior_baseline_fires_when_link_is_normal() {
+        let fast = mirror_load("probe-prior-fast.test");
+        fast.speed_ewma
+            .store(2 * 1024 * 1024, Ordering::Relaxed); // 达先验，但 last_sample_ms=0(无新鲜样本)
+        let me = mirror_load("probe-prior-me.test");
+        me.speed_ewma.store(0, Ordering::Relaxed);
+        me.last_fail_ms.store(0, Ordering::Relaxed);
+        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+                Bytes::from(vec![0u8; SPEED_SAMPLE_MIN_BYTES as usize]),
+            ))]),
+        ));
+        let guard = LoadGuard::charge(me.clone(), SPEED_SAMPLE_MIN_BYTES);
+        let mut wrapped = cutoff_watched_body(
+            body,
+            guard,
+            me.clone(),
+            vec![fast],
+            CutMeta {
+                chain_host: "probe-prior.test".into(),
+                mirror: "probe-prior-me.test".into(),
+                label: "h/p".into(),
+            },
+            Arc::new(|_: &str| {}),
+        );
+        // own ≈ 128KB / 0.2s ≈ 640KB/s < 先验 1.6MB/s 的一半 → 探测出局。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 数据帧
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // EOS
+        drop(wrapped);
+        assert_ne!(
+            me.last_fail_ms.load(Ordering::Relaxed),
+            0,
+            "先验基准应判罚首轮慢探测片"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_prior_baseline_spares_all_slow_links() {
+        let slow = mirror_load("probe-prior-slow.test");
+        slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 远低于先验七成
+        let me = mirror_load("probe-prior-me2.test");
+        me.speed_ewma.store(0, Ordering::Relaxed);
+        me.last_fail_ms.store(0, Ordering::Relaxed);
+        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+                Bytes::from(vec![0u8; SPEED_SAMPLE_MIN_BYTES as usize]),
+            ))]),
+        ));
+        let guard = LoadGuard::charge(me.clone(), SPEED_SAMPLE_MIN_BYTES);
+        let mut wrapped = cutoff_watched_body(
+            body,
+            guard,
+            me.clone(),
+            vec![slow],
+            CutMeta {
+                chain_host: "probe-prior2.test".into(),
+                mirror: "probe-prior-me2.test".into(),
+                label: "h/p".into(),
+            },
+            Arc::new(|_: &str| {}),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await;
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await;
+        drop(wrapped);
+        assert_eq!(
+            me.last_fail_ms.load(Ordering::Relaxed),
+            0,
+            "全员都慢(链路本身差)不得按先验误杀"
+        );
+    }
+
     /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
     fn mirror_test_direct_leg() -> DirectLeg<'static> {
         DirectLeg {
@@ -1368,7 +1461,7 @@ mod tests {
         me.speed_ewma.store(0, Ordering::Relaxed);
         me.last_fail_ms.store(0, Ordering::Relaxed);
         me.in_flight_bytes.store(0, Ordering::Relaxed);
-        // 两帧 128KB，帧间 2.2s：own ≈ 58KB/s < 250KB/s(基准/20) → 掐。
+        // 两帧 96KB，帧间 1.4s：own ≈ 68KB/s < 250KB/s(基准/20) → 掐。
         let chunks = vec![
             Bytes::from(vec![0u8; CUT_CHECKPOINT_BYTES as usize]);
             2
@@ -1397,7 +1490,7 @@ mod tests {
         loop {
             assert!(tokio::time::Instant::now() < deadline, "掐断测试超时");
             match http_body_util::BodyExt::frame(&mut wrapped).await {
-                Some(Ok(_)) => tokio::time::sleep(Duration::from_millis(2200)).await,
+                Some(Ok(_)) => tokio::time::sleep(Duration::from_millis(1400)).await,
                 Some(Err(_)) => {
                     got_err = true;
                     break;
