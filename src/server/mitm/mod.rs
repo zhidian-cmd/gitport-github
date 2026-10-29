@@ -152,7 +152,7 @@ async fn mitm_http(
         }
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
-        return mitm_unavailable(&req, &host);
+        return mitm_unavailable(&req, &host, "上游请求构造失败, 代理正在按表自动重试。");
     };
 
     let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
@@ -217,7 +217,7 @@ async fn mitm_http(
             ));
         } else {
             (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
-            return mitm_unavailable(&req, &host);
+            return mitm_unavailable(&req, &host, "镜像链全部不可用(大文件域不回落直连)。若使用自建镜像请检查其可用性, 或在工作台补充公共镜像。");
         }
     }
     let name = config::pool_for(&host);
@@ -246,7 +246,7 @@ async fn mitm_http(
                     }
                 }
             }
-            return mitm_unavailable(&req, &host);
+            return mitm_unavailable(&req, &host, "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。");
         }
     };
     if is_simple
@@ -260,7 +260,7 @@ async fn mitm_http(
                     "[MITM] {host}{} 拦截页化解失败: {e}",
                     path_of(req.uri())
                 ));
-                return mitm_unavailable(&req, &host);
+                return mitm_unavailable(&req, &host, "全部边缘均返回风控拦截页, 代理正在按表自动重试。");
             }
         }
     }
@@ -635,6 +635,7 @@ fn write_upstream(
 fn mitm_unavailable(
     req: &hyper::Request<Incoming>,
     host: &str,
+    reason: &str,
 ) -> axum::response::Response<BoxBody> {
     if req.method() != Method::GET {
         return plain_502();
@@ -653,7 +654,7 @@ margin-right:10px;animation:p 1.2s ease-out infinite}}\
 h1{{font-size:19px;margin:0 0 14px}}p{{font-size:13.5px;color:#98a2b3;margin:6px 0}}\
 code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decoration:none}}</style></head>\
 <body><div class=\"c\"><h1><span class=\"dot\"></span>{host} 暂时不可用</h1>\
-<p>当前处于封锁窗口期, 代理正在按表自动重试。</p>\
+<p>{reason}</p>\
 <p>本页每 8 秒自动刷新, 窗口一过即可打开。</p>\
 <p>状态可查看工作台 <a href=\"http://127.0.0.1:{ui_port}\">127.0.0.1:{ui_port}</a>。</p>\
 </div></body></html>",

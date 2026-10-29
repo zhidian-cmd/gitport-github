@@ -534,6 +534,7 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
 /// 整表保存自定义镜像注册表：校验（https:// 开头、无空格、去尾斜杠、去重去空）、
 /// 与旧表做差集（新增/停用/删除），交由镜像链对齐后落盘。返回启用中的地址列表。
 /// 删除条目由"新旧差集"自动从链中移除——删除即彻底消失。
+/// 前端提交前必须先 GET 合并最新（防旧页面状态覆盖收编条目）。
 pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {

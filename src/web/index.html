@@ -126,7 +126,7 @@
         <div class="panel">
           <h2>Cloudflare Worker 部署教程（约 3 分钟，全程免费）</h2>
           <pre id="workercode" class="code">export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     let rest = decodeURIComponent(url.pathname.slice(1)) + url.search;
     if (rest.startsWith("https:/") && !rest.startsWith("https://")) rest = "https:/" + rest;
@@ -140,7 +140,19 @@
     headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
     const target = new URL(rest);
-    return fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
+    // GET/HEAD 无 Range 的请求走 CF 边缘缓存：命中即免回源（速度与公共镜像同级），
+    // 未命中回源一次后入缓存。带 Range 的下载流直通（缓存副本无法 206 切片）。
+    const cacheable = (request.method === "GET" || request.method === "HEAD")
+      && !request.headers.get("range");
+    if (cacheable) {
+      const cached = await caches.default.match(target.toString());
+      if (cached) return cached;
+    }
+    const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
+    if (cacheable && upstream.ok) {
+      ctx.waitUntil(caches.default.put(target.toString(), upstream.clone()));
+    }
+    return upstream;
   }
 }</pre>
           <div class="row">
@@ -154,7 +166,7 @@
           </div>
           <p class="hint" style="margin-top:6px;line-height:1.9">
             ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
-            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy；<br>
+            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存：首次回源后同一资源免回源，速度与公共镜像同级）；<br>
             ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
             ④ 把地址粘贴到上方「我的镜像」→ 点「启动」。之后「启动/关闭」只增删 plans.json 链成员，地址注册表原位保留；<br>
             ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。
