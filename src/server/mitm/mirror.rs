@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const MIRROR_CHAIN_CAP: usize = 5;
-/// 无样本时的假设速率；ECT 退化为在途最少，再退化为链序。
+/// 无样本时的基准速率；pick_mirror 按链位注入 -5%/家的梯度(封底 75%)。
 const DEFAULT_MIRROR_SPEED: u64 = 2 * 1024 * 1024;
 /// 失败降权窗；全体都在窗内则放开过滤。
 const MIRROR_FAIL_WINDOW_MS: u64 = 60_000;
@@ -120,12 +120,12 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 最小者胜；并列取链序。失败窗内的镜像跳过，全军都在窗内则放开。
+/// ECT 最小者胜；并列(相差 ≤5%, 用 ect*100 ≤ best*105 无地板比较)轮转均摊。
+/// 失败窗内的镜像跳过，全军都在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
     for allow_recent_failures in [false, true] {
-        let mut best: Option<usize> = None;
         let mut best_ect = u64::MAX;
         for (i, ld) in loads.iter().enumerate() {
             if !allow_recent_failures {
@@ -136,20 +136,56 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
             }
             let speed = {
                 let s = ld.speed_ewma.load(Ordering::Relaxed);
-                if s == 0 { DEFAULT_MIRROR_SPEED } else { s }
+                if s == 0 {
+                    // 冷启动梯度：链位越后假设越慢(封底 75%)，连发自然沿链铺开。
+                    DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 20 * (i as u64).min(5)
+                } else {
+                    s
+                }
             };
-            let ect = ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) / speed;
+            // ECT 毫秒：字节 / (B/s) × 1000。秒级整数在 MB/s × MB 域只剩个位数,
+            // 5% 容差不足一步, 并列判定全靠它有毫秒分辨率。
+            let ect = ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed;
             if ect < best_ect {
                 best_ect = ect;
-                best = Some(i);
             }
         }
-        if let Some(i) = best {
-            return i;
+        // 容差内全部入围，轮转均摊；真差距(>5%)仍严格选快者。
+        let mut tied: Vec<usize> = Vec::new();
+        for (i, ld) in loads.iter().enumerate() {
+            if !allow_recent_failures {
+                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+                if lf != 0 && now.saturating_sub(lf) < MIRROR_FAIL_WINDOW_MS {
+                    continue;
+                }
+            }
+            let speed = {
+                let s = ld.speed_ewma.load(Ordering::Relaxed);
+                if s == 0 {
+                    DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 20 * (i as u64).min(5)
+                } else {
+                    s
+                }
+            };
+            let ect = ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed;
+            // 5% 容差交叉乘法(无整除地板)。
+            if ect * 100 <= best_ect * 105 {
+                tied.push(i);
+            }
+        }
+        if let Some(&i) = tied.first() {
+            if tied.len() == 1 {
+                return i;
+            }
+            let n = TIE_ROTATOR.fetch_add(1, Ordering::Relaxed);
+            return tied[(n % tied.len() as u64) as usize];
         }
     }
     0
 }
+
+/// 轮转计数器：并列候选间均摊。
+static TIE_ROTATOR: AtomicU64 = AtomicU64::new(0);
 
 fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
     if chain_len == 0 {
@@ -807,7 +843,7 @@ mod tests {
         b.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 无样本 → 默认速率下按在途字节 → 全零按链序。
+    /// 无样本 → 梯度速率下按在途字节分 → 全零时轮转均摊不塞链头。
     #[test]
     fn cold_start_falls_back_to_chain_order() {
         let a = mirror_load("cold-a.test");
@@ -817,10 +853,47 @@ mod tests {
         a.in_flight_bytes.store(0, Ordering::Relaxed);
         b.in_flight_bytes.store(0, Ordering::Relaxed);
         let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
-        assert_eq!(pick_mirror(&chain, 1024), 0, "全零：链序首位");
+        // 梯度: a=2MB/s(位0), b=1.9MB/s(位1) → a 的 ECT 略小但在 5% 容差内 → 轮转。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(pick_mirror(&chain, 1024));
+        }
+        assert!(
+            seen.contains(&0) && seen.contains(&1),
+            "冷启动全空应在容差内轮转均摊, 不塞链头: {seen:?}"
+        );
+        // 在途拉开(超容差) → 严格选闲者。
         a.in_flight_bytes.store(8 * 1024 * 1024, Ordering::Relaxed);
-        assert_eq!(pick_mirror(&chain, 1024), 1, "默认速率下按在途字节分");
+        assert_eq!(pick_mirror(&chain, 1024), 1, "梯度速率下按在途字节分");
         a.in_flight_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// ECT 相差 ≤5% 轮转均摊，>5% 严格选快者(ECT 核心语义不被稀释)。
+    #[test]
+    fn ect_tie_rotates_within_tolerance_only() {
+        let a = mirror_load("tie-a.test");
+        let b = mirror_load("tie-b.test");
+        a.in_flight_bytes.store(0, Ordering::Relaxed);
+        b.in_flight_bytes.store(0, Ordering::Relaxed);
+        let chain = vec!["tie-a.test".to_string(), "tie-b.test".to_string()];
+        // 速度差 4%(容差内) + 在途全零 → ECT 并列 → 轮转两家都出。
+        a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
+        b.speed_ewma.store(2088 * 1024, Ordering::Relaxed); // +4%
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(pick_mirror(&chain, 8 * 1024 * 1024));
+        }
+        assert!(
+            seen.contains(&0) && seen.contains(&1),
+            "5% 内并列应轮转: {seen:?}"
+        );
+        // 速度差 30%(超容差) → 恒选快者 b。
+        b.speed_ewma.store(26 * 1024 * 1024 / 10, Ordering::Relaxed); // 2.6MB/s
+        for _ in 0..10 {
+            assert_eq!(pick_mirror(&chain, 8 * 1024 * 1024), 1, "真差距必须严格选快");
+        }
+        a.speed_ewma.store(0, Ordering::Relaxed);
+        b.speed_ewma.store(0, Ordering::Relaxed);
     }
 
     #[test]
