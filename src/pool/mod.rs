@@ -702,7 +702,15 @@ pub fn sync_custom_mirrors(removed: &[String]) {
         Some(t) => t,
         None => return,
     };
+    // 链全空时(全新安装)先按 CONTENT_HOSTS 建键：values_mut() 对空表遍历不到
+    // 任何东西，没有这步启用中的镜像永远落不进链(校准/大文件全哑)。
+    if !enabled.is_empty() {
+        for h in CONTENT_HOSTS {
+            tab.mirrors.entry(h.to_string()).or_default();
+        }
+    }
     let changed = align_custom_mirrors(&mut tab.mirrors, &enabled, &disabled);
+    // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
     drop(g);
     if changed {
         write_plans_file(&plans_path(), &plans_snapshot(), &mirror_chains_snapshot());
@@ -1336,6 +1344,38 @@ mod tests {
             legacy.contains(&"https://legacy-only.example".to_string()),
             "仅旧字典有的 host 照常并入: {legacy:?}"
         );
+        // 清场：正规路径删除自建镜像（注册表 + 全部链），不给后续测试留全局残留。
+        crate::settings::set_worker_mirrors(Vec::new()).ok();
+    }
+
+    /// 全新安装(链全空) + 添加镜像 → 启用中的镜像必须落进全部 8 条链。
+    /// v0.5.0 回归：values_mut() 对空表遍历不到任何东西，镜像只进注册表不进链。
+    #[test]
+    fn fresh_install_mirror_lands_in_all_chains() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        crate::settings::save_worker_mirrors(Vec::new());
+        let dir = tmpdir();
+        std::fs::write(&dir.join("plans.json"), r#"{"core": []}"#).unwrap();
+        serial_load(&dir, Vec::new(), None);
+        assert!(
+            mirror_chain("raw.githubusercontent.com").is_empty(),
+            "前置: 全新安装链应为空"
+        );
+        // 模拟 UI 添加并启用一个镜像(整表保存走 sync_custom_mirrors)。
+        crate::settings::set_worker_mirrors(vec![crate::settings::WorkerMirror {
+            url: "https://my-worker.example.com".to_string(),
+            on: true,
+        }])
+        .unwrap();
+        for h in CONTENT_HOSTS {
+            let c = mirror_chain(h);
+            assert!(
+                c.contains(&"https://my-worker.example.com".to_string()),
+                "{h} 链必须收到启用中的镜像(全新安装也必须生效): {c:?}"
+            );
+        }
+        // 清场：正规路径删除，注册表与全部链恢复空。
+        crate::settings::set_worker_mirrors(Vec::new()).ok();
     }
 
     #[test]
@@ -1370,10 +1410,16 @@ mod tests {
             ],
             "用户链原样保留(含自部署镜像): {raw_chain:?}"
         );
-        // 缺链 host = 无镜像腿，数据决定
-        assert!(
-            mirror_chain("media.githubusercontent.com").is_empty(),
-            "无链 host 不应被填默认"
+        // 缺链 host：注册表有启用镜像时按 CONTENT_HOSTS 铺键并对齐全量
+        // (自建镜像进所有链是既有设计)；无启用镜像时该 host 真正无链。
+        let media = mirror_chain("media.githubusercontent.com");
+        assert_eq!(
+            media,
+            vec![
+                "https://v4.gh-proxy.org".to_string(),
+                "https://my-self.example.com".to_string()
+            ],
+            "media 无自带链, 应被注册表对齐填成启用镜像全量: {media:?}"
         );
         let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
         assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
