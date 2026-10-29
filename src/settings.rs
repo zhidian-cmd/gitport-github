@@ -121,7 +121,29 @@ pub fn is_our_pac(cur: &str) -> bool {
 /// 接管时的备份判定：cur 非空、不是正要写的、不是上次写的(last_pac)——
 /// 其余都算用户的配置，必须备份(同形态 ≠ 我们的，端口无关判定会误吞)。
 fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
-    !cur.trim().is_empty() && cur != pac && cur != last_pac
+    let cur = cur.trim();
+    !cur.is_empty() && cur != pac.trim() && cur != last_pac.trim()
+}
+
+/// 系统里的 PAC 是不是我们自己写的那条。
+/// last_pac 非空时按确切字符串比较——别家同形态(`127.0.0.1:别的端口/proxy.pac`)
+/// 不算我们的，清场时不许动；为空(升级前的旧配置)只此一次退回形状判定。
+fn is_our_current_pac(cur: &str, last_pac: &str) -> bool {
+    let last = last_pac.trim();
+    if last.is_empty() {
+        return is_our_pac(cur);
+    }
+    cur.trim() == last
+}
+
+/// 备份值本身是不是我们写过的 PAC(旧版误把自己的地址备份进来的残留)。
+/// 是则不还原——还原死 PAC 会让浏览器把 GitHub 流量发到一个没人在听的端口。
+fn backup_is_ours(backup: &str, last_pac: &str) -> bool {
+    let last = last_pac.trim();
+    if last.is_empty() {
+        return is_our_pac(backup);
+    }
+    backup.trim() == last
 }
 
 /// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
@@ -213,7 +235,7 @@ pub fn ensure_system_proxy() {
     clear_if_ours(&key, &cur);
 }
 
-/// 还原系统代理：端口无关，任何 /proxy.pac 残留都视为我们的并清理。
+/// 还原系统代理：只动我们上次写进去的那条 PAC（last_pac 精确比较），别家的不碰。
 pub fn remove_system_proxy() {
     let Ok(key) = internet_settings_key() else {
         return;
@@ -224,8 +246,11 @@ pub fn remove_system_proxy() {
 
 fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
+    let last = state().last_pac.lock().unwrap().clone();
     let keep_manual = manual_proxy_active(key);
-    if !backup.is_empty() && !is_our_pac(&backup) {
+    // 只排除"我们写过的地址"(last_pac)，不再按形状排除：别家同形态的 PAC
+    // 被备份进来之后必须还原回去，按形状丢等于备份白做(2026-10-29 审计第四轮)。
+    if !backup.is_empty() && !backup_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
         let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
         let _ = key.set_value("AutoConfigURL", &backup);
@@ -254,9 +279,10 @@ fn manual_proxy_active(key: &RegKey) -> bool {
     enabled && !server.trim().is_empty()
 }
 
-/// 当前 PAC 是我们设置的才还原（还原用户原配置时也排除我们的旧 PAC）。
+/// 确实是上次我们写进去的那条 PAC 才还原（别的工具中途接管了就不碰）。
 fn clear_if_ours(key: &RegKey, cur: &str) {
-    if !is_our_pac(cur) {
+    let last = state().last_pac.lock().unwrap().clone();
+    if !is_our_current_pac(cur, &last) {
         return;
     }
     restore_or_clear(key);
@@ -480,8 +506,11 @@ fn heal_stale_proxy() {
         return;
     };
     let cur = get_auto_config_url(&key);
-    if cur.is_empty() || !is_our_pac(&cur) {
-        return; // 本来就干净，或是用户自己的配置：绝不触碰
+    let last = state().last_pac.lock().unwrap().clone();
+    if cur.is_empty() || !is_our_current_pac(&cur, &last) {
+        // 本来就干净，或系统里已是别人的 PAC：绝不触碰——留给 ensure_system_proxy
+        // 按"先备份、后接管"的正规路径处理。
+        return;
     }
     restore_or_clear(&key);
 }
@@ -614,6 +643,40 @@ mod tests {
             "http://127.0.0.1:9999/proxy.pac"
         ));
         assert!(!should_backup_foreign("", pac, ""));
+    }
+
+    /// 清场只认 last_pac：运行期间别家接管了 PAC（同形态），不许当自己的删掉。
+    #[test]
+    fn clear_only_exact_last_pac() {
+        let ours = "http://127.0.0.1:7811/proxy.pac";
+        assert!(is_our_current_pac(ours, ours));
+        assert!(
+            !is_our_current_pac("http://127.0.0.1:7890/proxy.pac", ours),
+            "别家同形态不算我们的，退出时不许动"
+        );
+        // 我们换过端口：上次写的那个仍是我们的
+        assert!(is_our_current_pac(
+            "http://127.0.0.1:9999/proxy.pac",
+            "http://127.0.0.1:9999/proxy.pac"
+        ));
+        // 旧配置没有 last_pac：退回形状判定，老版本残留仍可清
+        assert!(is_our_current_pac(ours, ""));
+        assert!(!is_our_current_pac("http://corp.example/pac.js", ""));
+    }
+
+    /// 备份还原：别家同形态的备份必须还回去，只有"恰是我们写过的"才丢弃。
+    #[test]
+    fn restore_keeps_foreign_same_shape_backup() {
+        let last = "http://127.0.0.1:7811/proxy.pac";
+        assert!(
+            !backup_is_ours("http://127.0.0.1:7890/proxy.pac", last),
+            "同形态的别家备份必须还原，按形状丢掉等于备份白做"
+        );
+        assert!(!backup_is_ours("http://corp.example/pac.js", last));
+        assert!(backup_is_ours(last, last), "上次写的自己不该还原(死 PAC)");
+        // 旧配置：形状判定兜底，防把我们的旧地址写回系统
+        assert!(backup_is_ours(last, ""));
+        assert!(!backup_is_ours("http://corp.example/pac.js", ""));
     }
 
     /// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
