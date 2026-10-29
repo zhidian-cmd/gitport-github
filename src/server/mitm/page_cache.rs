@@ -638,6 +638,13 @@ fn page_file_name(key: &str) -> String {
     format!("{:016x}", fnv1a(key))
 }
 
+/// 磁盘条目反序列化形态：状态码 + 规范化响应头 + 压缩体。
+type DiskEntry = (
+    u16,
+    Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    Bytes,
+);
+
 /// 读单文件条目；损坏/截断/非 200 = None（miss 自愈）。
 /// 仅测试使用：生产路径走 load_disk_entry_reason（带拒绝原因）。
 #[cfg(test)]
@@ -646,11 +653,7 @@ fn load_disk_entry(
     // 请求方带不带会话：带会话却拿到未登录页 = 会话已死（污染）；匿名浏览存下的
     // 匿名页必须能正常命中，否则未登录用户的缓存等于全废。
     logged_in: bool,
-) -> Option<(
-    u16,
-    Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
-    Bytes,
-)> {
+) -> Option<DiskEntry> {
     load_disk_entry_reason(key, logged_in).ok()
 }
 
@@ -659,11 +662,7 @@ fn load_disk_entry(
 fn load_disk_entry_reason(
     key: &str,
     logged_in: bool,
-) -> Result<(
-    u16,
-    Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
-    Bytes,
-), &'static str> {
+) -> Result<DiskEntry, &'static str> {
     let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
     // 长寿命条目按 mtime 判保质期（GitHub 改版后旧骨架就是坏的）。
@@ -1217,6 +1216,8 @@ mod page_cache_tests {
     }
 
     /// A. 读写往返、类型闸门、坏文件自愈、PeekRaw 拼回。
+    // own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn roundtrip_gates_and_self_heal() {
         let (dir, _dir_guard) = own_dir("rw");
@@ -1416,6 +1417,8 @@ mod page_cache_tests {
     }
 
     /// C. 键的语义（身份 / 编码 / 会话边界）、写后失效、未登录页防污染、闸门页。
+    // own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn keys_invalidation_and_pollution() {
         let (dir, _dir_guard) = own_dir("key");

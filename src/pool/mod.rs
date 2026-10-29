@@ -441,20 +441,34 @@ impl DialCrew {
     }
 }
 
+/// 串发请求描述：拨哪个池的哪个 host、怎么拨；ctx/log 横切参数留函数位。
+pub struct DialSkip<'a> {
+    pub pool_name: &'a str,
+    pub host: &'a str,
+    pub tls_handshake: bool,
+    pub skip_ips: &'a [String],
+    pub passthrough: bool,
+    pub slot: u8,
+    pub crew: Option<&'a DialCrew>,
+}
+
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s。
 /// skip_ips = 双通道硬排除(两条通道不落同一 IP)；全被排除时忽略 skip。
 /// slot：1 = 主键游标, 2 = `~2` 副键，双通道各记各的。
 pub async fn serial_dial_skip(
-    pool_name: &str,
-    host: &str,
+    req: DialSkip<'_>,
     ctx: CancellationToken,
-    tls_handshake: bool,
     log: Option<&LogFn>,
-    skip_ips: &[String],
-    passthrough: bool,
-    slot: u8,
-    crew: Option<&DialCrew>,
 ) -> Result<(dial::Dialed, String, String), String> {
+    let DialSkip {
+        pool_name,
+        host,
+        tls_handshake,
+        skip_ips,
+        passthrough,
+        slot,
+        crew,
+    } = req;
     {
         let g = lock(&SERIAL);
         let tab = g.as_ref().unwrap();
@@ -1479,6 +1493,8 @@ mod tests {
     }
 
     /// 串发重试引擎实机圈：TCP 拒 → 沿圈到活条 → 驻留 + 死亡退避。
+    // 串行锁有意全程持有: 测试期间独占全局表, 跨 await 是本意。
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn serial_dial_rotates_on_failure_and_parks_on_success() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -1498,14 +1514,16 @@ mod tests {
         serial_load(&dir, Vec::new(), None);
 
         let (conn, ip, _) = serial_dial_skip(
-            "core",
-            "github.com",
+            DialSkip {
+                pool_name: "core",
+                host: "github.com",
+                tls_handshake: false,
+                skip_ips: &[],
+                passthrough: false,
+                slot: 1,
+                crew: None,
+            },
             CancellationToken::new(),
-            false,
-            None,
-            &[],
-            false,
-            1,
             None,
         )
         .await
@@ -1528,14 +1546,16 @@ mod tests {
 
         // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
         let (conn, ip, _) = serial_dial_skip(
-            "core",
-            "github.com",
+            DialSkip {
+                pool_name: "core",
+                host: "github.com",
+                tls_handshake: false,
+                skip_ips: &[],
+                passthrough: false,
+                slot: 1,
+                crew: None,
+            },
             CancellationToken::new(),
-            false,
-            None,
-            &[],
-            false,
-            1,
             None,
         )
         .await

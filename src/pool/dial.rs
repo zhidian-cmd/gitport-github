@@ -475,12 +475,9 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
 #[cfg(test)]
 pub fn system_roots() -> Arc<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
-    match rustls_native_certs::load_native_certs() {
-        CertificateResult { certs, .. } => {
-            for c in certs {
-                let _ = roots.add(c);
-            }
-        }
+    let CertificateResult { certs, .. } = rustls_native_certs::load_native_certs();
+    for c in certs {
+        let _ = roots.add(c);
     }
     Arc::new(roots)
 }

@@ -344,14 +344,16 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     let name = config::pool_for(host);
     if pool::SERIAL_POOLS.contains(&name) {
         let (conn, ip, _shape) = pool::serial_dial_skip(
-            name,
-            host,
+            pool::DialSkip {
+                pool_name: name,
+                host,
+                tls_handshake: false,
+                skip_ips: &[],
+                passthrough: true,
+                slot: 1,
+                crew: None,
+            },
             CancellationToken::new(),
-            false,
-            None,
-            &[],
-            true,
-            1,
             None,
         )
         .await?;

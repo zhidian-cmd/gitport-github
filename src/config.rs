@@ -149,6 +149,7 @@ pub const WHITELIST_HOSTS: &[WhitelistHost] = &[
 /// - 透传腿：2~3 段、间隔 20~70ms 随机。历史实测值，靠随机形态躲签名化反制。
 /// - 白名单腿：固定 3 段、间隔 100ms。更保守——这批域名走的是真名 SNI，
 ///   一旦被拼齐就是明文暴露，宁可多等 200ms 也要把重组窗口赌死。
+///
 /// 改任一侧前先看另一侧的注释，别只调一处。
 pub const WHITELIST_SPLIT_SEGS: usize = 3;
 pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;

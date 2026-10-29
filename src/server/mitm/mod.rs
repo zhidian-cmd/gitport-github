@@ -518,13 +518,14 @@ async fn try_cached(
     out: &hyper::Request<BoxBody>,
     host: &str,
     info: &UpstreamInfo,
-    name: &str,
     is_simple: bool,
-    is_content: bool,
-    path: &str,
     body: &Option<Bytes>,
-    want_slot: Option<u8>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
+    // name/path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
+    let name = config::pool_for(host);
+    let path = path_of(out.uri());
+    let want_slot = if is_search_path(&path) { Some(1) } else { None };
+    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     let up = upstream::cached_h2_in(host, want_slot)?;
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
@@ -569,11 +570,7 @@ pub(super) async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    if let Some(r) = try_cached(
-        log, out, host, info, name, is_simple, is_content, &path, body, want_slot,
-    )
-    .await
-    {
+    if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
         return r;
     }
 // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
@@ -587,11 +584,7 @@ pub(super) async fn get_direct(
     //  18 个在途请求各自拨号，单飞锁前排成 10 秒以上的队。）
     if upstream::cached_h2_in(host, want_slot).is_some() {
         guard.take();
-        if let Some(r) = try_cached(
-            log, out, host, info, name, is_simple, is_content, &path, body, want_slot,
-        )
-        .await
-        {
+        if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
             return r;
         }
         guard = Some(dial_lock.lock().await);

@@ -319,15 +319,17 @@ async fn h2_dial_slot(
     crew: Option<&pool::DialCrew>,
 ) -> Result<H2Upstream, String> {
     let (conn_io, ip, shape) = pool::serial_dial_skip(
-        pool_name,
-        host,
+        pool::DialSkip {
+            pool_name,
+            host,
+            tls_handshake: true,
+            skip_ips,
+            passthrough: false,
+            slot,
+            crew,
+        },
         CancellationToken::new(),
-        true,
         Some(log),
-        skip_ips,
-        false,
-        slot,
-        crew,
     )
     .await
     .map_err(|e| e.to_string())?;

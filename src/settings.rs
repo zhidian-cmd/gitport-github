@@ -289,6 +289,7 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 ///   1. 键位恒为 `pool::circle_keys()` 全量——core/all、api/all、edge/{content,assets,io,auth}；
 ///   2. 顺序恒为表序，从上到下，不随 HashMap 抖动；
 ///   3. 值 `""` = 该族未驻留（与"键缺失"等价，但写出来让人能看全 schema）。
+///
 /// 读兼容对象、`[[k,v],…]` 数组、整段缺失；写只写对象。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LastIpTable(Vec<(String, String)>);

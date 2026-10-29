@@ -118,9 +118,7 @@ fn host_is_auth(host: &str) -> bool {
 pub fn fastly_last_octet(ip: &str) -> Option<&str> {
     let mut o = ip.split('.');
     match (o.next(), o.next(), o.next(), o.next()) {
-        (Some("185"), Some("199"), Some(n), Some(last))
-            if matches!(n, "108" | "109" | "110" | "111") =>
-        {
+        (Some("185"), Some("199"), Some("108" | "109" | "110" | "111"), Some(last)) => {
             Some(last)
         }
         _ => None,

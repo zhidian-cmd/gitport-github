@@ -4,6 +4,7 @@
 use crate::pool::LogFn;
 use crate::settings;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
@@ -305,7 +306,7 @@ pub fn run(args: DesktopArgs) -> ! {
     let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let _ = EVENT_PROXY.set(proxy.clone());
-    let slot = Arc::new(Mutex::new(WinSlot {
+    let slot = Rc::new(Mutex::new(WinSlot {
         win: None,
         wv: None,
     }));
