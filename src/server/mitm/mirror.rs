@@ -21,10 +21,12 @@ const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 const SPEED_SAMPLE_BYTES: u64 = 1024 * 1024;
 const SPEED_SAMPLE_MIN_BYTES: u64 = 256 * 1024;
 
-/// 在途字节 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
+/// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
+/// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者，负载摊开少误掐。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
+    pub(super) in_flight_streams: AtomicU64,
     pub(super) speed_ewma: AtomicU64,
     pub(super) last_fail_ms: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
@@ -95,6 +97,7 @@ pub(super) struct LoadGuard {
 impl LoadGuard {
     fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
+        load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
         LoadGuard {
             load,
             charged: new_bytes,
@@ -105,8 +108,9 @@ impl LoadGuard {
         }
     }
 
-    /// 直连腿专用：调用方已自行 charge,守卫只接手"逐帧归还 + Drop 收尾"。
+    /// 直连腿专用：调用方已自行 charge(含流数),守卫只接手"逐帧归还 + Drop 收尾"。
     pub(super) fn resume_charged(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
+        load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
         LoadGuard {
             load,
             charged: new_bytes,
@@ -146,10 +150,15 @@ impl Drop for LoadGuard {
         if residual > 0 {
             self.load.in_flight_bytes.fetch_sub(residual, Ordering::Relaxed);
         }
+        // 流数随流终结归位(正常读完/客户端断开/掐断全走这里)。
+        self.load
+            .in_flight_streams
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)轮转均摊。
+/// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)组内二级判据：
+/// 选在途流数最少者(负载摊开，少误掐)，流数也相同才轮转均摊。
 /// 失败窗内的镜像跳过，全军都在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
@@ -180,7 +189,7 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
                 best_ect = best_ect.min(ect_of(ld, i));
             }
         }
-        // 容差内全部入围，轮转均摊；真差距(>5%)仍严格选快者。
+        // 容差内全部入围；真差距(>5%)仍严格选快者。
         let tied: Vec<usize> = (0..loads.len())
             .filter(|&i| healthy(&loads[i], allow_recent_failures))
             .filter(|&i| ect_of(&loads[i], i) * 100 <= best_ect * 105)
@@ -189,8 +198,24 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
             if tied.len() == 1 {
                 return first;
             }
+            // 二级判据：在途流数最少者胜(避免往高压镜像继续堆片，减少误掐)；
+            // 流数也并列才轮转均摊。
+            let min_streams = tied
+                .iter()
+                .map(|&i| loads[i].in_flight_streams.load(Ordering::Relaxed))
+                .min()
+                .unwrap_or(0);
+            let fewest: Vec<usize> = tied
+                .into_iter()
+                .filter(|&i| {
+                    loads[i].in_flight_streams.load(Ordering::Relaxed) == min_streams
+                })
+                .collect();
+            if fewest.len() == 1 {
+                return fewest[0];
+            }
             let n = TIE_ROTATOR.fetch_add(1, Ordering::Relaxed);
-            return tied[(n % tied.len() as u64) as usize];
+            return fewest[(n % fewest.len() as u64) as usize];
         }
     }
     0
@@ -949,6 +974,8 @@ mod tests {
         b.in_flight_bytes.store(0, Ordering::Relaxed);
         let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
         // 梯度(-4%/家): a=2MB/s(位0), b=1.92MB/s(位1) → a 的 ECT 差 +4.17% < 5% 容差 → 轮转。
+        a.in_flight_streams.store(0, Ordering::Relaxed);
+        b.in_flight_streams.store(0, Ordering::Relaxed);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..20 {
             seen.insert(pick_mirror(&chain, 1024));
@@ -961,6 +988,43 @@ mod tests {
         a.in_flight_bytes.store(8 * 1024 * 1024, Ordering::Relaxed);
         assert_eq!(pick_mirror(&chain, 1024), 1, "梯度速率下按在途字节分");
         a.in_flight_bytes.store(0, Ordering::Relaxed);
+        a.in_flight_streams.store(0, Ordering::Relaxed);
+        b.in_flight_streams.store(0, Ordering::Relaxed);
+    }
+
+    /// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转。
+    /// 高压镜像(流多)不再被继续堆片，从源头减少掐断误判。
+    #[test]
+    fn tie_prefers_fewer_inflight_streams() {
+        let a = mirror_load("streams-a.test");
+        let b = mirror_load("streams-b.test");
+        a.in_flight_bytes.store(0, Ordering::Relaxed);
+        b.in_flight_bytes.store(0, Ordering::Relaxed);
+        a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
+        b.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
+        a.in_flight_streams.store(0, Ordering::Relaxed);
+        b.in_flight_streams.store(0, Ordering::Relaxed);
+        let chain = vec!["streams-a.test".to_string(), "streams-b.test".to_string()];
+        // ECT 并列(同速同在途字节)、A 已压 3 流 B 空闲 → 恒选 B。
+        a.in_flight_streams.store(3, Ordering::Relaxed);
+        for _ in 0..10 {
+            assert_eq!(pick_mirror(&chain, 1024), 1, "流少的 B 应胜出");
+        }
+        // B 也压上 3 流 → 流数并列 → 轮转两家都出。
+        b.in_flight_streams.store(3, Ordering::Relaxed);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(pick_mirror(&chain, 1024));
+        }
+        assert!(
+            seen.contains(&0) && seen.contains(&1),
+            "流数并列应轮转: {seen:?}"
+        );
+        // 清场。
+        a.in_flight_streams.store(0, Ordering::Relaxed);
+        b.in_flight_streams.store(0, Ordering::Relaxed);
+        a.speed_ewma.store(0, Ordering::Relaxed);
+        b.speed_ewma.store(0, Ordering::Relaxed);
     }
 
     /// ECT 相差 ≤5% 轮转均摊，>5% 严格选快者(ECT 核心语义不被稀释)。
