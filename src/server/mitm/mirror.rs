@@ -23,11 +23,11 @@ const SPEED_SAMPLE_MIN_BYTES: u64 = 256 * 1024;
 
 /// 在途字节 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
 #[derive(Default)]
-struct MirrorLoad {
-    in_flight_bytes: AtomicU64,
-    speed_ewma: AtomicU64,
-    last_fail_ms: AtomicU64,
-    last_sample_ms: AtomicU64,
+pub(super) struct MirrorLoad {
+    pub(super) in_flight_bytes: AtomicU64,
+    pub(super) speed_ewma: AtomicU64,
+    pub(super) last_fail_ms: AtomicU64,
+    pub(super) last_sample_ms: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -36,6 +36,21 @@ static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
 fn mirror_load(mirror: &str) -> Arc<MirrorLoad> {
     let mut g = MIRROR_LOAD.lock().unwrap_or_else(|p| p.into_inner());
     g.entry(mirror.to_string()).or_default().clone()
+}
+
+/// 供直连腿(mod.rs)记账：直连候选与镜像共用同一张负载表。
+pub(super) fn mirror_load_for(mirror: &str) -> Arc<MirrorLoad> {
+    mirror_load(mirror)
+}
+
+/// 直连候选的记账键(mod.rs 组装 DirectLeg 前后共用)。
+pub(super) fn direct_load_key(chain_host: &str) -> String {
+    format!("direct/{chain_host}")
+}
+
+/// 从 Range 头估请求体积(mod.rs 组装直连腿的 charge 用)。
+pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
+    range_bytes(range)
 }
 
 fn ewma_update(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
@@ -68,7 +83,7 @@ fn force_ewma(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
 
 /// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
 /// 记账封顶于记账额防下溢；采样走原始字节，开放区间超记账额后采样不停。
-struct LoadGuard {
+pub(super) struct LoadGuard {
     load: Arc<MirrorLoad>,
     charged: u64,
     delivered: u64,
@@ -90,7 +105,21 @@ impl LoadGuard {
         }
     }
 
-    fn on_frame(&mut self, n: u64) {
+    /// 直连腿专用：调用方已自行 charge,守卫只接手"逐帧归还 + Drop 收尾"。
+    pub(super) fn resume_charged(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
+        LoadGuard {
+            load,
+            charged: new_bytes,
+            delivered: 0,
+            raw_delivered: 0,
+            mark_at: Instant::now(),
+            mark_bytes: 0,
+        }
+    }
+
+    /// 交付一帧：记账按记账额归还(封顶于 charged，防镜像无视 Range 回全量把
+    /// 计数打成负)；原始累计照走。满一个采样间隔刷新一次速率。
+    pub(super) fn on_frame(&mut self, n: u64) {
         let credit = n.min(self.charged.saturating_sub(self.delivered));
         self.delivered += credit;
         self.raw_delivered += n;
@@ -351,10 +380,23 @@ fn mirror_chain_cap(host: &str) -> Option<usize> {
     (!pool::route::is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
 }
 
+/// 直连腿的注入接口：mod.rs 组装完整 future(拨号+记账+掐断包装已含)，
+/// mirror.rs 只管 ECT 派发与失败降权——不感知拨号细节。
+pub(super) struct DirectLeg<'a> {
+    pub fetch: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<hyper::Response<BoxBody>, String>>
+                + Send
+                + 'a,
+        >,
+    >,
+}
+
 pub(super) async fn chain_fetch(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
+    direct: DirectLeg<'_>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     // 凭据查询串等价 bearer，交第三方镜像即外泄。
     if let Some(q) = out.uri().query() {
@@ -390,19 +432,49 @@ pub(super) async fn chain_fetch(
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
     let chain = pool::mirror_chain(chain_host);
-    if chain.is_empty() {
-        return Err(format!("{host} 无镜像链({chain_host})"));
-    }
+    // 直连同台：直连是候选池里的普通选手(键 direct/{host})，ECT 一视同仁；
+    // 零镜像时候选=仅直连，502 只在"镜像+直连全灭"时发生。
+    let direct_key = format!("direct/{chain_host}");
+    let mut candidates: Vec<String> = chain.clone();
+    candidates.push(direct_key.clone());
     if pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
     let limit = mirror_chain_cap(chain_host)
-        .unwrap_or(chain.len())
-        .min(chain.len());
+        .unwrap_or(candidates.len())
+        .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
-    let start = pick_mirror(&chain, new_bytes);
-    for i in walk_order(chain.len(), start, limit) {
-        let m = chain[i].as_str();
+    let start = pick_mirror(&candidates, new_bytes);
+    let mut direct = direct;
+    for i in walk_order(candidates.len(), start, limit) {
+        let m = candidates[i].as_str();
+        // 直连候选：拨号/游标/连接池/记账包装全在 fetch future 内(mod.rs 组装)。
+        if m == direct_key {
+            let t0 = Instant::now();
+            match direct.fetch.as_mut().await {
+                Ok(resp) => {
+                    mirror_load(&direct_key).last_fail_ms.store(0, Ordering::Relaxed);
+                    (log)(&format!(
+                        "[直连] {host}{path} ECT 胜出({}ms), 候选 {}/{}",
+                        t0.elapsed().as_millis(),
+                        i + 1,
+                        candidates.len()
+                    ));
+                    pool::MIRROR_BREAKER.clear(chain_host);
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    mirror_load(&direct_key)
+                        .last_fail_ms
+                        .store(pool::now_ms(), Ordering::Relaxed);
+                    (log)(&format!(
+                        "[直连] {host}{path} 失败({e}, {}ms), 链内下一个",
+                        t0.elapsed().as_millis()
+                    ));
+                    continue;
+                }
+            }
+        }
         let req = match mirror_request(out, m, &orig_url) {
             Ok(r) => r,
             Err(e) => {
@@ -800,10 +872,50 @@ mod tests {
             .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
             .body(upstream::empty_body())
             .unwrap();
-        let err = chain_fetch(&log, &req, "raw.githubusercontent.com")
-            .await
-            .unwrap_err();
+        let err = chain_fetch(
+            &log,
+            &req,
+            "raw.githubusercontent.com",
+            mirror_test_direct_leg(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("拒绝镜像"), "签名 URL 不得交给第三方镜像: {err}");
+    }
+
+    /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
+    fn mirror_test_direct_leg() -> DirectLeg<'static> {
+        DirectLeg {
+            fetch: Box::pin(async {
+                Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into())
+            }),
+        }
+    }
+
+    /// 直连同台：candidates = 镜像 + direct/{host}，ECT 统一派发。
+    #[test]
+    fn direct_competes_as_candidate() {
+        let chain = vec!["cand-m.test".to_string()];
+        let cands = [
+            chain.as_slice(),
+            &[direct_load_key("cand-host.test")][..],
+        ];
+        let all: Vec<String> = cands.concat();
+        // 直连快(EWMA 高) 镜像无样本(默认 2MB/s): ECT 直连小 → 选直连键。
+        let d = mirror_load_for(&direct_load_key("cand-host.test"));
+        d.speed_ewma.store(8 * 1024 * 1024, Ordering::Relaxed);
+        let pick = pick_mirror(&all, 8 * 1024 * 1024);
+        assert_eq!(all[pick], direct_load_key("cand-host.test"), "直连快时应胜出");
+        // 直连失败降权后 → 轮到镜像。
+        d.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
+        let pick = pick_mirror(&all, 8 * 1024 * 1024);
+        assert_eq!(all[pick], "cand-m.test", "直连降权后应选镜像");
+        d.speed_ewma.store(0, Ordering::Relaxed);
+        d.last_fail_ms.store(0, Ordering::Relaxed);
+        // 零镜像: candidates 只有直连, pick 恒 0(直连键)。
+        let only_direct = vec![direct_load_key("cand-host.test")];
+        assert_eq!(all.len(), 2, "镜像+直连=2 候选");
+        assert_eq!(pick_mirror(&only_direct, 1024), 0, "零镜像时候选=仅直连");
     }
 
     /// 忙而快的胜过闲而慢的；快镜像在途过深则公式自纠改选空闲者。

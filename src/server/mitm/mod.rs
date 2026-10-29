@@ -204,21 +204,49 @@ async fn mitm_http(
             pool::route::Route::Mirror
         )
     {
-        if let Ok(resp) = chain_fetch(&log, &out_body, &host).await {
+        let chain_host = pool::route::mirror_chain_host(&host, &path);
+        let new_bytes =
+            mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
+        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
+        // 直连失败记 60s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
+        let load = mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
+        load.in_flight_bytes
+            .fetch_add(new_bytes, std::sync::atomic::Ordering::Relaxed);
+        let log2 = log.clone();
+        let out2 = &out_body;
+        let host2 = host.clone();
+        let body2 = replay.clone();
+        let info2 = info.clone();
+        let fetch = Box::pin(async move {
+            match get_direct(&log2, out2, &host2, &info2, true, &body2).await {
+                Ok(resp) => {
+                    let (parts, body) = resp.into_parts();
+                    let mut guard = mirror::LoadGuard::resume_charged(load, new_bytes);
+                    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+                        if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {
+                            guard.on_frame(n);
+                        }
+                        frame
+                    });
+                    Ok(hyper::Response::from_parts(parts, BoxBody::new(body)))
+                }
+                Err(e) => {
+                    load.in_flight_bytes
+                        .fetch_sub(new_bytes, std::sync::atomic::Ordering::Relaxed);
+                    Err(e)
+                }
+            }
+        });
+        if let Ok(resp) = chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await {
             return write_upstream(resp, "mirror", &info);
         }
-        // 链为空（全新安装未配任何镜像）= 没有镜像腿可走：回落直连串发池。
-        // 透传(非 MITM)模式下这些大文件域本来就走池，开了核心功能不该更差。
-        // 链非空但全灭保持原设计：大文件域直连必被限速/封锁，不回落到池。
-        let chain_host = pool::route::mirror_chain_host(&host, &path);
-        if pool::mirror_chain(&chain_host).is_empty() {
-            (log)(&format!(
-                "[MITM] {host}{path} 无镜像链(未配置), 回落直连串发"
-            ));
-        } else {
-            (log)(&format!("[MITM] {host}{path} 镜像链全灭, 不回落直连"));
-            return mitm_unavailable(&req, &host, "镜像链全部不可用(大文件域不回落直连)。若使用自建镜像请检查其可用性, 或在工作台补充公共镜像。");
-        }
+        // 镜像+直连全灭：无更多腿可试。
+        (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用"));
+        return mitm_unavailable(
+            &req,
+            &host,
+            "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
+        );
     }
     let name = config::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
@@ -226,7 +254,45 @@ async fn mitm_http(
         Err(e) => {
             match pool::route::fallback_for(&name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
-                    if let Ok(r) = chain_fetch(&log, &out_body, &host).await {
+                    let chain_host = pool::route::mirror_chain_host(&host, &path);
+                    let new_bytes = mirror::range_bytes_of(
+                        req.headers().get("range").and_then(|v| v.to_str().ok()),
+                    );
+                    // 直连刚在全灭分支失败过: load 会带 60s 降权, chain_fetch 内
+                    // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
+                    let load =
+                        mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
+                    load.in_flight_bytes
+                        .fetch_add(new_bytes, std::sync::atomic::Ordering::Relaxed);
+                    let log2 = log.clone();
+                    let out2 = &out_body;
+                    let host2 = host.clone();
+                    let body2 = replay.clone();
+                    let info2 = info.clone();
+                    let fetch = Box::pin(async move {
+                        match get_direct(&log2, out2, &host2, &info2, true, &body2).await {
+                            Ok(resp) => {
+                                let (parts, body) = resp.into_parts();
+                                let mut guard =
+                                    mirror::LoadGuard::resume_charged(load, new_bytes);
+                                let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+                                    if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {
+                                        guard.on_frame(n);
+                                    }
+                                    frame
+                                });
+                                Ok(hyper::Response::from_parts(parts, BoxBody::new(body)))
+                            }
+                            Err(e) => {
+                                load.in_flight_bytes
+                                    .fetch_sub(new_bytes, std::sync::atomic::Ordering::Relaxed);
+                                Err(e)
+                            }
+                        }
+                    });
+                    if let Ok(r) =
+                        chain_fetch(&log, &out_body, &host, mirror::DirectLeg { fetch }).await
+                    {
                         return write_upstream(r, "mirror", &info);
                     }
                     (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭"));
