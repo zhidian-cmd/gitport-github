@@ -92,12 +92,15 @@ pub(super) struct LoadGuard {
     raw_delivered: u64,
     mark_at: Instant,
     mark_bytes: u64,
+    /// 构造时镜像尚无速度样本 = 本流是探测片(首个真实样本)。
+    pub(super) is_probe: bool,
 }
 
 impl LoadGuard {
     fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
         load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
+        let is_probe = load.speed_ewma.load(Ordering::Relaxed) == 0;
         LoadGuard {
             load,
             charged: new_bytes,
@@ -105,12 +108,14 @@ impl LoadGuard {
             raw_delivered: 0,
             mark_at: Instant::now(),
             mark_bytes: 0,
+            is_probe,
         }
     }
 
     /// 直连腿专用：调用方已自行 charge(含流数),守卫只接手"逐帧归还 + Drop 收尾"。
     pub(super) fn resume_charged(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
+        let is_probe = load.speed_ewma.load(Ordering::Relaxed) == 0;
         LoadGuard {
             load,
             charged: new_bytes,
@@ -118,6 +123,7 @@ impl LoadGuard {
             raw_delivered: 0,
             mark_at: Instant::now(),
             mark_bytes: 0,
+            is_probe,
         }
     }
 
@@ -155,6 +161,13 @@ impl Drop for LoadGuard {
             .in_flight_streams
             .fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// 探测轮末位淘汰(纯函数)：镜像首个样本的速率 vs 有样本同伴中位数。
+/// 低于一半 → 探测判定"体质差"，60s 降权。小片熬不到掐断的 2s 窗口，
+/// 靠这里把探测结论变成账本事实。
+fn probe_outlier(own: u64, peer_median: Option<u64>) -> bool {
+    peer_median.is_some_and(|m| own < m / 2)
 }
 
 /// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)组内二级判据：
@@ -394,7 +407,36 @@ fn cutoff_watched_body(
                 Some((Ok(frame), st))
             }
             Some(Err(e)) => Some((Err(e), st)),
-            None => None, // EOS: drop → 守卫收尾
+            None => {
+                // EOS = 流正常读完。探测轮末位淘汰：本流是该镜像首个速度样本
+                // (探测片)，速率低于有样本同伴中位数一半 → 记 60s 降权。
+                // 小片熬不到掐断的 2s 窗口，探测结论在这里落账本。
+                let was_probe =
+                    st.guard.is_probe && st.guard.delivered >= SPEED_SAMPLE_MIN_BYTES;
+                let now_ms = pool::now_ms();
+                let fresh: Vec<u64> = st
+                    .peers
+                    .iter()
+                    .filter(|p| {
+                        let s = p.last_sample_ms.load(Ordering::Relaxed);
+                        s != 0 && now_ms.saturating_sub(s) < CUT_PEER_FRESH_MS
+                    })
+                    .map(|p| p.speed_ewma.load(Ordering::Relaxed))
+                    .filter(|s| *s > 0)
+                    .collect();
+                let median = peer_median(&fresh);
+                let own = st.guard.delivered * 1000
+                    / st.guard.mark_at.elapsed().as_millis().max(1) as u64;
+                if was_probe && probe_outlier(own, median) {
+                    st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
+                    let base = median.unwrap_or(0) / 1024;
+                    (st.log)(&format!(
+                        "[镜像] {} {} 探测片速率 {}KB/s 低于同伴一半(基准 {base}KB/s), 探测出局(60s)",
+                        st.label, st.mirror, own / 1024
+                    ));
+                }
+                None
+            }
         }
     });
     BoxBody::new(http_body_util::StreamBody::new(stream))
