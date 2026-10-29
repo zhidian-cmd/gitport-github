@@ -14,7 +14,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - **隧道握手首包分片**：CONNECT 透传把 ClientHello 拆成 2~3 段（切点/间隔每连接随机）再发，DPI 拼不齐 SNI——真名腿免于 RST 的掩体（byedpi 同款思路，纯用户态，可 A/B 开关）
 - **文档站能开**：`docs` / `support` / `resources` / `desktop` / `pages` 等 10 个 Fastly / Azure 上的子域，原先被当成主站去连、必回 400 Whoa。现在它们走自己的腿：按段选对的边缘 IP、报真名、ClientHello 拆 3 段（间隔 100ms），连不上还能自动换候选
 - **连接复用到极限**：高频 host 双 h2 连接 + 按实测耗时择优，GitHub 前端遥测本地拦掉（一个字节不发往上游）
-- **大文件多一条路**：Release / 源码包走镜像串行链，直连全灭仍能下载
+- **大文件多路竞速**：Release / 源码包由直连与镜像链同台竞速（ECT 派发），按「预计最早下完」选路；候选全灭才失败
 
 ## 快速上手
 
@@ -64,6 +64,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - [页面缓存](docs/CACHE.md) —— 缓什么/不缓什么、会话语义、分钥匙、骨架门、头像 302 记忆
 - [高级配置](docs/CONFIG.md) —— plans.json 手改指南、IP 认读、分流域名总表
 - [术语速查](docs/GLOSSARY.md) —— 网络与封锁名词大白话
+- [更新日志](CHANGELOG.md) —— 0.5.0 / 0.5.1 变更一览
 
 ## 构建
 
