@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const MIRROR_CHAIN_CAP: usize = 5;
-/// 无样本时的基准速率；pick_mirror 按链位注入 -5%/家的梯度(封底 75%)。
+/// 冷启动先验 2MB/s：已自 ECT 退役(探测轮保证派发前全员实测交卷)，
+/// 仅存于 EOS 探测的兜底基准——全员无新鲜样本时按其封底 1.6MB/s 判罚。
 const DEFAULT_MIRROR_SPEED: u64 = 2 * 1024 * 1024;
 /// 失败降权窗；全体都在窗内则放开过滤。
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
@@ -162,21 +163,14 @@ fn probe_outlier(own: u64, peer_median: Option<u64>) -> bool {
 
 /// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)组内二级判据：
 /// 选在途流数最少者(负载摊开，少误掐)，流数也相同才轮转均摊。
-/// 失败窗内的镜像跳过，全军都在窗内则放开。
+/// 失败窗内的镜像跳过，全军都在窗内则放开。探测态走 probe_pick，勿用此函数。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
-    // 单点实现：速度(冷启动按链位 -4%/家, 封底 80%) 与 ECT 毫秒。
-    // 梯度必须 <5% 容差：-5%/家会使 ECT 差 +5.26% 越线，铺开失效。
-    let ect_of = |ld: &MirrorLoad, i: usize| -> u64 {
-        let speed = {
-            let s = ld.speed_ewma.load(Ordering::Relaxed);
-            if s == 0 {
-                DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 25 * (i as u64).min(5)
-            } else {
-                s
-            }
-        };
+    // 单点实现：ECT 毫秒。探测轮保证派发前全员交卷，这里不该见到零样本；
+    // 防御性 .max(1)：未交卷且在失败窗的候选 ECT 无穷大，稳定态里垫底。
+    let ect_of = |ld: &MirrorLoad| -> u64 {
+        let speed = ld.speed_ewma.load(Ordering::Relaxed).max(1);
         ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed
     };
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
@@ -187,15 +181,15 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     };
     for allow_recent_failures in [false, true] {
         let mut best_ect = u64::MAX;
-        for (i, ld) in loads.iter().enumerate() {
+        for ld in loads.iter() {
             if healthy(ld, allow_recent_failures) {
-                best_ect = best_ect.min(ect_of(ld, i));
+                best_ect = best_ect.min(ect_of(ld));
             }
         }
         // 容差内全部入围；真差距(>5%)仍严格选快者。
         let tied: Vec<usize> = (0..loads.len())
             .filter(|&i| healthy(&loads[i], allow_recent_failures))
-            .filter(|&i| ect_of(&loads[i], i) * 100 <= best_ect * 105)
+            .filter(|&i| ect_of(&loads[i]) * 100 <= best_ect * 105)
             .collect();
         if let Some(&first) = tied.first() {
             if tied.len() == 1 {
@@ -226,6 +220,33 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
 
 /// 轮转计数器：并列候选间均摊。
 static TIE_ROTATOR: AtomicU64 = AtomicU64::new(0);
+
+/// 探测轮游标：并发派发下连续领取必命中不同候选(连续整数 mod n 两两不同)。
+static PROBE_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// 探测态选家：链内有从未交卷(无速度样本)且健康的候选 → 原子游标轮转领取，
+/// 并发分片天然一片一家；无(或全在失败窗) → None，交回 ECT 稳定态。
+/// 这是 2MB/s 先验从 ECT 退役后的补位：速度一律实测，不再猜。
+fn probe_pick(candidates: &[String]) -> Option<usize> {
+    let now = pool::now_ms();
+    let unprobed: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            let ld = mirror_load(m);
+            ld.last_sample_ms.load(Ordering::Relaxed) == 0 && {
+                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+                lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if unprobed.is_empty() {
+        return None;
+    }
+    let n = PROBE_CURSOR.fetch_add(1, Ordering::Relaxed);
+    Some(unprobed[(n % unprobed.len() as u64) as usize])
+}
 
 fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
     if chain_len == 0 {
@@ -538,7 +559,20 @@ pub(super) async fn chain_fetch(
         .unwrap_or(candidates.len())
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
-    let start = pick_mirror(&candidates, new_bytes);
+    // 探测态优先：链内有从未交卷的候选 → 一片一家实测(原子游标)，全员交卷
+    // 后回 ECT 纯实测竞速。2MB/s 先验自 ECT 退役，仅存于 EOS 兜底基准。
+    let start = match probe_pick(&candidates) {
+        Some(i) => {
+            (log)(&format!(
+                "[探测] {host}{path} 探测轮领取 {} (候选 {}/{}), 交卷后回 ECT",
+                candidates[i],
+                i + 1,
+                candidates.len()
+            ));
+            i
+        }
+        None => pick_mirror(&candidates, new_bytes),
+    };
     let mut direct = direct;
     let mut order = walk_order(candidates.len(), start, limit);
     append_direct_if_missed(
@@ -1146,6 +1180,66 @@ mod tests {
         }
     }
 
+    /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
+    #[test]
+    fn probe_round_hands_each_candidate_one_shard() {
+        let chain = vec![
+            "probe-all.test".to_string(),
+            "probe-bl.test".to_string(),
+            "probe-cl.test".to_string(),
+        ];
+        let mut picks = std::collections::HashSet::new();
+        for _ in 0..3 {
+            picks.insert(probe_pick(&chain).unwrap());
+        }
+        assert_eq!(picks.len(), 3, "探测轮前 3 次领取应覆盖全部候选: {picks:?}");
+        for m in &chain {
+            mirror_load(m)
+                .last_sample_ms
+                .store(pool::now_ms(), Ordering::Relaxed);
+        }
+        assert!(probe_pick(&chain).is_none(), "全员交卷应退出探测态");
+        for m in &chain {
+            mirror_load(m).last_sample_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// 探测态跳过：未交卷但在失败窗内的候选不领片；全员无健康未交卷 → None。
+    #[test]
+    fn probe_skips_failed_unprobed_and_yields_to_ect() {
+        let a = mirror_load("probe-skip-a.test");
+        let b = mirror_load("probe-skip-b.test");
+        let chain = vec!["probe-skip-a.test".to_string(), "probe-skip-b.test".to_string()];
+        // a 未交卷但刚失败 → 跳过；b 已交卷 → 无探测目标。
+        a.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
+        b.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
+        assert!(
+            probe_pick(&chain).is_none(),
+            "失败窗内的未交卷候选不应被探测"
+        );
+        // a 失败窗过 → 恢复可探测，领取 a。
+        a.last_fail_ms.store(0, Ordering::Relaxed);
+        assert_eq!(probe_pick(&chain), Some(0));
+        a.last_sample_ms.store(0, Ordering::Relaxed);
+        b.last_sample_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// 先验退役：未交卷候选在 ECT 里按无穷大垫底——已交卷的慢腿也胜过它。
+    #[test]
+    fn ect_after_retirement_unprobed_loses_to_probed_slow() {
+        let slow = mirror_load("retire-slow.test");
+        slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 100KB/s 已交卷
+        let unprobed = mirror_load("retire-unprobed.test");
+        unprobed.speed_ewma.store(0, Ordering::Relaxed);
+        let chain = vec!["retire-slow.test".to_string(), "retire-unprobed.test".to_string()];
+        assert_eq!(
+            pick_mirror(&chain, 1024),
+            0,
+            "未交卷者 ECT 无穷大, 已交卷的慢腿也胜出(先验不再掺和)"
+        );
+        slow.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
     /// 直连同台：candidates = 镜像 + direct/{host}，ECT 统一派发。
     #[test]
     fn direct_competes_as_candidate() {
@@ -1155,7 +1249,7 @@ mod tests {
             &[direct_load_key("cand-host.test")][..],
         ];
         let all: Vec<String> = cands.concat();
-        // 直连快(EWMA 高) 镜像无样本(默认 2MB/s): ECT 直连小 → 选直连键。
+        // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
         let d = mirror_load_for(&direct_load_key("cand-host.test"));
         d.speed_ewma.store(8 * 1024 * 1024, Ordering::Relaxed);
         let pick = pick_mirror(&all, 8 * 1024 * 1024);
@@ -1192,7 +1286,7 @@ mod tests {
         b.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 无样本 → 梯度速率下按在途字节分 → 全零时轮转均摊不塞链头。
+    /// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
     #[test]
     fn cold_start_falls_back_to_chain_order() {
         let a = mirror_load("cold-a.test");
@@ -1202,7 +1296,7 @@ mod tests {
         a.in_flight_bytes.store(0, Ordering::Relaxed);
         b.in_flight_bytes.store(0, Ordering::Relaxed);
         let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
-        // 梯度(-4%/家): a=2MB/s(位0), b=1.92MB/s(位1) → a 的 ECT 差 +4.17% < 5% 容差 → 轮转。
+        // 全未交卷 → ECT 同为无穷大 → 并列 → 轮转(先验已退役, 不再按链位铺开)。
         a.in_flight_streams.store(0, Ordering::Relaxed);
         b.in_flight_streams.store(0, Ordering::Relaxed);
         let mut seen = std::collections::HashSet::new();
