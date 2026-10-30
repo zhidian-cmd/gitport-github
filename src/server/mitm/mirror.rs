@@ -29,7 +29,8 @@ const SAMPLE_TIME_FLOOR_MS: u64 = 100;
 const SPEED_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
 const SAMPLE_MIN_WINDOW_US: u64 = 2_000;
 
-/// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
+/// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)
+/// / 最近哨兵片时刻(0=从未——悬殊绝食者每 SENTINEL_GAP_MS 一片验证)。
 /// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者，负载摊开少误掐。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
@@ -38,6 +39,7 @@ pub(super) struct MirrorLoad {
     pub(super) speed_ewma: AtomicU64,
     pub(super) last_fail_ms: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
+    pub(super) last_sentinel_ms: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -189,9 +191,10 @@ fn probe_outlier(own: u64, peer_median: Option<u64>) -> bool {
     peer_median.is_some_and(|m| own < m / 2)
 }
 
-/// ECT 最小者胜；并列(相差 ≤5%, ect*100 ≤ best*105 无地板比较)组内二级判据：
-/// 选在途流数最少者(负载摊开，少误掐)，流数也相同才轮转均摊。
-/// 失败窗内的镜像跳过，全军都在窗内则放开。探测态走 probe_pick，勿用此函数。
+/// ECT 绝对最小者胜，无容差——速度差 30 倍的现实里 5% 容差是把片撒给慢腿的
+/// 祸根。仅当 ECT 完全相等(逐毫秒)才二级: 在途流数最少 → 仍相等才轮转。
+/// 悬殊绝食: 实测速度 < 当前最快速度 ÷8 的候选本轮不派发(每 5s 一片哨兵验证,
+/// 变快凭实测成绩回归)。失败窗内的镜像跳过，全军都在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
@@ -208,40 +211,67 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
         }
     };
     for allow_recent_failures in [false, true] {
-        let mut best_ect = u64::MAX;
-        for ld in loads.iter() {
-            if healthy(ld, allow_recent_failures) {
-                best_ect = best_ect.min(ect_of(ld));
-            }
-        }
-        // 容差内全部入围；真差距(>5%)仍严格选快者。
-        let tied: Vec<usize> = (0..loads.len())
+        let elig: Vec<usize> = (0..loads.len())
             .filter(|&i| healthy(&loads[i], allow_recent_failures))
-            .filter(|&i| ect_of(&loads[i]) * 100 <= best_ect * 105)
             .collect();
-        if let Some(&first) = tied.first() {
-            if tied.len() == 1 {
-                return first;
-            }
-            // 二级判据：在途流数最少者胜(避免往高压镜像继续堆片，减少误掐)；
-            // 流数也并列才轮转均摊。
-            let min_streams = tied
-                .iter()
-                .map(|&i| loads[i].in_flight_streams.load(Ordering::Relaxed))
-                .min()
-                .unwrap_or(0);
-            let fewest: Vec<usize> = tied
-                .into_iter()
-                .filter(|&i| {
-                    loads[i].in_flight_streams.load(Ordering::Relaxed) == min_streams
-                })
-                .collect();
-            if fewest.len() == 1 {
-                return fewest[0];
-            }
-            let n = TIE_ROTATOR.fetch_add(1, Ordering::Relaxed);
-            return fewest[(n % fewest.len() as u64) as usize];
+        if elig.is_empty() {
+            continue;
         }
+        // 悬殊绝食: 有成绩者里最快的速度为锚, 慢其 8 倍者本轮绝食——
+        // 只在哨兵间隔(5s)到点时放行一片验证。无成绩者不参与锚定也不被绝食。
+        let fastest = elig
+            .iter()
+            .filter_map(|&i| {
+                let s = loads[i].speed_ewma.load(Ordering::Relaxed);
+                (s > 0).then_some(s)
+            })
+            .max()
+            .unwrap_or(0);
+        let elig: Vec<usize> = elig
+            .into_iter()
+            .filter(|&i| {
+                let s = loads[i].speed_ewma.load(Ordering::Relaxed);
+                if s == 0 || fastest == 0 || s * SENTINEL_RATIO >= fastest {
+                    return true; // 正常竞速圈
+                }
+                // 绝食者: 哨兵到点才放行一片
+                let ls = loads[i].last_sentinel_ms.load(Ordering::Relaxed);
+                ls == 0 || now.saturating_sub(ls) >= SENTINEL_GAP_MS
+            })
+            .collect();
+        if elig.is_empty() {
+            continue;
+        }
+        // 绝对最小; 完全相等才二级判据。
+        let best = elig
+            .iter()
+            .map(|&i| ect_of(&loads[i]))
+            .min()
+            .unwrap_or(u64::MAX);
+        let tied: Vec<usize> = elig
+            .into_iter()
+            .filter(|&i| ect_of(&loads[i]) == best)
+            .collect();
+        if tied.len() == 1 {
+            return tied[0];
+        }
+        // 完全相等: 在途流数最少者胜; 流数也相同才轮转均摊。
+        let min_streams = tied
+            .iter()
+            .map(|&i| loads[i].in_flight_streams.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0);
+        let fewest: Vec<usize> = tied
+            .into_iter()
+            .filter(|&i| {
+                loads[i].in_flight_streams.load(Ordering::Relaxed) == min_streams
+            })
+            .collect();
+        if fewest.len() == 1 {
+            return fewest[0];
+        }
+        let n = TIE_ROTATOR.fetch_add(1, Ordering::Relaxed);
+        return fewest[(n % fewest.len() as u64) as usize];
     }
     0
 }
@@ -347,6 +377,10 @@ const CUT_PEER_FRESH_MS: u64 = 30_000;
 /// 它同时兜住防连坐——阈值最低 = μ(1−2.5/8) ≈ 0.69μ, 正常落点永不入圈,
 /// 全体都慢的链不互杀。
 const CUT_MIN_PEERS: usize = 3;
+/// 悬殊绝食者的哨兵间隔：每 5s 放一片验证"它还是慢的吗"。变快凭实测成绩回归。
+const SENTINEL_GAP_MS: u64 = 5_000;
+/// 悬殊绝食线：实测速度 < 最快者 ÷8 → 本轮只吃哨兵片。
+const SENTINEL_RATIO: u64 = 8;
 /// 每链每窗上限：掐满放行爬行，宁可慢不可自残。
 const CUT_LIMIT_PER_WINDOW: u32 = 4;
 const CUT_LIMIT_WINDOW_MS: u64 = 60_000;
@@ -658,7 +692,31 @@ pub(super) async fn chain_fetch(
             ));
             i
         }
-        None => pick_mirror(&candidates, new_bytes),
+        None => {
+            let i = pick_mirror(&candidates, new_bytes);
+            // 哨兵记账: 被选中的若处于绝食区(慢最快者 8 倍), 记本次放行时刻。
+            let ld = mirror_load(&candidates[i]);
+            let s = ld.speed_ewma.load(Ordering::Relaxed);
+            let fastest = candidates
+                .iter()
+                .filter_map(|c| {
+                    let v = mirror_load(c).speed_ewma.load(Ordering::Relaxed);
+                    (v > 0).then_some(v)
+                })
+                .max()
+                .unwrap_or(0);
+            if s > 0 && fastest > 0 && s * SENTINEL_RATIO < fastest {
+                ld.last_sentinel_ms
+                    .store(pool::now_ms(), Ordering::Relaxed);
+                (log)(&format!(
+                    "[ECT] {host}{path} 哨兵片放行 {} ({}KB/s < 最快 {}/8), 验证是否恢复",
+                    candidates[i],
+                    s / 1024,
+                    fastest / 1024 / 8
+                ));
+            }
+            i
+        }
     };
     let mut direct = direct;
     let mut order = walk_order(candidates.len(), start, limit);
@@ -1524,32 +1582,54 @@ mod tests {
         b.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// ECT 相差 ≤5% 轮转均摊，>5% 严格选快者(ECT 核心语义不被稀释)。
+    /// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废。
+    /// 仅 ECT 完全相等才走二级(流数/轮转)。
     #[test]
-    fn ect_tie_rotates_within_tolerance_only() {
+    fn ect_strict_minimum_no_tolerance() {
         let a = mirror_load("tie-a.test");
         let b = mirror_load("tie-b.test");
         a.in_flight_bytes.store(0, Ordering::Relaxed);
         b.in_flight_bytes.store(0, Ordering::Relaxed);
         let chain = vec!["tie-a.test".to_string(), "tie-b.test".to_string()];
-        // 速度差 4%(容差内) + 在途全零 → ECT 并列 → 轮转两家都出。
+        // 速度差 4% → 恒选快者 b(容差时代会轮转)。
         a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
         b.speed_ewma.store(2088 * 1024, Ordering::Relaxed); // +4%
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..20 {
-            seen.insert(pick_mirror(&chain, 8 * 1024 * 1024));
-        }
-        assert!(
-            seen.contains(&0) && seen.contains(&1),
-            "5% 内并列应轮转: {seen:?}"
-        );
-        // 速度差 30%(超容差) → 恒选快者 b。
-        b.speed_ewma.store(26 * 1024 * 1024 / 10, Ordering::Relaxed); // 2.6MB/s
         for _ in 0..10 {
-            assert_eq!(pick_mirror(&chain, 8 * 1024 * 1024), 1, "真差距必须严格选快");
+            assert_eq!(pick_mirror(&chain, 8 * 1024 * 1024), 1, "无容差: 4% 差距也严格选快");
         }
         a.speed_ewma.store(0, Ordering::Relaxed);
         b.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
+    /// 悬殊绝食: 慢最快者 8 倍 → 出局(除非哨兵到点); 6 倍慢仍在竞速圈。
+    #[test]
+    fn starvation_removes_far_slower_candidates() {
+        let fast = mirror_load("star-fast.test");
+        let slow = mirror_load("star-slow.test");
+        let near = mirror_load("star-near.test");
+        fast.speed_ewma.store(12 * 1024 * 1024, Ordering::Relaxed);
+        slow.speed_ewma.store(370 * 1024, Ordering::Relaxed); // 32 倍慢 → 绝食
+        near.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed); // 6 倍慢 → 留圈
+        slow.last_sentinel_ms.store(pool::now_ms(), Ordering::Relaxed); // 哨兵刚发过
+        let chain = vec![
+            "star-fast.test".to_string(),
+            "star-slow.test".to_string(),
+            "star-near.test".to_string(),
+        ];
+        // slow 被绝食: 20 次都不该选它(ECT 上它也最差)。
+        for _ in 0..20 {
+            assert_ne!(pick_mirror(&chain, 1024), 1, "绝食者不得接客");
+        }
+        // 哨兵到点: slow 恢复参评资格——fast/near 在途拉满时它可被选中。
+        slow.last_sentinel_ms.store(0, Ordering::Relaxed);
+        fast.in_flight_bytes.store(100 * 1024 * 1024, Ordering::Relaxed);
+        near.in_flight_bytes.store(100 * 1024 * 1024, Ordering::Relaxed);
+        assert_eq!(pick_mirror(&chain, 1024), 1, "哨兵到点, 绝食者恢复资格");
+        fast.in_flight_bytes.store(0, Ordering::Relaxed);
+        near.in_flight_bytes.store(0, Ordering::Relaxed);
+        slow.speed_ewma.store(0, Ordering::Relaxed);
+        fast.speed_ewma.store(0, Ordering::Relaxed);
+        near.speed_ewma.store(0, Ordering::Relaxed);
     }
 
     #[test]
