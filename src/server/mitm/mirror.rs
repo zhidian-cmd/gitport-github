@@ -341,13 +341,11 @@ const CUT_MIN_WINDOW_MS: u64 = 250;
 /// 慢启动已过; 之后的低速率就是真低速率, 60KB/600ms 也是合法读数。
 const CUT_WARMUP_WINDOWS: u32 = 2;
 const CUT_PEER_FRESH_MS: u64 = 30_000;
-/// 流速度 < 同伴中位数 / 该值 = 显著离群。4 = 倍数轴甜点: 2~3 倍落在
-/// "并发挤占的暂时落后"重叠区(掐了会震荡——空闲后又变快再被派再被掐),
-/// 交给 ECT 在途记账自然调节; 4 倍以上是占着位置不干活, 必须掐。
-const CUT_SIGNIFICANCE_DIVISOR: u64 = 4;
-/// 绝对地板: own ≥512KB/s 不参评——任何网络下这速度都够快; 同时挡掉
-/// "全体都慢但有一家略慢"的连坐(倍数轴在烂链里会放大噪声)。
-const CUT_MIN_OWN_RATE: u64 = 512 * 1024;
+/// z 判据参数: own 落在同伴 μ − 2.5σ̂ 之下才掐(σ̂ = max(σ, μ/8))。
+/// 2.5σ ≈ 单侧 0.6%——"正常候选随机波动到这么慢"不足百分之一。
+/// σ 下限 μ/8: 全挤在一起时 σ→0 会把阈值收成刀刃, 微小波动即掐, 震荡;
+/// 它同时兜住防连坐——阈值最低 = μ(1−2.5/8) ≈ 0.69μ, 正常落点永不入圈,
+/// 全体都慢的链不互杀。
 const CUT_MIN_PEERS: usize = 3;
 /// 每链每窗上限：掐满放行爬行，宁可慢不可自残。
 const CUT_LIMIT_PER_WINDOW: u32 = 4;
@@ -362,9 +360,28 @@ fn peer_median(peer_rates: &[u64]) -> Option<u64> {
     Some(sorted[sorted.len() / 2])
 }
 
-fn should_cut(own_rate: u64, median: Option<u64>) -> bool {
-    // 地板先行: 512KB/s 以上不值得掐(重发成本 > 收益), 也挡烂链连坐。
-    own_rate < CUT_MIN_OWN_RATE && median.is_some_and(|m| own_rate < m / CUT_SIGNIFICANCE_DIVISOR)
+/// z 判据(离散度自适应)：own < μ−2.5σ̂(σ̂=max(σ, μ/8)) 且 own < μ/2
+/// 且 own < 512KB/s 地板——三道护栏各挡一类误杀，缺一不可。
+fn should_cut(own_rate: u64, peers: &[u64]) -> bool {
+    if peers.len() < CUT_MIN_PEERS {
+        return false;
+    }
+    let n = peers.len() as u64;
+    let mu = peers.iter().sum::<u64>() / n;
+    // 总体标准差, 定点 ×1000 保平方精度: sqrt(Σ(x−μ)²/n)。
+    let var_x1000 = peers
+        .iter()
+        .map(|x| {
+            let d = x.abs_diff(mu) * 1000;
+            d * d
+        })
+        .sum::<u64>()
+        / n;
+    let sigma = (var_x1000 as f64).sqrt().round() as u64; // = σ*1000
+    let sigma_hat = sigma.max(mu * 125); // μ/8, 千分位基准(= μ*1000/8)
+    // 阈值 = μ − 2.5σ̂: σ̂ 是千分位(×1000)基准, 回缩: 2.5×σ̂/1000 = σ̂/400。
+    let threshold = mu.saturating_sub(sigma_hat / 400);
+    own_rate < threshold
 }
 
 static CUT_LIMITER: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
@@ -460,13 +477,12 @@ fn cutoff_watched_body(
                             .map(|p| p.speed_ewma.load(Ordering::Relaxed))
                             .filter(|s| *s > 0)
                             .collect();
-                        let median = peer_median(&fresh);
                         let own = st.since_cp * 1_000_000
                             / elapsed.as_micros().max(1) as u64;
-                        if should_cut(own, median) && cut_allowed(&st.chain_host) {
+                        if should_cut(own, &fresh) && cut_allowed(&st.chain_host) {
                             force_ewma(&st.load, st.since_cp, elapsed);
                             st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
-                            let base = median.unwrap_or(0) / 1024;
+                            let base = fresh.iter().sum::<u64>() / fresh.len() as u64 / 1024;
                             (st.log)(&format!(
                                 "[镜像] {} {} 速率 {}KB/s 显著低于同伴(基准 {base}KB/s), 掐断断流, 交由客户端重发",
                                 st.label, st.mirror, own / 1024
@@ -1651,45 +1667,48 @@ mod tests {
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 相对差值检验：全军低速零误杀，一快多慢慢鼠照样暴露；同伴不足不评。
+    /// z 判据：离散度自适应——挤链里贴着中位数的异常也掐，散链里不误杀，
+    /// 全军低速(地板/μ/2)零误杀，同伴不足不评。
     #[test]
     fn cutoff_significance_median_of_fresh_peers() {
-        let m = |rates: &[u64]| peer_median(rates);
-        assert!(should_cut(2 * 1024, m(&[100 * 1024, 100 * 1024, 120 * 1024])));
-        assert!(!should_cut(50 * 1024, m(&[50 * 1024, 50 * 1024, 60 * 1024])));
-        assert!(should_cut(
-            2 * 1024,
-            m(&[100 * 1024, 90 * 1024, 110 * 1024, 95 * 1024])
-        ));
-        assert!(!should_cut(0, m(&[100 * 1024, 100 * 1024])));
-        assert!(!should_cut(0, m(&[])));
+        // 挤链 [4.8, 5.0, 5.2]MB/s: σ≈163KB→σ̂=μ/8=625KB; 阈值=5.0M−2.5×0.625M≈3.44M
+        // → 3.4MB/s 判掉(÷4 判据下这是永不触发的盲区)。
+        let tight = &[4800u64 * 1024, 5000 * 1024, 5200 * 1024];
+        assert!(should_cut(3400 * 1024, tight), "挤链里低于 μ−2.5σ̂ 的近异常应掐");
+        assert!(!should_cut(3600 * 1024, tight), "挤链里阈值之上不掐");
+        // 散链 [1, 3, 5]MB/s: σ≈1.63M > μ/8; 阈值=3M−2.5×1.63M<0 → 1.2MB/s 不掐。
+        let loose = &[1000u64 * 1024, 3000 * 1024, 5000 * 1024];
+        assert!(!should_cut(1200 * 1024, loose), "散链(σ 大)里 1.2MB/s 是正常落点, 不掐");
+        // 真塌方: 同伴 5MB/s, own 250KB/s——地板之下且远超 2.5σ̂。
+        let fast = &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024];
+        assert!(should_cut(250 * 1024, fast), "真塌方必须掐");
+        // 全军低速但无离群: σ̂ 下限(μ/8)保阈值不收成刀刃, 接近中位数的落点不掐。
+        let all_slow = &[90u64 * 1024, 100 * 1024, 110 * 1024];
+        assert!(!should_cut(90 * 1024, all_slow), "低速链里接近同伴的不掐(σ̂ 下限防刀刃)");
+        // 同伴不足(2 家)不评。
+        assert!(!should_cut(0, &[100u64 * 1024, 100 * 1024]));
+        assert!(!should_cut(0, &[]));
     }
 
-    /// 显著性刻度钉死(÷4 + 512KB/s 地板, 地板优先): 地板之上一律不掐——
-    /// 512KB/s 在任何网络下都够快, 重发成本 > 收益; 地板之下且 4 倍慢才掐。
+    /// z 判据刻度钉死: 挤链近异常(σ̂ 下限生效)、散链宽容、2 倍慢护栏圈外。
     #[test]
     fn cut_significance_scale() {
-        let m5 = Some(5 * 1024 * 1024);
-        assert!(
-            !should_cut(1024 * 1024, m5),
-            "1MB/s 在地板之上——5 倍慢也不掐, 重发不值"
-        );
-        assert!(
-            !should_cut(2500 * 1024, m5),
-            "2 倍慢是正常离散, 交给 ECT 在途记账"
-        );
-        assert!(
-            !should_cut(600 * 1024, Some(2 * 1024 * 1024)),
-            "地板之上——烂链里不连坐"
-        );
-        assert!(
-            should_cut(400 * 1024, m5),
-            "地板之下 + 12 倍慢: 真塌方必须掐"
-        );
-        assert!(
-            !should_cut(100 * 1024, Some(300 * 1024)),
-            "地板之下但 3 倍慢(<4): 不掐"
-        );
+        // 挤链(σ≈0, σ̂=μ/8): 1MB/s vs μ≈5MB/s 是 8σ̂ 外的真异常 → 掐
+        // (z 语义: "慢"由离散度定义, 挤链里偏离 80% 就是异常, 不是正常离散)。
+        assert!(should_cut(
+            1024 * 1024,
+            &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024]
+        ));
+        // 挤链 2.5MB/s(μ 的一半, 4σ̂ 外) → 掐。
+        assert!(should_cut(
+            2500 * 1024,
+            &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024]
+        ));
+        // σ̂ 下限验证: 完美挤链(σ≈0)时阈值不收成刀刃——
+        // μ=5M, σ̂=μ/8=625K, 阈值=5M−2.5×0.625M≈3.44M, 3.4M 判掉、3.5M 不判。
+        let perfect = &[5u64 * 1024 * 1024, 5000 * 1024, 5000 * 1024];
+        assert!(should_cut(3400 * 1024, perfect));
+        assert!(!should_cut(3500 * 1024, perfect));
     }
 
     #[test]
