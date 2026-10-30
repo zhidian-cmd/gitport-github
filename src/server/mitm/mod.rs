@@ -474,6 +474,8 @@ fn direct_leg<'a>(
         let mut guard = mirror::LoadGuard::charge(load, new_bytes);
         match get_direct(&log2, out, &host2, &info2, true, &body2).await {
             Ok(resp) => {
+                // 头已到：码表重跑，IP 表串发拨号/等待不进速度样本。
+                guard.restart_mark();
                 let (parts, body) = resp.into_parts();
                 let body = http_body_util::BodyExt::map_frame(body, move |frame| {
                     if let Some(n) = frame.data_ref().map(|d| d.len() as u64) {

@@ -134,6 +134,15 @@ impl LoadGuard {
             self.mark_bytes = self.raw_delivered;
         }
     }
+
+    /// 测速时钟重置：响应头到达时调用。建连/拨号/等待服务器开腔的全部耗时
+    /// 只存在于墙钟，不进任何速度样本——否则探测片判分与 EWMA 首区间被
+    /// 等待稀释，且快镜像被稀释得更狠(等待是常数)，候选差距被压缩。
+    /// 在途记账不受影响：charge 仍在派发时发生(ECT 分子要含已派出未到货)。
+    pub(super) fn restart_mark(&mut self) {
+        self.mark_at = Instant::now();
+        self.mark_bytes = self.raw_delivered;
+    }
 }
 
 impl Drop for LoadGuard {
@@ -622,6 +631,8 @@ pub(super) async fn chain_fetch(
         let t0 = Instant::now();
         match mirror_do(req, m, log).await {
             Ok(resp) => {
+                // 头已到：码表重跑，建连/等待耗时留在墙钟不进速度样本。
+                guard.restart_mark();
                 mirror_load(m).last_fail_ms.store(0, Ordering::Relaxed);
                 (log)(&format!(
                     "[镜像] {host}{path} via {m} (链位 {}/{len}, ECT起点 #{}, 头 {ms}ms)",
@@ -1178,6 +1189,25 @@ mod tests {
                 Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into())
             }),
         }
+    }
+
+    /// 测速时钟从响应头起算：派发后的建连/等待不进首个采样区间。
+    /// 头到达时 restart_mark 重置码表——等待段只存在于墙钟，不进速度数字。
+    #[test]
+    fn speed_clock_starts_at_response_head() {
+        let ld = mirror_load("clock-head.test");
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
+        std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
+        g.restart_mark(); // 头到达，码表重跑
+        std::thread::sleep(Duration::from_millis(5));
+        g.on_frame(512 * 1024);
+        let s = ld.speed_ewma.load(Ordering::Relaxed);
+        assert!(
+            s > 20 * 1024 * 1024,
+            "首区间不得包含建连/等待耗时(不重置 ≈512KB/125ms≈4MB/s): {s}B/s"
+        );
+        ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
     /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
