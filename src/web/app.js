@@ -237,9 +237,6 @@ $('mirrorRows').addEventListener('click', async e => {
     row.url = url;
     row.on = !row.on;
     await commitMirrors();
-  } else if (btn.dataset.act === 'trust') {
-    row.trusted = btn.checked;
-    await commitMirrors();
   } else if (btn.dataset.act === 'del') {
     const url = row.url;
     MIRRORS.splice(idx, 1);
@@ -248,8 +245,18 @@ $('mirrorRows').addEventListener('click', async e => {
   }
 });
 
+/* 信任是 checkbox: click 监听只认 button[data-act], 收不到它——单独挂 change。 */
+$('mirrorRows').addEventListener('change', async e => {
+  if (!e.target.matches('input[data-act="trust"]')) return;
+  const row = MIRRORS[+e.target.dataset.idx];
+  if (!row) return;
+  row.trusted = e.target.checked;
+  await commitMirrors();
+});
+
 $('mirrorRows').addEventListener('input', e => {
-  if (e.target.matches('input[data-idx]')) {
+  // 只认文本框: trust checkbox 同样带 data-idx, 但没有 url 语义
+  if (e.target.matches('input[type="text"][data-idx]')) {
     const idx = +e.target.dataset.idx;
     if (MIRRORS[idx]) MIRRORS[idx].url = e.target.value;
   }
