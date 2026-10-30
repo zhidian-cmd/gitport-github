@@ -28,8 +28,8 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 
 | 做不到 | 原因 | 应对 |
 |---|---|---|
-| macOS / Linux | 桌面框架 Windows 专属 | macOS 推荐 Watt Toolkit / Clash Verge |
-| 大文件上传快 | 伪装 SNI 链路每流限速（~119KB/s），push/单附件是单流协议 | 多附件并发；优先走 release 附件上传（直拨 ~1.3MB/s） |
+| macOS / Linux | 系统代理、托盘、剪贴板全调 Windows API（winreg / WinInet） | macOS 推荐 Watt Toolkit / Clash Verge |
+| 大文件上传快 | push 与单附件都是单流协议，一条 TCP 的吞吐就是天花板（本机实测约 119KB/s）；代码里没有限速，换链路会变 | 多附件并发；优先走 release 附件上传（本机实测直拨约 1.3MB/s） |
 | 一劳永逸 | GitHub 边缘 IP 会迁移 | 种子补缺 + DNS 兜底腿自愈；极端情况手改 `plans.json` |
 | 零门槛 | MITM 需装本地根证书 | WebUI 一键安装；不装也能用 |
 | 加速所有网站 | 只路由 GitHub 系域名 | 其他站点用通用代理 |
@@ -42,8 +42,8 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 
 ## 常见问题
 
-- **push 大包慢？** 伪装 SNI 上行带宽有限（~115KB/s），与代理无关；流式直通保证不 502，中断后整体重传。
-- **raw 偶发 6~8 秒？** 真名 SNI 被点名 RST；熔断+镜像兜底已就位，自动恢复。
+- **push 大包慢？** push 是单流协议，一条 TCP 的吞吐就是天花板（本机实测约 119KB/s，代码里没有限速）；流式直通保证不 502，中断后整体重传。
+- **raw 偶发 6~8 秒？** 直连池到 Fastly 内容边缘间歇受阻（走的是伪装 SNI，真名 SNI 只用在白名单域名上，跟这里无关）；内容域熔断 + 镜像兜底已就位，自动恢复。
 - **浏览器报证书风险？** MITM 开了但根证书未装/浏览器未重启；WebUI 一键装根后重启浏览器。
 - **端口冲突？** `.\gitport-github.exe -port 7812 -webui 7813`。
 - **页面显示「暂时不可用」？** 封锁窗口期，8 秒自动刷新，窗口一过即恢复。
