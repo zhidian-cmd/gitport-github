@@ -335,9 +335,10 @@ fn validate_mirror_response(had_range: bool, status: u16, content_type: &str) ->
 
 // ---- 慢镜像掐断：相对差值检验，全军低速零误杀 ----
 
-const CUT_CHECKPOINT_BYTES: u64 = 96 * 1024;
-
-const CUT_MIN_WINDOW_MS: u64 = 1_200;
+const CUT_MIN_WINDOW_MS: u64 = 300;
+/// 单流累计交付 <256KB 不掐——TCP 慢启动/ramp-up 期的低速率是起步噪声，
+/// 与 EOS 探测门同一精神：没考完试不打分。
+const CUT_MIN_TOTAL_BYTES: u64 = 256 * 1024;
 const CUT_PEER_FRESH_MS: u64 = 30_000;
 /// 流速度 < 同伴中位数 / 该值 = 显著离群。
 const CUT_SIGNIFICANCE_DIVISOR: u64 = 20;
@@ -427,37 +428,41 @@ fn cutoff_watched_body(
                 let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
                 st.guard.on_frame(n);
                 st.since_cp += n;
-                if st.since_cp >= CUT_CHECKPOINT_BYTES {
-                    let elapsed = st.cp_at.elapsed();
-                    if elapsed.as_millis() as u64 >= CUT_MIN_WINDOW_MS {
-                        let now_ms = pool::now_ms();
-                        let fresh: Vec<u64> = st
-                            .peers
-                            .iter()
-                            .filter(|p| {
-                                let s = p.last_sample_ms.load(Ordering::Relaxed);
-                                s != 0 && now_ms.saturating_sub(s) < CUT_PEER_FRESH_MS
-                            })
-                            .map(|p| p.speed_ewma.load(Ordering::Relaxed))
-                            .filter(|s| *s > 0)
-                            .collect();
-                        let median = peer_median(&fresh);
-                        let own = st.since_cp * 1_000_000
-                            / elapsed.as_micros().max(1) as u64;
-                        if should_cut(own, median) && cut_allowed(&st.chain_host) {
-                            force_ewma(&st.load, st.since_cp, elapsed);
-                            st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
-                            let base = median.unwrap_or(0) / 1024;
-                            (st.log)(&format!(
-                                "[镜像] {} {} 速率 {}KB/s 显著低于同伴(基准 {base}KB/s), 掐断断流, 交由客户端重发",
-                                st.label, st.mirror, own / 1024
-                            ));
-                            return Some((
-                                Err(std::io::Error::other("镜像显著慢于同伴, 已掐断")),
-                                st,
-                            ));
-                        }
+                // 即到即判：观察窗(慢启动)过后每帧都评——判定原料是"已交付
+                // 字节 + 窗龄"，不再等攒满检查点。慢镜像攒料慢，旧逻辑的判定
+                // 反而被交付速度拖住；速率正常时判定点不会通过，快路径零成本。
+                let elapsed = st.cp_at.elapsed();
+                let observed = st.guard.delivered >= CUT_MIN_TOTAL_BYTES
+                    && elapsed.as_millis() >= u128::from(CUT_MIN_WINDOW_MS);
+                if observed {
+                    let now_ms = pool::now_ms();
+                    let fresh: Vec<u64> = st
+                        .peers
+                        .iter()
+                        .filter(|p| {
+                            let s = p.last_sample_ms.load(Ordering::Relaxed);
+                            s != 0 && now_ms.saturating_sub(s) < CUT_PEER_FRESH_MS
+                        })
+                        .map(|p| p.speed_ewma.load(Ordering::Relaxed))
+                        .filter(|s| *s > 0)
+                        .collect();
+                    let median = peer_median(&fresh);
+                    let own = st.since_cp * 1_000_000
+                        / elapsed.as_micros().max(1) as u64;
+                    if should_cut(own, median) && cut_allowed(&st.chain_host) {
+                        force_ewma(&st.load, st.since_cp, elapsed);
+                        st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
+                        let base = median.unwrap_or(0) / 1024;
+                        (st.log)(&format!(
+                            "[镜像] {} {} 速率 {}KB/s 显著低于同伴(基准 {base}KB/s), 掐断断流, 交由客户端重发",
+                            st.label, st.mirror, own / 1024
+                        ));
+                        return Some((
+                            Err(std::io::Error::other("镜像显著慢于同伴, 已掐断")),
+                            st,
+                        ));
                     }
+                    // 未触发：窗口滑动，从本帧重新起算——下次判定看的是最新一段。
                     st.since_cp = 0;
                     st.cp_at = Instant::now();
                 }
@@ -1619,8 +1624,8 @@ mod tests {
     fn force_ewma_overrides_stale_high_impression() {
         let ld = mirror_load("force-override.test");
         ld.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
-        force_ewma(&ld, CUT_CHECKPOINT_BYTES, Duration::from_millis(2_600));
-        let expect = CUT_CHECKPOINT_BYTES * 1000 / 2_600;
+        force_ewma(&ld, 256 * 1024, Duration::from_millis(2_600));
+        let expect = 256 * 1024 * 1_000_000 / 2_600_000;
         assert_eq!(
             ld.speed_ewma.load(Ordering::Relaxed),
             expect,
@@ -1672,10 +1677,12 @@ mod tests {
         me.speed_ewma.store(0, Ordering::Relaxed);
         me.last_fail_ms.store(0, Ordering::Relaxed);
         me.in_flight_bytes.store(0, Ordering::Relaxed);
-        // 两帧 96KB，帧间 1.4s：own ≈ 68KB/s < 250KB/s(基准/20) → 掐。
+        // 6 帧 ×128KB、帧间 800ms：帧 2 到达时窗龄 800ms、累计 256KB(过 ramp-up
+        // 门)、own = 128KB/800ms = 160KB/s < 250KB/s(基准/20) → 即到即判，
+        // 不再等攒检查点。
         let chunks = vec![
-            Bytes::from(vec![0u8; CUT_CHECKPOINT_BYTES as usize]);
-            2
+            Bytes::from(vec![0u8; 128 * 1024]);
+            6
         ];
         let stream = futures_util::stream::iter(
             chunks
@@ -1683,7 +1690,7 @@ mod tests {
                 .map(|b| Ok::<_, std::io::Error>(hyper::body::Frame::data(b))),
         );
         let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(stream));
-        let guard = LoadGuard::charge(me.clone(), 2 * CUT_CHECKPOINT_BYTES);
+        let guard = LoadGuard::charge(me.clone(), 6 * 128 * 1024);
         let mut wrapped = cutoff_watched_body(
             body,
             guard,
@@ -1701,7 +1708,7 @@ mod tests {
         loop {
             assert!(tokio::time::Instant::now() < deadline, "掐断测试超时");
             match http_body_util::BodyExt::frame(&mut wrapped).await {
-                Some(Ok(_)) => tokio::time::sleep(Duration::from_millis(1400)).await,
+                Some(Ok(_)) => tokio::time::sleep(Duration::from_millis(800)).await,
                 Some(Err(_)) => {
                     got_err = true;
                     break;
