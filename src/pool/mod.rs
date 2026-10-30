@@ -734,10 +734,9 @@ pub fn sync_custom_mirrors(removed: &[String]) {
 
 pub fn mirror_chain(host: &str) -> Vec<String> {
     let g = lock(&SERIAL);
+    // None = 池未初始化(单测独立跑 chain_fetch 时)——空链等价"无镜像腿"。
     g.as_ref()
-        .unwrap()
-        .mirrors
-        .get(host)
+        .and_then(|t| t.mirrors.get(host))
         .cloned()
         .unwrap_or_default()
 }
