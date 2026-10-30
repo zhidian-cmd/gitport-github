@@ -19,8 +19,15 @@ const DEFAULT_MIRROR_SPEED: u64 = 2 * 1024 * 1024;
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-const SPEED_SAMPLE_BYTES: u64 = 512 * 1024;
-const SPEED_SAMPLE_MIN_BYTES: u64 = 128 * 1024;
+const SPEED_SAMPLE_BYTES: u64 = 64 * 1024;
+/// 采样时间窗：字节攒不够也行——距上次采样满 100ms 照样出读数，
+/// 慢镜像/停滞不再被"攒不够字节"拖住(停滞 100ms 内现形)。
+const SAMPLE_TIME_FLOOR_MS: u64 = 100;
+/// 单窗接收双门：时间有效(窗跨 ≥2ms, 字节数不限——停滞信号必须收)或
+/// 字节有效(≥16KB, 数个 TCP 段的平均斜率)。唯一拒收单个突发碎片
+/// (亚 2ms 且亚 16KB, 纯调度噪声)。16KB 同时是探测判分的 delivered 门槛。
+const SPEED_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
+const SAMPLE_MIN_WINDOW_US: u64 = 2_000;
 
 /// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)。
 /// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者，负载摊开少误掐。
@@ -57,11 +64,16 @@ pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
 }
 
 fn ewma_update(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
-    let ms = elapsed.as_millis() as u64;
-    if bytes < SPEED_SAMPLE_MIN_BYTES || ms == 0 {
+    let us = elapsed.as_micros() as u64;
+    if bytes == 0 || us == 0 {
         return;
     }
-    let sample = bytes * 1000 / ms;
+    // 双门接收：时间有效(≥2ms, 字节数不限)或字节有效(≥16KB)——唯一拒收
+    // 单个突发碎片。微秒分辨率下小窗不再被毫秒粒度整批丢弃。
+    if us < SAMPLE_MIN_WINDOW_US && bytes < SPEED_SAMPLE_MIN_BYTES {
+        return;
+    }
+    let sample = bytes * 1_000_000 / us;
     let old = load.speed_ewma.load(Ordering::Relaxed);
     // 权重 6:4（α=0.4）：半衰约 1.4 个样本，比 7:3（α=0.3，半衰 1.94）更快跟住
     // 最新网速；再往 0.7 走，单个 512KB 块的抖动就能把估值砍半，派发会在镜像间
@@ -79,12 +91,12 @@ fn ewma_update(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
 /// 掐断采样：直接覆盖，不做历史混合——混样要 8 轮才能压下塌方镜像的旧印象；
 /// 60s 失败窗过后正常流量样本自然抬回，暂时抽风不误伤。
 fn force_ewma(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
-    let ms = elapsed.as_millis() as u64;
-    if bytes == 0 || ms == 0 {
+    let us = elapsed.as_micros() as u64;
+    if bytes == 0 || us == 0 {
         return;
     }
     load.speed_ewma
-        .store((bytes * 1000 / ms).max(1), Ordering::Relaxed);
+        .store((bytes * 1_000_000 / us).max(1), Ordering::Relaxed);
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
 }
 
@@ -97,6 +109,8 @@ pub(super) struct LoadGuard {
     raw_delivered: u64,
     mark_at: Instant,
     mark_bytes: u64,
+    /// 体流起点(响应头到达)：探测判分用全片体速率, 不随区间采样重置。
+    head_at: Instant,
     /// 构造时镜像尚无速度样本 = 本流是探测片(首个真实样本)。
     pub(super) is_probe: bool,
 }
@@ -113,6 +127,7 @@ impl LoadGuard {
             raw_delivered: 0,
             mark_at: Instant::now(),
             mark_bytes: 0,
+            head_at: Instant::now(),
             is_probe,
         }
     }
@@ -128,8 +143,11 @@ impl LoadGuard {
             self.load.in_flight_bytes.fetch_sub(credit, Ordering::Relaxed);
         }
         let since_mark = self.raw_delivered - self.mark_bytes;
-        if since_mark >= SPEED_SAMPLE_BYTES {
-            ewma_update(&self.load, since_mark, self.mark_at.elapsed());
+        let since_time = self.mark_at.elapsed();
+        if since_mark >= SPEED_SAMPLE_BYTES
+            || since_time.as_millis() >= u128::from(SAMPLE_TIME_FLOOR_MS)
+        {
+            ewma_update(&self.load, since_mark, since_time);
             self.mark_at = Instant::now();
             self.mark_bytes = self.raw_delivered;
         }
@@ -141,6 +159,7 @@ impl LoadGuard {
     /// 在途记账不受影响：charge 仍在派发时发生(ECT 分子要含已派出未到货)。
     pub(super) fn restart_mark(&mut self) {
         self.mark_at = Instant::now();
+        self.head_at = Instant::now();
         self.mark_bytes = self.raw_delivered;
     }
 }
@@ -423,7 +442,8 @@ fn cutoff_watched_body(
                             .filter(|s| *s > 0)
                             .collect();
                         let median = peer_median(&fresh);
-                        let own = st.since_cp * 1000 / elapsed.as_millis().max(1) as u64;
+                        let own = st.since_cp * 1_000_000
+                            / elapsed.as_micros().max(1) as u64;
                         if should_cut(own, median) && cut_allowed(&st.chain_host) {
                             force_ewma(&st.load, st.since_cp, elapsed);
                             st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
@@ -479,8 +499,8 @@ fn cutoff_watched_body(
                         None
                     }
                 });
-                let own = st.guard.delivered * 1000
-                    / st.guard.mark_at.elapsed().as_millis().max(1) as u64;
+                let own = st.guard.delivered * 1_000_000
+                    / st.guard.head_at.elapsed().as_micros().max(1) as u64;
                 if was_probe && probe_outlier(own, median) {
                     st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
                     let base = median.unwrap_or(0) / 1024;
@@ -1210,6 +1230,41 @@ mod tests {
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
+    /// 时间窗触发：字节攒不够 64KB，但 100ms 到了照样出读数——停滞 100ms 内现形。
+    #[test]
+    fn time_floor_fires_sample_on_stall() {
+        let ld = mirror_load("stall-clock.test");
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
+        std::thread::sleep(Duration::from_millis(120));
+        g.on_frame(4 * 1024); // 4KB 远不足字节窗，但时间窗已到
+        let s = ld.speed_ewma.load(Ordering::Relaxed);
+        assert!(
+            s > 0 && s < 200 * 1024,
+            "时间窗应触发停滞读数(4KB/120ms ≈ 34KB/s): {s}B/s"
+        );
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
+    /// 双门接收：同是 1KB,亚 2ms 的碎片窗拒收,跨 2ms 的时间有效窗收。
+    #[test]
+    fn fragment_rejected_but_time_valid_window_accepted() {
+        let ld = mirror_load("fragment.test");
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+        ewma_update(&ld, 1024, Duration::from_millis(1)); // 亚 2ms 且亚 16KB
+        assert_eq!(
+            ld.speed_ewma.load(Ordering::Relaxed),
+            0,
+            "突发碎片窗不得落账(纯调度噪声)"
+        );
+        ewma_update(&ld, 1024, Duration::from_millis(5)); // ≥2ms → 时间有效
+        assert!(
+            ld.speed_ewma.load(Ordering::Relaxed) > 0,
+            "时间有效窗(哪怕只有 1KB)应落账——停滞信号必须收"
+        );
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
     /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
     #[test]
     fn probe_round_hands_each_candidate_one_shard() {
@@ -1528,8 +1583,8 @@ mod tests {
             "6:4 必须比 7:3 更贴近新样本: now={now} old={old_weights}"
         );
 
-        // 低于 SPEED_SAMPLE_MIN_BYTES(128KB) 的样本不落账
-        ewma_update(&ld, 64 * 1024, Duration::from_secs(1));
+        // 突发碎片(亚 2ms 且亚 16KB)不落账
+        ewma_update(&ld, 1024, Duration::from_millis(1));
         assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), now);
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
