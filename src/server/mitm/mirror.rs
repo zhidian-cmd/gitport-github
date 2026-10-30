@@ -341,8 +341,13 @@ const CUT_MIN_WINDOW_MS: u64 = 250;
 /// 慢启动已过; 之后的低速率就是真低速率, 60KB/600ms 也是合法读数。
 const CUT_WARMUP_WINDOWS: u32 = 2;
 const CUT_PEER_FRESH_MS: u64 = 30_000;
-/// 流速度 < 同伴中位数 / 该值 = 显著离群。
-const CUT_SIGNIFICANCE_DIVISOR: u64 = 20;
+/// 流速度 < 同伴中位数 / 该值 = 显著离群。4 = 倍数轴甜点: 2~3 倍落在
+/// "并发挤占的暂时落后"重叠区(掐了会震荡——空闲后又变快再被派再被掐),
+/// 交给 ECT 在途记账自然调节; 4 倍以上是占着位置不干活, 必须掐。
+const CUT_SIGNIFICANCE_DIVISOR: u64 = 4;
+/// 绝对地板: own ≥512KB/s 不参评——任何网络下这速度都够快; 同时挡掉
+/// "全体都慢但有一家略慢"的连坐(倍数轴在烂链里会放大噪声)。
+const CUT_MIN_OWN_RATE: u64 = 512 * 1024;
 const CUT_MIN_PEERS: usize = 3;
 /// 每链每窗上限：掐满放行爬行，宁可慢不可自残。
 const CUT_LIMIT_PER_WINDOW: u32 = 4;
@@ -358,7 +363,8 @@ fn peer_median(peer_rates: &[u64]) -> Option<u64> {
 }
 
 fn should_cut(own_rate: u64, median: Option<u64>) -> bool {
-    median.is_some_and(|m| own_rate < m / CUT_SIGNIFICANCE_DIVISOR)
+    // 地板先行: 512KB/s 以上不值得掐(重发成本 > 收益), 也挡烂链连坐。
+    own_rate < CUT_MIN_OWN_RATE && median.is_some_and(|m| own_rate < m / CUT_SIGNIFICANCE_DIVISOR)
 }
 
 static CUT_LIMITER: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
@@ -1657,6 +1663,33 @@ mod tests {
         ));
         assert!(!should_cut(0, m(&[100 * 1024, 100 * 1024])));
         assert!(!should_cut(0, m(&[])));
+    }
+
+    /// 显著性刻度钉死(÷4 + 512KB/s 地板, 地板优先): 地板之上一律不掐——
+    /// 512KB/s 在任何网络下都够快, 重发成本 > 收益; 地板之下且 4 倍慢才掐。
+    #[test]
+    fn cut_significance_scale() {
+        let m5 = Some(5 * 1024 * 1024);
+        assert!(
+            !should_cut(1024 * 1024, m5),
+            "1MB/s 在地板之上——5 倍慢也不掐, 重发不值"
+        );
+        assert!(
+            !should_cut(2500 * 1024, m5),
+            "2 倍慢是正常离散, 交给 ECT 在途记账"
+        );
+        assert!(
+            !should_cut(600 * 1024, Some(2 * 1024 * 1024)),
+            "地板之上——烂链里不连坐"
+        );
+        assert!(
+            should_cut(400 * 1024, m5),
+            "地板之下 + 12 倍慢: 真塌方必须掐"
+        );
+        assert!(
+            !should_cut(100 * 1024, Some(300 * 1024)),
+            "地板之下但 3 倍慢(<4): 不掐"
+        );
     }
 
     #[test]
