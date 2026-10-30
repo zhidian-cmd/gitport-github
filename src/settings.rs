@@ -29,11 +29,14 @@ struct SettingsState {
 }
 
 /// 一条自定义镜像：url = Worker 反代地址（拼接格式），on = 是否已启用进镜像链。
+/// trusted = 用户标记"可信"：带凭据(sig/jwt)的 URL 也放行给它——签名等效
+/// 一小时有效的提货凭证，交给第三方=用户知情授权，风险自担(文档已警示)。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
     pub url: String,
     pub on: bool,
+    pub trusted: bool,
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -607,7 +610,7 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
-        norm.push(WorkerMirror { url: u, on: w.on });
+        norm.push(WorkerMirror { url: u, on: w.on, trusted: w.trusted });
     }
     let old = worker_mirrors();
     let removed: Vec<String> = old
@@ -620,6 +623,19 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
     save()?;
     crate::pool::sync_custom_mirrors(&removed);
     Ok(enabled)
+}
+
+/// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。
+/// chain_fetch 凭据串判定处调用——命中则签名 URL 仍走镜像链(用户授权)。
+pub fn trusted_mirrors() -> std::collections::HashSet<String> {
+    state()
+        .worker_mirrors
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| w.on && w.trusted)
+        .map(|w| w.url.clone())
+        .collect()
 }
 
 
@@ -814,6 +830,7 @@ mod tests {
             worker_mirrors: vec![WorkerMirror {
                 url: "https://my.worker".to_string(),
                 on: true,
+                trusted: false,
             }],
         };
         let json = serde_json::to_string_pretty(&f).unwrap();

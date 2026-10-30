@@ -380,6 +380,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                 registry.push(crate::settings::WorkerMirror {
                     url: u.clone(),
                     on: true,
+                    trusted: false,
                 });
                 adopted = true;
             }
@@ -1379,6 +1380,7 @@ mod tests {
         crate::settings::set_worker_mirrors(vec![crate::settings::WorkerMirror {
             url: "https://my-worker.example.com".to_string(),
             on: true,
+            trusted: false,
         }])
         .unwrap();
         for h in CONTENT_HOSTS {

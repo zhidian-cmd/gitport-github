@@ -147,7 +147,7 @@ function applySettings(s) {
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
 }
 function applyMirrors(s) {
-  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
+  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
   renderMirrors();
 }
 /* 一次 /api/settings 喂两边：开关回显 + 镜像列表（启动与切页都不再拉两次） */
@@ -184,8 +184,11 @@ function renderMirrors() {
 function mirrorRow(m, i) {
   const toggle = m.on ? '关闭' : '启动';
   const cls = m.on ? 'btn sm' : 'btn sm primary';
+  const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
+    '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
   return '<div class="mirror-row">' +
     '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
+    trust +
     '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
     '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +
     '</div>';
@@ -205,12 +208,12 @@ async function commitMirrors(opts = {}) {
       }
     } catch (e) { /* 拉取失败按本地状态提交 */ }
   }
-  const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on}));
+  const mirrors = MIRRORS.filter(m => m.url).map(m => ({url: m.url, on: !!m.on, trusted: !!m.trusted}));
   let r;
   try { r = await postJSON('/api/settings/workerMirrors', {mirrors}); }
   catch (e) { alert('保存失败: ' + e); return; }
   if (!r.ok) { alert('保存失败: ' + (r.error || '')); }
-  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on}));
+  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
   renderMirrors();
 }
 
@@ -233,6 +236,9 @@ $('mirrorRows').addEventListener('click', async e => {
     if (!url) { toast('请先填入镜像地址'); return; }
     row.url = url;
     row.on = !row.on;
+    await commitMirrors();
+  } else if (btn.dataset.act === 'trust') {
+    row.trusted = btn.checked;
     await commitMirrors();
   } else if (btn.dataset.act === 'del') {
     const url = row.url;

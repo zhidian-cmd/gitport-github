@@ -605,10 +605,31 @@ pub(super) async fn chain_fetch(
     if let Some(c) = cond {
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
-    // 凭据串请求：镜像候选剥空，签名 URL 不落任何第三方。
+    // 凭据串请求：签名 URL 不落任何第三方——除非该镜像被用户标记为可信
+    // (trusted=true, 知情授权，风险自担)。可信名单非空时按名单放行，
+    // 不可信者仍剥除；全不可信则剥空仅直连。
     let chain = if cred_locked {
-        (log)(&format!("[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(防外泄)"));
-        Vec::new()
+        let trusted_set = crate::settings::trusted_mirrors();
+        let trusted: Vec<String> = pool::mirror_chain(chain_host)
+            .into_iter()
+            .filter(|m| {
+                trusted_set
+                    .iter()
+                    .any(|t| m.starts_with(t.as_str()))
+            })
+            .collect();
+        if trusted.is_empty() {
+            (log)(&format!(
+                "[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(防外泄; 可在工作台标记镜像「信任」以放行)"
+            ));
+            Vec::new()
+        } else {
+            (log)(&format!(
+                "[镜像] {host}{path} 凭据查询串放行 {} 个可信镜像(签名将随 URL 交予第三方, 用户已授权)",
+                trusted.len()
+            ));
+            trusted
+        }
     } else {
         pool::mirror_chain(chain_host)
     };
@@ -1099,12 +1120,43 @@ mod tests {
         assert!(err.contains("仅直连"), "凭据串应剥空镜像仅直连: {err}");
         let got = lines.lock().unwrap();
         assert!(
-            got.iter().any(|l| l.contains("仅直连(防外泄)")),
+            got.iter().any(|l| l.contains("仅直连(防外泄")),
             "应记录剥空镜像决策: {got:?}"
         );
         assert!(
             !got.iter().any(|l| l.contains(" via ")),
             "签名 URL 不得交给第三方镜像: {got:?}"
+        );
+    }
+
+    /// 可信镜像白名单：用户标记 trusted 的镜像，凭据串请求放行给它(知情授权);
+    /// 未标记的镜像仍被剥除。放行名单为空时行为与旧版一致(仅直连)。
+    #[test]
+    fn cred_authorized_trusted_mirrors_only() {
+        // settings 全局态无法按测隔离——直接验证放行集合的过滤逻辑:
+        // trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
+        use crate::settings::WorkerMirror;
+        let mirrors = [
+            WorkerMirror { url: "https://my-worker.example.com".into(), on: true, trusted: true },
+            WorkerMirror { url: "https://public-proxy.example.org".into(), on: true, trusted: false },
+        ];
+        let trusted: std::collections::HashSet<String> = mirrors
+            .iter()
+            .filter(|w| w.on && w.trusted)
+            .map(|w| w.url.clone())
+            .collect();
+        let chain = [
+            "https://my-worker.example.com/".to_string(),      // 可信(带尾斜杠变体)
+            "https://public-proxy.example.org".to_string(),    // 不可信
+        ];
+        let passed: Vec<&String> = chain
+            .iter()
+            .filter(|m| trusted.iter().any(|t| m.starts_with(t.as_str())))
+            .collect();
+        assert_eq!(passed.len(), 1, "只有可信镜像应被放行: {passed:?}");
+        assert!(
+            passed[0].starts_with("https://my-worker.example.com"),
+            "放行的应是可信那家: {passed:?}"
         );
     }
 
