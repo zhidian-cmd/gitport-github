@@ -62,10 +62,14 @@ fn ewma_update(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
     }
     let sample = bytes * 1000 / ms;
     let old = load.speed_ewma.load(Ordering::Relaxed);
+    // 权重 6:4（α=0.4）：半衰约 1.4 个样本，比 7:3（α=0.3，半衰 1.94）更快跟住
+    // 最新网速；再往 0.7 走，单个 512KB 块的抖动就能把估值砍半，派发会在镜像间
+    // 来回跳，EOS 探测/掐断的同伴基准(peer_median)也跟着抖。
+    // 坏消息有专用通道：掐断走 force_ewma 直接覆盖，不靠这里慢慢跟。
     let next = if old == 0 {
         sample
     } else {
-        (old * 7 + sample * 3) / 10
+        (old * 6 + sample * 4) / 10
     };
     load.speed_ewma.store(next.max(1), Ordering::Relaxed);
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
@@ -1363,7 +1367,7 @@ mod tests {
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
     }
 
-    /// 首样本直取，后续 α=0.3 平滑；小样本忽略。
+    /// 首样本直取，后续 α=0.4 平滑；小样本忽略。
     #[test]
     fn speed_ewma_smoothing() {
         let ld = mirror_load("ewma.test");
@@ -1371,10 +1375,38 @@ mod tests {
         ewma_update(&ld, 256 * 1024, Duration::from_secs(1));
         assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 256 * 1024);
         ewma_update(&ld, 1024 * 1024, Duration::from_secs(1));
-        let expect = (256 * 1024 * 7 + 1024 * 1024 * 3) / 10;
+        let expect = (256 * 1024 * 6 + 1024 * 1024 * 4) / 10;
         assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), expect);
         ewma_update(&ld, 128, Duration::from_millis(1));
         assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), expect);
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
+    /// 权重 6:4 的"跟得更快"方向：1MB/s 旧印象遇到 2MB/s 新样本后必须落到
+    /// 1.4MB/s（7:3 只有 1.3MB/s）。这条钉住方向，改回 7:3 会红。
+    #[test]
+    fn ewma_follows_latest_sample_harder() {
+        let ld = mirror_load("ewma-weights.test");
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+        ewma_update(&ld, 1024 * 1024, Duration::from_secs(1)); // 基线 1MB/s
+        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 1024 * 1024);
+
+        ewma_update(&ld, 2 * 1024 * 1024, Duration::from_secs(1)); // 新样本 2MB/s
+        let now = ld.speed_ewma.load(Ordering::Relaxed);
+        assert_eq!(
+            now,
+            (1024 * 1024 * 6 + 2 * 1024 * 1024 * 4) / 10,
+            "6:4 应落在 1.4MB/s"
+        );
+        let old_weights = (1024 * 1024 * 7 + 2 * 1024 * 1024 * 3) / 10;
+        assert!(
+            now > old_weights,
+            "6:4 必须比 7:3 更贴近新样本: now={now} old={old_weights}"
+        );
+
+        // 低于 SPEED_SAMPLE_MIN_BYTES(128KB) 的样本不落账
+        ewma_update(&ld, 64 * 1024, Duration::from_secs(1));
+        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), now);
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
