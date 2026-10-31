@@ -17,10 +17,9 @@ const MIRROR_CHAIN_CAP: usize = 5;
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 探测交分双门槛：距头满 100ms(时间地板, TCP 突发打不出幽灵样本)且
-/// 交付满 16KB(滤 1-byte Range 探针/空流); Drop 终值用 2ms 窗兜底。
-const SPEED_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
-const SAMPLE_MIN_WINDOW_US: u64 = 2_000;
+/// 探测交分：严格按时间——距响应头每满 100ms 按全片运行均速交一次卷,
+/// 此后每帧刷新。字节数不设门槛: 交分时刻确定(不随速率/并发漂移),
+/// 1-byte Range 探针活不过 100ms 自然不交卷, 亚毫秒突发打不出幽灵样本。
 const SAMPLE_TIME_FLOOR_MS: u64 = 100;
 
 /// 在途字节 / 在途流数 / 速度分(0=未交卷; 探测交卷后冻结) / 失败时刻(0=从未)
@@ -60,8 +59,8 @@ pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
 }
 
 /// 探测交分：head_at 起算的全片运行平均，唯一的速度写入通道——交卷即冻结，
-/// 正常流永不覆盖。字节/时间双门槛由调用方把关, 滤 1-byte Range 探针与
-/// TCP 突发, 亚毫秒缓冲残流打不出 GB/s 幽灵样本。
+/// 正常流永不覆盖。100ms 时间门槛由调用方把关: 1-byte 探针活不过 100ms
+/// 自然不交卷, 亚毫秒突发打不出幽灵样本。
 fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
     if bytes == 0 || us == 0 {
         return;
@@ -106,7 +105,7 @@ impl LoadGuard {
 
     /// 交付一帧：记账按记账额归还(封顶于 charged，防镜像无视 Range 回全量把
     /// 计数打成负)；原始累计照走。分数冻结: 只有探测流写速度, 且是 head_at
-    /// 起算的全片运行平均——满 16KB 字节门槛 + 100ms 时间地板才落分。
+    /// 起算的全片运行平均——距头每满 100ms 落一分, 只看时间不看字节。
     pub(super) fn on_frame(&mut self, n: u64) {
         let credit = n.min(self.charged.saturating_sub(self.delivered));
         self.delivered += credit;
@@ -119,7 +118,7 @@ impl LoadGuard {
         }
         let since_bytes = self.raw_delivered - self.head_bytes;
         let since_us = self.head_at.elapsed().as_micros() as u64;
-        if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes >= SPEED_SAMPLE_MIN_BYTES {
+        if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
             store_probe_score(&self.load, since_bytes, since_us);
         }
     }
@@ -137,10 +136,11 @@ impl LoadGuard {
 impl Drop for LoadGuard {
     fn drop(&mut self) {
         // 探测片终值: 全片均速定稿(被清场提前断流的探测片也在此交卷记分)。
+        // 同一严格时间规则: 距头满 100ms 且有字节才交, 短命流不交卷。
         if self.is_probe {
             let since_bytes = self.raw_delivered - self.head_bytes;
             let since_us = self.head_at.elapsed().as_micros() as u64;
-            if since_bytes >= SPEED_SAMPLE_MIN_BYTES && since_us >= SAMPLE_MIN_WINDOW_US {
+            if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
                 store_probe_score(&self.load, since_bytes, since_us);
             }
         }
@@ -1051,8 +1051,7 @@ mod tests {
         }
     }
 
-    /// 探测流交卷: 全片均速从响应头起算(head_at), 建连/等待不进分母;
-    /// on_frame 通道满 100ms 地板, 终值走 Drop 通道。
+    /// 探测流交卷: 全片均速从响应头起算(head_at), 建连/等待不进分母。
     #[test]
     fn probe_scores_from_response_head() {
         let ld = mirror_load("probe-score.test");
@@ -1061,34 +1060,28 @@ mod tests {
         assert!(g.is_probe, "无分镜像派出的流必须是探测流");
         std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
         g.restart_mark(); // 头到达, 测速时钟起算
-        std::thread::sleep(Duration::from_millis(5));
-        g.on_frame(512 * 1024);
-        assert_eq!(
-            ld.speed_ewma.load(Ordering::Relaxed),
-            0,
-            "头后未满 100ms 地板不得提前交分"
-        );
-        drop(g); // 终值: 512KB / ~5ms ≈ 100MB/s
+        std::thread::sleep(Duration::from_millis(150)); // 体流 150ms
+        g.on_frame(1024 * 1024); // 1MB/150ms ≈ 6.8MB/s; 含建连等待 ≈ 1MB/270ms ≈ 3.8MB/s
         let s = ld.speed_ewma.load(Ordering::Relaxed);
         assert!(
-            s > 20 * 1024 * 1024,
-            "全片均速不得包含建连/等待耗时(否则 ≈512KB/125ms≈4MB/s): {s}B/s"
+            s > 5 * 1024 * 1024,
+            "全片均速不得包含建连/等待耗时: {s}B/s"
         );
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 交分门槛与时间地板：满 16KB 且距头满 100ms 才落分——停滞 100ms 内现形。
+    /// 严格时间交分：距头满 100ms 即落分, 字节数不限——停滞 100ms 内现形。
     #[test]
     fn time_floor_fires_sample_on_stall() {
         let ld = mirror_load("stall-clock.test");
         ld.speed_ewma.store(0, Ordering::Relaxed);
         let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
         std::thread::sleep(Duration::from_millis(120));
-        g.on_frame(16 * 1024); // 满 16KB 门槛 + 120ms 地板 → 交分
+        g.on_frame(4 * 1024); // 4KB 也交: 只看时间不看字节
         let s = ld.speed_ewma.load(Ordering::Relaxed);
         assert!(
             s > 0 && s < 200 * 1024,
-            "时间地板应触发停滞读数(16KB/120ms ≈ 136KB/s): {s}B/s"
+            "时间地板应触发停滞读数(4KB/120ms ≈ 34KB/s): {s}B/s"
         );
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
