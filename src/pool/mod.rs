@@ -1,6 +1,7 @@
 //! 串发拨号：plans.json 唯一权威。成功驻留游标、失败前移；SNI 文件权威、与校验名解耦。
 pub mod dial;
 pub mod route;
+pub(crate) mod mirror_stats;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -667,23 +668,33 @@ pub async fn serial_dial_skip(
 }
 
 
-/// 按清单对齐镜像链（幂等）：enabled 追加链尾，disabled 移除；链内已有成员位置不动。
+/// 按清单对齐镜像链（幂等）：链内已有成员位置不动，缺的追加链尾，该摘的摘除。
+/// 大文件 host(is_big_file_host) 用 enabled/disabled——启动/关闭开关只在这里
+/// 生效；其余 host 用 small_enabled/small_disabled——开关无关, 注册表全量
+/// 按序保留, 仅摘除已删除地址。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
     enabled: &[String],
     disabled: &[String],
+    small_enabled: &[String],
+    small_disabled: &[String],
 ) -> bool {
     let mut changed = false;
-    for chain in mirrors.values_mut() {
-        // 移除：停用/已删且仍在链中的
-        for u in disabled {
+    for (h, chain) in mirrors.iter_mut() {
+        let (en, dis) = if route::is_big_file_host(h) {
+            (enabled, disabled)
+        } else {
+            (small_enabled, small_disabled)
+        };
+        // 移除：该摘的且仍在链中的
+        for u in dis {
             if chain.iter().any(|m| m == u) {
                 chain.retain(|m| m != u);
                 changed = true;
             }
         }
-        // 注入：启用中但链里还没有的 → 追加到链尾
-        for u in enabled {
+        // 注入：该进的但链里还没有的 → 追加到链尾
+        for u in en {
             if !chain.iter().any(|m| m == u) {
                 chain.push(u.clone());
                 changed = true;
@@ -699,6 +710,8 @@ fn builtin_mirror_urls() -> std::collections::HashSet<String> {
 }
 
 /// 按注册表对齐全部镜像链（幂等）；removed = 本次删除的地址。
+/// 开关只管大文件链：off 的镜从 is_big_file_host 的链摘除；小文件链按链序
+/// 全量保留（启停价值低），仅摘除已删除的地址。
 pub fn sync_custom_mirrors(removed: &[String]) {
     let registry = crate::settings::worker_mirrors();
     let enabled: Vec<String> = registry
@@ -712,19 +725,20 @@ pub fn sync_custom_mirrors(removed: &[String]) {
         .map(|w| w.url.clone())
         .collect();
     disabled.extend(removed.iter().cloned());
+    let all: Vec<String> = registry.iter().map(|w| w.url.clone()).collect();
     let mut g = lock(&SERIAL);
     let tab = match g.as_mut() {
         Some(t) => t,
         None => return,
     };
     // 链全空时(全新安装)先按 CONTENT_HOSTS 建键：values_mut() 对空表遍历不到
-    // 任何东西，没有这步启用中的镜像永远落不进链(校准/大文件全哑)。
-    if !enabled.is_empty() {
+    // 任何东西，没有这步镜像永远落不进链(校准/大文件全哑)。
+    if !all.is_empty() {
         for h in CONTENT_HOSTS {
             tab.mirrors.entry(h.to_string()).or_default();
         }
     }
-    let changed = align_custom_mirrors(&mut tab.mirrors, &enabled, &disabled);
+    let changed = align_custom_mirrors(&mut tab.mirrors, &enabled, &disabled, &all, removed);
     // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
     drop(g);
     if changed {
@@ -1257,7 +1271,7 @@ mod tests {
         m.insert("raw.githubusercontent.com".into(), vec!["https://pub1".into()]);
         let enabled = vec!["https://customB".to_string(), "https://customA".to_string()];
         let disabled = vec!["https://customC".to_string()];
-        assert!(align_custom_mirrors(&mut m, &enabled, &disabled));
+        assert!(align_custom_mirrors(&mut m, &enabled, &disabled, &enabled, &disabled));
         // github.com：链里没有的 customB 追加到链尾；已在链中的成员位置不动
         assert_eq!(
             m["github.com"],
@@ -1274,11 +1288,11 @@ mod tests {
             vec!["https://pub1".to_string(), "https://customB".to_string(), "https://customA".to_string()]
         );
         // 幂等：再跑一次无变更
-        assert!(!align_custom_mirrors(&mut m, &enabled, &disabled));
+        assert!(!align_custom_mirrors(&mut m, &enabled, &disabled, &enabled, &disabled));
         // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失；其余不动
         let enabled2 = vec!["https://customA".to_string()];
         let disabled2 = vec!["https://customB".to_string(), "https://customC".to_string()];
-        assert!(align_custom_mirrors(&mut m, &enabled2, &disabled2));
+        assert!(align_custom_mirrors(&mut m, &enabled2, &disabled2, &enabled2, &disabled2));
         assert!(!m["github.com"].iter().any(|x| x == "https://customB"));
         assert_eq!(
             m["github.com"],
@@ -1297,13 +1311,54 @@ mod tests {
         m.insert("github.com".into(), vec!["https://old.worker".into(), "https://a.example".into()]);
         let new = vec!["https://new.worker".to_string()];
         let old = vec!["https://old.worker".to_string()];
-        align_custom_mirrors(&mut m, &new, &old);
+        align_custom_mirrors(&mut m, &new, &old, &new, &old);
         let c = &m["github.com"];
         assert_eq!(
             c,
             &vec!["https://a.example".to_string(), "https://new.worker".to_string()]
         );
         assert!(!c.iter().any(|x| x.contains("old.worker")));
+    }
+
+    /// 开关语义：启动/关闭只摘大文件链；小文件链全量按序保留(off 的也留)。
+    #[test]
+    fn toggle_gates_big_file_chains_only() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        crate::settings::save_worker_mirrors(Vec::new());
+        let dir = tmpdir();
+        std::fs::write(
+            dir.join("plans.json"),
+            r#"{
+  "core": [],
+  "mirrors_big":   {"codeload.github.com": ["https://on.example", "https://off.example"]},
+  "mirrors_small": {"raw.githubusercontent.com": ["https://on.example"]}
+}"#,
+        )
+        .unwrap();
+        crate::settings::save_worker_mirrors(vec![
+            crate::settings::WorkerMirror {
+                url: "https://on.example".into(),
+                on: true,
+                trusted: false,
+            },
+            crate::settings::WorkerMirror {
+                url: "https://off.example".into(),
+                on: false,
+                trusted: false,
+            },
+        ]);
+        serial_load(&dir, Vec::new(), None);
+        sync_custom_mirrors(&[]);
+        let big = mirror_chain("codeload.github.com");
+        assert!(big.contains(&"https://on.example".to_string()), "启用镜留在大文件链: {big:?}");
+        assert!(!big.contains(&"https://off.example".to_string()), "关闭镜从大文件链摘除: {big:?}");
+        let small = mirror_chain("raw.githubusercontent.com");
+        assert!(
+            small.contains(&"https://on.example".to_string())
+                && small.contains(&"https://off.example".to_string()),
+            "小文件链不受开关影响, 关闭镜按链序保留: {small:?}"
+        );
+        crate::settings::save_worker_mirrors(Vec::new());
     }
 
     /// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；

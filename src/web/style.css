@@ -168,6 +168,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* 自定义镜像行：地址 + 启停 + 垃圾桶 */
 .mirror-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
 .mirror-row .text-input{margin-top:0;flex:1;max-width:none}
+.mirror-stat{opacity:.65;font-size:11px;white-space:nowrap;flex-shrink:0}
 .icon-btn{border:1px solid var(--line-strong);background:var(--panel-2);border-radius:8px;width:34px;height:34px;
           display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--sub);
           transition:color .15s,border-color .15s;flex-shrink:0}

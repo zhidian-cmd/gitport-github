@@ -33,6 +33,8 @@ pub(super) struct MirrorLoad {
     pub(super) last_fail_ms: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
     pub(super) cull_epoch: AtomicU64,
+    /// 镜像 URL(评估缓存键; mirror_load 创建时填)。
+    url: String,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -40,7 +42,14 @@ static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
 
 fn mirror_load(mirror: &str) -> Arc<MirrorLoad> {
     let mut g = MIRROR_LOAD.lock().unwrap_or_else(|p| p.into_inner());
-    g.entry(mirror.to_string()).or_default().clone()
+    g.entry(mirror.to_string())
+        .or_insert_with(|| {
+            Arc::new(MirrorLoad {
+                url: mirror.to_string(),
+                ..Default::default()
+            })
+        })
+        .clone()
 }
 
 /// 供直连腿(mod.rs)记账：直连候选与镜像共用同一张负载表。
@@ -65,9 +74,11 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
     if bytes == 0 || us == 0 {
         return;
     }
-    load.speed_ewma
-        .store((bytes * 1_000_000 / us).max(1), Ordering::Relaxed);
+    let score = (bytes * 1_000_000 / us).max(1);
+    load.speed_ewma.store(score, Ordering::Relaxed);
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
+    // 历史评估缓存: 每会话每镜 1 条(首落分)。只写不读——派发路径不碰它。
+    pool::mirror_stats::record(&load.url, score);
 }
 
 /// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。

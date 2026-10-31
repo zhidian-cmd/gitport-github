@@ -148,6 +148,7 @@ function applySettings(s) {
 }
 function applyMirrors(s) {
   MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
+  STATS = s.mirrorStats || {};
   renderMirrors();
 }
 /* 一次 /api/settings 喂两边：开关回显 + 镜像列表（启动与切页都不再拉两次） */
@@ -170,10 +171,13 @@ $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked
    settings.json 永久记录全部网址（点垃圾桶才彻底消失）；
    启动/关闭只增删 plans.json 镜像链成员，注册表不受影响。 */
 let MIRRORS = [];
+let STATS = {};
 const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
 // HTML 属性转义：五个预定义字符实体一个都不能少——少一个就是一条注入面
 // （曾把 & < > " 原样返回，镜像 URL 里的 "><script> 直接逃逸 value="" 属性执行）。
-const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'\u0026amp;','<':'\u0026lt;','>':'\u0026gt;','"':'\u0026quot;',"'":'\u0026#39;'}[c]));
+/* 探测交分历史速读: bytes/s → MB/s(KB/s), 仅评估展示用, 不参与任何派发 */
+const fmtRate = v => v >= 1048576 ? (v / 1048576).toFixed(1) + 'MB/s' : Math.max(1, Math.round(v / 1024)) + 'KB/s';
 
 function renderMirrors() {
   $('mirrorRows').innerHTML = MIRRORS.length
@@ -186,8 +190,11 @@ function mirrorRow(m, i) {
   const cls = m.on ? 'btn sm' : 'btn sm primary';
   const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
     '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
+  const st = STATS[m.url];
+  const stat = st && st.n ? '<span class="mirror-stat" title="大文件探测交分历史(仅评估镜像价值, 不参与派发)">' + st.n + '次 · ' + fmtRate(st.median) + '</span>' : '';
   return '<div class="mirror-row">' +
     '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
+    stat +
     trust +
     '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
     '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +

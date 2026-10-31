@@ -39,7 +39,9 @@ fn run() {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let _ = std::env::set_current_dir(&exe_dir);
-    logger::set_crash_path(&exe_dir);
+    let cache_dir = exe_dir.join(".cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    logger::set_crash_path(&cache_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
 
