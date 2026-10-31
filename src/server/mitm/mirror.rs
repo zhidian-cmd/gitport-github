@@ -84,7 +84,6 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
 }
 
 /// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
-/// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
 /// 顺序缀尾。稳定排序保证同速者不跳动(幂等关键)。
 fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<String> {
     let mut idx: Vec<usize> = (0..chain.len()).collect();
@@ -461,13 +460,188 @@ pub(super) struct DirectLeg<'a> {
     >,
 }
 
+/// 切分下载: 无 Range / 单字节试探片命中大文件链时代理替下载器并发。
+/// 按各镜速度比例切段(MirrorLoad 冻结分 → 历史中位 → 均分), 并发拉取,
+/// MergeBody 按预划边界合并成单河; 段失败向其余镜发补救请求(限 2 次)。
+/// 各段流速 = 测速: 实际字节/实际耗时, 小片不足 100ms 照交(交分即冻结)。
+async fn split_download(
+    log: &LogFn,
+    out: &hyper::Request<crate::server::upstream::BoxBody>,
+    orig_url: &str,
+    chain: &[String],
+    path: &str,
+    host: &str,
+) -> Result<hyper::Response<crate::server::upstream::BoxBody>, String> {
+    let now = pool::now_ms();
+    let healthy: Vec<String> = chain
+        .iter()
+        .filter(|m| {
+            let ld = mirror_load(m);
+            let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+            lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
+        })
+        .cloned()
+        .collect();
+    if healthy.is_empty() {
+        return Err(format!("{host} 切分路径: 链内全员失败窗中"));
+    }
+    let speed_of = |m: &str| -> u64 {
+        let s = mirror_load(m).speed_ewma.load(Ordering::Relaxed);
+        if s > 0 {
+            s
+        } else {
+            pool::mirror_stats::median_of(m)
+        }
+    };
+    let speeds: Vec<u64> = healthy.iter().map(|m| speed_of(m)).collect();
+    // 总长按假设值切(8MB); 段请求带明确 Range, 尾段 EOF 自然收缩。
+    let total = range_bytes(None);
+    let segs = super::merge::split_by_speed(total, &speeds, healthy.len());
+    (log)(&format!(
+        "[切分] {host}{path} 按速度比例切 {} 段, 并发拉取",
+        segs.len()
+    ));
+    let mut bodies: Vec<(String, u64, u64, Result<crate::server::upstream::BoxBody, String>)> =
+        Vec::new();
+    for ((start, end), m) in segs.iter().zip(healthy.iter()) {
+        let mut req = mirror_request(out, m, orig_url)?;
+        if !(*start == 0 && *end >= total) {
+            let hv = http::HeaderValue::from_str(&format!("bytes={start}-{}", end - 1))
+                .map_err(|e| e.to_string())?;
+            req.headers_mut().insert(http::header::RANGE, hv);
+        }
+        match mirror_do(req, m, log).await {
+            Ok(resp) => {
+                let (_, body) = resp.into_parts();
+                bodies.push((m.clone(), *start, *end, Ok(body)));
+            }
+            Err(e) => {
+                mirror_load(m)
+                    .last_fail_ms
+                    .store(pool::now_ms(), Ordering::Relaxed);
+                (log)(&format!("[切分] {host} {m} 段 [{start}..{end}) 失败({e}), 缺口留待续传"));
+            }
+        }
+    }
+    if bodies.is_empty() {
+        return Err(format!("{host} 切分路径: 全部段失败"));
+    }
+    bodies.sort_by_key(|(_, s, _, _)| *s);
+    let ready: Vec<(u64, crate::server::upstream::BoxBody)> = bodies
+        .into_iter()
+        .map(|(_, e, _, b)| (e, b.expect("bodies 只收 Ok 段")))
+        .collect();
+    let merged = super::merge::MergeBody::new(ready);
+    // unfold 包装器: 缺口内联补救(限 2 次)——向链内其他健康镜像拉剩余区间。
+    let st = SplitState {
+        merge: merged,
+        chain: chain.to_vec(),
+        orig_url: orig_url.to_string(),
+        host: host.to_string(),
+        method: out.method().clone(),
+        rescues: 0,
+        log: log.clone(),
+    };
+    let stream = futures_util::stream::unfold(st, |mut st| async move {
+        loop {
+            if let Some(gap_end) = st.merge.gap.take() {
+                if st.rescues >= 2 {
+                    return Some((
+                        Err(std::io::Error::other("切分段补救次数耗尽, 断流交客户端重试")),
+                        st,
+                    ));
+                }
+                st.rescues += 1;
+                let from = st.merge.sent();
+                match st.fetch_rescue(from, gap_end).await {
+                    Ok(body) => {
+                        (st.log)(&format!(
+                            "[切分] {} 缺口 [{from}..{gap_end}) 补救重拉(第 {} 次)",
+                            st.host, st.rescues
+                        ));
+                        st.merge.feed_rescue(gap_end, body);
+                    }
+                    Err(e) => {
+                        return Some((
+                            Err(std::io::Error::other(format!("切分段补救失败: {e}"))),
+                            st,
+                        ));
+                    }
+                }
+            }
+            let poll = std::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(std::pin::Pin::new(&mut st.merge), cx)
+            })
+            .await;
+            match poll {
+                Some(Ok(f)) => return Some((Ok(f), st)),
+                Some(Err(e)) => return Some((Err(e), st)),
+                None => {
+                    if st.merge.gap.is_some() {
+                        continue; // 补救后继续
+                    }
+                    return None; // 真 EOS
+                }
+            }
+        }
+    });
+    let resp = hyper::Response::builder()
+        .status(200)
+        .body(crate::server::upstream::BoxBody::new(
+            http_body_util::StreamBody::new(stream),
+        ))
+        .map_err(|e| e.to_string())?;
+    Ok(resp)
+}
+
+/// split_download 的 unfold 状态: MergeBody + 补救材料。
+struct SplitState {
+    merge: super::merge::MergeBody,
+    chain: Vec<String>,
+    orig_url: String,
+    host: String,
+    method: http::Method,
+    rescues: u32,
+    log: LogFn,
+}
+
+impl SplitState {
+    /// 向链内其他健康镜像发补救请求(剩余区间 sent..gap_end)。
+    async fn fetch_rescue(&self, from: u64, to: u64) -> Result<crate::server::upstream::BoxBody, String> {
+        let now = pool::now_ms();
+        let mate = self
+            .chain
+            .iter()
+            .find(|m| {
+                let ld = mirror_load(m);
+                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+                (lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS)
+                    && ld.speed_ewma.load(Ordering::Relaxed) > 0
+            })
+            .or_else(|| self.chain.first())
+            .ok_or_else(|| "无可用补救镜像".to_string())?;
+        let req = hyper::Request::builder()
+            .method(self.method.clone())
+            .uri(format!("{}/{}", "", self.orig_url.trim_start_matches("https://")))
+            .header(
+                http::header::RANGE,
+                http::HeaderValue::from_str(&format!("bytes={from}-{}", to - 1))
+                    .map_err(|e| e.to_string())?,
+            )
+            .body(crate::server::upstream::empty_body())
+            .map_err(|e| e.to_string())?;
+        let resp = mirror_do(req, mate, &self.log).await?;
+        let (_, body) = resp.into_parts();
+        Ok(body)
+    }
+}
+
 pub(super) async fn chain_fetch(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
     direct: DirectLeg<'_>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 凭据查询串等价 bearer，交第三方镜像即外泄——标记后剥空镜像，仅派直连。
     let cred_locked = out.uri().query().is_some_and(has_credential_query);
     let orig_url = format!(
         "https://{host}{}",
@@ -529,6 +703,14 @@ pub(super) async fn chain_fetch(
     let direct_key = format!("direct/{chain_host}");
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
+    // 切分路径(仅大文件链): 无 Range / 单字节试探片, 代理替下载器并发,
+    // 按镜像速度比例切段, MergeBody 合并成单河; 各段流速即测速交分。
+    if pool::route::is_big_file_host(chain_host)
+        && !chain.is_empty()
+        && super::merge::splittable_range(range)
+    {
+        return split_download(log, out, &orig_url, &chain, &path, host).await;
+    }
     // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
     if !chain.is_empty() && pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));

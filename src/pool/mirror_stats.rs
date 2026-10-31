@@ -137,6 +137,13 @@ pub(crate) fn snapshot() -> Vec<(String, bool)> {
     out
 }
 
+/// 链序重排/切分用: 各镜历史中位速率(bytes/s, 无记录为 0)。
+/// 链序重排/切分用: 各镜历史中位速率(bytes/s, 无记录为 0)。
+pub(crate) fn median_of(mirror: &str) -> u64 {
+    let st = load();
+    st.mirrors.get(mirror).map(|rs| median(rs)).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
