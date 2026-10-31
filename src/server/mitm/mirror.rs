@@ -79,8 +79,48 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
     // 历史评估缓存: 每会话每镜 1 条(首落分)。只写不读——派发路径不碰它。
     pool::mirror_stats::record(&load.url, score);
+    // 链序按速度重排落盘: 链头恒为实测最快(IDM 首片/非下载器直接受益)。
+    resort_chain_by_speed(&load.url);
 }
 
+/// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
+/// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
+/// 顺序缀尾。稳定排序保证同速者不跳动(幂等关键)。
+fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<String> {
+    let mut idx: Vec<usize> = (0..chain.len()).collect();
+    idx.sort_by_key(|&i| std::cmp::Reverse(speed_of(&chain[i])));
+    idx.into_iter().map(|i| chain[i].clone()).collect()
+}
+
+/// 探测交分后按最新速度分重排该镜像所属链并落盘 plans.json——链头恒为
+/// 实测最快: IDM 爬坡首片与非下载器场景直接命中快腿; 并发派发仍由 ECT 接管。
+fn resort_chain_by_speed(scored_url: &str) {
+    let chains = pool::mirror_chains_snapshot();
+    let Some((host, chain)) = chains
+        .into_iter()
+        .find(|(_, c)| c.iter().any(|m| m == scored_url))
+    else {
+        return;
+    };
+    if !pool::route::is_big_file_host(&host) {
+        return; // 小文件链序归校准管
+    }
+    let now = pool::now_ms();
+    let speed_of = |m: &str| -> u64 {
+        let ld = mirror_load(m);
+        let lf = ld.last_fail_ms.load(Ordering::Relaxed);
+        let failed = lf != 0 && now.saturating_sub(lf) < MIRROR_FAIL_WINDOW_MS;
+        if failed {
+            0
+        } else {
+            ld.speed_ewma.load(Ordering::Relaxed)
+        }
+    };
+    let new_chain = speed_sorted_chain(&chain, &speed_of);
+    pool::set_mirror_chain(&host, &new_chain, "测速");
+}
+
+/// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
 /// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
 /// 记账封顶于记账额防下溢；采样走原始字节，开放区间超记账额后采样不停。
 pub(super) struct LoadGuard {
@@ -189,6 +229,7 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
         let speed = ld.speed_ewma.load(Ordering::Relaxed).max(1);
         ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed
     };
+
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
         allow_recent_failures || {
             let lf = ld.last_fail_ms.load(Ordering::Relaxed);
@@ -1412,6 +1453,36 @@ mod tests {
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
     }
 
+    /// 链序按速度重排(纯函数): 快者在前, 无分/失败窗者保持原序缀尾, 同速稳定。
+    #[test]
+    fn speed_sorted_chain_orders_and_stabilizes() {
+        let chain = vec![
+            "https://a".to_string(),
+            "https://b".to_string(),
+            "https://c".to_string(),
+            "https://d".to_string(),
+        ];
+        // 速度: a=100, b=0(无分), c=500, d=100 → c, a, d, b (b 原位缀尾, a/d 同速稳定)
+        let speed_of = |m: &str| -> u64 {
+            match m {
+                "https://a" => 100,
+                "https://c" => 500,
+                "https://d" => 100,
+                _ => 0,
+            }
+        };
+        let out = speed_sorted_chain(&chain, &speed_of);
+        assert_eq!(
+            out,
+            vec!["https://c".to_string(), "https://a".to_string(), "https://d".to_string(), "https://b".to_string()],
+            "速度降序 + 无分缀尾 + 同速稳定: {out:?}"
+        );
+        // 已排序输入重排 = 恒等(幂等)。
+        let again = speed_sorted_chain(&out, &speed_of);
+        assert_eq!(again, out, "已排序链重排必须恒等(零写盘的幂等基础)");
+    }
+
+    /// 分数冻结：正常流(镜像已有分)只记账, 永不改写速度分。
     /// 分数冻结：正常流(镜像已有分)只记账, 永不改写速度分。
     #[test]
     fn normal_stream_never_touches_score() {
