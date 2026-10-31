@@ -64,7 +64,6 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - [页面缓存](docs/CACHE.md) —— 缓什么/不缓什么、会话语义、分钥匙、骨架门、头像 302 记忆
 - [高级配置](docs/CONFIG.md) —— plans.json 手改指南、IP 认读、分流域名总表
 - [术语速查](docs/GLOSSARY.md) —— 网络与封锁名词大白话
-- [更新日志](CHANGELOG.md) —— 0.5.0 / 0.5.1 变更一览
 
 ## 构建
 
