@@ -56,4 +56,5 @@ fn restrict(path: &str, rights: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "tests/winsec.rs"]
 mod tests;

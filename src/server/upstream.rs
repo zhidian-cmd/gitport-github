@@ -688,7 +688,9 @@ pub fn prepend_body(prefix: Vec<bytes::Bytes>, tail: BoxBody) -> BoxBody {
 }
 
 #[cfg(test)]
+#[path = "../tests/server/upstream_conn_slot_tests.rs"]
 mod conn_slot_tests;
 
 #[cfg(test)]
+#[path = "../tests/server/upstream.rs"]
 mod tests;

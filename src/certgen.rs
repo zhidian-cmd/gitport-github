@@ -213,4 +213,5 @@ pub fn install_ca(dir: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "tests/certgen.rs"]
 mod tests;

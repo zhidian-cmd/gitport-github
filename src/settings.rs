@@ -640,4 +640,5 @@ pub fn trusted_mirrors() -> std::collections::HashSet<String> {
 
 
 #[cfg(test)]
+#[path = "tests/settings.rs"]
 mod tests;

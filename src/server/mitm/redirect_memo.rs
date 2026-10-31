@@ -89,4 +89,5 @@ fn backdate(path: &str, query: Option<&str>) {
 }
 
 #[cfg(test)]
+#[path = "../../tests/server/mitm/redirect_memo.rs"]
 mod tests;

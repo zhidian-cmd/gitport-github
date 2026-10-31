@@ -140,4 +140,5 @@ pub(crate) fn snapshot() -> Vec<(String, bool)> {
 }
 
 #[cfg(test)]
+#[path = "../tests/pool/mirror_stats.rs"]
 mod tests;

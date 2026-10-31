@@ -282,4 +282,5 @@ pub fn fallback_for(pool: &str, host: &str) -> Fallback {
 }
 
 #[cfg(test)]
+#[path = "../tests/pool/route.rs"]
 mod tests;

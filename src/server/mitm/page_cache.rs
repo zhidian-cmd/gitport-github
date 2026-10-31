@@ -1009,4 +1009,5 @@ fn page_cache_clear() {
 }
 
 #[cfg(test)]
+#[path = "../../tests/server/mitm/page_cache_tests.rs"]
 mod page_cache_tests;
