@@ -1,6 +1,5 @@
 ﻿//! MITM：池内域名本地终结 TLS，按 route::master_route 分流（直连串发 / 内容域回落镜像链 / 大文件域直连同台 ECT 派发 / 流式直通）。
 //! 拦截页(403 restricted/400 Whoa)本地识别 gh_defuse。
-mod racing;
 use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;

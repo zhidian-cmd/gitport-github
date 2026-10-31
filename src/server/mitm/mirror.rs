@@ -1,6 +1,7 @@
 //! 镜像链：回落兜底 + 图片链 TTFB 校准 + 凭据防护。
 //! 请求级派发：ECT=(在途字节+新请求字节)/速度选起点，失败沿链顺延；不内切不缓冲。
-//! 掐断：带 Range 的流慢于同伴中位数/20 即断流，交客户端重发。
+//! 清场：探测交卷后严劣于链内最快者的镜像盖纪元号, 在途断流交客户端重发;
+//! 速度分数由探测片一次性交卷冻结(全片均速), 正常流永不改写。
 use super::{path_of, BoxBody};
 use crate::pool::{self, LogFn};
 use crate::server::upstream;
@@ -12,26 +13,19 @@ use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 const MIRROR_CHAIN_CAP: usize = 5;
-/// 冷启动先验 2MB/s：已自 ECT 退役(探测轮保证派发前全员实测交卷)，
-/// 仅存于 EOS 探测的兜底基准——全员无新鲜样本时按其封底 1.6MB/s 判罚。
-const DEFAULT_MIRROR_SPEED: u64 = 2 * 1024 * 1024;
 /// 失败降权窗；全体都在窗内则放开过滤。
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-const SPEED_SAMPLE_BYTES: u64 = 64 * 1024;
-/// 采样时间窗：字节攒不够也行——距上次采样满 100ms 照样出读数，
-/// 慢镜像/停滞不再被"攒不够字节"拖住(停滞 100ms 内现形)。
-const SAMPLE_TIME_FLOOR_MS: u64 = 100;
-/// 单窗接收双门：时间有效(窗跨 ≥2ms, 字节数不限——停滞信号必须收)或
-/// 字节有效(≥16KB, 数个 TCP 段的平均斜率)。唯一拒收单个突发碎片
-/// (亚 2ms 且亚 16KB, 纯调度噪声)。16KB 同时是探测判分的 delivered 门槛。
+/// 探测交分双门槛：距头满 100ms(时间地板, TCP 突发打不出幽灵样本)且
+/// 交付满 16KB(滤 1-byte Range 探针/空流); Drop 终值用 2ms 窗兜底。
 const SPEED_SAMPLE_MIN_BYTES: u64 = 16 * 1024;
 const SAMPLE_MIN_WINDOW_US: u64 = 2_000;
+const SAMPLE_TIME_FLOOR_MS: u64 = 100;
 
-/// 在途字节 / 在途流数 / 速度 EWMA(0=无样本) / 失败时刻(0=从未) / 最近采样时刻(0=从未)
-/// / 最近哨兵片时刻(0=从未——悬殊绝食者每 SENTINEL_GAP_MS 一片验证)。
-/// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者，负载摊开少误掐。
+/// 在途字节 / 在途流数 / 速度分(0=未交卷; 探测交卷后冻结) / 失败时刻(0=从未)
+/// / 最近采样时刻(0=从未) / 清场纪元(严劣让位时 +1, 在途流逐帧核对)。
+/// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
@@ -39,6 +33,7 @@ pub(super) struct MirrorLoad {
     pub(super) speed_ewma: AtomicU64,
     pub(super) last_fail_ms: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
+    pub(super) cull_epoch: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -64,35 +59,10 @@ pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
     range_bytes(range)
 }
 
-fn ewma_update(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
-    let us = elapsed.as_micros() as u64;
-    if bytes == 0 || us == 0 {
-        return;
-    }
-    // 双门接收：时间有效(≥2ms, 字节数不限)或字节有效(≥16KB)——唯一拒收
-    // 单个突发碎片。微秒分辨率下小窗不再被毫秒粒度整批丢弃。
-    if us < SAMPLE_MIN_WINDOW_US && bytes < SPEED_SAMPLE_MIN_BYTES {
-        return;
-    }
-    let sample = bytes * 1_000_000 / us;
-    let old = load.speed_ewma.load(Ordering::Relaxed);
-    // 权重 6:4（α=0.4）：半衰约 1.4 个样本，比 7:3（α=0.3，半衰 1.94）更快跟住
-    // 最新网速；再往 0.7 走，单个 512KB 块的抖动就能把估值砍半，派发会在镜像间
-    // 来回跳，EOS 探测/掐断的同伴基准(peer_median)也跟着抖。
-    // 坏消息有专用通道：掐断走 force_ewma 直接覆盖，不靠这里慢慢跟。
-    let next = if old == 0 {
-        sample
-    } else {
-        (old * 6 + sample * 4) / 10
-    };
-    load.speed_ewma.store(next.max(1), Ordering::Relaxed);
-    load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
-}
-
-/// 掐断采样：直接覆盖，不做历史混合——混样要 8 轮才能压下塌方镜像的旧印象；
-/// 60s 失败窗过后正常流量样本自然抬回，暂时抽风不误伤。
-fn force_ewma(load: &MirrorLoad, bytes: u64, elapsed: Duration) {
-    let us = elapsed.as_micros() as u64;
+/// 探测交分：head_at 起算的全片运行平均，唯一的速度写入通道——交卷即冻结，
+/// 正常流永不覆盖。字节/时间双门槛由调用方把关, 滤 1-byte Range 探针与
+/// TCP 突发, 亚毫秒缓冲残流打不出 GB/s 幽灵样本。
+fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
     if bytes == 0 || us == 0 {
         return;
     }
@@ -108,8 +78,8 @@ pub(super) struct LoadGuard {
     charged: u64,
     delivered: u64,
     raw_delivered: u64,
-    mark_at: Instant,
-    mark_bytes: u64,
+    /// head_at 时的 raw_delivered 基准(全片均速的字节分母起点)。
+    head_bytes: u64,
     /// 体流起点(响应头到达)：探测判分用全片体速率, 不随区间采样重置。
     head_at: Instant,
     /// 构造时镜像尚无速度样本 = 本流是探测片(首个真实样本)。
@@ -117,10 +87,6 @@ pub(super) struct LoadGuard {
 }
 
 impl LoadGuard {
-    /// 已交付字节数(接力切换的 Range 起点)。
-    pub(super) fn delivered(&self) -> u64 {
-        self.delivered
-    }
 
     pub(super) fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
@@ -131,8 +97,7 @@ impl LoadGuard {
             charged: new_bytes,
             delivered: 0,
             raw_delivered: 0,
-            mark_at: Instant::now(),
-            mark_bytes: 0,
+            head_bytes: 0,
             head_at: Instant::now(),
             is_probe,
         }
@@ -140,7 +105,8 @@ impl LoadGuard {
 
 
     /// 交付一帧：记账按记账额归还(封顶于 charged，防镜像无视 Range 回全量把
-    /// 计数打成负)；原始累计照走。满一个采样间隔刷新一次速率。
+    /// 计数打成负)；原始累计照走。分数冻结: 只有探测流写速度, 且是 head_at
+    /// 起算的全片运行平均——满 16KB 字节门槛 + 100ms 时间地板才落分。
     pub(super) fn on_frame(&mut self, n: u64) {
         let credit = n.min(self.charged.saturating_sub(self.delivered));
         self.delivered += credit;
@@ -148,52 +114,47 @@ impl LoadGuard {
         if credit > 0 {
             self.load.in_flight_bytes.fetch_sub(credit, Ordering::Relaxed);
         }
-        let since_mark = self.raw_delivered - self.mark_bytes;
-        let since_time = self.mark_at.elapsed();
-        if since_mark >= SPEED_SAMPLE_BYTES
-            || since_time.as_millis() >= u128::from(SAMPLE_TIME_FLOOR_MS)
-        {
-            ewma_update(&self.load, since_mark, since_time);
-            self.mark_at = Instant::now();
-            self.mark_bytes = self.raw_delivered;
+        if !self.is_probe {
+            return;
+        }
+        let since_bytes = self.raw_delivered - self.head_bytes;
+        let since_us = self.head_at.elapsed().as_micros() as u64;
+        if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes >= SPEED_SAMPLE_MIN_BYTES {
+            store_probe_score(&self.load, since_bytes, since_us);
         }
     }
 
     /// 测速时钟重置：响应头到达时调用。建连/拨号/等待服务器开腔的全部耗时
-    /// 只存在于墙钟，不进任何速度样本——否则探测片判分与 EWMA 首区间被
-    /// 等待稀释，且快镜像被稀释得更狠(等待是常数)，候选差距被压缩。
+    /// 只存在于墙钟，不进速度样本——否则探测交分被等待稀释，且快镜像被
+    /// 稀释得更狠(等待是常数)，候选差距被压缩。
     /// 在途记账不受影响：charge 仍在派发时发生(ECT 分子要含已派出未到货)。
     pub(super) fn restart_mark(&mut self) {
-        self.mark_at = Instant::now();
         self.head_at = Instant::now();
-        self.mark_bytes = self.raw_delivered;
+        self.head_bytes = self.raw_delivered;
     }
 }
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
-        ewma_update(
-            &self.load,
-            self.raw_delivered - self.mark_bytes,
-            self.mark_at.elapsed(),
-        );
+        // 探测片终值: 全片均速定稿(被清场提前断流的探测片也在此交卷记分)。
+        if self.is_probe {
+            let since_bytes = self.raw_delivered - self.head_bytes;
+            let since_us = self.head_at.elapsed().as_micros() as u64;
+            if since_bytes >= SPEED_SAMPLE_MIN_BYTES && since_us >= SAMPLE_MIN_WINDOW_US {
+                store_probe_score(&self.load, since_bytes, since_us);
+            }
+        }
         let residual = self.charged.saturating_sub(self.delivered);
         if residual > 0 {
             self.load.in_flight_bytes.fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/客户端断开/掐断全走这里)。
+        // 流数随流终结归位(正常读完/客户端断开/清场断流全走这里)。
         self.load
             .in_flight_streams
             .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// 探测轮末位淘汰(纯函数)：镜像首个样本的速率 vs 有样本同伴中位数。
-/// 低于一半 → 探测判定"体质差"，45s 降权。小片熬不到掐断的 1.2s 窗口，
-/// 靠这里把探测结论变成账本事实。
-fn probe_outlier(own: u64, peer_median: Option<u64>) -> bool {
-    peer_median.is_some_and(|m| own < m / 2)
-}
 
 /// ECT 绝对最小者胜，无容差——速度差 30 倍的现实里 5% 容差是把片撒给慢腿的
 /// 祸根。仅当 ECT 完全相等(逐毫秒)才二级: 在途流数最少 → 仍相等才轮转。
@@ -341,221 +302,81 @@ fn validate_mirror_response(had_range: bool, status: u16, content_type: &str) ->
     Ok(())
 }
 
-// ---- 慢镜像掐断：相对差值检验，全军低速零误杀 ----
+// ---- 清场：探测交卷后严劣于链内最快者让位, 在途断流交客户端重发 ----
 
-const CUT_MIN_WINDOW_MS: u64 = 250;
-/// 判定资格 = 完整滑过 N 个观察窗(时间锚定, 与吞吐解耦)——旧版绑字节数
-/// (累计 ≥256KB)又倒挂了一次: 越慢的镜像被豁免越久。2 窗 ≈ 2-3 个 RTT,
-/// 慢启动已过; 之后的低速率就是真低速率, 60KB/600ms 也是合法读数。
-const CUT_WARMUP_WINDOWS: u32 = 2;
-const CUT_PEER_FRESH_MS: u64 = 30_000;
-/// z 判据参数: own 落在同伴 μ − 2.5σ̂ 之下才掐(σ̂ = max(σ, μ/8))。
-/// 2.5σ ≈ 单侧 0.6%——"正常候选随机波动到这么慢"不足百分之一。
-/// σ 下限 μ/8: 全挤在一起时 σ→0 会把阈值收成刀刃, 微小波动即掐, 震荡;
-/// 它同时兜住防连坐——阈值最低 = μ(1−2.5/8) ≈ 0.69μ, 正常落点永不入圈,
-/// 全体都慢的链不互杀。
-const CUT_MIN_PEERS: usize = 3;
-/// 每链每窗上限：掐满放行爬行，宁可慢不可自残。
-const CUT_LIMIT_PER_WINDOW: u32 = 4;
-const CUT_LIMIT_WINDOW_MS: u64 = 60_000;
-
-fn peer_median(peer_rates: &[u64]) -> Option<u64> {
-    if peer_rates.len() < CUT_MIN_PEERS {
-        return None;
-    }
-    let mut sorted = peer_rates.to_vec();
-    sorted.sort_unstable();
-    Some(sorted[sorted.len() / 2])
-}
-
-/// z 判据(离散度自适应)：own < μ−2.5σ̂(σ̂=max(σ, μ/8)) 且 own < μ/2
-/// 且 own < 512KB/s 地板——三道护栏各挡一类误杀，缺一不可。
-fn should_cut(own_rate: u64, peers: &[u64]) -> bool {
-    if peers.len() < CUT_MIN_PEERS {
-        return false;
-    }
-    let n = peers.len() as u64;
-    let mu = peers.iter().sum::<u64>() / n;
-    // 总体标准差, 定点 ×1000 保平方精度: sqrt(Σ(x−μ)²/n)。
-    let var_x1000 = peers
-        .iter()
-        .map(|x| {
-            let d = x.abs_diff(mu) * 1000;
-            d * d
-        })
-        .sum::<u64>()
-        / n;
-    let sigma = (var_x1000 as f64).sqrt().round() as u64; // = σ*1000
-    let sigma_hat = sigma.max(mu * 125); // μ/8, 千分位基准(= μ*1000/8)
-    // 阈值 = μ − 2.5σ̂: σ̂ 是千分位(×1000)基准, 回缩: 2.5×σ̂/1000 = σ̂/400。
-    let threshold = mu.saturating_sub(sigma_hat / 400);
-    own_rate < threshold
-}
-
-static CUT_LIMITER: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn cut_allowed(chain_host: &str) -> bool {
-    let mut g = CUT_LIMITER.lock().unwrap_or_else(|p| p.into_inner());
-    let now = Instant::now();
-    let e = g.entry(chain_host.to_string()).or_insert((now, 0));
-    if now.duration_since(e.0).as_millis() as u64 >= CUT_LIMIT_WINDOW_MS {
-        *e = (now, 0);
-    }
-    if e.1 >= CUT_LIMIT_PER_WINDOW {
-        return false;
-    }
-    e.1 += 1;
-    true
-}
-
-struct CutState {
+struct CullState {
     body: BoxBody,
     guard: LoadGuard,
     load: Arc<MirrorLoad>,
     peers: Vec<Arc<MirrorLoad>>,
-    chain_host: String,
-    mirror: String,
+    my_epoch: u64,
+    culled: bool,
     label: String,
+    mirror: String,
     log: LogFn,
-    since_cp: u64,
-    cp_at: Instant,
-    /// 已完整滑过的观察窗数：≥CUT_WARMUP_WINDOWS 后取得判定资格。
-    windows_done: u32,
 }
 
-struct CutMeta {
-    chain_host: String,
-    mirror: String,
-    label: String,
-}
-
-/// 显著慢于同伴即 Err 终止流，客户端重发重进派发；无 Range 的流不经过这里。
-fn cutoff_watched_body(
+/// 清场监视(带 Range 的流)：逐帧核对纪元, 本镜像被清场即 Err 断流, 客户端
+/// 重发重进派发; 探测流交分后自检, 严劣于链内已交卷最大者 → 盖纪元号(本镜像
+/// 全部在途流下一帧断流)。并列最快者保留, 均摊走 ECT; 无 Range 流不经过这里。
+fn cull_watched_body(
     body: BoxBody,
     guard: LoadGuard,
     load: Arc<MirrorLoad>,
     peers: Vec<Arc<MirrorLoad>>,
-    meta: CutMeta,
+    label: String,
+    mirror: String,
     log: LogFn,
 ) -> BoxBody {
-    let CutMeta {
-        chain_host,
-        mirror,
-        label,
-    } = &meta;
-    let st = CutState {
+    let my_epoch = load.cull_epoch.load(Ordering::Relaxed);
+    let st = CullState {
         body,
         guard,
         load,
         peers,
-        chain_host: chain_host.clone(),
-        mirror: mirror.clone(),
-        label: label.clone(),
+        my_epoch,
+        culled: false,
+        label,
+        mirror,
         log,
-        since_cp: 0,
-        cp_at: Instant::now(),
-        windows_done: 0,
     };
     let stream = futures_util::stream::unfold(st, |mut st| async move {
+        // 纪元不匹配: 本镜像已被清场(含本流上一帧触发的让位), 断流重发。
+        if st.load.cull_epoch.load(Ordering::Relaxed) != st.my_epoch {
+            return Some((
+                Err(std::io::Error::other("镜像已清场让位, 断流交客户端重发")),
+                st,
+            ));
+        }
         match http_body_util::BodyExt::frame(&mut st.body).await {
             Some(Ok(frame)) => {
                 let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
                 st.guard.on_frame(n);
-                st.since_cp += n;
-                // 窗完成判定与掐断判定分离：窗龄满 250ms 即为一个完整窗
-                // (与有无资格无关)，窗数累计；资格 = 完整滑过 2 窗(时间锚定,
-                // ~500ms, 与吞吐无关)——旧版绑字节数又倒挂: 越慢的镜像被
-                // 豁免越久。有资格后窗龄满即判，慢镜像不再被自己的交付
-                // 速度拖住；速率正常时判定点不会通过，快路径零成本。
-                let elapsed = st.cp_at.elapsed();
-                if elapsed.as_millis() >= u128::from(CUT_MIN_WINDOW_MS) {
-                    // 窗龄满：先判(够资格则用满窗差商)，再重开窗。
-                    // 资格 = 完整滑过 2 窗(时间锚定, ~500ms, 与吞吐无关)——
-                    // 旧版绑字节数又倒挂: 越慢的镜像被豁免越久。
-                    if st.windows_done >= CUT_WARMUP_WINDOWS {
-                        let now_ms = pool::now_ms();
-                        let fresh: Vec<u64> = st
-                            .peers
-                            .iter()
-                            .filter(|p| {
-                                let s = p.last_sample_ms.load(Ordering::Relaxed);
-                                s != 0 && now_ms.saturating_sub(s) < CUT_PEER_FRESH_MS
-                            })
-                            .map(|p| p.speed_ewma.load(Ordering::Relaxed))
-                            .filter(|s| *s > 0)
-                            .collect();
-                        let own = st.since_cp * 1_000_000
-                            / elapsed.as_micros().max(1) as u64;
-                        if should_cut(own, &fresh) && cut_allowed(&st.chain_host) {
-                            force_ewma(&st.load, st.since_cp, elapsed);
-                            st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
-                            let base = fresh.iter().sum::<u64>() / fresh.len() as u64 / 1024;
-                            (st.log)(&format!(
-                                "[镜像] {} {} 速率 {}KB/s 显著低于同伴(基准 {base}KB/s), 掐断断流, 交由客户端重发",
-                                st.label, st.mirror, own / 1024
-                            ));
-                            return Some((
-                                Err(std::io::Error::other("镜像显著慢于同伴, 已掐断")),
-                                st,
-                            ));
-                        }
+                // 探测交分自检: 本镜像速度严格小于链内已交卷最大者 → 让位。
+                if !st.culled && st.guard.is_probe {
+                    let my = st.load.speed_ewma.load(Ordering::Relaxed);
+                    let top = st
+                        .peers
+                        .iter()
+                        .map(|p| p.speed_ewma.load(Ordering::Relaxed))
+                        .max()
+                        .unwrap_or(0);
+                    if my > 0 && top > my {
+                        st.culled = true;
+                        st.load.cull_epoch.fetch_add(1, Ordering::Relaxed);
+                        (st.log)(&format!(
+                            "[清场] {} {} 探测交分 {}KB/s 严劣于链内最快 {}KB/s, 在途让位重发",
+                            st.label,
+                            st.mirror,
+                            my / 1024,
+                            top / 1024
+                        ));
                     }
-                    // 窗重开：窗数 +1, 下一段从本帧后重新起算。
-                    st.windows_done = st.windows_done.saturating_add(1);
-                    st.since_cp = 0;
-                    st.cp_at = Instant::now();
                 }
                 Some((Ok(frame), st))
             }
             Some(Err(e)) => Some((Err(e), st)),
-            None => {
-                // EOS = 流正常读完。探测轮末位淘汰：本流是该镜像首个速度样本
-                // (探测片)，速率低于同伴基准一半 → 记 45s 降权。
-                // 小片熬不到掐断的 1.2s 窗口，探测结论在这里落账本。
-                // 基准两级：有新鲜样本同伴用其中位数；全员无样本(首批并发，
-                // 谁都没考过)用冷启动先验兜底——但只在至少一家交出"达到先验
-                // 70%"成绩时才启用先验判罚，全员都慢(链路本身差)则免检不乱杀。
-                let was_probe =
-                    st.guard.is_probe && st.guard.delivered >= SPEED_SAMPLE_MIN_BYTES;
-                let now_ms = pool::now_ms();
-                let fresh: Vec<u64> = st
-                    .peers
-                    .iter()
-                    .filter(|p| {
-                        let s = p.last_sample_ms.load(Ordering::Relaxed);
-                        s != 0 && now_ms.saturating_sub(s) < CUT_PEER_FRESH_MS
-                    })
-                    .map(|p| p.speed_ewma.load(Ordering::Relaxed))
-                    .filter(|s| *s > 0)
-                    .collect();
-                let median = peer_median(&fresh);
-                let median = median.or_else(|| {
-                    let floor = DEFAULT_MIRROR_SPEED - DEFAULT_MIRROR_SPEED / 25 * 5;
-                    // 至少一家跑出先验七成才算"链路正常，有人真慢"。
-                    if fresh.is_empty()
-                        && st.peers.iter().any(|p| {
-                            let s = p.speed_ewma.load(Ordering::Relaxed);
-                            s * 10 >= floor * 7
-                        })
-                    {
-                        Some(floor)
-                    } else {
-                        None
-                    }
-                });
-                let own = st.guard.delivered * 1_000_000
-                    / st.guard.head_at.elapsed().as_micros().max(1) as u64;
-                if was_probe && probe_outlier(own, median) {
-                    st.load.last_fail_ms.store(now_ms, Ordering::Relaxed);
-                    let base = median.unwrap_or(0) / 1024;
-                    (st.log)(&format!(
-                        "[镜像] {} {} 探测片速率 {}KB/s 低于同伴一半(基准 {base}KB/s), 探测出局(45s)",
-                        st.label, st.mirror, own / 1024
-                    ));
-                }
-                None
-            }
+            None => None,
         }
     });
     BoxBody::new(http_body_util::StreamBody::new(stream))
@@ -728,7 +549,7 @@ pub(super) async fn chain_fetch(
                     ms = t0.elapsed().as_millis()
                 ));
                 pool::MIRROR_BREAKER.clear(chain_host);
-                // 带 Range 挂掐断监视 + racing 陪跑；无 Range 只记账不掐（浏览器下载掐了是用户可见失败）。
+                // 带 Range 挂清场监视(纪元核对+探测让位)；无 Range 只记账(浏览器断流是用户可见失败)。
                 let (mut parts, body) = resp.into_parts();
                 parts.extensions.insert("mirror");
                 let body = if range.is_some() {
@@ -737,76 +558,13 @@ pub(super) async fn chain_fetch(
                         .filter(|x| x.as_str() != m)
                         .map(|x| mirror_load(x))
                         .collect();
-                    // racing 陪跑: 从其余镜像倒序找一家, 同 Range 再拉一路——
-                    // 字节先到先用, 下载器按偏移去重; 陪跑建流失败退化为纯 A。
-                    // 只挑有速度样本的镜像(未交卷者交给探测轮管)。
-                    let mate = candidates
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(j, x)| {
-                            *j != i
-                                && x.as_str() != direct_key
-                                && mirror_load(x).speed_ewma.load(Ordering::Relaxed) > 0
-                        })
-                        .map(|(_, x)| x.clone());
-                    let mate_body = match &mate {
-                        Some(mate_url) => {
-                            let mate_load = mirror_load(mate_url);
-                            let mut mguard = LoadGuard::charge(mate_load.clone(), new_bytes);
-                            match mirror_request(out, mate_url, &orig_url) {
-                                Ok(mreq) => match mirror_do(mreq, mate_url, log).await {
-                                    Ok(mresp) => {
-                                        mate_load.last_fail_ms.store(0, Ordering::Relaxed);
-                                        (log)(&format!(
-                                            "[racing] {host}{path} 陪跑 {mate_url} 与 {m} 同 Range 竞速"
-                                        ));
-                                        let (_, mbody) = mresp.into_parts();
-                                        // 陪跑记账: 独立 guard 逐帧归还, Drop 收尾。
-                                        let mbody = http_body_util::BodyExt::map_frame(
-                                            mbody,
-                                            move |frame| {
-                                                if let Some(n) =
-                                                    frame.data_ref().map(|d| d.len() as u64)
-                                                {
-                                                    mguard.on_frame(n);
-                                                }
-                                                frame
-                                            },
-                                        );
-                                        Some(super::racing::to_box(mbody))
-                                    }
-                                    Err(me) => {
-                                        mate_load
-                                            .last_fail_ms
-                                            .store(pool::now_ms(), Ordering::Relaxed);
-                                        (log)(&format!(
-                                            "[racing] {host} 陪跑 {mate_url} 建流失败({me}), 纯单路"
-                                        ));
-                                        None
-                                    }
-                                },
-                                Err(me) => {
-                                    (log)(&format!(
-                                        "[racing] {host} 陪跑 {mate_url} 请求构造失败({me})"
-                                    ));
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    let raced = super::racing::RelayBody::new(body, mate_body, guard.delivered());
-                    cutoff_watched_body(
-                        super::racing::to_box(raced),
+                    cull_watched_body(
+                        body,
                         guard,
                         mirror_load(m),
                         peers,
-                        CutMeta {
-                            chain_host: chain_host.to_string(),
-                            mirror: m.to_string(),
-                            label: format!("{host}{path}"),
-                        },
+                        format!("{host}{path}"),
+                        m.to_string(),
                         log.clone(),
                     )
                 } else {
@@ -1283,81 +1041,6 @@ mod tests {
         assert_eq!(order, vec![0, 4, 8], "已在窗内不重复追加");
     }
 
-    /// EOS 探测的先验基准：全员无新鲜样本时，只要有同伴达先验七成即以先验
-    /// 为基准判罚(首轮大逃杀)；全员都慢(链路差)则免检不乱杀。
-    #[tokio::test]
-    async fn probe_prior_baseline_fires_when_link_is_normal() {
-        let fast = mirror_load("probe-prior-fast.test");
-        fast.speed_ewma
-            .store(2 * 1024 * 1024, Ordering::Relaxed); // 达先验，但 last_sample_ms=0(无新鲜样本)
-        let me = mirror_load("probe-prior-me.test");
-        me.speed_ewma.store(0, Ordering::Relaxed);
-        me.last_fail_ms.store(0, Ordering::Relaxed);
-        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
-            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
-                Bytes::from(vec![0u8; SPEED_SAMPLE_MIN_BYTES as usize]),
-            ))]),
-        ));
-        let guard = LoadGuard::charge(me.clone(), SPEED_SAMPLE_MIN_BYTES);
-        let mut wrapped = cutoff_watched_body(
-            body,
-            guard,
-            me.clone(),
-            vec![fast],
-            CutMeta {
-                chain_host: "probe-prior.test".into(),
-                mirror: "probe-prior-me.test".into(),
-                label: "h/p".into(),
-            },
-            Arc::new(|_: &str| {}),
-        );
-        // own ≈ 128KB / 0.2s ≈ 640KB/s < 先验 1.6MB/s 的一半 → 探测出局。
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 数据帧
-        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // EOS
-        drop(wrapped);
-        assert_ne!(
-            me.last_fail_ms.load(Ordering::Relaxed),
-            0,
-            "先验基准应判罚首轮慢探测片"
-        );
-    }
-
-    #[tokio::test]
-    async fn probe_prior_baseline_spares_all_slow_links() {
-        let slow = mirror_load("probe-prior-slow.test");
-        slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 远低于先验七成
-        let me = mirror_load("probe-prior-me2.test");
-        me.speed_ewma.store(0, Ordering::Relaxed);
-        me.last_fail_ms.store(0, Ordering::Relaxed);
-        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
-            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
-                Bytes::from(vec![0u8; SPEED_SAMPLE_MIN_BYTES as usize]),
-            ))]),
-        ));
-        let guard = LoadGuard::charge(me.clone(), SPEED_SAMPLE_MIN_BYTES);
-        let mut wrapped = cutoff_watched_body(
-            body,
-            guard,
-            me.clone(),
-            vec![slow],
-            CutMeta {
-                chain_host: "probe-prior2.test".into(),
-                mirror: "probe-prior-me2.test".into(),
-                label: "h/p".into(),
-            },
-            Arc::new(|_: &str| {}),
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = http_body_util::BodyExt::frame(&mut wrapped).await;
-        let _ = http_body_util::BodyExt::frame(&mut wrapped).await;
-        drop(wrapped);
-        assert_eq!(
-            me.last_fail_ms.load(Ordering::Relaxed),
-            0,
-            "全员都慢(链路本身差)不得按先验误杀"
-        );
-    }
 
     /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
     fn mirror_test_direct_leg() -> DirectLeg<'static> {
@@ -1368,59 +1051,48 @@ mod tests {
         }
     }
 
-    /// 测速时钟从响应头起算：派发后的建连/等待不进首个采样区间。
-    /// 头到达时 restart_mark 重置码表——等待段只存在于墙钟，不进速度数字。
+    /// 探测流交卷: 全片均速从响应头起算(head_at), 建连/等待不进分母;
+    /// on_frame 通道满 100ms 地板, 终值走 Drop 通道。
     #[test]
-    fn speed_clock_starts_at_response_head() {
-        let ld = mirror_load("clock-head.test");
+    fn probe_scores_from_response_head() {
+        let ld = mirror_load("probe-score.test");
         ld.speed_ewma.store(0, Ordering::Relaxed);
-        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
+        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024); // 无分 → 探测流
+        assert!(g.is_probe, "无分镜像派出的流必须是探测流");
         std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
-        g.restart_mark(); // 头到达，码表重跑
+        g.restart_mark(); // 头到达, 测速时钟起算
         std::thread::sleep(Duration::from_millis(5));
         g.on_frame(512 * 1024);
+        assert_eq!(
+            ld.speed_ewma.load(Ordering::Relaxed),
+            0,
+            "头后未满 100ms 地板不得提前交分"
+        );
+        drop(g); // 终值: 512KB / ~5ms ≈ 100MB/s
         let s = ld.speed_ewma.load(Ordering::Relaxed);
         assert!(
             s > 20 * 1024 * 1024,
-            "首区间不得包含建连/等待耗时(不重置 ≈512KB/125ms≈4MB/s): {s}B/s"
+            "全片均速不得包含建连/等待耗时(否则 ≈512KB/125ms≈4MB/s): {s}B/s"
         );
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 时间窗触发：字节攒不够 64KB，但 100ms 到了照样出读数——停滞 100ms 内现形。
+    /// 交分门槛与时间地板：满 16KB 且距头满 100ms 才落分——停滞 100ms 内现形。
     #[test]
     fn time_floor_fires_sample_on_stall() {
         let ld = mirror_load("stall-clock.test");
         ld.speed_ewma.store(0, Ordering::Relaxed);
         let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
         std::thread::sleep(Duration::from_millis(120));
-        g.on_frame(4 * 1024); // 4KB 远不足字节窗，但时间窗已到
+        g.on_frame(16 * 1024); // 满 16KB 门槛 + 120ms 地板 → 交分
         let s = ld.speed_ewma.load(Ordering::Relaxed);
         assert!(
             s > 0 && s < 200 * 1024,
-            "时间窗应触发停滞读数(4KB/120ms ≈ 34KB/s): {s}B/s"
+            "时间地板应触发停滞读数(16KB/120ms ≈ 136KB/s): {s}B/s"
         );
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// 双门接收：同是 1KB,亚 2ms 的碎片窗拒收,跨 2ms 的时间有效窗收。
-    #[test]
-    fn fragment_rejected_but_time_valid_window_accepted() {
-        let ld = mirror_load("fragment.test");
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-        ewma_update(&ld, 1024, Duration::from_millis(1)); // 亚 2ms 且亚 16KB
-        assert_eq!(
-            ld.speed_ewma.load(Ordering::Relaxed),
-            0,
-            "突发碎片窗不得落账(纯调度噪声)"
-        );
-        ewma_update(&ld, 1024, Duration::from_millis(5)); // ≥2ms → 时间有效
-        assert!(
-            ld.speed_ewma.load(Ordering::Relaxed) > 0,
-            "时间有效窗(哪怕只有 1KB)应落账——停滞信号必须收"
-        );
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-    }
 
     /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
     #[test]
@@ -1705,219 +1377,95 @@ mod tests {
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
     }
 
-    /// 首样本直取，后续 α=0.4 平滑；小样本忽略。
+    /// 分数冻结：正常流(镜像已有分)只记账, 永不改写速度分。
     #[test]
-    fn speed_ewma_smoothing() {
-        let ld = mirror_load("ewma.test");
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-        ewma_update(&ld, 256 * 1024, Duration::from_secs(1));
-        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 256 * 1024);
-        ewma_update(&ld, 1024 * 1024, Duration::from_secs(1));
-        let expect = (256 * 1024 * 6 + 1024 * 1024 * 4) / 10;
-        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), expect);
-        ewma_update(&ld, 128, Duration::from_millis(1));
-        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), expect);
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-    }
-
-    /// 权重 6:4 的"跟得更快"方向：1MB/s 旧印象遇到 2MB/s 新样本后必须落到
-    /// 1.4MB/s（7:3 只有 1.3MB/s）。这条钉住方向，改回 7:3 会红。
-    #[test]
-    fn ewma_follows_latest_sample_harder() {
-        let ld = mirror_load("ewma-weights.test");
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-        ewma_update(&ld, 1024 * 1024, Duration::from_secs(1)); // 基线 1MB/s
-        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 1024 * 1024);
-
-        ewma_update(&ld, 2 * 1024 * 1024, Duration::from_secs(1)); // 新样本 2MB/s
-        let now = ld.speed_ewma.load(Ordering::Relaxed);
-        assert_eq!(
-            now,
-            (1024 * 1024 * 6 + 2 * 1024 * 1024 * 4) / 10,
-            "6:4 应落在 1.4MB/s"
-        );
-        let old_weights = (1024 * 1024 * 7 + 2 * 1024 * 1024 * 3) / 10;
-        assert!(
-            now > old_weights,
-            "6:4 必须比 7:3 更贴近新样本: now={now} old={old_weights}"
-        );
-
-        // 突发碎片(亚 2ms 且亚 16KB)不落账
-        ewma_update(&ld, 1024, Duration::from_millis(1));
-        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), now);
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-    }
-
-    /// 开放区间超记账额后：in_flight 停在 0 不下溢，采样照走。
-    /// 帧间真实睡眠：ewma_update 要求窗口耗时 >0 毫秒。
-    #[tokio::test]
-    async fn on_frame_sampling_outlives_charge_cap() {
-        let ld = mirror_load("raw-sampling.test");
-        ld.in_flight_bytes.store(0, Ordering::Relaxed);
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-        let mut g = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024);
-        let frame = 1024 * 1024u64;
-        for _ in 0..10 {
-            g.on_frame(frame);
-            tokio::time::sleep(Duration::from_millis(3)).await;
-        }
-        assert_eq!(
-            ld.in_flight_bytes.load(Ordering::Relaxed),
-            0,
-            "记账封顶后 in_flight 必须停在 0, 不得下溢"
-        );
-        assert!(
-            ld.speed_ewma.load(Ordering::Relaxed) > 0,
-            "超记账额后 EWMA 采样必须继续"
-        );
-        ld.speed_ewma.store(0, Ordering::Relaxed);
-    }
-
-    /// 掐断采样覆盖旧印象，不做 α=0.3 混合。
-    #[test]
-    fn force_ewma_overrides_stale_high_impression() {
-        let ld = mirror_load("force-override.test");
+    fn normal_stream_never_touches_score() {
+        let ld = mirror_load("freeze.test");
         ld.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
-        force_ewma(&ld, 256 * 1024, Duration::from_millis(2_600));
-        let expect = 256 * 1024 * 1_000_000 / 2_600_000;
+        let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024); // 有分 → 非探测
+        assert!(!g.is_probe, "已有分的镜像派出的流不得是探测流");
+        g.on_frame(1024 * 1024);
+        drop(g);
         assert_eq!(
             ld.speed_ewma.load(Ordering::Relaxed),
-            expect,
-            "掐断采样必须覆盖旧印象"
+            5 * 1024 * 1024,
+            "正常流不得改写冻结分数"
         );
-        assert!(expect < 5 * 1024 * 1024 / 20, "实测值应远低于快基准/20");
         ld.speed_ewma.store(0, Ordering::Relaxed);
     }
 
-    /// z 判据：离散度自适应——挤链里贴着中位数的异常也掐，散链里不误杀，
-    /// 全军低速(地板/μ/2)零误杀，同伴不足不评。
-    #[test]
-    fn cutoff_significance_median_of_fresh_peers() {
-        // 挤链 [4.8, 5.0, 5.2]MB/s: σ≈163KB→σ̂=μ/8=625KB; 阈值=5.0M−2.5×0.625M≈3.44M
-        // → 3.4MB/s 判掉(÷4 判据下这是永不触发的盲区)。
-        let tight = &[4800u64 * 1024, 5000 * 1024, 5200 * 1024];
-        assert!(should_cut(3400 * 1024, tight), "挤链里低于 μ−2.5σ̂ 的近异常应掐");
-        assert!(!should_cut(3600 * 1024, tight), "挤链里阈值之上不掐");
-        // 散链 [1, 3, 5]MB/s: σ≈1.63M > μ/8; 阈值=3M−2.5×1.63M<0 → 1.2MB/s 不掐。
-        let loose = &[1000u64 * 1024, 3000 * 1024, 5000 * 1024];
-        assert!(!should_cut(1200 * 1024, loose), "散链(σ 大)里 1.2MB/s 是正常落点, 不掐");
-        // 真塌方: 同伴 5MB/s, own 250KB/s——地板之下且远超 2.5σ̂。
-        let fast = &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024];
-        assert!(should_cut(250 * 1024, fast), "真塌方必须掐");
-        // 全军低速但无离群: σ̂ 下限(μ/8)保阈值不收成刀刃, 接近中位数的落点不掐。
-        let all_slow = &[90u64 * 1024, 100 * 1024, 110 * 1024];
-        assert!(!should_cut(90 * 1024, all_slow), "低速链里接近同伴的不掐(σ̂ 下限防刀刃)");
-        // 同伴不足(2 家)不评。
-        assert!(!should_cut(0, &[100u64 * 1024, 100 * 1024]));
-        assert!(!should_cut(0, &[]));
-    }
-
-    /// z 判据刻度钉死: 挤链近异常(σ̂ 下限生效)、散链宽容、2 倍慢护栏圈外。
-    #[test]
-    fn cut_significance_scale() {
-        // 挤链(σ≈0, σ̂=μ/8): 1MB/s vs μ≈5MB/s 是 8σ̂ 外的真异常 → 掐
-        // (z 语义: "慢"由离散度定义, 挤链里偏离 80% 就是异常, 不是正常离散)。
-        assert!(should_cut(
-            1024 * 1024,
-            &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024]
-        ));
-        // 挤链 2.5MB/s(μ 的一半, 4σ̂ 外) → 掐。
-        assert!(should_cut(
-            2500 * 1024,
-            &[5u64 * 1024 * 1024, 5200 * 1024, 4800 * 1024]
-        ));
-        // σ̂ 下限验证: 完美挤链(σ≈0)时阈值不收成刀刃——
-        // μ=5M, σ̂=μ/8=625K, 阈值=5M−2.5×0.625M≈3.44M, 3.4M 判掉、3.5M 不判。
-        let perfect = &[5u64 * 1024 * 1024, 5000 * 1024, 5000 * 1024];
-        assert!(should_cut(3400 * 1024, perfect));
-        assert!(!should_cut(3500 * 1024, perfect));
-    }
-
-    #[test]
-    fn cut_limiter_caps_per_window() {
-        let key = "cut-limit.test";
-        for _ in 0..CUT_LIMIT_PER_WINDOW {
-            assert!(cut_allowed(key), "窗口内前 {CUT_LIMIT_PER_WINDOW} 次应放行");
-        }
-        assert!(
-            !cut_allowed(key),
-            "窗口内第 {} 次应拒绝",
-            CUT_LIMIT_PER_WINDOW + 1
-        );
-    }
-
-    /// 显著慢流在 checkpoint 处 Err 终止；守卫全额归还、last_fail 与慢速率入表。
+    /// 清场触发: 探测流交分后严劣于链内已交卷最大者 → 盖纪元号, 在途断流。
     #[tokio::test]
-    async fn cutoff_body_aborts_significantly_slow_stream() {
-        let peers: Vec<Arc<MirrorLoad>> = (0..3)
-            .map(|i| {
-                let p = mirror_load(&format!("cut-peer{i}.test"));
-                p.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
-                p.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
-                p
-            })
-            .collect();
-        let me = mirror_load("cut-me.test");
+    async fn cull_fires_for_strictly_slower_probe() {
+        let fast = mirror_load("cull-fast.test");
+        fast.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
+        let me = mirror_load("cull-me.test");
         me.speed_ewma.store(0, Ordering::Relaxed);
-        me.last_fail_ms.store(0, Ordering::Relaxed);
-        me.in_flight_bytes.store(0, Ordering::Relaxed);
-        // 8 帧 ×64KB、帧间 900ms:窗资格 = 完整滑过 2 窗(时间锚定, 与吞吐无关)。
-        // 帧 2(窗龄 900ms ✓→窗1)→ 帧 3(✓→窗2)→ 帧 4:资格 ✓、窗龄 900ms ✓、
-        // own = 64KB/900ms ≈ 71KB/s < 250KB/s(基准/20) → 掐。慢镜像判定 ~3s
-        // 内完成, 与速率无关——64KB 也照样攒得出判定。
-        let chunks = vec![
-            Bytes::from(vec![0u8; 64 * 1024]);
-            8
-        ];
-        let stream = futures_util::stream::iter(
-            chunks
-                .into_iter()
-                .map(|b| Ok::<_, std::io::Error>(hyper::body::Frame::data(b))),
-        );
-        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(stream));
-        let guard = LoadGuard::charge(me.clone(), 8 * 64 * 1024);
-        let mut wrapped = cutoff_watched_body(
+        me.cull_epoch.store(0, Ordering::Relaxed);
+        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+                Bytes::from(vec![0u8; 64 * 1024]),
+            ))]),
+        ));
+        let guard = LoadGuard::charge(me.clone(), 64 * 1024); // 无分 → 探测流
+        let mut wrapped = cull_watched_body(
             body,
             guard,
             me.clone(),
-            peers,
-            CutMeta {
-                chain_host: "cut-host.test".into(),
-                mirror: "cut-mirror.test".into(),
-                label: "h/p".into(),
-            },
+            vec![fast.clone()],
+            "h/p".into(),
+            "cull-me.test".into(),
             Arc::new(|_: &str| {}),
         );
-        let mut got_err = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            assert!(tokio::time::Instant::now() < deadline, "掐断测试超时");
-            match http_body_util::BodyExt::frame(&mut wrapped).await {
-                Some(Ok(_)) => tokio::time::sleep(Duration::from_millis(900)).await,
-                Some(Err(_)) => {
-                    got_err = true;
-                    break;
-                }
-                None => break,
-            }
-        }
-        drop(wrapped);
-        assert!(got_err, "显著慢流应在 checkpoint 处被掐断");
-        assert_eq!(
-            me.in_flight_bytes.load(Ordering::Relaxed),
-            0,
-            "掐断后守卫必须全额归还"
-        );
+        tokio::time::sleep(Duration::from_millis(120)).await; // 满交分地板
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 帧 → 交分 ~546KB/s → 触发清场
         assert_ne!(
-            me.last_fail_ms.load(Ordering::Relaxed),
+            me.cull_epoch.load(Ordering::Relaxed),
             0,
-            "掐断必须记 last_fail"
+            "严劣于链内最快的探测片应触发清场盖纪元"
         );
-        assert!(
-            me.speed_ewma.load(Ordering::Relaxed) > 0,
-            "掐断必须强制采样慢速率入 EWMA"
+        let got_err = matches!(
+            http_body_util::BodyExt::frame(&mut wrapped).await,
+            Some(Err(_))
+        );
+        assert!(got_err, "被清场镜像的在途流必须断流交客户端重发");
+        me.speed_ewma.store(0, Ordering::Relaxed);
+        me.cull_epoch.store(0, Ordering::Relaxed);
+        fast.speed_ewma.store(0, Ordering::Relaxed);
+    }
+
+    /// 并列最快者保留: 链内无更快者 → 不盖纪元, 存量自然跑完。
+    #[tokio::test]
+    async fn cull_spares_when_no_faster_peer() {
+        let slow = mirror_load("tie-slow.test");
+        slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 同伴比我慢
+        let me = mirror_load("tie-me.test");
+        me.speed_ewma.store(0, Ordering::Relaxed);
+        me.cull_epoch.store(0, Ordering::Relaxed);
+        let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+                Bytes::from(vec![0u8; 64 * 1024]),
+            ))]),
+        ));
+        let guard = LoadGuard::charge(me.clone(), 64 * 1024);
+        let mut wrapped = cull_watched_body(
+            body,
+            guard,
+            me.clone(),
+            vec![slow.clone()],
+            "h/p".into(),
+            "tie-me.test".into(),
+            Arc::new(|_: &str| {}),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 交分 ~546KB/s > 100KB/s
+        assert_eq!(
+            me.cull_epoch.load(Ordering::Relaxed),
+            0,
+            "链内无更快者不得清场(并列最快保留)"
         );
         me.speed_ewma.store(0, Ordering::Relaxed);
-        me.last_fail_ms.store(0, Ordering::Relaxed);
+        me.cull_epoch.store(0, Ordering::Relaxed);
+        slow.speed_ewma.store(0, Ordering::Relaxed);
     }
 }
