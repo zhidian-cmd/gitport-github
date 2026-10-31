@@ -69,21 +69,19 @@ pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
 
 /// 探测交分：head_at 起算的全片运行平均，唯一的速度写入通道——交卷即冻结，
 /// 正常流永不覆盖。100ms 时间门槛由调用方把关: 1-byte 探针活不过 100ms
-/// 自然不交卷, 亚毫秒突发打不出幽灵样本。
-fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
+/// 自然不交卷, 亚毫秒突发打不出幽灵样本。返回本次分数(调用方按需落评估账)。
+fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
     if bytes == 0 || us == 0 {
-        return;
+        return 0;
     }
     let score = (bytes * 1_000_000 / us).max(1);
     load.speed_ewma.store(score, Ordering::Relaxed);
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
-    // 历史评估缓存: 每会话每镜 1 条(首落分)。只写不读——派发路径不碰它。
-    pool::mirror_stats::record(&load.url, score);
     // 链序按速度重排落盘: 链头恒为实测最快(IDM 首片/非下载器直接受益)。
     resort_chain_by_speed(&load.url);
+    score
 }
 
-/// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
 /// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
 /// 顺序缀尾。稳定排序保证同速者不跳动(幂等关键)。
 fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<String> {
@@ -92,18 +90,26 @@ fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<S
     idx.into_iter().map(|i| chain[i].clone()).collect()
 }
 
+/// 需要按速度重排的链: 只挑大文件链, 且链里确实有这个镜像。
+/// 一个镜像同挂三条大文件链, 必须全部命中——只排一条等于另两条永不更新。
+fn big_chains_with<'a>(
+    chains: &'a HashMap<String, Vec<String>>,
+    url: &str,
+) -> Vec<(&'a String, &'a Vec<String>)> {
+    chains
+        .iter()
+        .filter(|(h, c)| pool::route::is_big_file_host(h.as_str()) && c.iter().any(|m| m == url))
+        .collect()
+}
+
 /// 探测交分后按最新速度分重排该镜像所属链并落盘 plans.json——链头恒为
 /// 实测最快: IDM 爬坡首片与非下载器场景直接命中快腿; 并发派发仍由 ECT 接管。
+/// 小文件链序归校准管, 这里一条都不碰。
 fn resort_chain_by_speed(scored_url: &str) {
     let chains = pool::mirror_chains_snapshot();
-    let Some((host, chain)) = chains
-        .into_iter()
-        .find(|(_, c)| c.iter().any(|m| m == scored_url))
-    else {
+    let targets = big_chains_with(&chains, scored_url);
+    if targets.is_empty() {
         return;
-    };
-    if !pool::route::is_big_file_host(&host) {
-        return; // 小文件链序归校准管
     }
     let now = pool::now_ms();
     let speed_of = |m: &str| -> u64 {
@@ -116,11 +122,12 @@ fn resort_chain_by_speed(scored_url: &str) {
             ld.speed_ewma.load(Ordering::Relaxed)
         }
     };
-    let new_chain = speed_sorted_chain(&chain, &speed_of);
-    pool::set_mirror_chain(&host, &new_chain, "测速");
+    for (host, chain) in targets {
+        let new_chain = speed_sorted_chain(chain, &speed_of);
+        pool::set_mirror_chain(host, &new_chain, "测速");
+    }
 }
 
-/// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
 /// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
 /// 记账封顶于记账额防下溢；采样走原始字节，开放区间超记账额后采样不停。
 pub(super) struct LoadGuard {
@@ -202,7 +209,10 @@ impl Drop for LoadGuard {
             let since_bytes = self.raw_delivered - self.head_bytes;
             let since_us = self.head_at.elapsed().as_micros() as u64;
             if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
-                store_probe_score(&self.load, since_bytes, since_us);
+                let score = store_probe_score(&self.load, since_bytes, since_us);
+                // 评估缓存只吃终值(全片均速): 首帧那 100ms 的慢启动读数只用于
+                // 当次派发与链序, 不能拿去判"这家镜像值不值得留"。
+                pool::mirror_stats::record(&self.load.url, score);
             }
         }
         let residual = self.charged.saturating_sub(self.delivered);
@@ -1482,7 +1492,31 @@ mod tests {
         assert_eq!(again, out, "已排序链重排必须恒等(零写盘的幂等基础)");
     }
 
-    /// 分数冻结：正常流(镜像已有分)只记账, 永不改写速度分。
+    /// 重排目标：只挑大文件链，且必须命中全部——一个镜像同挂三条大文件链，
+    /// 只排一条等于另两条永不更新(旧实现还会先撞上小文件链直接放弃)。
+    #[test]
+    fn big_chains_with_picks_every_big_chain_not_small() {
+        let v = |urls: &[&str]| urls.iter().map(|u| u.to_string()).collect::<Vec<_>>();
+        let mut chains: HashMap<String, Vec<String>> = HashMap::new();
+        chains.insert("codeload.github.com".into(), v(&["https://a", "https://b"]));
+        chains.insert(
+            "release-assets.githubusercontent.com".into(),
+            v(&["https://a"]),
+        );
+        chains.insert("raw.githubusercontent.com".into(), v(&["https://a"]));
+        chains.insert("objects.githubusercontent.com".into(), v(&["https://other"]));
+        let mut hosts: Vec<&str> = big_chains_with(&chains, "https://a")
+            .into_iter()
+            .map(|(h, _)| h.as_str())
+            .collect();
+        hosts.sort_unstable();
+        assert_eq!(
+            hosts,
+            vec!["codeload.github.com", "release-assets.githubusercontent.com"],
+            "含该镜像的两条大文件链都要排；小文件链和不含它的链都不许碰"
+        );
+    }
+
     /// 分数冻结：正常流(镜像已有分)只记账, 永不改写速度分。
     #[test]
     fn normal_stream_never_touches_score() {

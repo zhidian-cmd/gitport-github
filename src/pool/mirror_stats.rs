@@ -96,10 +96,12 @@ fn median(rs: &[Rec]) -> u64 {
     v[v.len() / 2]
 }
 
-/// 探测交分落账: 每会话每镜 1 条(首落分)。到里程碑时评估——只产建议
-/// (日志一条), 绝不改动 settings/镜像链, 启停决定权完全在用户。
+/// 探测落账: 每会话每镜 1 条(流结束时的终值, 不是首帧的慢启动读数)。
+/// 到里程碑时评估——只产建议(日志一条), 绝不改动 settings/镜像链。
+/// `direct/` 是直连腿的记账键, 不是镜像: 不参评, 否则直连会当"最快基准"
+/// 把真实镜像全比下去。
 pub(crate) fn record(mirror: &str, speed: u64) {
-    if mirror.is_empty() || speed == 0 {
+    if mirror.is_empty() || speed == 0 || mirror.starts_with("direct/") {
         return;
     }
     {
