@@ -136,4 +136,5 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) {
 }
 
 #[cfg(test)]
+#[path = "tests/logger.rs"]
 mod tests;

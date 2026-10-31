@@ -143,4 +143,5 @@ pub(super) async fn gh_defuse(
 }
 
 #[cfg(test)]
+#[path = "../../tests/server/mitm/defuse.rs"]
 mod tests;

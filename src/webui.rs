@@ -375,6 +375,7 @@ async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> 
 }
 
 #[cfg(test)]
+#[path = "tests/webui.rs"]
 mod tests;
 
 async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBody>) -> Response {

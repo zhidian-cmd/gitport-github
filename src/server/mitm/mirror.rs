@@ -897,4 +897,5 @@ pub async fn calibrate_chains(log: &LogFn) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../tests/server/mitm/mirror.rs"]
 mod tests;

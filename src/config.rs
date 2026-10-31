@@ -202,4 +202,5 @@ pub fn pooled_domains() -> impl Iterator<Item = &'static str> {
 }
 
 #[cfg(test)]
+#[path = "tests/config.rs"]
 mod tests;

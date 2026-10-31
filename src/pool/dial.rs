@@ -491,7 +491,9 @@ pub fn system_roots() -> Arc<rustls::RootCertStore> {
 
 /// 分片器单测：分片默认关掉线上验证就只剩"看日志猜"，这里直接量时间差。
 #[cfg(test)]
+#[path = "../tests/pool/dial_split_hello_tests.rs"]
 mod split_hello_tests;
 
 #[cfg(test)]
+#[path = "../tests/pool/dial.rs"]
 mod tests;

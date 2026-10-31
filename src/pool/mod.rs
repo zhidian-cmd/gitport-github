@@ -841,7 +841,9 @@ pub static CONTENT_BREAKER: Breaker = Breaker::new(120);
 pub static MIRROR_BREAKER: Breaker = Breaker::new(60);
 
 #[cfg(test)]
+#[path = "../tests/pool/dial_crew_tests.rs"]
 mod dial_crew_tests;
 
 #[cfg(test)]
+#[path = "../tests/pool/mod.rs"]
 mod tests;

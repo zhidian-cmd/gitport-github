@@ -800,4 +800,5 @@ async fn dns_direct_fetch(
 }
 
 #[cfg(test)]
+#[path = "../../tests/server/mitm/mod.rs"]
 mod tests;
