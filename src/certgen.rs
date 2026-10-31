@@ -8,15 +8,20 @@ use rustls_pki_types::PrivateKeyDer;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use time::OffsetDateTime;
 
 use crate::pool::LogFn;
+
+/// 叶子证书有效期 365 天；签发超过这个时长就重签。留 7 天余量，
+/// 免得常驻进程在第 366 天集体握手失败。
+const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
 
 pub struct Authority {
     cert_pem: String, // CA 证书 PEM（Issuer 重建/导出用）
     cert_der: Vec<u8>,
     ca_key: KeyPair,
-    leaves: Mutex<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    leaves: Mutex<HashMap<String, (SystemTime, Arc<rustls::sign::CertifiedKey>)>>,
 }
 
 fn issuer_of<'a>(
@@ -32,8 +37,12 @@ impl Authority {
         // 先查缓存：签过的都已经过了下面那道校验，没必要每个连接重跑一遍域名表。
         {
             let leaves = self.leaves.lock().unwrap();
-            if let Some(c) = leaves.get(host) {
-                return Ok(c.clone());
+            if let Some((issued, c)) = leaves.get(host) {
+                // 快到期的不用: 命中也要看年龄。时钟回拨(elapsed 出错)同样按过期处理,
+                // 宁可多签一次, 也不要拿一张可能已过期的证书去握手。
+                if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
+                    return Ok(c.clone());
+                }
             }
         }
         // 纵深防御：根证书本身是 Unconstrained、10 年有效，按 SNI 现签不受任何约束。
@@ -77,7 +86,7 @@ impl Authority {
         self.leaves
             .lock()
             .unwrap()
-            .insert(host.to_string(), certified.clone());
+            .insert(host.to_string(), (SystemTime::now(), certified.clone()));
         Ok(certified)
     }
 }

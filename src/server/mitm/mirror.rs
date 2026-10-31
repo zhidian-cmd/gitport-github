@@ -62,11 +62,6 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// 从 Range 头估请求体积(mod.rs 组装直连腿的 charge 用)。
-pub(super) fn range_bytes_of(range: Option<&str>) -> u64 {
-    range_bytes(range)
-}
-
 /// 探测交分：head_at 起算的全片运行平均，唯一的速度写入通道——交卷即冻结，
 /// 正常流永不覆盖。100ms 时间门槛由调用方把关: 1-byte 探针活不过 100ms
 /// 自然不交卷, 亚毫秒突发打不出幽灵样本。返回本次分数(调用方按需落评估账)。
@@ -78,7 +73,7 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
     load.speed_ewma.store(score, Ordering::Relaxed);
     load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
     // 链序按速度重排落盘: 链头恒为实测最快(IDM 首片/非下载器直接受益)。
-    resort_chain_by_speed(&load.url);
+    resort_throttled(&load.url);
     score
 }
 
@@ -100,6 +95,28 @@ fn big_chains_with<'a>(
         .iter()
         .filter(|(h, c)| pool::route::is_big_file_host(h.as_str()) && c.iter().any(|m| m == url))
         .collect()
+}
+
+/// 重排节流: 链序只影响探测轮先派给谁、ECT 完全并列时的轮转起点、以及某家
+/// 失败后下一个试谁——正在跑的流不会被重新派发，晚一秒没有代价。
+/// 而每帧重排要复制整张链表，顺序翻动时还会 fsync：全局限一秒一次。
+const RESORT_MIN_INTERVAL_MS: u64 = 1000;
+static LAST_RESORT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn resort_throttled(scored_url: &str) {
+    let now = pool::now_ms();
+    let last = LAST_RESORT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < RESORT_MIN_INTERVAL_MS {
+        return;
+    }
+    // 抢占: 并发写分时只有一个线程进重排, 其余直接返回。
+    if LAST_RESORT_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    resort_chain_by_speed(scored_url);
 }
 
 /// 探测交分后按最新速度分重排该镜像所属链并落盘 plans.json——链头恒为
@@ -344,8 +361,8 @@ fn append_direct_if_missed(
 }
 
 
-/// bytes=a-b → b-a+1；开放区间/无头/畸形按假设值。
-fn range_bytes(range: Option<&str>) -> u64 {
+/// bytes=a-b → b-a+1；开放区间/无头/畸形按假设值。派发记账与直连腿共用。
+pub(super) fn range_bytes(range: Option<&str>) -> u64 {
     let Some(spec) = range.and_then(|r| r.trim().strip_prefix("bytes=")) else {
         return ASSUMED_REQUEST_BYTES;
     };
@@ -513,11 +530,7 @@ pub(super) async fn chain_fetch(
         let trusted_set = crate::settings::trusted_mirrors();
         let trusted: Vec<String> = pool::mirror_chain(chain_host)
             .into_iter()
-            .filter(|m| {
-                trusted_set
-                    .iter()
-                    .any(|t| m.starts_with(t.as_str()))
-            })
+            .filter(|m| trusted_set.iter().any(|t| same_origin(m, t)))
             .collect();
         if trusted.is_empty() {
             (log)(&format!(
@@ -757,6 +770,17 @@ fn calib_fail_label(e: &str) -> &'static str {
         "失败"
     }
 }
+
+/// 同源判定: scheme://host[:port] 全等(忽略大小写与尾斜杠)。用前缀判会把
+/// `https://gh-proxy.org.evil.tld` 当成 `https://gh-proxy.org`——签名 URL
+/// 等同 1 小时提货凭证, 前缀一松就等于送人。
+fn same_origin(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.trim().trim_end_matches('/').to_ascii_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
 fn has_credential_query(query: &str) -> bool {
     query.split('&').any(|kv| {
         let name = kv.split('=').next().unwrap_or("").to_lowercase();
