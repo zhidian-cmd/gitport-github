@@ -456,9 +456,11 @@ async fn send_once(
 
 /// 直连腿组装(主路径与兜底路径共用一份)：charge 在 future 首行——镜像胜出
 /// 丢弃本 future 时零残留, Err/取消靠 guard Drop 归还(字节+流数)。
+#[allow(clippy::too_many_arguments)] // 直连腿组装的字面清单, 强行并参只会丢语义
 fn direct_leg<'a>(
     chain_host: &str,
     new_bytes: u64,
+    big: bool,
     log: &LogFn,
     out: &'a hyper::Request<BoxBody>,
     host: &str,
@@ -471,7 +473,7 @@ fn direct_leg<'a>(
     let body2 = body.clone();
     let info2 = info.clone();
     let fetch = Box::pin(async move {
-        let mut guard = mirror::LoadGuard::charge(load, new_bytes);
+        let mut guard = mirror::LoadGuard::charge(load, new_bytes, big);
         match get_direct(&log2, out, &host2, &info2, true, &body2).await {
             Ok(resp) => {
                 // 头已到：码表重跑，IP 表串发拨号/等待不进速度样本。
@@ -502,7 +504,16 @@ async fn mirror_or_direct(
     info: &UpstreamInfo,
     replay: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let fetch = direct_leg(chain_host, new_bytes, log, out_body, host, info, replay);
+    let fetch = direct_leg(
+        chain_host,
+        new_bytes,
+        pool::route::is_big_file_host(chain_host),
+        log,
+        out_body,
+        host,
+        info,
+        replay,
+    );
     let resp = chain_fetch(log, out_body, host, fetch).await?;
     let route = resp
         .extensions()
@@ -804,7 +815,7 @@ mod tests {
             .unwrap();
         let log: LogFn = Arc::new(|_: &str| {});
         let info = UpstreamInfo::default();
-        let leg = direct_leg("debt.test", 8 * 1024 * 1024, &log, &out, "debt.test", &info, &None);
+        let leg = direct_leg("debt.test", 8 * 1024 * 1024, true, &log, &out, "debt.test", &info, &None);
         drop(leg);
         assert_eq!(
             load.in_flight_bytes.load(std::sync::atomic::Ordering::Relaxed),

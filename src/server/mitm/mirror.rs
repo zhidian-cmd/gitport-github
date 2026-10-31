@@ -85,6 +85,8 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) {
 /// 记账封顶于记账额防下溢；采样走原始字节，开放区间超记账额后采样不停。
 pub(super) struct LoadGuard {
     load: Arc<MirrorLoad>,
+    /// 大文件机器标记: false = 小文件流, 与速度分/在途/失败窗/评估缓存零接触。
+    big: bool,
     charged: u64,
     delivered: u64,
     raw_delivered: u64,
@@ -92,19 +94,24 @@ pub(super) struct LoadGuard {
     head_bytes: u64,
     /// 体流起点(响应头到达)：探测判分用全片体速率, 不随区间采样重置。
     head_at: Instant,
-    /// 构造时镜像尚无速度样本 = 本流是探测片(首个真实样本)。
+    /// 大文件链且镜像尚无速度样本 = 本流是探测片(小文件流恒 false)。
     pub(super) is_probe: bool,
 }
 
 impl LoadGuard {
 
-    pub(super) fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
-        load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
-        load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
-        let is_probe = load.speed_ewma.load(Ordering::Relaxed) == 0;
+    /// big=false = 小文件流: 零充值零归还零采样, 与大文件机器绝对解耦。
+    pub(super) fn charge(load: Arc<MirrorLoad>, new_bytes: u64, big: bool) -> Self {
+        let charged = if big { new_bytes } else { 0 };
+        if big {
+            load.in_flight_bytes.fetch_add(charged, Ordering::Relaxed);
+            load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
+        }
+        let is_probe = big && load.speed_ewma.load(Ordering::Relaxed) == 0;
         LoadGuard {
             load,
-            charged: new_bytes,
+            big,
+            charged,
             delivered: 0,
             raw_delivered: 0,
             head_bytes: 0,
@@ -124,7 +131,7 @@ impl LoadGuard {
         if credit > 0 {
             self.load.in_flight_bytes.fetch_sub(credit, Ordering::Relaxed);
         }
-        if !self.is_probe {
+        if !self.big {
             return;
         }
         let since_bytes = self.raw_delivered - self.head_bytes;
@@ -146,6 +153,9 @@ impl LoadGuard {
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
+        if !self.big {
+            return; // 小文件流: 零充值零归还, 与大文件机器零接触。
+        }
         // 探测片终值: 全片均速定稿(被清场提前断流的探测片也在此交卷记分)。
         // 同一严格时间规则: 距头满 100ms 且有字节才交, 短命流不交卷。
         if self.is_probe {
@@ -488,24 +498,35 @@ pub(super) async fn chain_fetch(
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
     // 探测态优先：链内有从未交卷的候选 → 一片一家实测(原子游标)，全员交卷
     // 后回 ECT 纯实测竞速。2MB/s 先验自 ECT 退役，仅存于 EOS 兜底基准。
-    let start = match probe_pick(&candidates) {
-        Some(i) => {
-            (log)(&format!(
-                "[探测] {host}{path} 探测轮领取 {} (候选 {}/{}), 交卷后回 ECT",
-                candidates[i],
-                i + 1,
-                candidates.len()
-            ));
-            i
+    // 大小文件绝对解耦：探测轮与 ECT 选点只属于大文件机器; 小文件消费
+    // 校准链序, 从链头逐个试, 对速度分/失败窗/在途/评估缓存零读零写。
+    let big = pool::route::is_big_file_host(chain_host);
+    let start = if big {
+        match probe_pick(&candidates) {
+            Some(i) => {
+                (log)(&format!(
+                    "[探测] {host}{path} 探测轮领取 {} (候选 {}/{}), 交卷后回 ECT",
+                    candidates[i],
+                    i + 1,
+                    candidates.len()
+                ));
+                i
+            }
+            None => pick_mirror(&candidates, new_bytes),
         }
-        None => pick_mirror(&candidates, new_bytes),
+    } else {
+        0
     };
     let mut direct = direct;
     let mut order = walk_order(candidates.len(), start, limit);
     append_direct_if_missed(
         &mut order,
         candidates.len() - 1,
-        mirror_load(&direct_key).last_fail_ms.load(Ordering::Relaxed),
+        if big {
+            mirror_load(&direct_key).last_fail_ms.load(Ordering::Relaxed)
+        } else {
+            0
+        },
         pool::now_ms(),
     );
     for i in order {
@@ -516,9 +537,12 @@ pub(super) async fn chain_fetch(
             match direct.fetch.as_mut().await {
                 Ok(mut resp) => {
                     resp.extensions_mut().insert("direct");
-                    mirror_load(&direct_key).last_fail_ms.store(0, Ordering::Relaxed);
+                    if big {
+                        mirror_load(&direct_key).last_fail_ms.store(0, Ordering::Relaxed);
+                    }
                     (log)(&format!(
-                        "[直连] {host}{path} ECT 胜出({}ms), 候选 {}/{}",
+                        "[直连] {host}{path} {}({}ms), 候选 {}/{}",
+                        if big { "ECT 胜出" } else { "链序首位" },
                         t0.elapsed().as_millis(),
                         i + 1,
                         candidates.len()
@@ -527,9 +551,11 @@ pub(super) async fn chain_fetch(
                     return Ok(resp);
                 }
                 Err(e) => {
-                    mirror_load(&direct_key)
-                        .last_fail_ms
-                        .store(pool::now_ms(), Ordering::Relaxed);
+                    if big {
+                        mirror_load(&direct_key)
+                            .last_fail_ms
+                            .store(pool::now_ms(), Ordering::Relaxed);
+                    }
                     (log)(&format!(
                         "[直连] {host}{path} 失败({e}, {}ms), 链内下一个",
                         t0.elapsed().as_millis()
@@ -545,16 +571,19 @@ pub(super) async fn chain_fetch(
                 continue;
             }
         };
-        let mut guard = LoadGuard::charge(mirror_load(m), new_bytes);
+        let mut guard = LoadGuard::charge(mirror_load(m), new_bytes, big);
         let t0 = Instant::now();
         match mirror_do(req, m, log).await {
             Ok(resp) => {
                 // 头已到：码表重跑，建连/等待耗时留在墙钟不进速度样本。
                 guard.restart_mark();
-                mirror_load(m).last_fail_ms.store(0, Ordering::Relaxed);
+                if big {
+                    mirror_load(m).last_fail_ms.store(0, Ordering::Relaxed);
+                }
                 (log)(&format!(
-                    "[镜像] {host}{path} via {m} (链位 {}/{len}, ECT起点 #{}, 头 {ms}ms)",
+                    "[镜像] {host}{path} via {m} (链位 {}/{len}, {} #{}, 头 {ms}ms)",
                     i + 1,
+                    if big { "ECT起点" } else { "链序起点" },
                     start + 1,
                     len = chain.len(),
                     ms = t0.elapsed().as_millis()
@@ -563,7 +592,7 @@ pub(super) async fn chain_fetch(
                 // 带 Range 挂清场监视(纪元核对+探测让位)；无 Range 只记账(浏览器断流是用户可见失败)。
                 let (mut parts, body) = resp.into_parts();
                 parts.extensions.insert("mirror");
-                let body = if range.is_some() {
+                let body = if range.is_some() && big {
                     let peers: Vec<Arc<MirrorLoad>> = chain
                         .iter()
                         .filter(|x| x.as_str() != m)
@@ -590,9 +619,11 @@ pub(super) async fn chain_fetch(
                 return Ok(hyper::Response::from_parts(parts, body));
             }
             Err(e) => {
-                mirror_load(m)
-                    .last_fail_ms
-                    .store(pool::now_ms(), Ordering::Relaxed);
+                if big {
+                    mirror_load(m)
+                        .last_fail_ms
+                        .store(pool::now_ms(), Ordering::Relaxed);
+                }
                 (log)(&format!(
                     "[镜像] {host} {m} 失败({e}, {}ms), 链内下一个",
                     t0.elapsed().as_millis()
@@ -1067,7 +1098,7 @@ mod tests {
     fn probe_scores_from_response_head() {
         let ld = mirror_load("probe-score.test");
         ld.speed_ewma.store(0, Ordering::Relaxed);
-        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024); // 无分 → 探测流
+        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024, true); // 无分 → 探测流
         assert!(g.is_probe, "无分镜像派出的流必须是探测流");
         std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
         g.restart_mark(); // 头到达, 测速时钟起算
@@ -1086,7 +1117,7 @@ mod tests {
     fn time_floor_fires_sample_on_stall() {
         let ld = mirror_load("stall-clock.test");
         ld.speed_ewma.store(0, Ordering::Relaxed);
-        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024);
+        let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024, true);
         std::thread::sleep(Duration::from_millis(120));
         g.on_frame(4 * 1024); // 4KB 也交: 只看时间不看字节
         let s = ld.speed_ewma.load(Ordering::Relaxed);
@@ -1360,7 +1391,7 @@ mod tests {
         let ld = mirror_load("acct.test");
         ld.in_flight_bytes.store(0, Ordering::Relaxed);
         {
-            let mut g = LoadGuard::charge(ld.clone(), 1000);
+            let mut g = LoadGuard::charge(ld.clone(), 1000, true);
             assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 1000);
             g.on_frame(400);
             assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 600);
@@ -1369,13 +1400,13 @@ mod tests {
         } // drop：残余归还
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "Drop 必须清残余");
         {
-            let mut g = LoadGuard::charge(ld.clone(), 100);
+            let mut g = LoadGuard::charge(ld.clone(), 100, true);
             g.on_frame(500);
             assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "交付封顶于记账");
         }
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
         {
-            let _g = LoadGuard::charge(ld.clone(), 4096);
+            let _g = LoadGuard::charge(ld.clone(), 4096, true);
             assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 4096);
         }
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
@@ -1386,7 +1417,7 @@ mod tests {
     fn normal_stream_never_touches_score() {
         let ld = mirror_load("freeze.test");
         ld.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
-        let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024); // 有分 → 非探测
+        let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024, true); // 有分 → 非探测
         assert!(!g.is_probe, "已有分的镜像派出的流不得是探测流");
         g.on_frame(1024 * 1024);
         drop(g);
@@ -1411,7 +1442,7 @@ mod tests {
                 Bytes::from(vec![0u8; 64 * 1024]),
             ))]),
         ));
-        let guard = LoadGuard::charge(me.clone(), 64 * 1024); // 无分 → 探测流
+        let guard = LoadGuard::charge(me.clone(), 64 * 1024, true); // 无分 → 探测流
         let mut wrapped = cull_watched_body(
             body,
             guard,
@@ -1451,7 +1482,7 @@ mod tests {
                 Bytes::from(vec![0u8; 64 * 1024]),
             ))]),
         ));
-        let guard = LoadGuard::charge(me.clone(), 64 * 1024);
+        let guard = LoadGuard::charge(me.clone(), 64 * 1024, true);
         let mut wrapped = cull_watched_body(
             body,
             guard,
@@ -1472,4 +1503,23 @@ mod tests {
         me.cull_epoch.store(0, Ordering::Relaxed);
         slow.speed_ewma.store(0, Ordering::Relaxed);
     }
+    /// 小文件流与大文件机器绝对解耦: 零充值零归还零采样零评估。
+    #[test]
+    fn small_stream_never_touches_big_file_state() {
+        let ld = mirror_load("small-decoupled.test");
+        ld.in_flight_bytes.store(0, Ordering::Relaxed);
+        ld.in_flight_streams.store(0, Ordering::Relaxed);
+        ld.speed_ewma.store(0, Ordering::Relaxed);
+        let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024, false); // 小文件流
+        assert!(!g.is_probe, "小文件流无探测语义");
+        g.on_frame(1024 * 1024);
+        std::thread::sleep(Duration::from_millis(120));
+        g.on_frame(64 * 1024); // 过 100ms 地板也不得交分
+        drop(g);
+        assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "零充值零归还");
+        assert_eq!(ld.in_flight_streams.load(Ordering::Relaxed), 0, "流数零接触");
+        assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 0, "小文件不写速度分");
+        assert_eq!(ld.last_sample_ms.load(Ordering::Relaxed), 0, "评估缓存零记录");
+    }
+
 }
