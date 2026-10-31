@@ -723,7 +723,7 @@ pub(super) async fn chain_fetch(
                     ms = t0.elapsed().as_millis()
                 ));
                 pool::MIRROR_BREAKER.clear(chain_host);
-                // 带 Range 挂掐断监视；无 Range 只记账不掐（浏览器下载掐了是用户可见失败）。
+                // 带 Range 挂掐断监视 + racing 陪跑；无 Range 只记账不掐（浏览器下载掐了是用户可见失败）。
                 let (mut parts, body) = resp.into_parts();
                 parts.extensions.insert("mirror");
                 let body = if range.is_some() {
@@ -732,8 +732,68 @@ pub(super) async fn chain_fetch(
                         .filter(|x| x.as_str() != m)
                         .map(|x| mirror_load(x))
                         .collect();
+                    // racing 陪跑: 从其余镜像倒序找一家, 同 Range 再拉一路——
+                    // 字节先到先用, 下载器按偏移去重; 陪跑建流失败退化为纯 A。
+                    // 只挑有速度样本的镜像(未交卷者交给探测轮管)。
+                    let mate = candidates
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(j, x)| {
+                            *j != i
+                                && x.as_str() != direct_key
+                                && mirror_load(x).speed_ewma.load(Ordering::Relaxed) > 0
+                        })
+                        .map(|(_, x)| x.clone());
+                    let mate_body = match &mate {
+                        Some(mate_url) => {
+                            let mate_load = mirror_load(mate_url);
+                            let mut mguard = LoadGuard::charge(mate_load.clone(), new_bytes);
+                            match mirror_request(out, mate_url, &orig_url) {
+                                Ok(mreq) => match mirror_do(mreq, mate_url, log).await {
+                                    Ok(mresp) => {
+                                        mate_load.last_fail_ms.store(0, Ordering::Relaxed);
+                                        (log)(&format!(
+                                            "[racing] {host}{path} 陪跑 {mate_url} 与 {m} 同 Range 竞速"
+                                        ));
+                                        let (_, mbody) = mresp.into_parts();
+                                        // 陪跑记账: 独立 guard 逐帧归还, Drop 收尾。
+                                        let mbody = http_body_util::BodyExt::map_frame(
+                                            mbody,
+                                            move |frame| {
+                                                if let Some(n) =
+                                                    frame.data_ref().map(|d| d.len() as u64)
+                                                {
+                                                    mguard.on_frame(n);
+                                                }
+                                                frame
+                                            },
+                                        );
+                                        Some(super::racing::to_box(mbody))
+                                    }
+                                    Err(me) => {
+                                        mate_load
+                                            .last_fail_ms
+                                            .store(pool::now_ms(), Ordering::Relaxed);
+                                        (log)(&format!(
+                                            "[racing] {host} 陪跑 {mate_url} 建流失败({me}), 纯单路"
+                                        ));
+                                        None
+                                    }
+                                },
+                                Err(me) => {
+                                    (log)(&format!(
+                                        "[racing] {host} 陪跑 {mate_url} 请求构造失败({me})"
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let raced = super::racing::racing_body(body, mate_body);
                     cutoff_watched_body(
-                        body,
+                        super::racing::to_box(raced),
                         guard,
                         mirror_load(m),
                         peers,
