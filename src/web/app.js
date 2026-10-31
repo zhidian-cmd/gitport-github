@@ -176,8 +176,6 @@ const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" s
 // HTML 属性转义：五个预定义字符实体一个都不能少——少一个就是一条注入面
 // （曾把 & < > " 原样返回，镜像 URL 里的 "><script> 直接逃逸 value="" 属性执行）。
 const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'\u0026amp;','<':'\u0026lt;','>':'\u0026gt;','"':'\u0026quot;',"'":'\u0026#39;'}[c]));
-/* 探测交分历史速读: bytes/s → MB/s(KB/s), 仅评估展示用, 不参与任何派发 */
-const fmtRate = v => v >= 1048576 ? (v / 1048576).toFixed(1) + 'MB/s' : Math.max(1, Math.round(v / 1024)) + 'KB/s';
 
 function renderMirrors() {
   $('mirrorRows').innerHTML = MIRRORS.length
@@ -188,10 +186,8 @@ function renderMirrors() {
 function mirrorRow(m, i) {
   const toggle = m.on ? '关闭' : '启动';
   const cls = m.on ? 'btn sm' : 'btn sm primary';
-  const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
-    '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
   const st = STATS[m.url];
-  const stat = st && st.n ? '<span class="mirror-stat" title="大文件探测交分历史(仅评估镜像价值, 不参与派发)">' + st.n + '次 · ' + fmtRate(st.median) + '</span>' : '';
+  const stat = st && st.adviseOff ? '<span class="mirror-stat" title="大文件探测历史评估: 历史中位速率垫底, 是否停用由你决定">建议停用</span>' : '';
   return '<div class="mirror-row">' +
     '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
     stat +

@@ -2,7 +2,7 @@
 //! 唯一用途是回答"这个镜像还配留在大文件链里吗"(镜像不是越多越好)。
 //! 真实下载派发路径不读这里——ECT 只用当次实测冻结分, 缓存与派发完全隔离。
 
-use crate::settings::{self, WorkerMirror};
+use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -96,7 +96,8 @@ fn median(rs: &[Rec]) -> u64 {
     v[v.len() / 2]
 }
 
-/// 探测交分落账: 每会话每镜 1 条(首落分)。到里程碑时评估并自动停用垫底镜。
+/// 探测交分落账: 每会话每镜 1 条(首落分)。到里程碑时评估——只产建议
+/// (日志一条), 绝不改动 settings/镜像链, 启停决定权完全在用户。
 pub(crate) fn record(mirror: &str, speed: u64) {
     if mirror.is_empty() || speed == 0 {
         return;
@@ -113,40 +114,24 @@ pub(crate) fn record(mirror: &str, speed: u64) {
     save(&st);
     if milestone {
         let to_off = evaluate(&st.mirrors);
-        if !to_off.is_empty() {
-            apply_off(&to_off);
-        }
-    }
-}
-
-fn apply_off(to_off: &[String]) {
-    let mut reg: Vec<WorkerMirror> = settings::worker_mirrors();
-    let mut changed = false;
-    for w in reg.iter_mut() {
-        if w.on && to_off.iter().any(|m| m == &w.url) {
-            w.on = false;
-            changed = true;
+        for u in to_off {
             if let Some(log) = super::lock(&super::SERIAL_LOG).as_ref() {
                 log(&format!(
-                    "[评估] {} 历史中位速率垫底(近 {EVAL_EVERY} 次), 大文件自动停用(可手动恢复)",
-                    w.url
+                    "[评估] {u} 历史中位速率垫底(近 {EVAL_EVERY} 次), 建议停用(手动处理)"
                 ));
             }
         }
     }
-    if changed {
-        settings::save_worker_mirrors(reg);
-        super::sync_custom_mirrors(&[]); // 大文件链摘除 + plans 落盘
-    }
 }
 
-/// UI 快照: (镜像, 记录数, 近期中位速率 bytes/s)。
-pub(crate) fn snapshot() -> Vec<(String, usize, u64)> {
+/// UI 快照: (镜像, 是否建议停用)。只给建议——不显示速度/次数。
+pub(crate) fn snapshot() -> Vec<(String, bool)> {
     let st = load();
-    let mut out: Vec<(String, usize, u64)> = st
+    let off = evaluate(&st.mirrors);
+    let mut out: Vec<(String, bool)> = st
         .mirrors
-        .iter()
-        .map(|(m, rs)| (m.clone(), rs.len(), median(rs)))
+        .keys()
+        .map(|m| (m.clone(), off.iter().any(|u| u == m)))
         .collect();
     out.sort();
     out

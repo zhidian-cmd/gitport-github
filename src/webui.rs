@@ -459,7 +459,7 @@ struct SettingsResp {
 async fn api_settings() -> Response {
     let stats: serde_json::Map<String, serde_json::Value> = crate::pool::mirror_stats::snapshot()
         .into_iter()
-        .map(|(u, n, med)| (u, serde_json::json!({ "n": n, "median": med })))
+        .map(|(u, advise)| (u, serde_json::json!({ "adviseOff": advise })))
         .collect();
     write_json(&SettingsResp {
         autostart: settings::autostart_enabled(),
