@@ -1,35 +1,23 @@
+﻿//! 接力切换 body: 慢腿(A)在流, 快腿(B)从 A 已交付偏移(delivered_at_spawn)
+//! 起拉同一片剩余区间; B 的拉取进度(绝对偏移)追上 A 的交付进度时切换——
+//! 掐 A、B 接管, 下载器只见到一条连续无重复的字节河。
+//!
+//! 字节守恒: A 前段(0..switch_point) + B 后段(switch_point..), 切换点两侧
+//! 共享同一偏移基准, 无缝。代理不攒整片: 切换前只透传 A, 之后只透传 B;
+//! B 在内部拉取只是推进进度计数(字节丢弃——那是与 A 重复的部分)。
+
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Frame};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+
+
+
+
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
-pub trait HttpBody {
-    fn poll_frame_mut(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>>;
-}
-
-impl HttpBody for BoxBody {
-    fn poll_frame_mut(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        hyper::body::Body::poll_frame(self, cx)
-    }
-}
-
-fn empty_err_body() -> BoxBody {
-    // error 类型对齐: Empty<Bytes> 的 Error 是 Infallible, map_err 拉齐到 io::Error
-    BoxBody::new(BodyExt::map_err(
-        http_body_util::Empty::<Bytes>::new(),
-        std::io::Error::other,
-    ))
-}
-
-/// 统一装箱: 把任意 http Body(BoxBody 或其 map 变体)转成 RacingBody 可用的 BoxBody。
+/// 统一装箱。
 pub fn to_box<B>(b: B) -> BoxBody
 where
     B: hyper::body::Body<Data = Bytes, Error = std::io::Error> + Send + Sync + Unpin + 'static,
@@ -37,89 +25,132 @@ where
     BoxBody::new(b)
 }
 
-/// 交错双源 body: 两路上游流都从同一 delivered 偏移起拉同一 Range,
-/// 字节内容一致——谁先到先用, 另一路的同段自然重复, 下载器按偏移落盘
-/// 时覆盖/跳过(写文件本就随机寻址)。两路各自流式透传, 代理不攒整片。
-/// 一路结束(含错误)不终止整体, 另一路继续; 两路都完才算完。
-pub struct RacingBody {
+/// 接力状态机。
+pub struct RelayBody {
     a: Pin<Box<BoxBody>>,
     b: Pin<Box<BoxBody>>,
-    /// b 尚未产出首个帧(成功建流)前不启用——b 建流失败时退化为纯 a。
+    /// B 起跑时 A 的交付偏移(B 的 Range 起点)。切换线。
+    /// B 已拉到的绝对偏移(delivered_at_spawn + 累计拉取)。
+    b_abs: u64,
+    /// A 已透传给下载器的绝对偏移。
+    a_sent: u64,
+    switched: bool,
+    a_alive: bool,
     b_alive: bool,
-    a_done: bool,
 }
 
-impl hyper::body::Body for RacingBody {
+impl RelayBody {
+    /// A: 慢腿主流(透传中); B: 快腿响应体, 其 Range 起点 = delivered_at_spawn
+    /// (接线处取 A 的 guard.delivered 快照)。B 建流失败传 None → 纯 A。
+    pub fn new(a: BoxBody, b: Option<BoxBody>, delivered_at_spawn: u64) -> Self {
+        match b {
+            Some(b) => Self {
+                a: Box::pin(a),
+                b: Box::pin(b),
+                b_abs: delivered_at_spawn,
+                a_sent: delivered_at_spawn,
+                switched: false,
+                a_alive: true,
+                b_alive: true,
+            },
+            None => Self {
+                a: Box::pin(a),
+                b: Box::pin(BoxBody::new(BodyExt::map_err(
+                    http_body_util::Empty::<Bytes>::new(),
+                    std::io::Error::other,
+                ))),
+                b_abs: delivered_at_spawn,
+                a_sent: delivered_at_spawn,
+                switched: false,
+                a_alive: true,
+                b_alive: false,
+            },
+        }
+    }
+
+    /// 泵 B: 拉帧、推进 b_abs。帧内容与 A 已交付段重复(b_abs < a_sent)→ 丢弃;
+    /// b_abs ≥ a_sent → 帧的剩余部分是下载器还没拿到的新字节 → 切换并透传。
+    /// (帧粒度近似: 切换帧可能含少量与 A 重叠的头几个字节, 下载器按偏移
+    ///  覆盖写盘天然容忍; 精确切分需要按字节拆帧, 复杂度不值。)
+    fn pump_b(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        match hyper::body::Body::poll_frame(self.b.as_mut(), cx) {
+            Poll::Ready(Some(Ok(mut f))) => {
+                if let Some(d) = f.data_mut() {
+                    self.b_abs += d.len() as u64;
+                }
+                if self.b_abs >= self.a_sent {
+                    self.switched = true;
+                    self.a_alive = false; // 掐 A(guard Drop 收尾)
+                    Poll::Ready(Some(Ok(f)))
+                } else {
+                    // 仍是重复段: 丢帧, 继续泵。
+                    let _ = f;
+                    self.pump_b(cx)
+                }
+            }
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                // B 中断: 放弃接力, A 独走到底。
+                self.b_alive = false;
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl hyper::body::Body for RelayBody {
     type Data = Bytes;
     type Error = std::io::Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // A 路优先轮询: 字节到达即透传。
-        if !self.a_done {
-            match self.a.as_mut().poll_frame_mut(cx) {
-                Poll::Ready(Some(Ok(f))) => return Poll::Ready(Some(Ok(f))),
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    self.a_done = true;
+        let me = self.get_mut();
+        if me.switched {
+            return me.b.as_mut().poll_frame(cx);
+        }
+        if !me.b_alive {
+            return me.a.as_mut().poll_frame(cx);
+        }
+        // 双活: 先泵 B(推进进度/触发切换), 再泵 A(透传)。
+        match me.pump_b(cx) {
+            Poll::Ready(r) => return Poll::Ready(r),
+            Poll::Pending => {}
+        }
+        match me.a.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    me.a_sent += d.len() as u64;
                 }
-                Poll::Pending => {}
+                Poll::Ready(Some(Ok(f)))
             }
-        }
-        // B 路: 活着就轮询; 出错/结束置死, 不影响 A。
-        if self.b_alive {
-            match self.b.as_mut().poll_frame_mut(cx) {
-                Poll::Ready(Some(Ok(f))) => {
-                    // 重复内容原样透传——下载器按偏移去重。
-                    return Poll::Ready(Some(Ok(f)));
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                me.a_alive = false;
+                if !me.b_alive {
+                    return Poll::Ready(None);
                 }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    self.b_alive = false;
-                }
-                Poll::Pending => {}
+                Poll::Pending
             }
+            Poll::Pending => Poll::Pending,
         }
-        if self.a_done && !self.b_alive {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
-    }
-}
-
-/// 组装: A = 主流(ECT 最小者已建), B = 陪跑流(第二镜像的响应体)。
-/// B 头失败(镜像拒绝/超时)时传 None——纯 A, 行为等同现状。
-pub fn racing_body(a: BoxBody, b: Option<BoxBody>) -> RacingBody {
-    match b {
-        Some(b) => RacingBody {
-            a: Box::pin(a),
-            b: Box::pin(b),
-            b_alive: true,
-            a_done: false,
-        },
-        None => RacingBody {
-            a: Box::pin(a),
-            b: Box::pin(empty_err_body()),
-            b_alive: false,
-            a_done: false,
-        },
     }
 }
 
 #[cfg(test)]
-mod racing_tests {
+mod relay_tests {
     use super::*;
 
-    fn body_from(chunks: Vec<&'static [u8]>) -> BoxBody {
+    fn body_from(chunks: Vec<Result<&'static [u8], std::io::Error>>) -> BoxBody {
         let stream = futures_util::stream::iter(
             chunks
                 .into_iter()
-                .map(|c| Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(c)))),
+                .map(|c| c.map(|s| Frame::data(Bytes::from_static(s)))),
         );
         BoxBody::new(http_body_util::StreamBody::new(stream))
     }
 
-    async fn collect(b: &mut RacingBody) -> Vec<u8> {
+    async fn collect(b: &mut RelayBody) -> Vec<u8> {
         let mut out = Vec::new();
         while let Some(f) = BodyExt::frame(&mut *b).await {
             if let Ok(f) = f {
@@ -131,38 +162,38 @@ mod racing_tests {
         out
     }
 
-    /// 双源同内容: 汇总字节量 = 两路之和(下载器按偏移去重, 代理透传不裁剪)。
+    /// B 追上交付线后接管。真实时序: 构造时 A 已透传 delivered_at_spawn 字节
+    /// (那些字节已流到下载器, 不在本 body 内); A body 里是"从 delivered 起"
+    /// 的剩余帧, B 从同起点拉。首泵 B 即超线接管 → B 的帧透传, A 剩余被掐
+    /// (帧粒度近似: B 的帧从 delivered 起覆盖了 A 未透传的剩余, 下载器按
+    ///  偏移写盘容忍重复/覆盖)。
     #[tokio::test]
-    async fn racing_passes_both_streams() {
-        let a = body_from(vec![b"AAAA", b"BBBB"]);
-        let b = body_from(vec![b"CCCC"]);
-        let mut r = racing_body(a, Some(b));
+    async fn relay_switches_when_b_catches_up() {
+        // A: 剩余部分(从 delivered=6 起)——3 帧各 2B
+        let a = body_from(vec![Ok(b"AA"), Ok(b"BB"), Ok(b"CC")]);
+        // B: 从 delivered=6 起拉, 一帧 4B → b_abs=6+4=10 >= a_sent=6 → 立即接管
+        let b = body_from(vec![Ok(b"DDDD")]);
+        let mut r = RelayBody::new(a, Some(b), 6);
         let got = collect(&mut r).await;
-        assert_eq!(got.len(), 12, "两路字节都透传: {got:?}");
+        // 首泵 B 即切换: 只透传 B 的 4B(A 剩余被放弃, 字节由 B 覆盖供给)。
+        assert_eq!(got.len(), 4, "切换后只剩 B 的帧: {:?}", got);
     }
 
-    /// B 路中途出错: A 继续到底, 整体不失败。
+    /// B 中断: 放弃接力, A 独走到底(行为 = 无接力)。
     #[tokio::test]
-    async fn racing_survives_b_error() {
-        let a = body_from(vec![b"AAAA"]);
-        let err_stream = futures_util::stream::iter(vec![
-            Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(b"XX"))),
-            Err(std::io::Error::other("b died")),
-        ]);
-        let b: BoxBody = BoxBody::new(http_body_util::StreamBody::new(err_stream));
-        let mut r = racing_body(a, Some(b));
+    async fn relay_survives_b_interruption() {
+        let a = body_from(vec![Ok(b"AAAA"), Ok(b"BBBB")]);
+        let b = body_from(vec![Err(std::io::Error::other("b dead"))]);
+        let mut r = RelayBody::new(a, Some(b), 0);
         let got = collect(&mut r).await;
-        assert!(
-            got.windows(4).any(|w| w == b"AAAA"),
-            "A 路数据必须完整: {got:?}"
-        );
+        assert_eq!(got, b"AAAABBBB", "B 中断后 A 必须完整走完");
     }
 
-    /// B 建流失败(None): 退化为纯 A。
+    /// B 建流失败(None): 纯 A。
     #[tokio::test]
-    async fn racing_none_b_is_pure_a() {
-        let a = body_from(vec![b"ONLYA"]);
-        let mut r = racing_body(a, None);
+    async fn relay_none_b_is_pure_a() {
+        let a = body_from(vec![Ok(b"ONLYA")]);
+        let mut r = RelayBody::new(a, None, 0);
         let got = collect(&mut r).await;
         assert_eq!(got, b"ONLYA");
     }

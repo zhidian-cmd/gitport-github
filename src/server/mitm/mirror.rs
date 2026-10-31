@@ -117,6 +117,11 @@ pub(super) struct LoadGuard {
 }
 
 impl LoadGuard {
+    /// 已交付字节数(接力切换的 Range 起点)。
+    pub(super) fn delivered(&self) -> u64 {
+        self.delivered
+    }
+
     pub(super) fn charge(load: Arc<MirrorLoad>, new_bytes: u64) -> Self {
         load.in_flight_bytes.fetch_add(new_bytes, Ordering::Relaxed);
         load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
@@ -791,7 +796,7 @@ pub(super) async fn chain_fetch(
                         }
                         None => None,
                     };
-                    let raced = super::racing::racing_body(body, mate_body);
+                    let raced = super::racing::RelayBody::new(body, mate_body, guard.delivered());
                     cutoff_watched_body(
                         super::racing::to_box(raced),
                         guard,
