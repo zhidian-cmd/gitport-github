@@ -692,7 +692,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             slot: 1,
             crew: None,
         },
-        CancellationToken::new(),
         None,
     )
     .await
@@ -724,7 +723,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             slot: 1,
             crew: None,
         },
-        CancellationToken::new(),
         None,
     )
     .await

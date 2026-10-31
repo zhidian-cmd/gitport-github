@@ -357,7 +357,6 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
                 slot: 1,
                 crew: None,
             },
-            CancellationToken::new(),
             None,
         )
         .await?;

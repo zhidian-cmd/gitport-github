@@ -11,7 +11,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
@@ -328,7 +327,6 @@ async fn h2_dial_slot(
             slot,
             crew,
         },
-        CancellationToken::new(),
         Some(log),
     )
     .await

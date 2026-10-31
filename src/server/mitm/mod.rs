@@ -206,7 +206,7 @@ async fn mitm_http(
     {
         let chain_host = pool::route::mirror_chain_host(&host, &path);
         let new_bytes =
-            mirror::range_bytes_of(req.headers().get("range").and_then(|v| v.to_str().ok()));
+            mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
         // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
         // 直连失败记 45s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
         match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
@@ -227,7 +227,7 @@ async fn mitm_http(
             match pool::route::fallback_for(name, &host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     let chain_host = pool::route::mirror_chain_host(&host, &path);
-                    let new_bytes = mirror::range_bytes_of(
+                    let new_bytes = mirror::range_bytes(
                         req.headers().get("range").and_then(|v| v.to_str().ok()),
                     );
                     // 直连刚在全灭分支失败过: load 会带 45s 降权, chain_fetch 内

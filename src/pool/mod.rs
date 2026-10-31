@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -443,7 +442,7 @@ impl DialCrew {
     }
 }
 
-/// 串发请求描述：拨哪个池的哪个 host、怎么拨；ctx/log 横切参数留函数位。
+/// 串发请求描述：拨哪个池的哪个 host、怎么拨。
 pub struct DialSkip<'a> {
     pub pool_name: &'a str,
     pub host: &'a str,
@@ -459,7 +458,6 @@ pub struct DialSkip<'a> {
 /// slot：1 = 主键游标, 2 = `~2` 副键，双通道各记各的。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
-    ctx: CancellationToken,
     log: Option<&LogFn>,
 ) -> Result<(dial::Dialed, String, String), String> {
     let DialSkip {
@@ -558,11 +556,7 @@ pub async fn serial_dial_skip(
         }
         tried += 1;
         let mode = p.sni.trim();
-        let attempt = dial::dial_one(host, &p.ip, mode, tls_handshake);
-        let result = tokio::select! {
-            _ = ctx.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "请求预算到期")),
-            r = attempt => r,
-        };
+        let result = dial::dial_one(host, &p.ip, mode, tls_handshake).await;
         match result {
             Ok(conn) => {
                 // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
@@ -580,9 +574,6 @@ pub async fn serial_dial_skip(
             }
             Err(e) => {
                 last_err = Some(e.to_string());
-                if ctx.is_cancelled() {
-                    break; // 预算到期：没试完 ≠ 全灭，不冷却
-                }
                 // 前移到下一候选；物理顺序不动，零写盘。
                 {
                     let mut g = lock(&SERIAL);
@@ -623,9 +614,6 @@ pub async fn serial_dial_skip(
         }
     }
 
-    if ctx.is_cancelled() {
-        return Err("请求预算到期".to_string());
-    }
     if budget_hit {
         // 预算烧满 = 同等退避，防重试每次再烧一遍；有镜像兜底的 host 豁免。
         if mirror_chain(host).is_empty() {
