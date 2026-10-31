@@ -1,15 +1,23 @@
-﻿//! 接力切换 body: 慢腿(A)在流, 快腿(B)从 A 已交付偏移(delivered_at_spawn)
-//! 起拉同一片剩余区间; B 的拉取进度(绝对偏移)追上 A 的交付进度时切换——
-//! 掐 A、B 接管, 下载器只见到一条连续无重复的字节河。
+﻿//! 接力切换 body: 慢腿(A)在流, 快腿(B)同 Range 再拉一路(镜像请求无法从
+//! A 的中途偏移续传, 重复段由丢帧吸收); B 的拉取进度(绝对偏移)追上 A 的
+//! 交付进度时切换——掐 A、B 接管, 下载器只见到一条连续无重复的字节河。
 //!
 //! 字节守恒: A 前段(0..switch_point) + B 后段(switch_point..), 切换点两侧
 //! 共享同一偏移基准, 无缝。代理不攒整片: 切换前只透传 A, 之后只透传 B;
+//! B 在内部拉取只是推进进度计数(重复段整帧丢弃)。
+//!
+//! 接管帧必须剃除与 A 已交付段重叠的头部, 从交付线(a_sent)精确续流:
+//! 下载器按连接流序写盘(第 n 字节 → Range 起点+n), 不读数据内的绝对偏移;
+//! 整帧透传的重复头会把该连接后续字节整体后移, 越过线程 Range 边界 →
+//! IDM 判「数据冲突」回退单线程。Bytes::advance 零拷贝剃除, 「帧粒度
+//! 近似、下载器覆盖写盘容忍」的假设不成立。
 //!
 //! 接管判据固定为「首帧越线即接管」(b_abs ≥ a_sent), 不可加领先量门槛
 //! (如「B 领先 1MB 才接管」): 零缓冲下, 终点落在交付线之上却不切换的 B 帧
 //! 只能丢弃, 而切换帧的起点随之上移到高于交付线 → 字节河出现永久空洞,
 //! 下载器流错位、文件损坏。字节守恒强制此判据; 防慢腿误接管的正确位置
 //! 是 ECT 派发决策(选谁陪跑), 不在切换条件里。
+use bytes::Buf;
 
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Frame};
@@ -73,32 +81,41 @@ impl RelayBody {
         }
     }
 
-    /// 泵 B: 拉帧、推进 b_abs。帧内容与 A 已交付段重复(b_abs < a_sent)→ 丢弃;
-    /// b_abs ≥ a_sent → 帧的剩余部分是下载器还没拿到的新字节 → 切换并透传。
-    /// (帧粒度近似: 切换帧可能含少量与 A 重叠的头几个字节, 下载器按偏移
-    ///  覆盖写盘天然容忍; 精确切分需要按字节拆帧, 复杂度不值。)
-    fn pump_b(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        match hyper::body::Body::poll_frame(self.b.as_mut(), cx) {
-            Poll::Ready(Some(Ok(mut f))) => {
-                if let Some(d) = f.data_mut() {
-                    self.b_abs += d.len() as u64;
+    /// 泵 B: 拉帧、推进 b_abs。整帧终点不高于交付线 → 纯重复, 丢弃续泵;
+    /// 越线帧 → 剃除与 A 已交付段重叠的头部后切换透传(见模块文档: 下载器
+    /// 按流序写盘, 重复头会整体移位)。loop 而非递归, 防大量小帧爆栈。
+    fn pump_b(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        loop {
+            match hyper::body::Body::poll_frame(self.b.as_mut(), cx) {
+                Poll::Ready(Some(Ok(mut f))) => {
+                    let start = self.b_abs;
+                    let len = f.data_ref().map(|d| d.len() as u64).unwrap_or(0);
+                    self.b_abs = start + len;
+                    if self.b_abs > self.a_sent {
+                        // 越线: 交付线之前的头部是与 A 重复的字节, 剃除。
+                        // 不变量 start ≤ a_sent → overlap < len, 剃后帧非空。
+                        let overlap = (self.a_sent - start) as usize;
+                        if overlap > 0 {
+                            if let Some(d) = f.data_mut() {
+                                d.advance(overlap);
+                            }
+                        }
+                        self.switched = true;
+                        self.a_alive = false; // 掐 A(guard Drop 收尾)
+                        return Poll::Ready(Some(Ok(f)));
+                    }
+                    // 整帧在交付线下: 丢弃, 续泵。
                 }
-                if self.b_abs >= self.a_sent {
-                    self.switched = true;
-                    self.a_alive = false; // 掐 A(guard Drop 收尾)
-                    Poll::Ready(Some(Ok(f)))
-                } else {
-                    // 仍是重复段: 丢帧, 继续泵。
-                    let _ = f;
-                    self.pump_b(cx)
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    // B 中断: 放弃接力, A 独走到底。
+                    self.b_alive = false;
+                    return Poll::Pending;
                 }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                // B 中断: 放弃接力, A 独走到底。
-                self.b_alive = false;
-                Poll::Pending
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -167,11 +184,9 @@ mod relay_tests {
         out
     }
 
-    /// B 追上交付线后接管。真实时序: 构造时 A 已透传 delivered_at_spawn 字节
-    /// (那些字节已流到下载器, 不在本 body 内); A body 里是"从 delivered 起"
-    /// 的剩余帧, B 从同起点拉。首泵 B 即超线接管 → B 的帧透传, A 剩余被掐
-    /// (帧粒度近似: B 的帧从 delivered 起覆盖了 A 未透传的剩余, 下载器按
-    ///  偏移写盘容忍重复/覆盖)。
+    /// B 首帧起点恰在交付线上(重叠为零)→ 整帧透传。构造时 A 已透传
+    /// delivered_at_spawn 字节(已流到下载器, 不在本 body 内); A body 是
+    /// "从 delivered 起"的剩余帧, B 同起点拉。首泵 B 即越线接管, A 被掐。
     #[tokio::test]
     async fn relay_switches_when_b_catches_up() {
         // A: 剩余部分(从 delivered=6 起)——3 帧各 2B
@@ -201,5 +216,45 @@ mod relay_tests {
         let mut r = RelayBody::new(a, None, 0);
         let got = collect(&mut r).await;
         assert_eq!(got, b"ONLYA");
+    }
+    /// 首轮 poll 返回 Pending(模拟 B 的 TTFB 晚于 A 交付), 之后透传 inner。
+    struct LazyBody {
+        inner: BoxBody,
+        primed: bool,
+    }
+
+    impl hyper::body::Body for LazyBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let me = self.get_mut();
+            if !me.primed {
+                me.primed = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut me.inner).poll_frame(cx)
+        }
+    }
+
+    /// 接管帧剃除重复头(移位回归)。下载器按连接流序写盘: 整帧透传跨线帧时,
+    /// 重复头会把该连接后续字节整体后移 → 越过线程 Range → IDM 判数据冲突。
+    /// 全流必须精确等于 Range 原文, 无重复无移位。
+    #[tokio::test]
+    async fn relay_trims_overlap_at_switch() {
+        // A: 12B 三帧; B: 同区间一帧 12B, 但首帧晚到——先让 A 交付 4B
+        // (a_sent=4), B 的跨线帧 [0..12) 剃掉前 4B 后接管。
+        let a = body_from(vec![Ok(b"AAAA"), Ok(b"BBBB"), Ok(b"CCCC")]);
+        let b = to_box(LazyBody {
+            inner: body_from(vec![Ok(b"AAAABBBBCCCC")]),
+            primed: false,
+        });
+        let mut r = RelayBody::new(a, Some(b), 0);
+        let got = collect(&mut r).await;
+        assert_eq!(got, b"AAAABBBBCCCC", "全流必须精确无重复无移位: {:?}", got);
     }
 }
