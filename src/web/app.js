@@ -186,6 +186,8 @@ function renderMirrors() {
 function mirrorRow(m, i) {
   const toggle = m.on ? '关闭' : '启动';
   const cls = m.on ? 'btn sm' : 'btn sm primary';
+  const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
+    '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
   const st = STATS[m.url];
   const stat = st && st.adviseOff ? '<span class="mirror-stat" title="大文件探测历史评估: 历史中位速率垫底, 是否停用由你决定">建议停用</span>' : '';
   return '<div class="mirror-row">' +
