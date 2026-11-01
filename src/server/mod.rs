@@ -65,12 +65,7 @@ pub fn stop_proxy(rt: &tokio::runtime::Runtime) {
 }
 
 pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToken) {
-    // 启动成功一行说清端口与工作台地址，别拆两行让日志开头就是两条重复信息。
-    (srv.log)(&format!(
-        "代理已启动 :{} · 工作台 http://127.0.0.1:{}",
-        crate::config::proxy_port(),
-        crate::config::webui_port()
-    ));
+    // 启动成功不出声：端口和工作台地址在概览页，日志只留事故。
     set_running(true);
     loop {
         let (conn, _) = tokio::select! {

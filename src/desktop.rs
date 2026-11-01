@@ -313,14 +313,12 @@ fn spawn_tray(
                     }
                 }
                 let _ = tx.send((ok, err));
-                // 成功只说结果一行；失败才把错误码和完整性一起抛出来。
-                let rect = tray_rect(hwnd);
-                if ok {
-                    note(format!("[启动] 托盘: 已注册 {rect}"));
-                } else {
+                // 注册成功不出声（图标本来就在托盘里）；失败才把错误码和完整性一起抛出来。
+                if !ok {
                     note(format!(
-                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {rect}",
-                        current_il()
+                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {}",
+                        current_il(),
+                        tray_rect(hwnd)
                     ));
                 }
                 TASKBAR_CREATED.store(
@@ -541,9 +539,8 @@ fn show_or_open(
     url: &str,
     log: &LogFn,
 ) {
-    if create_window(slot, elwt, url, log) {
-        (log)("工作台窗口已创建");
-    } else {
+    // 建窗成功不出声（窗口本身可见）；WebView2 不可用才留痕。
+    if !create_window(slot, elwt, url, log) {
         open_browser(url);
     }
 }
@@ -656,7 +653,6 @@ pub fn run(args: DesktopArgs) -> ! {
                     drop(g);
                     // 清场放后台：这里重试删除最多等 3s，不能卡住界面线程；重开窗口前 join。
                     *UDF_CLEANUP.lock().unwrap() = Some(std::thread::spawn(remove_webview_udf));
-                    (log)("工作台已收起到托盘, WebView2 及其数据目录已清理(点击托盘重开)");
                 } else {
                     do_quit(control_flow);
                 }

@@ -85,18 +85,18 @@ fn run() {
     if let Err(e) = server::start_proxy_with(&rt, srv, config::proxy_port()) {
         log_fn(&format!("代理启动失败: {e}"));
     } else {
-        // 分流开关接管系统代理(全关 = no-op)。结果原样留痕：静默失败最坑人。
-        match settings::ensure_system_proxy() {
-            Ok(note) => log_fn(&format!("[启动] 系统代理: {note}")),
-            Err(e) => log_fn(&format!("[启动] 系统代理: 未接管 —— {e}")),
+        // 分流开关接管系统代理(全关 = no-op)。只在没接管成功时留痕：接上是常态，不占日志。
+        if let Err(e) = settings::ensure_system_proxy() {
+            log_fn(&format!("[启动] 系统代理: 未接管 —— {e}"));
         }
     }
     let me = settings::exe_name();
     match settings::autostart_state() {
-        Ok(v) if v.is_empty() => log_fn("[启动] 开机自启: 未登记"),
-        // 登记的是本 exe 就只说"已登记"；指向别处才需要原样打出来（那是真问题）。
-        Ok(v) if !me.is_empty() && v.contains(me.as_str()) => log_fn("[启动] 开机自启: 已登记"),
-        Ok(v) => log_fn(&format!("[启动] 开机自启: 指向别处 —— {v}")),
+        // 登记的是本 exe（或本来就没登记）是常态，不出声；指向别处才是真问题。
+        Ok(v) if !v.is_empty() && (me.is_empty() || !v.contains(me.as_str())) => {
+            log_fn(&format!("[启动] 开机自启: 指向别处 —— {v}"))
+        }
+        Ok(_) => {}
         Err(e) => log_fn(&format!("[启动] 开机自启: 读不到 —— {e}")),
     }
 
