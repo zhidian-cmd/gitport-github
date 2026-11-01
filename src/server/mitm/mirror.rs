@@ -717,7 +717,8 @@ async fn probe_total(
 }
 
 /// 直连段请求：克隆原请求头换成本段 Range，再走直连腿。
-/// 直连只有一路，但配上 1 家镜像就是两段——这正是「镜像不满额」最常见的样子。
+/// release 的下载地址本身不放文件，会 302 到 release-assets——跟一跳，
+/// 把 Range 带过去。跳转目标的 IP 与原 host 无关，用独立记账。
 async fn segment_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -727,17 +728,57 @@ async fn segment_direct(
     s: u64,
     e: u64,
 ) -> Result<hyper::Response<BoxBody>, String> {
+    let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
+        .map_err(|err| err.to_string())?;
     let mut req = hyper::Request::builder()
         .method(out.method())
         .uri(out.uri())
         .body(protocol::empty_body())
         .map_err(|err| err.to_string())?;
     *req.headers_mut() = out.headers().clone();
-    req.headers_mut().insert(
-        http::header::RANGE,
-        http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
-            .map_err(|err| err.to_string())?,
-    );
+    req.headers_mut().insert(http::header::RANGE, range.clone());
+    strip_body_headers(&mut req);
+    let mut resp = super::get_direct(log, &req, host, info, true, replay).await?;
+
+    // 3xx：内容在别处。最多跟两跳（release 实测一跳到位）。
+    let mut hops = 0;
+    while resp.status().is_redirection() && hops < 2 {
+        let Some(loc) = resp
+            .headers()
+            .get(http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            break;
+        };
+        let Ok(uri) = loc.parse::<http::Uri>() else {
+            break;
+        };
+        let Some(next_host) = uri.host().map(str::to_string) else {
+            break;
+        };
+        hops += 1;
+        (log)(&format!("[切片] 直连 {host} 跳转到 {next_host}"));
+        let mut req2 = hyper::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(protocol::empty_body())
+            .map_err(|err| err.to_string())?;
+        for (k, v) in req.headers() {
+            if k.as_str().eq_ignore_ascii_case("host") {
+                continue;
+            }
+            req2.headers_mut().insert(k.clone(), v.clone());
+        }
+        req2.headers_mut().insert(http::header::RANGE, range.clone());
+        let fresh = super::UpstreamInfo::default();
+        resp = super::get_direct(log, &req2, &next_host, &fresh, true, replay).await?;
+    }
+    Ok(resp)
+}
+
+/// 分段请求统一剥掉这两类头：压缩会把每段各压一遍拼起来就是坏数据，
+/// 条件请求会让上游回 304 而段请求要的是实体。
+fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     for h in [
         http::header::ACCEPT_ENCODING,
         http::header::IF_NONE_MATCH,
@@ -746,7 +787,6 @@ async fn segment_direct(
     ] {
         req.headers_mut().remove(h);
     }
-    super::get_direct(log, &req, host, info, true, replay).await
 }
 
 /// 切片下载：一条请求按镜像数平均切段、并发拉，按边界合并回单条字节流。
@@ -764,7 +804,7 @@ async fn split_download(
     if out.method() != http::Method::GET {
         return Ok(None); // HEAD/其他方法没有体可切
     }
-    let path = path_of(out.uri());
+    let path = out.uri().path().to_string();
     let now = now_ms();
     let healthy: Vec<&str> = candidates
         .iter()
@@ -825,16 +865,7 @@ async fn split_download(
                         let hv = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
                             .map_err(|err| err.to_string())?;
                         req.headers_mut().insert(http::header::RANGE, hv);
-                        // 分段必须拿原始字节：压缩会把每段各自压一遍，拼起来就是坏数据；
-                        // 条件请求会让镜像回 304，段请求要的是实体。
-                        for h in [
-                            http::header::ACCEPT_ENCODING,
-                            http::header::IF_NONE_MATCH,
-                            http::header::IF_MODIFIED_SINCE,
-                            http::header::IF_RANGE,
-                        ] {
-                            req.headers_mut().remove(h);
-                        }
+                        strip_body_headers(&mut req);
                         mirror_do(req, m, log).await
                     }
                     Err(err) => Err(err),
@@ -960,16 +991,18 @@ struct SplitCtx {
 impl SplitCtx {
     /// 补拉 [from, to)：偏移相对区间起点，发出去要加 base。
     async fn rescue(&self, from: u64, to: u64) -> Result<BoxBody, String> {
-        let now = now_ms();
-        let m = self
+        // 按 ECT（在途字节 ÷ 实测速度）挑最小者。不能挑"最空闲"：
+        // 刚被掐掉的镜像负载归零，正是最空闲的那个，补回去就是原地打转。
+        let mirrors: Vec<String> = self
             .chain
             .iter()
-            .filter(|m| {
-                let lf = mirror_load(m).last_fail_ms.load(Ordering::Relaxed);
-                lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
-            })
-            .min_by_key(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed))
-            .ok_or_else(|| "无可用补发镜像".to_string())?;
+            .filter(|m| !m.starts_with("direct/"))
+            .cloned()
+            .collect();
+        if mirrors.is_empty() {
+            return Err("无可用补发镜像".to_string());
+        }
+        let m = &mirrors[pick_mirror(&mirrors, to - from)];
         let req = hyper::Request::builder()
             .method(self.method.clone())
             .uri(format!("{m}/{}", self.orig_url))
