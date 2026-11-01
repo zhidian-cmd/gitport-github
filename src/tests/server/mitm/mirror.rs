@@ -101,7 +101,10 @@ fn credential_query_detection() {
         assert!(has_credential_query(q), "{q} 应判含凭据");
     }
     for q in ["", "foo=token", "page=2&q=tokenize", "tokens=1"] {
-        assert!(!has_credential_query(q), "{q} 不该误判（名字才参与，值不算）");
+        assert!(
+            !has_credential_query(q),
+            "{q} 不该误判（名字才参与，值不算）"
+        );
     }
 }
 
@@ -120,8 +123,7 @@ fn ttfb_rank_fastest_first_failures_last() {
 
 #[tokio::test]
 async fn chain_fetch_cred_locks_to_direct() {
-    let lines: Arc<std::sync::Mutex<Vec<String>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = lines.clone();
     let log: LogFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
     let req = hyper::Request::builder()
@@ -158,8 +160,16 @@ fn cred_authorized_trusted_mirrors_only() {
     // trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
     use crate::settings::WorkerMirror;
     let mirrors = [
-        WorkerMirror { url: "https://my-worker.example.com".into(), on: true, trusted: true },
-        WorkerMirror { url: "https://public-proxy.example.org".into(), on: true, trusted: false },
+        WorkerMirror {
+            url: "https://my-worker.example.com".into(),
+            on: true,
+            trusted: true,
+        },
+        WorkerMirror {
+            url: "https://public-proxy.example.org".into(),
+            on: true,
+            trusted: false,
+        },
     ];
     let trusted: std::collections::HashSet<String> = mirrors
         .iter()
@@ -167,8 +177,8 @@ fn cred_authorized_trusted_mirrors_only() {
         .map(|w| w.url.clone())
         .collect();
     let chain = [
-        "https://my-worker.example.com/".to_string(),      // 可信(带尾斜杠变体)
-        "https://public-proxy.example.org".to_string(),    // 不可信
+        "https://my-worker.example.com/".to_string(), // 可信(带尾斜杠变体)
+        "https://public-proxy.example.org".to_string(), // 不可信
     ];
     let passed: Vec<&String> = chain
         .iter()
@@ -191,9 +201,16 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
         .uri("https://cred-brk.test/f?sig=abc")
         .body(protocol::empty_body())
         .unwrap();
-    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg(), &Default::default(), &None)
-        .await
-        .unwrap_err();
+    let err = chain_fetch(
+        &log,
+        &req,
+        host,
+        mirror_test_direct_leg(),
+        &Default::default(),
+        &None,
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("仅直连"), "凭据串请求应仅派直连: {err}");
     assert!(
         !pool::MIRROR_BREAKER.open(host),
@@ -213,9 +230,16 @@ async fn breaker_spares_direct_only_requests() {
         .uri("https://brk-cred.test/f?sig=abc")
         .body(protocol::empty_body())
         .unwrap();
-    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg(), &Default::default(), &None)
-        .await
-        .unwrap_err();
+    let err = chain_fetch(
+        &log,
+        &req,
+        host,
+        mirror_test_direct_leg(),
+        &Default::default(),
+        &None,
+    )
+    .await
+    .unwrap_err();
     assert!(!err.contains("熔断"), "直连独走不得撞镜像熔断: {err}");
     assert!(err.contains("仅直连"), "应照常仅派直连: {err}");
     pool::MIRROR_BREAKER.clear(host);
@@ -236,7 +260,6 @@ fn append_direct_gated_by_health_and_presence() {
     assert_eq!(order, vec![0, 4, 8], "已在窗内不重复追加");
 }
 
-
 /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
 fn mirror_test_direct_leg() -> DirectLeg<'static> {
     DirectLeg {
@@ -255,10 +278,10 @@ fn probe_scores_from_measure_window() {
     assert!(g.is_probe, "无分镜像派出的流必须是探测流");
     std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
     g.restart_mark(); // 头到达
-    // 预热期：慢启动只下 512KB，这段不该进分数
+                      // 预热期：慢启动只下 512KB，这段不该进分数
     std::thread::sleep(Duration::from_millis(110));
     g.on_frame(512 * 1024); // 满预热 → 记窗口起点
-    // 窗口期：500ms 下 5MB
+                            // 窗口期：500ms 下 5MB
     std::thread::sleep(Duration::from_millis(520));
     g.on_frame(5 * 1024 * 1024);
     let s = ld.speed_ewma.load(Ordering::Relaxed);
@@ -352,7 +375,6 @@ fn live_window_tracks_busy_mirror_and_freezes_when_idle() {
     ld.win_base_ms.store(0, Ordering::Relaxed);
 }
 
-
 /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
 #[test]
 fn probe_round_hands_each_candidate_one_shard() {
@@ -388,7 +410,10 @@ fn probe_round_hands_each_candidate_one_shard() {
 fn probe_skips_failed_unprobed_and_yields_to_ect() {
     let a = mirror_load("probe-skip-a.test");
     let b = mirror_load("probe-skip-b.test");
-    let chain = vec!["probe-skip-a.test".to_string(), "probe-skip-b.test".to_string()];
+    let chain = vec![
+        "probe-skip-a.test".to_string(),
+        "probe-skip-b.test".to_string(),
+    ];
     // 隔离: 清并发测试残留, 再摆本测要的姿态。
     a.last_fail_ms.store(0, Ordering::Relaxed);
     a.last_sample_ms.store(0, Ordering::Relaxed);
@@ -415,7 +440,10 @@ fn ect_after_retirement_unprobed_loses_to_probed_slow() {
     slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 100KB/s 已交卷
     let unprobed = mirror_load("retire-unprobed.test");
     unprobed.speed_ewma.store(0, Ordering::Relaxed);
-    let chain = vec!["retire-slow.test".to_string(), "retire-unprobed.test".to_string()];
+    let chain = vec![
+        "retire-slow.test".to_string(),
+        "retire-unprobed.test".to_string(),
+    ];
     assert_eq!(
         pick_mirror(&chain, 1024),
         0,
@@ -428,16 +456,17 @@ fn ect_after_retirement_unprobed_loses_to_probed_slow() {
 #[test]
 fn direct_competes_as_candidate() {
     let chain = vec!["cand-m.test".to_string()];
-    let cands = [
-        chain.as_slice(),
-        &[direct_load_key("cand-host.test")][..],
-    ];
+    let cands = [chain.as_slice(), &[direct_load_key("cand-host.test")][..]];
     let all: Vec<String> = cands.concat();
     // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
     let d = mirror_load_for(&direct_load_key("cand-host.test"));
     d.speed_ewma.store(8 * 1024 * 1024, Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
-    assert_eq!(all[pick], direct_load_key("cand-host.test"), "直连快时应胜出");
+    assert_eq!(
+        all[pick],
+        direct_load_key("cand-host.test"),
+        "直连快时应胜出"
+    );
     // 直连失败降权后 → 轮到镜像。
     d.last_fail_ms.store(now_ms(), Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
@@ -463,7 +492,8 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     // A (0.5+10)/5 ≈ 2s < B 10/0.5 = 20s → A。
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 0);
     // A (100+10)/5 = 22 > B 20 → B。
-    a.in_flight_bytes.store(100 * 1024 * 1024, Ordering::Relaxed);
+    a.in_flight_bytes
+        .store(100 * 1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 1);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     a.speed_ewma.store(0, Ordering::Relaxed);
@@ -547,7 +577,11 @@ fn ect_strict_minimum_no_tolerance() {
     a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
     b.speed_ewma.store(2088 * 1024, Ordering::Relaxed); // +4%
     for _ in 0..10 {
-        assert_eq!(pick_mirror(&chain, 8 * 1024 * 1024), 1, "无容差: 4% 差距也严格选快");
+        assert_eq!(
+            pick_mirror(&chain, 8 * 1024 * 1024),
+            1,
+            "无容差: 4% 差距也严格选快"
+        );
     }
     a.speed_ewma.store(0, Ordering::Relaxed);
     b.speed_ewma.store(0, Ordering::Relaxed);
@@ -591,7 +625,11 @@ fn range_size_parsing() {
         ASSUMED_REQUEST_BYTES,
         "逆区间：畸形按假设"
     );
-    assert_eq!(range_bytes(Some("bytes=0-99,200-299")), 100, "多区间取第一段");
+    assert_eq!(
+        range_bytes(Some("bytes=0-99,200-299")),
+        100,
+        "多区间取第一段"
+    );
 }
 
 #[test]
@@ -626,11 +664,19 @@ fn byte_accounting_lifecycle() {
         g.on_frame(400);
         assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 200);
     } // drop：残余归还
-    assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "Drop 必须清残余");
+    assert_eq!(
+        ld.in_flight_bytes.load(Ordering::Relaxed),
+        0,
+        "Drop 必须清残余"
+    );
     {
         let mut g = LoadGuard::charge(ld.clone(), 100, true);
         g.on_frame(500);
-        assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "交付封顶于记账");
+        assert_eq!(
+            ld.in_flight_bytes.load(Ordering::Relaxed),
+            0,
+            "交付封顶于记账"
+        );
     }
     assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
     {
@@ -661,7 +707,12 @@ fn speed_sorted_chain_orders_and_stabilizes() {
     let out = speed_sorted_chain(&chain, &speed_of);
     assert_eq!(
         out,
-        vec!["https://c".to_string(), "https://a".to_string(), "https://d".to_string(), "https://b".to_string()],
+        vec![
+            "https://c".to_string(),
+            "https://a".to_string(),
+            "https://d".to_string(),
+            "https://b".to_string()
+        ],
         "速度降序 + 无分缀尾 + 同速稳定: {out:?}"
     );
     // 已排序输入重排 = 恒等(幂等)。
@@ -681,7 +732,10 @@ fn big_chains_with_picks_every_big_chain_not_small() {
         v(&["https://a"]),
     );
     chains.insert("raw.githubusercontent.com".into(), v(&["https://a"]));
-    chains.insert("objects.githubusercontent.com".into(), v(&["https://other"]));
+    chains.insert(
+        "objects.githubusercontent.com".into(),
+        v(&["https://other"]),
+    );
     let mut hosts: Vec<&str> = big_chains_with(&chains, "https://a")
         .into_iter()
         .map(|(h, _)| h.as_str())
@@ -689,7 +743,10 @@ fn big_chains_with_picks_every_big_chain_not_small() {
     hosts.sort_unstable();
     assert_eq!(
         hosts,
-        vec!["codeload.github.com", "release-assets.githubusercontent.com"],
+        vec![
+            "codeload.github.com",
+            "release-assets.githubusercontent.com"
+        ],
         "含该镜像的两条大文件链都要排；小文件链和不含它的链都不许碰"
     );
 }
@@ -719,13 +776,13 @@ async fn cull_fires_for_strictly_slower_probe() {
     let me = mirror_load("cull-me.test");
     me.speed_ewma.store(0, Ordering::Relaxed);
     me.cull_epoch.store(0, Ordering::Relaxed);
-    let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
-        futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+    let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+        vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
             Bytes::from(vec![0u8; 64 * 1024]),
-        ))]),
-    ));
+        ))],
+    )));
     let guard = LoadGuard::charge(me.clone(), 64 * 1024, true); // 无分 → 探测流
-    // 分数由窗口测量写；这里直接摆一个慢分，模拟窗口刚交卷。
+                                                                // 分数由窗口测量写；这里直接摆一个慢分，模拟窗口刚交卷。
     me.speed_ewma.store(546 * 1024, Ordering::Relaxed);
     me.last_sample_ms.store(now_ms(), Ordering::Relaxed);
     let mut wrapped = cull_watched_body(
@@ -761,11 +818,11 @@ async fn cull_spares_when_no_faster_peer() {
     let me = mirror_load("tie-me.test");
     me.speed_ewma.store(0, Ordering::Relaxed);
     me.cull_epoch.store(0, Ordering::Relaxed);
-    let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
-        futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+    let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+        vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
             Bytes::from(vec![0u8; 64 * 1024]),
-        ))]),
-    ));
+        ))],
+    )));
     let guard = LoadGuard::charge(me.clone(), 64 * 1024, true);
     let mut wrapped = cull_watched_body(
         body,
@@ -800,17 +857,29 @@ fn small_stream_never_touches_big_file_state() {
     std::thread::sleep(Duration::from_millis(120));
     g.on_frame(64 * 1024); // 过 100ms 地板也不得交分
     drop(g);
-    assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0, "零充值零归还");
-    assert_eq!(ld.in_flight_streams.load(Ordering::Relaxed), 0, "流数零接触");
+    assert_eq!(
+        ld.in_flight_bytes.load(Ordering::Relaxed),
+        0,
+        "零充值零归还"
+    );
+    assert_eq!(
+        ld.in_flight_streams.load(Ordering::Relaxed),
+        0,
+        "流数零接触"
+    );
     assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 0, "小文件不写速度分");
-    assert_eq!(ld.last_sample_ms.load(Ordering::Relaxed), 0, "评估缓存零记录");
+    assert_eq!(
+        ld.last_sample_ms.load(Ordering::Relaxed),
+        0,
+        "评估缓存零记录"
+    );
 }
 
 // ---- 切片驱动：缺口自己续、失败只算空手、绝不提前收尾 ----
 
 /// 假镜像：要 [from, to) 就给 to−from 个同一字节。
 fn fake_fetch(byte: u8) -> Fetch {
-    Box::new(move |from: u64, to: u64| {
+    Arc::new(move |from: u64, to: u64| {
         Box::pin(async move {
             let n = (to - from) as usize;
             let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
@@ -824,11 +893,11 @@ fn fake_fetch(byte: u8) -> Fetch {
 }
 
 fn body_of(data: &'static [u8]) -> BoxBody {
-    BoxBody::new(http_body_util::StreamBody::new(
-        futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+    BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+        vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
             Bytes::from_static(data),
-        ))]),
-    ))
+        ))],
+    )))
 }
 
 fn ctx_with(fetch: Fetch) -> SplitCtx {
@@ -845,7 +914,10 @@ async fn driver_rescues_early_eof_and_finishes() {
     let now = Instant::now();
     // 段 1 [0,10) 只给 4B 就 EOF；段 2 [10,20) 完整。
     let mb = MergeBody::new(
-        vec![(0, 10, now, body_of(b"AAAA")), (10, 20, now, body_of(b"BBBBBBBBBB"))],
+        vec![
+            (0, 10, now, body_of(b"AAAA")),
+            (10, 20, now, body_of(b"BBBBBBBBBB")),
+        ],
         20,
     );
     let body = drive_split(mb, ctx_with(fake_fetch(b'C')));
@@ -865,7 +937,7 @@ async fn driver_gives_up_after_repeated_dead_fills() {
     let now = Instant::now();
     let dead = body_of(b"");
     let mb = MergeBody::new(vec![(0, 10, now, dead)], 10);
-    let fetch: Fetch = Box::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
+    let fetch: Fetch = Arc::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
     let res = http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))).await;
     assert!(res.is_err(), "补不起来必须报错，不能假装下完");
 }

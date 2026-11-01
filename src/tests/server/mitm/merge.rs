@@ -91,11 +91,11 @@ fn split_keep_is_rate_proportional() {
 }
 
 fn seg(data: &'static [u8]) -> BoxBody {
-    BoxBody::new(http_body_util::StreamBody::new(
-        futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(
-            Bytes::from_static(data),
-        ))]),
-    ))
+    BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+        vec![Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(
+            data,
+        )))],
+    )))
 }
 
 /// 供 prefix 字节后装死（真停滞，不是 EOF）。
@@ -234,10 +234,7 @@ fn segments_are_read_concurrently() {
         "队首卡着的时候，后面那段必须已经被读完（一帧 + EOF），实际只推了 {} 次",
         tail_polls.load(Ordering::SeqCst)
     );
-    assert!(
-        stuck_polls.load(Ordering::SeqCst) >= 1,
-        "队首也必须被推过"
-    );
+    assert!(stuck_polls.load(Ordering::SeqCst) >= 1, "队首也必须被推过");
 }
 
 /// 段边界吻合时直接接下一段，不登记缺口。
@@ -270,10 +267,7 @@ fn cut_shrinks_boundary_and_hands_off_tail() {
     m.feed(40, 100, now, seg(&[b'C'; 60]));
     assert!(drain(&mut m, &mut out));
     assert_eq!(out.len(), 100);
-    assert!(
-        out[40..].iter().all(|&b| b == b'C'),
-        "尾部必须来自接手的流"
-    );
+    assert!(out[40..].iter().all(|&b| b == b'C'), "尾部必须来自接手的流");
 }
 
 /// 停滞只收自己没收到的那截，缓冲里的字节一个都不丢。
@@ -297,29 +291,59 @@ fn reap_keeps_received_bytes() {
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 没闲连接不许切：切了只是给自己多开一条流，服务器可能直接惩罚。
+/// 没有闲连接也能抢：新开一条流要付的建连成本，已经折进收益判据。
 #[test]
-fn plan_cut_waits_for_idle_connection() {
+fn plan_cut_pays_setup_without_idle_connection() {
     let now = Instant::now();
     let slow = 4 * MIN_PIECE;
     let mut m = MergeBody::new(
         vec![
             (0, slow, now - Duration::from_secs(2), stalled(b"")),
-            (slow, 8 * MIN_PIECE, now - Duration::from_secs(2), stalled(b"")),
+            (
+                slow,
+                8 * MIN_PIECE,
+                now - Duration::from_secs(2),
+                stalled(b""),
+            ),
         ],
         8 * MIN_PIECE,
     );
-    // 手工造两条速率样本：一条慢、一条快（并当作刚轮询过）。
+    // 手工造两条速率样本：一条慢（5KB/s）、一条快（256KB/s）。
     for (k, got) in [(0u64, 10_000u64), (slow, MIN_PIECE)] {
         let s = m.segs.get_mut(&k).unwrap();
         s.got = got;
         s.last_poll = now;
     }
-    assert!(m.plan_cut(now).is_none(), "idle_credit=0 不该切");
-    m.idle_credit = 1;
-    let cut = m.plan_cut(now).expect("有闲连接 + 慢段 → 该切");
+    let cut = m
+        .plan_cut(now)
+        .expect("收益远大于建连成本，credit=0 也该切");
     assert_eq!(cut.1, slow, "尾巴应到段尾为止");
     assert!(cut.0 > 10_000 && cut.0 < slow, "切点 {cut:?}");
+}
+
+/// 两家一样快：谁都不该被抢——抢过来还得付建连，纯亏。
+#[test]
+fn plan_cut_spares_when_no_faster_peer() {
+    let now = Instant::now();
+    let half = 4 * MIN_PIECE;
+    let mut m = MergeBody::new(
+        vec![
+            (0, half, now - Duration::from_secs(2), stalled(b"")),
+            (
+                half,
+                8 * MIN_PIECE,
+                now - Duration::from_secs(2),
+                stalled(b""),
+            ),
+        ],
+        8 * MIN_PIECE,
+    );
+    for k in [0u64, half] {
+        let s = m.segs.get_mut(&k).unwrap();
+        s.got = MIN_PIECE;
+        s.last_poll = now;
+    }
+    assert!(m.plan_cut(now).is_none(), "同样快，没有抢的收益");
 }
 
 /// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。

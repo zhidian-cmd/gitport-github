@@ -113,6 +113,8 @@ struct Seg {
     done: bool,
     /// 结束原因（仅 done 时有意义）。
     err: Option<std::io::Error>,
+    /// 收尾时冻结的均速：断了之后 begin 还在走，现算会一路衰减成假慢。
+    frozen_rate: Option<f64>,
 }
 
 impl Seg {
@@ -130,6 +132,7 @@ impl Seg {
             last_cut: None,
             done: false,
             err: None,
+            frozen_rate: None,
         }
     }
 
@@ -138,8 +141,18 @@ impl Seg {
         self.start + self.got
     }
 
-    /// 起跑至今的均速。样本不足时按 0 处理，不当成慢。
+    /// 收尾时把均速定格：之后 begin 继续走，现算只会越来越"慢"。
+    fn freeze(&mut self, now: Instant) {
+        if self.frozen_rate.is_none() {
+            self.frozen_rate = Some(self.rate(now));
+        }
+    }
+
+    /// 起跑至今的均速。样本不足时按 0 处理，不当成慢；收尾后返回冻结值。
     fn rate(&self, now: Instant) -> f64 {
+        if let Some(r) = self.frozen_rate {
+            return r;
+        }
         let el = now.saturating_duration_since(self.begin);
         if el < RATE_WARMUP {
             return 0.0;
@@ -227,7 +240,7 @@ impl MergeBody {
         self.segs.insert(start, Seg::new(start, end, at, body));
     }
 
-    fn queue_fill(&mut self, from: u64, to: u64) {
+    pub(super) fn queue_fill(&mut self, from: u64, to: u64) {
         if to <= from || self.fill.iter().any(|&(f, t)| f == from && t == to) {
             return;
         }
@@ -263,11 +276,13 @@ impl MergeBody {
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
                     progressed = true;
+                    seg.freeze(now);
                     seg.done = true;
                     seg.err = Some(e);
                 }
                 std::task::Poll::Ready(None) => {
                     progressed = true;
+                    seg.freeze(now); // 定格这家的实测速度，供别人当"最快"基准
                     seg.done = true;
                     freed += 1; // 连接空出来了，可以接活
                 }
@@ -301,6 +316,7 @@ impl MergeBody {
             let old_end = seg.end;
             seg.end = pos;
             seg.body = protocol::empty_body();
+            seg.freeze(now);
             seg.done = true;
             seg.err = Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -314,34 +330,32 @@ impl MergeBody {
         any
     }
 
-    /// 让位：把预计最晚完成的段切掉尾巴，交给闲下来的连接。
+    /// 让位：把预计最晚完成的段切掉尾巴，交给最快的镜像。
     /// 判据是「抢过来能提前多少」——剩余 ÷ 我的速度 对 剩余 ÷ 最快速度 + 建连。
+    /// 没有空闲连接也可以抢：新开一条流的代价就是那次建连，已折进判据里。
     /// 返回被切出去的区间。
     pub(super) fn plan_cut(&mut self, now: Instant) -> Option<(u64, u64)> {
-        if self.idle_credit == 0 || !self.fill.is_empty() {
+        if !self.fill.is_empty() {
             return None;
         }
+        // 有闲连接 = 复用，不花建连；没有 = 新开一条，收益要盖过建连才算划算。
+        let setup = if self.idle_credit > 0 {
+            0.0
+        } else {
+            SPLIT_SETUP_SECS
+        };
+        // 基准取「链内最快实测」：已收尾的段用冻结值，仍在跑的用现算。
         let mut best_rate: f64 = 0.0;
-        let mut best_etc = f64::INFINITY;
         for s in self.segs.values() {
-            // 没在看着的（我们在忙队首）和缓冲顶格的（我们自己不读）不算慢。
-            if now.saturating_duration_since(s.last_poll) > POLL_GAP
-                || s.buffered >= SEG_BUFFER_MAX
-            {
-                continue;
+            // 没在看着的（我们在忙队首）和缓冲顶格的（我们自己不读）不算慢——
+            // 但已收尾的段没有轮询了，它的冻结值就是最可信的证据。
+            let watched = now.saturating_duration_since(s.last_poll) <= POLL_GAP
+                && s.buffered < SEG_BUFFER_MAX;
+            if s.done || watched {
+                best_rate = best_rate.max(s.rate(now));
             }
-            let r = s.rate(now);
-            if r <= 0.0 {
-                continue;
-            }
-            best_rate = best_rate.max(r);
-            let pos = s.pos();
-            if s.done || pos >= s.end {
-                continue;
-            }
-            best_etc = best_etc.min((s.end - pos) as f64 / r);
         }
-        if best_rate <= 0.0 || !best_etc.is_finite() {
+        if best_rate <= 0.0 {
             return None;
         }
         // 受害者：预计完成时间最大的那段。
@@ -350,8 +364,7 @@ impl MergeBody {
             if s.done || s.last_cut.is_some_and(|t| now - t < CUT_COOLDOWN) {
                 continue;
             }
-            if now.saturating_duration_since(s.last_poll) > POLL_GAP
-                || s.buffered >= SEG_BUFFER_MAX
+            if now.saturating_duration_since(s.last_poll) > POLL_GAP || s.buffered >= SEG_BUFFER_MAX
             {
                 continue;
             }
@@ -368,7 +381,9 @@ impl MergeBody {
                 continue;
             }
             let etc = remaining as f64 / r;
-            if etc <= best_etc + SPLIT_SETUP_SECS {
+            // 抢过来要多久：按链内最快速度跑完，再加可能的建连成本。
+            let steal = remaining as f64 / best_rate + setup;
+            if etc <= steal {
                 continue; // 抢过来也快不了多少
             }
             if victim.is_none_or(|(_, _, _, v)| etc > v) {
