@@ -26,12 +26,23 @@ const WARMUP_MS: u64 = 100;
 /// 那测的是首包反应；500ms 窗口慢家也有 150KB 样本，快家有 3MB，排序不会错。
 const MEASURE_MS: u64 = 500;
 
+/// 运行期窗口：有流在跑时，每这么久按「本镜像全流合计字节 ÷ 实际耗时」更新一次分数。
+/// 接的活越多分数越贴近真实总吞吐，ECT 才会跟着涨——否则快的那家被压到几百 KB/s，
+/// 分数还停在单流峰值，补发会一直往它身上堆。
+const RATE_WINDOW_MS: u64 = 500;
+
 /// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败与采样时刻、清场纪元。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
     pub(super) in_flight_streams: AtomicU64,
+    /// 这家的吞吐：有流在跑时按窗口跟着实测走，没有流就停在最后一次。
     pub(super) speed_ewma: AtomicU64,
+    /// 大文件交付字节的镜像级累计（所有流合并），窗口速率的分子。
+    bytes_total: AtomicU64,
+    /// 窗口基线：(字节, 时刻)。`win_base_ms == 0` = 当前没有流在跑，下一帧重新起算。
+    win_base_bytes: AtomicU64,
+    win_base_ms: AtomicU64,
     pub(super) last_fail_ms: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
     pub(super) cull_epoch: AtomicU64,
@@ -62,6 +73,47 @@ pub(super) fn mirror_load_for(mirror: &str) -> Arc<MirrorLoad> {
 /// 直连候选的记账键(mod.rs 组装 DirectLeg 前后共用)。
 pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
+}
+
+/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际耗时」更新分数。
+/// 一个窗口只让一条流结算（CAS 抢占），重复调用直接返回。
+/// 没有帧就不会走到这里——待机镜像的分数自然停在最后一次，不需要额外冻结逻辑。
+fn settle_window(load: &MirrorLoad) {
+    let now = now_ms();
+    let base = load.win_base_ms.load(Ordering::Relaxed);
+    if base == 0 {
+        // 待机转忙：从第一帧起算，拨号和待机时长都不进分母。
+        if load
+            .win_base_ms
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            load.win_base_bytes
+                .store(load.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        return;
+    }
+    let dt = now.saturating_sub(base);
+    if dt < RATE_WINDOW_MS {
+        return;
+    }
+    if load
+        .win_base_ms
+        .compare_exchange(base, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // 这一窗刚被别的流结算过
+    }
+    let total = load.bytes_total.load(Ordering::Relaxed);
+    let prev = load.win_base_bytes.load(Ordering::Relaxed);
+    load.win_base_bytes.store(total, Ordering::Relaxed);
+    let bytes = total.saturating_sub(prev);
+    if bytes == 0 {
+        return; // 这一窗没数据：保留上次分数，不写成 0
+    }
+    load.speed_ewma
+        .store((bytes.saturating_mul(1000) / dt.max(1)).max(1), Ordering::Relaxed);
+    load.last_sample_ms.store(now, Ordering::Relaxed);
 }
 
 /// 按 head_at 起算的全片均速落分；返回分数供评估缓存记账。
@@ -212,7 +264,10 @@ impl LoadGuard {
         if !self.big {
             return;
         }
-        // 只有探测流写分：普通流只记账，不覆盖这家的成绩。
+        // 镜像级累计：ECT 的分母是这家的总吞吐，不是某一条流自己的均速。
+        self.load.bytes_total.fetch_add(n, Ordering::Relaxed);
+        settle_window(&self.load);
+        // 探测流只负责冷启动的初值；之后的分数由窗口在运行中持续更新。
         if !self.is_probe || self.measured {
             return;
         }
@@ -263,9 +318,10 @@ impl Drop for LoadGuard {
             self.load.in_flight_bytes.fetch_sub(residual, Ordering::Relaxed);
         }
         // 流数随流终结归位(正常读完/客户端断开/清场断流全走这里)。
-        self.load
-            .in_flight_streams
-            .fetch_sub(1, Ordering::Relaxed);
+        // 最后一条流关闭窗口：待机期间不累计时间，下个忙期从第一帧重新起算。
+        if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.load.win_base_ms.store(0, Ordering::Relaxed);
+        }
     }
 }
 

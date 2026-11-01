@@ -289,6 +289,69 @@ fn stall_still_scores_after_window() {
     ld.speed_ewma.store(0, Ordering::Relaxed);
 }
 
+/// 运行期窗口：有流在跑就跟着实测走（同一镜像的多条流合并结算），停流后停在最后一次。
+#[test]
+fn live_window_tracks_busy_mirror_and_freezes_when_idle() {
+    let ld = mirror_load("live-window.test");
+    ld.speed_ewma.store(0, Ordering::Relaxed);
+    ld.bytes_total.store(0, Ordering::Relaxed);
+    ld.win_base_bytes.store(0, Ordering::Relaxed);
+    ld.win_base_ms.store(0, Ordering::Relaxed);
+    ld.in_flight_streams.store(0, Ordering::Relaxed);
+
+    let mut a = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
+    let mut b = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
+    a.on_frame(512 * 1024); // 忙期第一帧只建基线
+    assert_eq!(
+        ld.speed_ewma.load(Ordering::Relaxed),
+        0,
+        "建基线那一帧不写分"
+    );
+
+    std::thread::sleep(Duration::from_millis(520));
+    a.on_frame(1024 * 1024); // 第一窗：1MB / 520ms ≈ 2MB/s
+    let first = ld.speed_ewma.load(Ordering::Relaxed);
+    assert!(
+        (1536..2560).contains(&(first / 1024)),
+        "第一窗应按实测写分(≈2MB/s): {first}B/s"
+    );
+
+    // 同一窗里两条流各自出字节：结算必须合并成这家的总吞吐，不能各算各的。
+    a.on_frame(512 * 1024);
+    b.on_frame(512 * 1024);
+    std::thread::sleep(Duration::from_millis(520));
+    b.on_frame(1024 * 1024); // 本窗合计 2MB / 520ms ≈ 3.9MB/s
+    let agg = ld.speed_ewma.load(Ordering::Relaxed);
+    assert!(
+        agg > first,
+        "两条流的字节要合并结算, 分数应随负载上升: {first} -> {agg}"
+    );
+
+    drop(a);
+    drop(b);
+    let frozen = ld.speed_ewma.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        ld.speed_ewma.load(Ordering::Relaxed),
+        frozen,
+        "没有流在跑就停在最后一次, 不得改分"
+    );
+
+    // 再次转忙：第一帧只重建基线，待机那 600ms 不能算进分母拉低分数。
+    let mut c = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
+    c.on_frame(1024);
+    assert_eq!(
+        ld.speed_ewma.load(Ordering::Relaxed),
+        frozen,
+        "忙期第一帧不得改分"
+    );
+    drop(c);
+
+    ld.speed_ewma.store(0, Ordering::Relaxed);
+    ld.bytes_total.store(0, Ordering::Relaxed);
+    ld.win_base_ms.store(0, Ordering::Relaxed);
+}
+
 
 /// 探测轮：全员未交卷时一片一家(前 N 次领取两两不同)；交卷即退出探测态。
 #[test]
