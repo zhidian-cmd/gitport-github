@@ -18,8 +18,13 @@ const MIRROR_CHAIN_CAP: usize = 5;
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 探测交分：距响应头满 100ms 才落分，1-byte 探针活不到那么久，打不出幽灵样本。
+/// 评估缓存的最低存活门槛：流活满这么久才值得记一条样本。
 const SAMPLE_TIME_FLOOR_MS: u64 = 100;
+/// 预热：响应头到达后先跑这么久，让慢启动过去，这段不计入速度。
+const WARMUP_MS: u64 = 100;
+/// 测量窗口：预热结束后取这么长的吞吐当分数。100ms 分不出 6MB/s 和 300KB/s——
+/// 那测的是首包反应；500ms 窗口慢家也有 150KB 样本，快家有 3MB，排序不会错。
+const MEASURE_MS: u64 = 500;
 
 /// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败与采样时刻、清场纪元。
 #[derive(Default)]
@@ -150,6 +155,10 @@ pub(super) struct LoadGuard {
     pub(super) is_probe: bool,
     /// 切片段：断的是代理自己发的请求，断了自有人补，必须判掐(不受"只掐探测流"限制)。
     pub(super) force_cull: bool,
+    /// 测量窗口起点：(时刻, 起点字节)。满 WARMUP_MS 时记一次。
+    measure_from: Option<(Instant, u64)>,
+    /// 已交卷：分数只写一次，之后冻结。
+    measured: bool,
 }
 
 impl LoadGuard {
@@ -172,6 +181,8 @@ impl LoadGuard {
             head_at: Instant::now(),
             is_probe,
             force_cull: false,
+            measure_from: None,
+            measured: false,
         }
     }
 
@@ -193,11 +204,28 @@ impl LoadGuard {
         if !self.big {
             return;
         }
-        let since_bytes = self.raw_delivered - self.head_bytes;
-        let since_us = self.head_at.elapsed().as_micros() as u64;
-        if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
-            store_probe_score(&self.load, since_bytes, since_us);
+        // 只有探测流写分：普通流只记账，不覆盖这家的成绩。
+        if !self.is_probe || self.measured {
+            return;
         }
+        // 预热：先跑满 WARMUP_MS，这段是慢启动，不计入速度。
+        let Some((t0, b0)) = self.measure_from else {
+            if self.head_at.elapsed() >= Duration::from_millis(WARMUP_MS) {
+                self.measure_from = Some((Instant::now(), self.raw_delivered));
+            }
+            return;
+        };
+        // 窗口满才交卷：取这 MEASURE_MS 内的吞吐，不看首包反应。
+        if t0.elapsed() < Duration::from_millis(MEASURE_MS) {
+            return;
+        }
+        let bytes = self.raw_delivered.saturating_sub(b0);
+        if bytes == 0 {
+            self.measured = true; // 窗口内一个字节都没有：不记分，等下次
+            return;
+        }
+        store_probe_score(&self.load, bytes, MEASURE_MS * 1000);
+        self.measured = true;
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -213,7 +241,7 @@ impl Drop for LoadGuard {
             return; // 小文件流: 零充值零归还, 与大文件机器零接触。
         }
         // 探测片终值：全片均速定稿，被清场提前断流的也在此记分；活不满 100ms 的不记。
-        if self.is_probe {
+        if self.is_probe && !self.measured {
             let since_bytes = self.raw_delivered - self.head_bytes;
             let since_us = self.head_at.elapsed().as_micros() as u64;
             if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {

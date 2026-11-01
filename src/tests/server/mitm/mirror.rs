@@ -246,37 +246,45 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     }
 }
 
-/// 探测流交卷: 全片均速从响应头起算(head_at), 建连/等待不进分母。
+/// 分数只取预热之后的窗口：慢启动那段字节不进分母。
 #[test]
-fn probe_scores_from_response_head() {
+fn probe_scores_from_measure_window() {
     let ld = mirror_load("probe-score.test");
     ld.speed_ewma.store(0, Ordering::Relaxed);
-    let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024, true); // 无分 → 探测流
+    let mut g = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true); // 无分 → 探测流
     assert!(g.is_probe, "无分镜像派出的流必须是探测流");
     std::thread::sleep(Duration::from_millis(120)); // 模拟建连+等待
-    g.restart_mark(); // 头到达, 测速时钟起算
-    std::thread::sleep(Duration::from_millis(150)); // 体流 150ms
-    g.on_frame(1024 * 1024); // 1MB/150ms ≈ 6.8MB/s; 含建连等待 ≈ 1MB/270ms ≈ 3.8MB/s
+    g.restart_mark(); // 头到达
+    // 预热期：慢启动只下 512KB，这段不该进分数
+    std::thread::sleep(Duration::from_millis(110));
+    g.on_frame(512 * 1024); // 满预热 → 记窗口起点
+    // 窗口期：500ms 下 5MB
+    std::thread::sleep(Duration::from_millis(520));
+    g.on_frame(5 * 1024 * 1024);
     let s = ld.speed_ewma.load(Ordering::Relaxed);
+    let expect = 5 * 1024 * 1024 * 1000 / 500; // 5MB / 500ms = 10MB/s
+    let diff = (s as i64 - expect as i64).unsigned_abs();
     assert!(
-        s > 5 * 1024 * 1024,
-        "全片均速不得包含建连/等待耗时: {s}B/s"
+        diff < expect / 10,
+        "分数应取窗口内吞吐(≈10MB/s), 不含预热期: {s}B/s"
     );
     ld.speed_ewma.store(0, Ordering::Relaxed);
 }
 
-/// 严格时间交分：距头满 100ms 即落分, 字节数不限——停滞 100ms 内现形。
+/// 窗口内几乎没数据也要交卷：停滞的家不能永远没分。
 #[test]
-fn time_floor_fires_sample_on_stall() {
+fn stall_still_scores_after_window() {
     let ld = mirror_load("stall-clock.test");
     ld.speed_ewma.store(0, Ordering::Relaxed);
     let mut g = LoadGuard::charge(ld.clone(), 4 * 1024 * 1024, true);
     std::thread::sleep(Duration::from_millis(120));
-    g.on_frame(4 * 1024); // 4KB 也交: 只看时间不看字节
+    g.on_frame(1024); // 满预热 → 记窗口起点
+    std::thread::sleep(Duration::from_millis(520));
+    g.on_frame(4 * 1024); // 窗口内只有 4KB
     let s = ld.speed_ewma.load(Ordering::Relaxed);
     assert!(
         s > 0 && s < 200 * 1024,
-        "时间地板应触发停滞读数(4KB/120ms ≈ 34KB/s): {s}B/s"
+        "停滞读数应很低(4KB/500ms ≈ 8KB/s): {s}B/s"
     );
     ld.speed_ewma.store(0, Ordering::Relaxed);
 }
@@ -650,6 +658,9 @@ async fn cull_fires_for_strictly_slower_probe() {
         ))]),
     ));
     let guard = LoadGuard::charge(me.clone(), 64 * 1024, true); // 无分 → 探测流
+    // 分数由窗口测量写；这里直接摆一个慢分，模拟窗口刚交卷。
+    me.speed_ewma.store(546 * 1024, Ordering::Relaxed);
+    me.last_sample_ms.store(now_ms(), Ordering::Relaxed);
     let mut wrapped = cull_watched_body(
         body,
         guard,
@@ -659,8 +670,7 @@ async fn cull_fires_for_strictly_slower_probe() {
         "cull-me.test".into(),
         Arc::new(|_: &str| {}),
     );
-    tokio::time::sleep(Duration::from_millis(120)).await; // 满交分地板
-    let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 帧 → 交分 ~546KB/s → 触发清场
+    let _ = http_body_util::BodyExt::frame(&mut wrapped).await; // 一帧即判
     assert_ne!(
         me.cull_epoch.load(Ordering::Relaxed),
         0,
