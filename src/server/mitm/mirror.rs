@@ -159,6 +159,8 @@ pub(super) struct LoadGuard {
     measure_from: Option<(Instant, u64)>,
     /// 已交卷：分数只写一次，之后冻结。
     measured: bool,
+    /// 切片段传输起点（收到 206 的时刻，不含建连）：段结束时据此打实测吞吐。
+    seg_start: Option<Instant>,
 }
 
 impl LoadGuard {
@@ -183,6 +185,7 @@ impl LoadGuard {
             force_cull: false,
             measure_from: None,
             measured: false,
+            seg_start: None,
         }
     }
 
@@ -192,6 +195,11 @@ impl LoadGuard {
         self
     }
 
+    /// 切片段：记下传输起点（响应头到达的时刻），段结束据此打吞吐。
+    pub(super) fn segment_from(mut self, t: Instant) -> Self {
+        self.seg_start = Some(t);
+        self
+    }
 
     /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；满 100ms 即按全片均速落分。
     pub(super) fn on_frame(&mut self, n: u64) {
@@ -417,6 +425,24 @@ struct CullState {
     log: LogFn,
 }
 
+/// 段收尾一行：多少字节 / 多少毫秒 / 合多少 MB/s。
+/// 日志此前只有“谁胜出”没有“跑多快”，判不出直连是真快还是只是抢到了位置。
+fn log_seg_end(st: &mut CullState, note: &str) {
+    let Some(t0) = st.guard.seg_start.take() else {
+        return;
+    };
+    // 建连耗时 = 打点时刻 − charge 时刻（charge 在发请求之前，段路径不重置表）。
+    let dial = t0.saturating_duration_since(st.guard.head_at).as_millis();
+    let ms = t0.elapsed().as_millis().max(1);
+    let mb = st.guard.raw_delivered as f64 / 1_048_576.0;
+    (st.log)(&format!(
+        "[段] {} {} {mb:.1}MB / {ms}ms = {:.2}MB/s (建连 {dial}ms){note}",
+        st.label,
+        st.mirror,
+        mb * 1000.0 / ms as f64
+    ));
+}
+
 /// 清场监视(仅带 Range 的流)：本镜像被盖纪元即断流；探测流交分后严劣于链内最快者时盖纪元。
 fn cull_watched_body(
     body: BoxBody,
@@ -442,6 +468,7 @@ fn cull_watched_body(
     let stream = futures_util::stream::unfold(st, |mut st| async move {
         // 纪元不匹配: 本镜像已被清场(含本流上一帧触发的让位), 断流重发。
         if st.load.cull_epoch.load(Ordering::Relaxed) != st.my_epoch {
+            log_seg_end(&mut st, " (清场断流)");
             return Some((
                 Err(std::io::Error::other("镜像已清场让位, 断流交客户端重发")),
                 st,
@@ -474,8 +501,14 @@ fn cull_watched_body(
                 }
                 Some((Ok(frame), st))
             }
-            Some(Err(e)) => Some((Err(e), st)),
-            None => None,
+            Some(Err(e)) => {
+                log_seg_end(&mut st, " (上游断流)");
+                Some((Err(e), st))
+            }
+            None => {
+                log_seg_end(&mut st, "");
+                None
+            }
         }
     });
     BoxBody::new(http_body_util::StreamBody::new(stream))
@@ -900,7 +933,9 @@ async fn split_download(
                 }
             };
             match got {
-                Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => Ok((guard, resp)),
+                Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                    Ok((guard.segment_from(Instant::now()), resp))
+                }
                 Ok(resp) => Err(format!("{m} 不支持分段(回 {})", resp.status())),
                 Err(err) => Err(err),
             }
