@@ -109,6 +109,74 @@ async fn merge_pumps_and_rescues() {
     assert_eq!(m.sent(), 10);
 }
 
+/// 九段必须并发读：队首卡住时，后面的段也要被推、数据进各自缓冲。
+/// 旧实现只 poll 队首，排队的段在队列里烂掉，轮到它们时只剩一帧就断。
+#[test]
+fn segments_are_read_concurrently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Stuck(Arc<AtomicUsize>);
+    impl hyper::body::Body for Stuck {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    struct Counted {
+        left: Option<Bytes>,
+        polls: Arc<AtomicUsize>,
+    }
+    impl hyper::body::Body for Counted {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            let me = self.get_mut();
+            me.polls.fetch_add(1, Ordering::SeqCst);
+            match me.left.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(Frame::data(b)))),
+                None => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    let stuck_polls = Arc::new(AtomicUsize::new(0));
+    let tail_polls = Arc::new(AtomicUsize::new(0));
+    let mut m = MergeBody::new(vec![
+        (4, BoxBody::new(Stuck(stuck_polls.clone()))),
+        (
+            8,
+            BoxBody::new(Counted {
+                left: Some(Bytes::from_static(b"BBBB")),
+                polls: tail_polls.clone(),
+            }),
+        ),
+    ]);
+    let waker = futures_util::task::noop_waker_ref();
+    let mut cx = std::task::Context::from_waker(waker);
+    let first = hyper::body::Body::poll_frame(std::pin::Pin::new(&mut m), &mut cx);
+    assert!(first.is_pending(), "队首卡住时不可能有交付");
+    assert_eq!(m.sent(), 0, "一个字节都不该出去");
+    assert!(
+        tail_polls.load(Ordering::SeqCst) >= 2,
+        "队首卡着的时候，后面那段必须已经被读完（一帧 + EOF），实际只推了 {} 次",
+        tail_polls.load(Ordering::SeqCst)
+    );
+    assert!(
+        stuck_polls.load(Ordering::SeqCst) >= 1,
+        "队首也必须被推过"
+    );
+}
+
 /// 段边界吻合时直接接下一段，不登记缺口。
 #[tokio::test]
 async fn merge_no_gap_when_boundary_aligned() {
