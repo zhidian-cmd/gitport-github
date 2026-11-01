@@ -23,14 +23,11 @@ struct SettingsState {
     last_pac: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
-    // 自定义镜像注册表：settings.json 永久记录（删除 = 彻底消失）；
-    // 启停状态只增删 plans.json 镜像链成员，不动注册表。
+    // 自定义镜像注册表：settings.json 永久记录；启停只改镜像链成员，不动注册表。
     worker_mirrors: Mutex<Vec<WorkerMirror>>,
 }
 
-/// 一条自定义镜像：url = Worker 反代地址（拼接格式），on = 是否已启用进镜像链。
-/// trusted = 用户标记"可信"：带凭据(sig/jwt)的 URL 也放行给它——签名等效
-/// 一小时有效的提货凭证，交给第三方=用户知情授权，风险自担(文档已警示)。
+/// 一条自定义镜像：url 为反代地址，on 为是否进链，trusted 表示用户授权把签名 URL 交给它。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
@@ -95,8 +92,7 @@ fn get_auto_config_url(key: &RegKey) -> String {
         .unwrap_or_default()
 }
 
-/// 是否本程序设置的 PAC：端口无关，任何 `127.0.0.1:端口/proxy.pac` 形态都算
-/// （我们写进去的必然是这个形态，不必再逐字记住自己写过什么）。
+/// 是否本程序设置的 PAC：任何 `127.0.0.1:端口/proxy.pac` 形态都算，端口无关。
 pub fn is_our_pac(cur: &str) -> bool {
     let cur = cur.trim();
     let Some(rest) = cur
@@ -121,16 +117,13 @@ pub fn is_our_pac(cur: &str) -> bool {
     &rest[idx..] == "/proxy.pac"
 }
 
-/// 接管时的备份判定：cur 非空、不是正要写的、不是上次写的(last_pac)——
-/// 其余都算用户的配置，必须备份(同形态 ≠ 我们的，端口无关判定会误吞)。
+/// 接管时该备份的：非空、不是正要写的、也不是上次自己写的，其余都算用户配置。
 fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
     let cur = cur.trim();
     !cur.is_empty() && cur != pac.trim() && cur != last_pac.trim()
 }
 
-/// 系统里的 PAC 是不是我们自己写的那条。
-/// last_pac 非空时按确切字符串比较——别家同形态(`127.0.0.1:别的端口/proxy.pac`)
-/// 不算我们的，清场时不许动；为空(升级前的旧配置)只此一次退回形状判定。
+/// 系统里的 PAC 是不是自己写的：last_pac 非空按确切字符串比，为空（升级前）退回形状判定一次。
 fn is_our_current_pac(cur: &str, last_pac: &str) -> bool {
     let last = last_pac.trim();
     if last.is_empty() {
@@ -139,8 +132,7 @@ fn is_our_current_pac(cur: &str, last_pac: &str) -> bool {
     cur.trim() == last
 }
 
-/// 备份值本身是不是我们写过的 PAC(旧版误把自己的地址备份进来的残留)。
-/// 是则不还原——还原死 PAC 会让浏览器把 GitHub 流量发到一个没人在听的端口。
+/// 备份值是不是自己写过的残留；是则不还原，免得把死 PAC 写回系统。
 fn backup_is_ours(backup: &str, last_pac: &str) -> bool {
     let last = last_pac.trim();
     if last.is_empty() {
@@ -160,14 +152,7 @@ fn refresh_wininet() {
     }
 }
 
-/// 连接级代理配置：只写 `AutoConfigURL` 字符串是不够的。
-///
-/// 系统真正读的是连接配置里的 `PROXY_TYPE_AUTO_PROXY_URL` 标志位。这一位不置，
-/// 注册表里写了地址也不会被采用；紧接着的 SETTINGS_CHANGED 刷新还会以旧配置为准
-/// 把它抹回去——表现就是日志说"已同步"、系统里其实一无所有（2026-10-27 实证：
-/// 写完 2 秒即空，`WinHttpGetIEProxyConfigForCurrentUser` 返回全空）。
-///
-/// `flags` 取 `PROXY_TYPE_*` 的组合；`pac` 为 None 表示不带自动配置脚本。
+/// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉。
 fn apply_conn_options(flags: u32, pac: Option<&str>) -> bool {
     use windows::core::PWSTR;
     use windows::Win32::Networking::WinInet::{
@@ -217,15 +202,12 @@ pub fn ensure_system_proxy() {
     let cur = get_auto_config_url(&key);
     let pac = pac_url();
     if github_pac() {
-        // 备份判定不看 is_our_pac：它端口无关，别家 127.0.0.1:port/proxy.pac
-        // 同形态会被当"我们的"吞掉(2026-10-29 审计)。以 last_pac(上次写的)
-        // 识别自己的残留——它不用备份，其余一律备份。
+        // 备份判定不看 is_our_pac：它端口无关，别家同形态会被吞；以 last_pac 认自己的残留。
         let last = state().last_pac.lock().unwrap().clone();
         if should_backup_foreign(&cur, &pac, &last) {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
-        // 不走 `cur == pac` 的早退：字符串在、标志位没开正是要修的那种状态。
-        // 连接级写入是幂等的，重复设一遍没有副作用。
+        // 不走 cur == pac 早退：字符串在、标志位没开正是要修的状态，重复设一遍无副作用。
         if apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&pac)) {
             // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
             let _ = key.set_value("AutoConfigURL", &pac);
@@ -251,15 +233,13 @@ fn restore_or_clear(key: &RegKey) {
     let backup = state().proxy_backup.lock().unwrap().clone();
     let last = state().last_pac.lock().unwrap().clone();
     let keep_manual = manual_proxy_active(key);
-    // 只排除"我们写过的地址"(last_pac)，不再按形状排除：别家同形态的 PAC
-    // 被备份进来之后必须还原回去，按形状丢等于备份白做(2026-10-29 审计第四轮)。
+    // 只排除 last_pac（自己写过），其余备份一律还原；按形状丢等于备份白做。
     if !backup.is_empty() && !backup_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
         let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
         let _ = key.set_value("AutoConfigURL", &backup);
     } else {
-        // 没有备份：把「启用自动配置脚本」这一位关掉。
-        // 只删字符串会留下「开关还开着、地址没了」的半截状态。
+        // 没有备份就关掉「启用自动配置脚本」，只删字符串会留下半截状态。
         let flags = if keep_manual {
             PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY
         } else {
@@ -274,8 +254,7 @@ fn restore_or_clear(key: &RegKey) {
     let _ = save();
 }
 
-/// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空）。
-/// 还原时拿它决定要不要保留手动代理那条路。
+/// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空），还原时决定要不要保留。
 fn manual_proxy_active(key: &RegKey) -> bool {
     let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
     let server = key.get_value::<String, _>("ProxyServer").unwrap_or_default();
@@ -328,19 +307,12 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 }
 
 
-/// 串发游标表：`{"core/all": "1.2.3.4", ...}`。
-/// 不变量（settings.json 的契约）：
-///   1. 键位恒为 `pool::circle_keys()` 全量——core/all、api/all、edge/{content,assets,io,auth}；
-///   2. 顺序恒为表序，从上到下，不随 HashMap 抖动；
-///   3. 值 `""` = 该族未驻留（与"键缺失"等价，但写出来让人能看全 schema）。
-///
-/// 读兼容对象、`[[k,v],…]` 数组、整段缺失；写只写对象。
+/// 串发游标表：键位恒为全量族键、顺序恒为表序、空值表示该族未驻留；读兼容数组与对象，写只写对象。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
-    /// 按规范键序成表：全量键位预写空值，再以给定记号覆盖；表外键（族改名/手写残留）直接丢弃，
-    /// 键位由 `circle_keys()` 单一决定。
+    /// 按规范键序成表：全量键位预写空值再覆盖，表外键直接丢弃。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut pending: HashMap<String, String> = marks.into_iter().collect();
         let rows = crate::pool::circle_keys()
@@ -368,8 +340,7 @@ impl Default for LastIpTable {
 impl Serialize for LastIpTable {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        // 逐项按现有顺序写入（serde_json 的 serializer 按调用序落盘）；
-        // 不能借 Map 容器中转：未开 preserve_order 时它会被 BTreeMap 重排成字典序。
+        // 按现有顺序逐项写；不能借 Map 中转，未开 preserve_order 会被重排成字典序。
         let mut map = s.serialize_map(Some(self.0.len()))?;
         for (key, ip) in &self.0 {
             map.serialize_entry(key, ip)?;
@@ -393,8 +364,7 @@ impl<'de> Deserialize<'de> for LastIpTable {
     }
 }
 
-/// 单字段容错：值写坏（类型不符）只回退该字段，不连坐整份配置。
-/// settings.json 允许手改，任何一处笔误都不该让开关、窗口位置、游标一起归零。
+/// 单字段容错：值写坏只回退该字段，不连坐整份配置。
 fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -405,8 +375,7 @@ where
 }
 
 #[derive(Serialize, Deserialize, Default)]
-// 字段名(camelCase)即既有落盘格式，不可改——漏 rename 会让旧文件反序列化失败静默回默认。
-// 容器级 default：漏键只回退该键；字段级 lenient：值写坏也只回退该键。
+// 字段名(camelCase)即落盘格式，不能改；容器 default 管漏键，字段 lenient 管坏值。
 #[serde(rename_all = "camelCase", default)]
 struct SettingsFile {
     #[serde(deserialize_with = "lenient")]
@@ -467,9 +436,7 @@ fn apply(v: SettingsFile) {
     *state().worker_mirrors.lock().unwrap() = v.worker_mirrors;
 }
 
-/// settings.json 保存互斥：快照 + 写盘必须整段原子完成。
-/// WebUI 改设置与拨号路径写游标（set_last_ips）是两条并发路径，无锁时互相拿
-/// 快照+写盘全程持锁，防旧快照覆写丢更新（保存是罕见事件，临界区短）。
+/// 保存互斥：快照与写盘全程持锁，防旧快照覆写丢更新（保存罕见，临界区短）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 fn save() -> Result<(), String> {
@@ -493,10 +460,7 @@ fn save() -> Result<(), String> {
     Ok(())
 }
 
-/// 陈旧接管自愈（启动时一次）：异常退出残留的 AutoConfigURL 按备份回填或删除；端口无关。
-/// 自愈是否该动手：我们管着 PAC(开关开着)或曾接管过(有备份)才碰注册表。
-/// 开关从没开过、备份也空——AutoConfigURL 哪怕长得像我们的 PAC 也是别的
-/// 工具的，绝不触碰(曾按形态误删他人物品，2026-10-29 审计)。
+/// 自愈是否该动手：开关开着或曾接管过（有备份）才碰注册表，否则 AutoConfigURL 再像也不碰。
 fn heal_should_touch(managed: bool, backup: &str) -> bool {
     managed || !backup.trim().is_empty()
 }
@@ -511,8 +475,7 @@ fn heal_stale_proxy() {
     let cur = get_auto_config_url(&key);
     let last = state().last_pac.lock().unwrap().clone();
     if cur.is_empty() || !is_our_current_pac(&cur, &last) {
-        // 本来就干净，或系统里已是别人的 PAC：绝不触碰——留给 ensure_system_proxy
-        // 按"先备份、后接管"的正规路径处理。
+        // 本来就干净，或已是别人的 PAC：不碰，留给 ensure_system_proxy 走先备份后接管。
         return;
     }
     restore_or_clear(&key);
@@ -522,8 +485,7 @@ pub fn last_ips() -> Vec<(String, String)> {
     state().last_ip.lock().unwrap().marks().to_vec()
 }
 
-/// 故障转移时记录驻留 IP(每池/族一个游标记号),并落盘 settings.json。
-/// 游标变化是窗口级罕见事件,直接同步写;崩溃最多丢最后一跳。
+/// 记录驻留 IP 并落盘；游标变化罕见，直接同步写，崩溃最多丢最后一跳。
 pub fn set_last_ips(marks: Vec<(String, String)>) {
     let next = LastIpTable::from_marks(marks);
     {
@@ -586,17 +548,13 @@ pub fn worker_mirrors() -> Vec<WorkerMirror> {
     state().worker_mirrors.lock().unwrap().clone()
 }
 
-/// 收编保存（启动迁移用）：仅落盘注册表，不动镜像链——链中本来就有，
-/// 位置交给测速校准。顺序保持调用方给的原序（先写哪个就是哪个）。
+/// 收编保存：只落盘注册表不动镜像链，顺序按调用方给的。
 pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     *state().worker_mirrors.lock().unwrap() = list;
     let _ = save();
 }
 
-/// 整表保存自定义镜像注册表：校验（https:// 开头、无空格、去尾斜杠、去重去空）、
-/// 与旧表做差集（新增/停用/删除），交由镜像链对齐后落盘。返回启用中的地址列表。
-/// 删除条目由"新旧差集"自动从链中移除——删除即彻底消失。
-/// 前端提交前必须先 GET 合并最新（防旧页面状态覆盖收编条目）。
+/// 整表保存：规范化校验后与旧表做差集，删除即彻底消失；前端提交前必须先 GET 合并。
 pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {
@@ -626,7 +584,6 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
 }
 
 /// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。
-/// chain_fetch 凭据串判定处调用——命中则签名 URL 仍走镜像链(用户授权)。
 pub fn trusted_mirrors() -> std::collections::HashSet<String> {
     state()
         .worker_mirrors

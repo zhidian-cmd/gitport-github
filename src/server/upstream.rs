@@ -23,16 +23,13 @@ pub fn empty_body() -> BoxBody {
 pub fn full_body(b: Bytes) -> BoxBody {
     BoxBody::new(http_body_util::Full::new(b).map_err(std::io::Error::other))
 }
-/// 每 host 最多两条自管 h2 连接（不用 legacy 池：体还在转发的连接不回池）。
-/// 一条连接承载该 host 的全部并发，但服务端对单连接的并发流有上限——实测 40 并发时
-/// 两条连接能把 p50 腰斩（2170ms → 1019ms），四条不再改善。只有成功过的连接入槽。
+/// 每 host 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
 #[derive(Clone)]
 pub struct H2Upstream {
     pub ip: String,
     /// 进程内唯一：同一 IP 的两条连接也要能精确区分，否则 keepalive 会删错。
     pub id: u64,
-    /// 游标槽位:1 = 主通道(主键游标),2 = 第二通道(`~2` 游标)。
-    /// 数据到手后的置顶/垫底记账跟着连接走,保证各记各的钥匙、互不覆盖。
+    /// 游标槽位：1 主通道、2 副通道，记账跟着连接走，各记各的钥匙。
     pub slot: u8,
     send: SendRequest<Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
@@ -40,8 +37,7 @@ pub struct H2Upstream {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 一条连接 + 它最近的响应耗时（EWMA，毫秒）。同 host 两条连接质量可能差很多，
-/// 实测出现过一条 p50 1671ms、另一条 460ms，轮转等于把一半请求喂给慢的。
+/// 一条连接 + 最近响应耗时（EWMA）：同 host 两条连接可能一快一慢，轮转会把请求喂给慢的。
 struct ConnSlot {
     up: H2Upstream,
     ewma: f64,
@@ -129,16 +125,12 @@ async fn keepalive_pass() {
     }
 }
 
-/// 取一条连接：优先近况最快的那条；每 8 次放一次轮转做探索，避免把慢连接饿死
-/// 到永远发现不了它变快。
+/// 取近况最快的那条，每 8 次放一次轮转做探索。
 pub fn cached_h2(host: &str) -> Option<H2Upstream> {
     cached_h2_in(host, None)
 }
 
-/// 带槽位过滤的取连接:`want_slot = Some(1)` 时只回主通道——搜索接口专用
-/// (GitHub blackbird 反爬对同会话跨 IP 敏感,实测会话在两通道间漂移会被
-/// 降级成无结果骨架页,2026-10-27 实证)。过滤池为空 = 主通道不在,回 None
-/// 交给拨号路径按主键游标重建;非搜索请求传 None 走原有轮转/择优。
+/// 带槽位过滤取连接：搜索接口只回主通道（会话跨 IP 漂移会被降级成无结果骨架）。
 pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     let mut g = pool::lock(conn_pool());
     let h = g.get_mut(host)?;
@@ -197,8 +189,7 @@ pub fn store_h2(host: &str, up: H2Upstream) {
     h.conns.push(ConnSlot { up, ewma: 0.0, n: 0 });
 }
 
-/// 按连接 id 精确摘除（keepalive / 复用失败都走这里）。
-/// 两条同 IP 的连接靠 IP 是分不开的，删错就会把健康的摘掉、坏的留着反复被轮转。
+/// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
 pub fn drop_h2_id(host: &str, id: u64) {
     let mut g = pool::lock(conn_pool());
     let empty = match g.get_mut(host) {
@@ -228,8 +219,7 @@ pub fn drop_h2(host: &str, ip: &str) {
     }
 }
 
-/// 首条连接建好后，后台补第二条（只对高频 host，失败不影响当前请求）。
-/// skip 池中所有活连接占用的 IP;游标用副键(~2),与主通道各记各的。
+/// 首条建好后后台补第二条（只对高频 host）；skip 池中活连接占用的 IP，游标用副键。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     if !DUAL_CONN_HOSTS.contains(&host) {
         return;
@@ -270,8 +260,7 @@ pub async fn h2_from_dialed(
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
-    // h2 握手（等对端回 SETTINGS）必须限时：TCP 3s / TLS 3s / 发请求 8s 都有，
-    // 唯独这步曾裸等——对端 TLS 通了之后装死，会永久持有 per-host 拨号锁，拖死整个域名。
+    // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
     let (send, mut conn) = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
         cb.handshake(conn_io),
@@ -306,9 +295,7 @@ fn occupied_ips(host: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 单通道拨号:串发选 IP(slot 游标钥匙) → boring 握手 → h2。
-/// 白名单域名走 edge 池,但握手由 dial_one 强制真名 + 分片,条目自带的 sni 不生效,
-/// 日志按实际形态标注,别被 plans.json 里的 "baidu.com" 骗了。
+/// 单通道拨号：串发选 IP → boring 握手 → h2；白名单域名的 sni 由 dial_one 强制真名分片。
 async fn h2_dial_slot(
     pool_name: &str,
     host: &str,
@@ -343,12 +330,7 @@ async fn h2_dial_slot(
     h2_from_dialed(host, conn_io, &ip, form, slot, log).await
 }
 
-/// 双通道高频站冷启动:两个任务并行竞速建连。
-/// - 各领各的游标钥匙(主键 / ~2 副键),成功各记各的,主通道的最优记忆不再被覆盖
-/// - SERIAL 表内 in-flight 认领:对方正在试的 IP 自动跳过,两个任务不重复劳动
-/// - 先成者立即服务请求;晚成者建完直接入库上岗——拿拨号锁醒来的排队请求
-///   会在循环顶部 cached_h2 复用到它,这就是"把排队的塞进自己这里"
-/// - 两个全败 = 现有全灭语义(冷却 30s)
+/// 双通道冷启动并行竞速：各领各的游标、跳过对方正在试的 IP，先成者服务、晚成者入库。
 async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
@@ -381,12 +363,7 @@ async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upst
             None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
         }
     };
-    // 收尾移交后台:晚成者建成照常入库上岗;失败则补建一次第二通道
-    // (skip 池中占用,失败静默降级单通道)。竞速败者的空试不再逐条刷红——
-    // 真实的候选超时由串发全灭日志记录。
-    // 收尾移交后台:晚成者建成照常入库上岗;失败则走统一的补建入口
-    // (maybe_spawn_second 自带 DUAL 名单/filling/满员检查,失败静默降级单通道)。
-    // 竞速败者的空试不再逐条刷红——真实的候选超时由串发全灭日志记录。
+    // 收尾移交后台：晚成者建成入库，失败走补建入口；竞速败者的空试不逐条刷红。
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
@@ -400,9 +377,7 @@ async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upst
     Ok(won)
 }
 
-/// 上游建连统一入口:双通道高频站池空走并行竞速,其余单发。
-/// 单发也 skip 池中活连接占用的 IP——修掉旧版"主连接断掉重拨时游标已被
-/// 第二条记账、又不 skip"导致两条通道撞同一 IP 的暗坑。
+/// 建连统一入口：双通道高频站池空走竞速，其余单发（单发也跳过池中占用的 IP）。
 pub async fn dial_upstream(
     pool_name: &str,
     host: &str,
@@ -462,8 +437,7 @@ pub async fn h2_recv_response(
         BoxBody::new(http_body_util::StreamBody::new(body_stream)),
     ))
 }
-/// 流前置三步共用（h2_send 与流式直通单点）：等配额 → 剥逐跳头 → 发头帧；
-/// eos = 头帧即请求终点（无体请求 true）。
+/// 流前置三步：等配额 → 剥逐跳头 → 发头帧；eos 表示头帧即请求终点。
 pub async fn h2_open_stream(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -489,8 +463,7 @@ pub async fn h2_send(
     }
     h2_recv_response(resp_fut).await
 }
-/// 流式直通·请求体泵：按对端窗口分片发送；客户端断开时弃流不补 EOS（pack 尾带校验和）。
-/// 返回 JoinHandle 供失败路径 abort（句柄丢弃会让泵滞留不回收）。
+/// 请求体泵：按对端窗口分片发送，客户端断开时弃流不补 EOS；句柄供失败路径 abort。
 pub fn h2_spawn_pump(
     mut send: h2::SendStream<Bytes>,
     mut body: BoxBody,
@@ -599,8 +572,7 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
 }
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 客户端声明接受 gzip。**唯一判定**：上游要不要强制 gzip、缓存要不要分 `-gz`/`-id` 桶
-/// 都调它——两处各写一份时，改一边就会让"压缩体发给没声明 gzip 的客户端"复现。
+/// 客户端是否接受 gzip：强制压缩与缓存分桶的唯一判定，两处各写一份必有一边漏改。
 pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
     let Some(v) = req
         .headers()
@@ -654,8 +626,7 @@ pub fn upstream_request<B>(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
-    // github.com/api 强制 gzip（大页面裸传是"进页面慢"主因，实测 327KB→44.5KB）；
-    // 嗅探边收边解压，原始压缩帧原样转发。其余 host 放行浏览器原生压缩。
+    // github.com/api 强制 gzip（大页面裸传是进页面慢的主因），边收边解压，原始压缩帧照转。
     let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();

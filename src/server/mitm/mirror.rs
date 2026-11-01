@@ -1,7 +1,4 @@
-//! 镜像链：回落兜底 + 图片链 TTFB 校准 + 凭据防护。
-//! 请求级派发：ECT=(在途字节+新请求字节)/速度选起点，失败沿链顺延；不内切不缓冲。
-//! 清场：探测交卷后严劣于链内最快者的镜像盖纪元号, 在途断流交客户端重发;
-//! 速度分数由探测片一次性交卷冻结(全片均速), 正常流永不改写。
+//! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护；派发走 ECT，清场断流交客户端重发。
 use super::{path_of, BoxBody};
 use crate::pool::{self, LogFn};
 use crate::server::upstream;
@@ -17,14 +14,10 @@ const MIRROR_CHAIN_CAP: usize = 5;
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 探测交分：严格按时间——距响应头每满 100ms 按全片运行均速交一次卷,
-/// 此后每帧刷新。字节数不设门槛: 交分时刻确定(不随速率/并发漂移),
-/// 1-byte Range 探针活不过 100ms 自然不交卷, 亚毫秒突发打不出幽灵样本。
+/// 探测交分：距响应头满 100ms 才落分，1-byte 探针活不到那么久，打不出幽灵样本。
 const SAMPLE_TIME_FLOOR_MS: u64 = 100;
 
-/// 在途字节 / 在途流数 / 速度分(0=未交卷; 探测交卷后冻结) / 失败时刻(0=从未)
-/// / 最近采样时刻(0=从未) / 清场纪元(严劣让位时 +1, 在途流逐帧核对)。
-/// 流数用于 ECT 并列组的第二级判据：组内选在途流最少者。
+/// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败与采样时刻、清场纪元。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
@@ -62,9 +55,7 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// 探测交分：head_at 起算的全片运行平均，唯一的速度写入通道——交卷即冻结，
-/// 正常流永不覆盖。100ms 时间门槛由调用方把关: 1-byte 探针活不过 100ms
-/// 自然不交卷, 亚毫秒突发打不出幽灵样本。返回本次分数(调用方按需落评估账)。
+/// 按 head_at 起算的全片均速落分；返回分数供评估缓存记账。
 fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
     if bytes == 0 || us == 0 {
         return 0;
@@ -77,16 +68,14 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
     score
 }
 
-/// 链序按速度重排(纯函数): 有分者速度降序在前, 无分/失败窗者保持原相对
-/// 顺序缀尾。稳定排序保证同速者不跳动(幂等关键)。
+/// 按速度降序重排链；无分/失败窗者保持原相对顺序缀尾（稳定排序，幂等）。
 fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<String> {
     let mut idx: Vec<usize> = (0..chain.len()).collect();
     idx.sort_by_key(|&i| std::cmp::Reverse(speed_of(&chain[i])));
     idx.into_iter().map(|i| chain[i].clone()).collect()
 }
 
-/// 需要按速度重排的链: 只挑大文件链, 且链里确实有这个镜像。
-/// 一个镜像同挂三条大文件链, 必须全部命中——只排一条等于另两条永不更新。
+/// 取出含该镜像的全部大文件链（一个镜像同挂三条，漏一条就永不更新）。
 fn big_chains_with<'a>(
     chains: &'a HashMap<String, Vec<String>>,
     url: &str,
@@ -97,9 +86,7 @@ fn big_chains_with<'a>(
         .collect()
 }
 
-/// 重排节流: 链序只影响探测轮先派给谁、ECT 完全并列时的轮转起点、以及某家
-/// 失败后下一个试谁——正在跑的流不会被重新派发，晚一秒没有代价。
-/// 而每帧重排要复制整张链表，顺序翻动时还会 fsync：全局限一秒一次。
+/// 重排节流：链序只影响探测顺序、并列轮转和失败兜底，晚一秒无代价；每帧重排却要复制整张链表。
 const RESORT_MIN_INTERVAL_MS: u64 = 1000;
 static LAST_RESORT_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -119,9 +106,7 @@ fn resort_throttled(scored_url: &str) {
     resort_chain_by_speed(scored_url);
 }
 
-/// 探测交分后按最新速度分重排该镜像所属链并落盘 plans.json——链头恒为
-/// 实测最快: IDM 爬坡首片与非下载器场景直接命中快腿; 并发派发仍由 ECT 接管。
-/// 小文件链序归校准管, 这里一条都不碰。
+/// 按最新速度重排该镜像所属的大文件链并落盘；小文件链序归校准管，这里不碰。
 fn resort_chain_by_speed(scored_url: &str) {
     let chains = pool::mirror_chains_snapshot();
     let targets = big_chains_with(&chains, scored_url);
@@ -145,8 +130,7 @@ fn resort_chain_by_speed(scored_url: &str) {
     }
 }
 
-/// 记账守卫：派发时记在途，交付逐帧归还，Drop 清残余。
-/// 记账封顶于记账额防下溢；采样走原始字节，开放区间超记账额后采样不停。
+/// 记账守卫：派发记在途、逐帧归还、Drop 清残余；归还封顶于记账额，采样走原始字节。
 pub(super) struct LoadGuard {
     load: Arc<MirrorLoad>,
     /// 大文件机器标记: false = 小文件流, 与速度分/在途/失败窗/评估缓存零接触。
@@ -185,9 +169,7 @@ impl LoadGuard {
     }
 
 
-    /// 交付一帧：记账按记账额归还(封顶于 charged，防镜像无视 Range 回全量把
-    /// 计数打成负)；原始累计照走。分数冻结: 只有探测流写速度, 且是 head_at
-    /// 起算的全片运行平均——距头每满 100ms 落一分, 只看时间不看字节。
+    /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；满 100ms 即按全片均速落分。
     pub(super) fn on_frame(&mut self, n: u64) {
         let credit = n.min(self.charged.saturating_sub(self.delivered));
         self.delivered += credit;
@@ -205,10 +187,7 @@ impl LoadGuard {
         }
     }
 
-    /// 测速时钟重置：响应头到达时调用。建连/拨号/等待服务器开腔的全部耗时
-    /// 只存在于墙钟，不进速度样本——否则探测交分被等待稀释，且快镜像被
-    /// 稀释得更狠(等待是常数)，候选差距被压缩。
-    /// 在途记账不受影响：charge 仍在派发时发生(ECT 分子要含已派出未到货)。
+    /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
     pub(super) fn restart_mark(&mut self) {
         self.head_at = Instant::now();
         self.head_bytes = self.raw_delivered;
@@ -220,15 +199,13 @@ impl Drop for LoadGuard {
         if !self.big {
             return; // 小文件流: 零充值零归还, 与大文件机器零接触。
         }
-        // 探测片终值: 全片均速定稿(被清场提前断流的探测片也在此交卷记分)。
-        // 同一严格时间规则: 距头满 100ms 且有字节才交, 短命流不交卷。
+        // 探测片终值：全片均速定稿，被清场提前断流的也在此记分；活不满 100ms 的不记。
         if self.is_probe {
             let since_bytes = self.raw_delivered - self.head_bytes;
             let since_us = self.head_at.elapsed().as_micros() as u64;
             if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
                 let score = store_probe_score(&self.load, since_bytes, since_us);
-                // 评估缓存只吃终值(全片均速): 首帧那 100ms 的慢启动读数只用于
-                // 当次派发与链序, 不能拿去判"这家镜像值不值得留"。
+                // 评估缓存只吃终值：首帧的慢启动读数只用于当次派发，不能用来判镜像去留。
                 pool::mirror_stats::record(&self.load.url, score);
             }
         }
@@ -244,14 +221,11 @@ impl Drop for LoadGuard {
 }
 
 
-/// ECT 绝对最小者胜，无容差——速度差 30 倍的现实里 5% 容差是把片撒给慢腿的
-/// 祸根。仅当 ECT 完全相等(逐毫秒)才二级: 在途流数最少 → 仍相等才轮转。
-/// 失败窗内的镜像跳过，全军都在窗内则放开。探测态走 probe_pick，勿用此函数。
+/// ECT 绝对最小者胜，无容差；完全相等才看流数、再相等才轮转。失败窗内的跳过，全在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = pool::now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
-    // 单点实现：ECT 毫秒。探测轮保证派发前全员交卷，这里不该见到零样本；
-    // 防御性 .max(1)：未交卷且在失败窗的候选 ECT 无穷大，稳定态里垫底。
+    // ECT 取毫秒；.max(1) 是防御：零样本的候选 ECT 无穷大，稳定态里垫底。
     let ect_of = |ld: &MirrorLoad| -> u64 {
         let speed = ld.speed_ewma.load(Ordering::Relaxed).max(1);
         ld.in_flight_bytes.load(Ordering::Relaxed).saturating_add(new_bytes) * 1000 / speed
@@ -310,9 +284,7 @@ static TIE_ROTATOR: AtomicU64 = AtomicU64::new(0);
 /// 探测轮游标：并发派发下连续领取必命中不同候选(连续整数 mod n 两两不同)。
 static PROBE_CURSOR: AtomicU64 = AtomicU64::new(0);
 
-/// 探测态选家：链内有从未交卷(无速度样本)且健康的候选 → 原子游标轮转领取，
-/// 并发分片天然一片一家；无(或全在失败窗) → None，交回 ECT 稳定态。
-/// 这是 2MB/s 先验从 ECT 退役后的补位：速度一律实测，不再猜。
+/// 探测轮选家：未交卷且健康的候选按原子游标轮转领取，并发分片天然一片一家；没有则交回 ECT。
 fn probe_pick(candidates: &[String]) -> Option<usize> {
     let now = pool::now_ms();
     let unprobed: Vec<usize> = candidates
@@ -343,8 +315,7 @@ fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
         .take(limit)
         .collect()
 }
-/// cap 窗口吃掉直连位时的末位兜底：直连已在窗内不动；刚失败(失败窗内)不追加
-/// (别急着重拨)；否则追加为最后一棒——镜像 cap 之外仍有本地腿。
+/// cap 窗口没轮到直连时把它追加为最后一棒；已在列表或刚失败的不追加。
 fn append_direct_if_missed(
     order: &mut Vec<usize>,
     direct_idx: usize,
@@ -405,9 +376,7 @@ struct CullState {
     log: LogFn,
 }
 
-/// 清场监视(带 Range 的流)：逐帧核对纪元, 本镜像被清场即 Err 断流, 客户端
-/// 重发重进派发; 探测流交分后自检, 严劣于链内已交卷最大者 → 盖纪元号(本镜像
-/// 全部在途流下一帧断流)。并列最快者保留, 均摊走 ECT; 无 Range 流不经过这里。
+/// 清场监视(仅带 Range 的流)：本镜像被盖纪元即断流；探测流交分后严劣于链内最快者时盖纪元。
 fn cull_watched_body(
     body: BoxBody,
     guard: LoadGuard,
@@ -476,8 +445,7 @@ fn mirror_chain_cap(host: &str) -> Option<usize> {
     (!pool::route::is_big_file_host(host)).then_some(MIRROR_CHAIN_CAP)
 }
 
-/// 直连腿的注入接口：mod.rs 组装完整 future(拨号+记账+掐断包装已含)，
-/// mirror.rs 只管 ECT 派发与失败降权——不感知拨号细节。
+/// 直连腿的注入接口：拨号与记账由 mod.rs 组装，这里只管 ECT 派发与失败降权。
 pub(super) struct DirectLeg<'a> {
     pub fetch: std::pin::Pin<
         Box<
@@ -523,9 +491,7 @@ pub(super) async fn chain_fetch(
     if let Some(c) = cond {
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
-    // 凭据串请求：签名 URL 不落任何第三方——除非该镜像被用户标记为可信
-    // (trusted=true, 知情授权，风险自担)。可信名单非空时按名单放行，
-    // 不可信者仍剥除；全不可信则剥空仅直连。
+    // 凭据串请求：签名 URL 不落第三方，除非镜像被标记为可信；全不可信则剥空仅直连。
     let chain = if cred_locked {
         let trusted_set = crate::settings::trusted_mirrors();
         let trusted: Vec<String> = pool::mirror_chain(chain_host)
@@ -547,8 +513,7 @@ pub(super) async fn chain_fetch(
     } else {
         pool::mirror_chain(chain_host)
     };
-    // 直连同台：直连是候选池里的普通选手(键 direct/{host})，ECT 一视同仁；
-    // 零镜像时候选=仅直连，502 只在"镜像+直连全灭"时发生。
+    // 直连同台：直连以 direct/{host} 的身份参与 ECT；502 只在镜像与直连全灭时发生。
     let direct_key = format!("direct/{chain_host}");
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
@@ -560,10 +525,7 @@ pub(super) async fn chain_fetch(
         .unwrap_or(candidates.len())
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
-    // 探测态优先：链内有从未交卷的候选 → 一片一家实测(原子游标)，全员交卷
-    // 后回 ECT 纯实测竞速。2MB/s 先验自 ECT 退役，仅存于 EOS 兜底基准。
-    // 大小文件绝对解耦：探测轮与 ECT 选点只属于大文件机器; 小文件消费
-    // 校准链序, 从链头逐个试, 对速度分/失败窗/在途/评估缓存零读零写。
+    // 探测轮优先：有未交卷候选就一片一家实测，全员交卷后回 ECT；小文件不参与，只按链序从头试。
     let big = pool::route::is_big_file_host(chain_host);
     let start = if big {
         match probe_pick(&candidates) {
@@ -771,9 +733,7 @@ fn calib_fail_label(e: &str) -> &'static str {
     }
 }
 
-/// 同源判定: scheme://host[:port] 全等(忽略大小写与尾斜杠)。用前缀判会把
-/// `https://gh-proxy.org.evil.tld` 当成 `https://gh-proxy.org`——签名 URL
-/// 等同 1 小时提货凭证, 前缀一松就等于送人。
+/// 同源判定：忽略大小写与尾斜杠后全等；前缀匹配会把 gh-proxy.org.evil.tld 当成自己人。
 fn same_origin(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
         s.trim().trim_end_matches('/').to_ascii_lowercase()

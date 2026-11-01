@@ -62,8 +62,7 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
 }
 
-/// 解风控循环的单步决策（纯函数，便于测试）：
-/// 归属缺失 → 重试上限 3 次；同 IP 再现 = 全员拦截页 → 交回真实响应。
+/// 解风控单步决策（纯函数）：归属缺失最多重试 3 次；同 IP 再现 = 全员拦截页，交回真实响应。
 fn defuse_retry(ip_empty: bool, empty_retries: u8, ip_seen: bool) -> bool {
     if ip_empty {
         return empty_retries <= 3;
@@ -114,17 +113,11 @@ pub(super) async fn gh_defuse(
             continue;
         }
         pool::cursor_note(name, host, &ip, false, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
-                                               // 风控页 = 该 IP 的连接不可信(HTTP 层成功所以连接活着) —— 必须同步
-                                               // 清复用槽, 否则下一个请求缓存命中又拿到坏连接: 垫底→重拨→再命中→
-                                               // 再垫底乒乓死循环(2026-10-15 实锤: 单 IP 重试计数刷到 129, 每个请求
-                                               // 白烧一次完整往返, 搜索/进仓库全部变慢)
+                                               // 风控页说明该 IP 的连接不可信，必须同步清复用槽，否则下个请求又拿到坏连接，垫底/重拨乒乓死循环。
         upstream::drop_h2(host, &ip);
-        // 2026-10-14 起直连腿每请求新拨号(fresh), 无共享连接池可丢 ——
-        // 垫底后下一 attempt 的 serial_dial 必然跳过该 IP
+        // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。
         tried += 1;
-        // 整表轮换完一圈(同 IP 再现) = 全员拦截页: 再转只会重复, 交回 GitHub
-        // 真实拦截响应终止。垫底+拔连接必须发生在终止判定之前 —— 否则交付时
-        // 坏连接仍挂在复用缓存, 下个请求乒乓(2026-10-17 复审补充)
+        // 同 IP 再现 = 全员拦截页，再转只会重复；垫底与拔连接必须在终止判定之前，否则坏连接还挂在缓存里。
         let ip_seen = !seen.insert(ip.to_string());
         if !defuse_retry(false, empty_ip_retries, ip_seen) {
             (log)(&format!(

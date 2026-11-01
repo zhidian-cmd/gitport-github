@@ -1,7 +1,4 @@
-//! 列表页缓存：只缓存 github.com 的列表页（搜索/issue/PR/commit/通知…），其余直通上游。
-//! 存储：pages/<hash> = [4B 头长][header JSON][body]，tmp+rename 原子落盘，管家线程串行做磁盘活。
-//! 寿命按会话算：连续导航一直有效，空闲超阈值整盘清空；Ctrl+F5 与写操作即时失效。
-//! 红线：不做后台 SWR（旧 cookie 重用会被判凭据泄露）；闸门页/未登录页/跨账号不缓存。
+//! 列表页缓存：只缓存 github.com 列表页与跟班 XHR，按会话存活；存 pages/<hash>，不做后台 SWR，闸门页/未登录页/跨账号不缓存。
 use super::BoxBody;
 use crate::pool::{now_ms, LogFn};
 use crate::server::upstream::{self, Incoming};
@@ -42,8 +39,7 @@ fn is_list_path(path: &str) -> bool {
     !numeric && segs.len() >= 2 && LIST_SEGMENTS.contains(&segs[segs.len() - 2])
 }
 
-/// 跟班 XHR 前缀：一次搜索页要拖 12 个（10 个 count + 黑鸟计数 + 缓存预热），
-/// 每个 250-600ms，是"退回搜索列表慢"的主因。它们不是文档导航，但同样按会话缓存。
+/// 跟班 XHR 前缀：一次搜索页要拖十几个，是“退回搜索列表慢”的主因，同样按会话缓存。
 const XHR_PREFIXES: &[&str] = &[
     "/search/count",
     "/search/blackbird_count",
@@ -68,16 +64,12 @@ fn is_home_path(path: &str) -> bool {
     path == "/" || path.is_empty()
 }
 
-/// 搜索列表页：GitHub 翻页是 React 软导航（sec-fetch-dest: empty）而非文档
-/// 导航——按导航形态收会导致翻页页永远不入缓存（2026-10-27 对照实验：同 URL
-/// document 入库、empty 被拒），来回翻页、从仓库退回全靠现拉转圈。
-/// 存取两侧同步放行；会话清盘仍只认文档导航（软导航不续命，与 XHR 同待遇）。
+/// 搜索列表页：翻页走 React 软导航，必须按路径认而不是按导航形态认，否则翻页永远不入缓存。
 fn is_search_page(path: &str) -> bool {
     path == "/search"
 }
 
-/// 条目落点：键尾 `-k` = 跨会话长寿命（keep/），其余 = 会话存储（pages/）。
-/// 会话清盘只清 pages/，所以骨架能在多次会话之间一直活着。
+/// 条目落点：键尾 `-k` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     if key.ends_with("-k") {
         dir.join("keep")
@@ -89,8 +81,7 @@ fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
 /// 长寿命条目的保质期：GitHub 改版后旧骨架就是坏的，超期当 miss 重取。
 const KEEP_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// 正文类型闸门：列表页只收 HTML；跟班 XHR 放宽到 JSON/纯文本
-/// （`/search/count` 回的是 HTML 片段，黑鸟计数回 JSON）。
+/// 正文类型闸门：列表页只收 HTML，跟班 XHR 放宽到 JSON/纯文本。
 fn body_type_allowed(content_type: Option<&str>, xhr: bool) -> bool {
     let Some(ct) = content_type else { return false };
     let ct = ct.trim();
@@ -116,8 +107,7 @@ fn note_nav() -> bool {
     let now = now_ms();
     let prev = LAST_NAV_MS.swap(now, Ordering::Relaxed);
     if prev == 0 {
-        // 进程首启：会话号取启动时刻而非从 1 递增——否则重启后又拿回 -s2，
-        // 与上一轮留在盘上的条目撞号，并发标签可能命中旧会话的页面。
+        // 会话号取启动时刻：从 1 递增会在重启后与盘上旧条目撞号。
         SESSION_EPOCH.store(now.max(1), Ordering::Relaxed);
         return true;
     }
@@ -134,8 +124,7 @@ fn set_last_nav(ms: u64) {
     LAST_NAV_MS.store(ms, Ordering::Relaxed);
 }
 
-/// 任务自带目录：发送时取一次（测试里每个测试一个目录），管家处理时不再读全局——
-/// 否则后台消息会落到当时碰巧在用的目录上，把别的测试正在删的目录写炸。
+/// 任务自带目录：发送时取一次，避免后台消息落到测试换过的全局目录上。
 enum CacheMsg {
     Save {
         key: String,
@@ -168,9 +157,7 @@ fn is_xhr_nav(req: &hyper::Request<Incoming>, host: &str) -> bool {
     host == CACHE_HOST && req.method() == Method::GET && is_xhr_path(req.uri().path())
 }
 
-/// 值不值得缓存：github.com 的列表页（文档导航）+ 跟班 XHR。
-/// Ctrl+F5（`Cache-Control: no-cache`）才直通；`max-age=0` 不拦——浏览器后退/前进
-/// 也带这个头，当成强制刷新会让缓存永远命不中（实测确认过）。
+/// 准入：github.com 的列表页（文档导航）+ 跟班 XHR；只有 Ctrl+F5 才直通，max-age=0 不算。
 fn cache_eligible(req: &hyper::Request<Incoming>, host: &str) -> bool {
     cache_eligible_rules(
         host,
@@ -212,8 +199,7 @@ pub(super) fn cache_take(
     if !is_doc_nav(req) && !xhr && !search_page {
         return None;
     }
-    // 新会话：先清上一会话的盘（交给管家，不阻塞本页），这一页必回源。
-    // 只有文档导航驱动会话——XHR/轮询不算"你还在逛"。
+    // 新会话：先让管家清上一会话的盘，这一页必回源；只有文档导航驱动会话。
     if is_doc_nav(req) && note_nav() {
         if !worker_send(CacheMsg::Purge, log) {
             LAST_NAV_MS.store(0, Ordering::Relaxed); // 清盘没投递出去：下次导航重试
@@ -272,8 +258,7 @@ pub(super) async fn cache_put(
     host: &str,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
-    // 拒存日志只认主站 /search：全量打会淹没日志（POST/非列表页每请求都走这里）。
-    // 静默拒存曾让"翻页页为什么进不了缓存"排查了一整晚（2026-10-28）。
+    // 拒存日志只认主站 /search，全量打会淹没日志。
     let search_dbg = host == CACHE_HOST
         && req.method() == Method::GET
         && req.uri().path().starts_with("/search");
@@ -288,9 +273,7 @@ pub(super) async fn cache_put(
         }
         return resp;
     }
-    // 只缓存 200：拦截页回放与 304 空体回放都踩过。
-    // 304 不落日志：那是浏览器条件请求命中了 GitHub 校验器、拿自己本地那份渲染，
-    // 每页十几个计数 XHR 全走这条路——留痕只会刷屏（2026-10-28 实测 21 条拒存 20 条是它）。
+    // 只缓存 200；304 不落日志——每页十几个计数 XHR 都走这条路，留痕只会刷屏。
     if resp.status() != StatusCode::OK {
         if search_dbg && resp.status() != StatusCode::NOT_MODIFIED {
             (log)(&format!(
@@ -314,8 +297,7 @@ pub(super) async fn cache_put(
     let xhr = is_xhr_path(req.uri().path());
     let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
     let search_page = is_search_page(req.uri().path());
-    // 分钥匙以实际 Content-Type 为准：GitHub 按请求 Accept 回 JSON 或 HTML，
-    // 两种正文同 URL 不同物（存侧不区分会导致 HTML 导航拿到 JSON）。
+    // 分钥匙以实际 Content-Type 为准：同 URL 可能回 JSON 也可能回 HTML。
     let ct_lower = resp
         .headers()
         .get("content-type")
@@ -486,8 +468,7 @@ fn account_name(cookies: Option<&str>) -> Option<&str> {
     })
 }
 
-/// 身份标签：未登录 "-cloggedout"，登录 "-c<账号>"（同机双账号不能串页；
-/// 取不到账号时哈希 user_session 值，不能哈希整条 Cookie）。
+/// 身份标签：未登录 -cloggedout，登录 -c<账号>；取不到账号就哈希 session 值，不能哈希整条 Cookie。
 fn session_fingerprint(cookies: Option<&str>) -> String {
     let Some(sess) = session_value(cookies) else {
         return "-cloggedout".into();
@@ -503,9 +484,7 @@ fn dbg_path(key: &str) -> &str {
     key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
 }
 
-/// 请求方要不要 JSON：GitHub 搜索页按 Accept 内容协商——`application/json`
-/// 回 JSON（React 软导航的数据请求），否则回 HTML（2026-10-28 实测）。
-/// 两种正文同 URL 不同物，必须分钥匙存取，否则 HTML 导航会拿到 JSON。
+/// 请求方要不要 JSON：GitHub 搜索页按 Accept 协商，同 URL 两种正文必须分钥匙。
 fn accept_wants_json(accept: Option<&str>) -> bool {
     let Some(a) = accept else {
         return false;
@@ -514,8 +493,7 @@ fn accept_wants_json(accept: Option<&str>) -> bool {
     a.contains("application/json") && !a.contains("text/html")
 }
 
-/// 搜索页的内容分钥匙：存侧以实际 Content-Type 为准（-html / -json），
-/// 取侧按请求 Accept 预测——预测错了只是 miss 重取，不会拿错正文。
+/// 搜索页的内容分钥匙：存侧看实际 Content-Type，取侧按 Accept 预测，猜错只是 miss。
 fn search_variant(accept: Option<&str>) -> &'static str {
     if accept_wants_json(accept) {
         "-json"
@@ -524,8 +502,7 @@ fn search_variant(accept: Option<&str>) -> &'static str {
     }
 }
 
-/// 缓存键 = 方法 + host + 路径/查询 + 身份标签 + 编码标签（纯函数，便于测试）。
-/// 当前会话可用的键：会话号拼在纯键外面，旧会话的条目自然查不到。
+/// 缓存键 = 方法 + host + 路径查询 + 身份标签 + 编码标签；会话号拼在外面，旧会话自然查不到。
 fn live_cache_key(
     uri: &http::Uri,
     host: &str,
@@ -552,9 +529,7 @@ fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool
     format!("GET {host}{}{q}{cookie_tag}{enc_tag}", uri.path())
 }
 
-/// /search 查询串归一化：去掉 p=1（与无 p 同页——GitHub 翻页链接两种形态都有，
-/// 实测缓存目录曾同时躺这两个条目）+ 参数按键名排序（防将来重排）。
-/// 只对 /search 生效：其他路径的参数顺序保持原样，个别接口参数顺序有语义。
+/// /search 查询串归一化：去掉 p=1 并按键名排序；其他路径保持原样，个别接口参数顺序有语义。
 fn normalize_query(path: &str, q: &str) -> String {
     if path != "/search" {
         return format!("?{q}");
@@ -584,10 +559,7 @@ fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
     String::from_utf8_lossy(&plain).to_lowercase()
 }
 
-/// GitHub blackbird 限流降级页:搜索返回"无结果"骨架(26KB 上下,缺结果数据
-/// 载体 embeddedData)。入缓存会被刷新反复命中,把一次性降级固化成"一直坏"
-/// (2026-10-27 实证:dev-sidecar 与 github 两词的条目均无 embeddedData,
-/// 而正常页——含真实零结果页——恒有)。骨架不存,刷新回源,恢复即自愈。
+/// 限流降级骨架（缺 embeddedData）不入缓存，否则一次降级会被刷新固化成“一直坏”。
 fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
     if !key.contains("/search?") {
         return false;
@@ -645,20 +617,17 @@ type DiskEntry = (
     Bytes,
 );
 
-/// 读单文件条目；损坏/截断/非 200 = None（miss 自愈）。
-/// 仅测试使用：生产路径走 load_disk_entry_reason（带拒绝原因）。
+/// 读单文件条目，损坏/截断/非 200 即 miss；仅测试使用。
 #[cfg(test)]
 fn load_disk_entry(
     key: &str,
-    // 请求方带不带会话：带会话却拿到未登录页 = 会话已死（污染）；匿名浏览存下的
-    // 匿名页必须能正常命中，否则未登录用户的缓存等于全废。
+    // 带会话却拿到未登录页 = 会话已死；匿名页必须能正常命中。
     logged_in: bool,
 ) -> Option<DiskEntry> {
     load_disk_entry_reason(key, logged_in).ok()
 }
 
-/// 带拒绝原因的读取："存了却命中不了"曾只能靠猜（2026-10-28 排查翻页缓存），
-/// 原因交给命中侧按需落日志。
+/// 带拒绝原因的读取，供命中侧按需落日志。
 fn load_disk_entry_reason(
     key: &str,
     logged_in: bool,
@@ -731,8 +700,7 @@ fn load_disk_entry_reason(
     Ok((status, hdrs, Bytes::copy_from_slice(body)))
 }
 
-/// 测试专用：绕开准入直读磁盘。`page_cache_get_logged_in` 模拟带会话的请求方
-/// （用来验证"带会话却拿到未登录页"要被当 miss）。
+/// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。
 #[cfg(test)]
 fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
     read_cached(key, false)
@@ -760,8 +728,7 @@ static BYTES_SINCE_WIPE: AtomicU64 = AtomicU64::new(0);
 fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     let pending = BYTES_SINCE_WIPE.fetch_add(written as u64, Ordering::Relaxed) + written as u64;
     if pending >= PAGE_CACHE_MAX_BYTES {
-        // 并发写同时越线时只让一个去清：谁把计数从 pending 抢回 0 谁动手，
-        // 没抢到的直接跳过（删目录是幂等的，但没必要每个线程都遍历一遍）。
+        // 并发越线时只让一个去清：抢到计数的动手，其余跳过。
         if BYTES_SINCE_WIPE
             .compare_exchange(pending, 0, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -800,7 +767,6 @@ fn persist_page_entry_blocking(
     });
     let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
     // 记账口径必须等于实际写入量：4 字节长度前缀 + 头部 JSON + 正文。
-    // 只算正文字节会让 200MB 上限实际超出一两 MB。
     maybe_wipe_on_growth(dir, 4 + hbytes.len() + bytes.len());
     let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
@@ -824,8 +790,7 @@ fn persist_page_entry_blocking(
     })
 }
 
-/// 收集体、复判（体积/会话污染）后投递 Save；响应原样或重建交给浏览器。
-/// `xhr` = 跟班请求：正文类型放宽到 HTML 片段 / JSON / 纯文本。
+/// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
 async fn collect_and_submit(
     log: &LogFn,
     key: &str,
@@ -845,8 +810,7 @@ async fn collect_and_submit(
     if !allowed && search_page
         && (ct.starts_with("text/html") || ct.starts_with("application/json"))
     {
-        // 搜索页的软导航按 Accept 协商出 JSON 或 HTML（2026-10-28 实测），
-        // 两者都是正经正文，分钥匙后照存。
+        // 搜索页软导航按 Accept 协商出 JSON 或 HTML，分钥匙后照存。
         allowed = true;
     }
     if !allowed {

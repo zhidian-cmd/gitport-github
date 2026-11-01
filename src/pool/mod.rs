@@ -82,8 +82,7 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 镜像链双字典(大文件/小文件分治)；旧单字典 `mirrors` 仅兼容读。
-/// 分类权在 host(is_big_file_host)，条目放错字典也会被归位。
+/// 镜像链双字典（大/小文件分治），旧单字典仅兼容读；分类权在 is_big_file_host。
 #[derive(serde::Deserialize, Clone, Default)]
 struct PlansFile {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -396,8 +395,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     write_plans_file(&path, &snap, &chains);
 }
 
-/// 数据层结果回写游标：成功驻留该 IP，失败前移一格；零写盘。
-/// passthrough 须与产生结果的腿一致，否则记到对方圈外。
+/// 数据层结果回写游标：成功驻留、失败前移，零写盘；passthrough 须与产生结果的腿一致。
 pub fn cursor_note(pool_name: &str, host: &str, ip: &str, ok: bool, passthrough: bool, slot: u8) {
     let family = route::serial_family(pool_name, host, passthrough);
     let mut key = format!("{pool_name}/{}", family.map_or("", |f| f.name));
@@ -453,9 +451,7 @@ pub struct DialSkip<'a> {
     pub crew: Option<&'a DialCrew>,
 }
 
-/// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s。
-/// skip_ips = 双通道硬排除(两条通道不落同一 IP)；全被排除时忽略 skip。
-/// slot：1 = 主键游标, 2 = `~2` 副键，双通道各记各的。
+/// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
     log: Option<&LogFn>,
@@ -656,10 +652,7 @@ pub async fn serial_dial_skip(
 }
 
 
-/// 按清单对齐镜像链（幂等）：链内已有成员位置不动，缺的追加链尾，该摘的摘除。
-/// 大文件 host(is_big_file_host) 用 enabled/disabled——启动/关闭开关只在这里
-/// 生效；其余 host 用 small_enabled/small_disabled——开关无关, 注册表全量
-/// 按序保留, 仅摘除已删除地址。
+/// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
     enabled: &[String],
@@ -697,9 +690,7 @@ fn builtin_mirror_urls() -> std::collections::HashSet<String> {
     seed_db().mirrors.into_values().flatten().collect()
 }
 
-/// 按注册表对齐全部镜像链（幂等）；removed = 本次删除的地址。
-/// 开关只管大文件链：off 的镜从 is_big_file_host 的链摘除；小文件链按链序
-/// 全量保留（启停价值低），仅摘除已删除的地址。
+/// 按注册表对齐全部镜像链（幂等）；开关只管大文件链，小文件链全量保留、仅摘已删除地址。
 pub fn sync_custom_mirrors(removed: &[String]) {
     let registry = crate::settings::worker_mirrors();
     let enabled: Vec<String> = registry
@@ -719,8 +710,7 @@ pub fn sync_custom_mirrors(removed: &[String]) {
         Some(t) => t,
         None => return,
     };
-    // 链全空时(全新安装)先按 CONTENT_HOSTS 建键：values_mut() 对空表遍历不到
-    // 任何东西，没有这步镜像永远落不进链(校准/大文件全哑)。
+    // 链全空时先按 CONTENT_HOSTS 建键，否则镜像永远落不进链。
     if !all.is_empty() {
         for h in CONTENT_HOSTS {
             tab.mirrors.entry(h.to_string()).or_default();

@@ -1,5 +1,4 @@
-﻿//! MITM：池内域名本地终结 TLS，按 route::master_route 分流（直连串发 / 内容域回落镜像链 / 大文件域直连同台 ECT 派发 / 流式直通）。
-//! 拦截页(403 restricted/400 Whoa)本地识别 gh_defuse。
+﻿//! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
 use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use crate::certgen::Authority;
 use crate::config;
@@ -86,8 +85,7 @@ pub async fn handle_connect_mitm(
             .await
     };
     if let Err(e) = result {
-        // 浏览器掐断本地连接(RST/提前关闭/写体中止)是高频日常行为(切页/取消/回收连接),
-        // 不当错误刷屏; 协议类等真错误仍保留。GitHub 侧故障有各自的行([串发]/[镜像]/[上游])。
+        // 浏览器掐断本地连接是高频日常，不刷屏；协议类真错误仍保留。
         let benign = e.to_string().contains("connection error")
             || e.is_incomplete_message()
             || e.is_closed()
@@ -119,24 +117,18 @@ async fn mitm_http(
             from_uri
         }
     };
-    // GitHub 前端遥测（Datadog RUM / error beacon）只占带宽、不影响页面功能。
-    // 实测 api.github.com 436 个请求里 325 个是它（p50 690ms），把搜索/GraphQL 挤在后面。
-    // 必须先把请求体读掉再回 204：body 不消费会让 hyper 重置连接，反而逼浏览器重开。
+    // GitHub 前端遥测只占带宽不影响功能（实测 436 个请求里 325 个是它），读掉请求体再回 204。
     if is_telemetry(&host, &path_of(req.uri())) {
         let _ = http_body_util::BodyExt::collect(req.into_body()).await;
         return no_content();
     }
 
     let info = UpstreamInfo::default();
-    // 页面缓存命中即秒回；细节全在 page_cache 模块。
-    // 勿加 SWR/后台 ETag 验证：_gh_sess 轮换，旧 cookie 重用被 GitHub 判定
-    // 账号泄露（与 /login 排除同源的安全边界）。要看最新按 F5 直达上游。
+    // 页面缓存命中即秒回；勿加 SWR/ETag 验证，旧 cookie 重用会被判账号泄露。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(cached, "cache", &info);
     }
-    // 头像入口 302 记忆：github.com/<user>.png 是「302 + no-cache」入口，浏览器
-    // 每次渲染页面都要重问一遍跳转（一个来回 260-310ms × 十几个并行）。跳转目标
-    // 按用户稳定，记住后本地直答——浏览器行为不变，只是来回归零。fast path 无日志。
+    // 头像入口 302 记忆：跳转目标按用户稳定，记住后本地直答，省掉每次渲染的来回。
     if req.method() == Method::GET {
         if let Some(loc) =
             redirect_memo::cached_location(&host, req.uri().path(), req.uri().query())
@@ -207,8 +199,7 @@ async fn mitm_http(
         let chain_host = pool::route::mirror_chain_host(&host, &path);
         let new_bytes =
             mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
-        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；链空时候选=仅直连。
-        // 直连失败记 45s 降权(与镜像同款)，全部候选(含直连)耗尽才 502。
+        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；全部候选耗尽才 502。
         match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
             Ok(resp) => return resp,
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
@@ -230,8 +221,7 @@ async fn mitm_http(
                     let new_bytes = mirror::range_bytes(
                         req.headers().get("range").and_then(|v| v.to_str().ok()),
                     );
-                    // 直连刚在全灭分支失败过: load 会带 45s 降权, chain_fetch 内
-                    // ECT 自动跳过直连优先镜像——语义即"兜底最后一次机会"。
+                    // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
                     match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await
                     {
                         Ok(resp) => return resp,
@@ -271,8 +261,7 @@ async fn mitm_http(
             }
         }
     }
-    // 写操作成功后的缓存失效：改完设置/发完评论跳回来必须看到新页面
-    // （内存热点同步清 + 磁盘半场投递管家线程，见 page_cache 模块）
+    // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
         && matches!(
             req.method(),
@@ -319,8 +308,7 @@ fn plain_502() -> axum::response::Response<BoxBody> {
         .body(upstream::full_body(Bytes::from_static(b"upstream unavailable")))
         .unwrap()
 }
-/// 流式直通：体不进缓冲边收边泵（h2 背压分片），单次尝试不重发。
-/// 响应头一到立即交付；泵失败绝不覆盖已交付的响应。
+/// 流式直通：体不进缓冲边收边泵，响应头一到立即交付，泵失败不覆盖已交付的响应。
 async fn stream_passthrough(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -432,15 +420,12 @@ fn request_budget(is_content: bool) -> Duration {
     }
 }
 
-/// GitHub 搜索(blackbird)反爬对同会话跨 IP 敏感:会话在双通道间漂移会被
-/// 降级成"无结果"骨架页(2026-10-27 实证)。搜索系请求固定走主通道。
+/// 搜索请求固定走主通道：GitHub 反爬对同会话跨 IP 敏感，漂移会被降级成无结果骨架。
 fn is_search_path(path: &str) -> bool {
     path.starts_with("/search")
 }
 
-/// 在给定连接上发一次请求、等响应头，返回 (响应, 耗时ms)。
-/// 三处调用点（复用快路径 / 串发新拨 / 系统 DNS 直连）共用这一份：
-/// 请求必须每次重建（BoxBody 不可克隆），预算与记账口径也只该有一处。
+/// 在给定连接上发一次请求、等响应头；三处调用点共用，请求每次重建（BoxBody 不可克隆）。
 async fn send_once(
     up: &upstream::H2Upstream,
     out: &hyper::Request<BoxBody>,
@@ -454,8 +439,7 @@ async fn send_once(
     }
 }
 
-/// 直连腿组装(主路径与兜底路径共用一份)：charge 在 future 首行——镜像胜出
-/// 丢弃本 future 时零残留, Err/取消靠 guard Drop 归还(字节+流数)。
+/// 直连腿组装（两条路径共用）：charge 在 future 首行，镜像胜出丢弃 future 时零残留。
 #[allow(clippy::too_many_arguments)] // 直连腿组装的字面清单, 强行并参只会丢语义
 fn direct_leg<'a>(
     chain_host: &str,
@@ -493,8 +477,7 @@ fn direct_leg<'a>(
     mirror::DirectLeg { fetch }
 }
 
-/// 主路径/兜底路径共用的镜像链派发：组装直连腿 + chain_fetch + 按实际胜出者
-/// 写诊断头。Err = 候选全灭(原因透传，交 502 日志)。
+/// 两条路径共用的镜像链派发：组装直连腿 + chain_fetch + 按胜出者写诊断头。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
@@ -574,8 +557,7 @@ pub(super) async fn get_direct(
     let name = config::pool_for(host);
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    // copilot-proxy 的后缀是 githubusercontent.com，会误命中内容域熔断；
-    // 它走 edge 的白名单族（Azure 段），不该被内容域的熔断拦住。
+    // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
     let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
@@ -589,9 +571,7 @@ pub(super) async fn get_direct(
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    // 必须重查：等锁期间别人可能刚建好连接，直接用就不会一起排队拨号。
-    // （曾经为省掉"两条都失效时多烧一个预算"砍掉过这里，结果一条连接收 GOAWAY 时
-    //  18 个在途请求各自拨号，单飞锁前排成 10 秒以上的队。）
+    // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
     if upstream::cached_h2_in(host, want_slot).is_some() {
         guard.take();
         if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
@@ -601,9 +581,7 @@ pub(super) async fn get_direct(
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 拿到拨号锁后再看一眼池子:等锁期间冷启动竞速的第二个任务可能已经
-        // 建成入库——排队者直接复用它,这就是"晚成者把排队的塞进自己这里"。
-        // fresh = 连接尚不在池中,发送成功后由这里入库;复用/竞速入库的不再重存。
+        // 拿到拨号锁后再看一眼池子：等锁期间竞速的第二个任务可能已建成，排队者直接复用。
         let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
             Some(up) => (up, false),
             None => match upstream::dial_upstream(name, host, log).await {
@@ -648,8 +626,7 @@ pub(super) async fn get_direct(
             }
             Err(e) => e,
         };
-        // 数据层失败：本次拨到的 IP 垫底，下一轮自动换候选。
-        // 垫底只认幂等且无镜像兜底的失败——POST/内容域失败不代表 IP 死，垫底会让池序被噪声刷换。
+        // 数据层失败才垫底 IP，且只认幂等、无镜像兜底的失败；POST/内容域失败不代表 IP 死。
         if !name.is_empty() && is_simple && !is_content {
             pool::cursor_note(name, host, &up.ip, false, false, up.slot);
         }
@@ -754,8 +731,7 @@ async fn dns_direct_fetch(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
         addrs.len()
     ));
-    // 与 get_direct 的口径一致：白名单域名不算内容域（copilot-proxy 后缀会误命中）。
-    // 预算跟候选地址无关，循环外算一次。
+    // 与 get_direct 口径一致：白名单域名不算内容域；预算与候选地址无关，循环外算一次。
     let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();

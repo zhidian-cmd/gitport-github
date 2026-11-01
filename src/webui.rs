@@ -52,11 +52,7 @@ fn local_origin(o: &str) -> bool {
     false
 }
 
-/// 写操作来源校验。
-/// - 浏览器一定带 Origin（跨站 POST 也带），校验它是不是本工作台。
-/// - 没有 Origin/Referer 的是本机脚本。**不再直接放行**，要求显式带
-///   `X-GitPort-Request: 1`：浏览器跨站带不了自定义头（会被 CORS 预检拦下），
-///   而本机程序要加这行才算表明意图。curl 用法变为加 `-H "X-GitPort-Request: 1"`。
+/// 写操作来源校验：浏览器必须同源，无 Origin/Referer 的本机脚本须显式带 `X-GitPort-Request: 1`。
 fn same_site_write(headers: &HeaderMap) -> bool {
     if let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         return local_origin(o);
@@ -288,8 +284,7 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
     })
 }
 
-/// 校准任务结束标志：Drop 里复位，panic 展开时同样会走到
-/// （否则一次意外 panic 就让校准按钮永久回"已在后台进行中"，只能重启）。
+/// 校准任务结束标志：Drop 里复位，panic 展开也会走到，否则按钮永久卡在“进行中”。
 struct CalibDone;
 
 impl Drop for CalibDone {
@@ -362,9 +357,7 @@ struct WorkerMirrorsBody {
     mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 整表保存自定义镜像注册表：新增/启停/删除都由前端提交完整清单，
-/// 后端按新旧差集对齐镜像链（删除的条目自动从链中消失——彻底删除），
-/// 并回传规范化后的注册表（前端据此重绘，避免本地态与服务端漂移）。
+/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
 async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
         Ok(_) => write_json(

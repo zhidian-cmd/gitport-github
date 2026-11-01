@@ -13,8 +13,7 @@ use time::OffsetDateTime;
 
 use crate::pool::LogFn;
 
-/// 叶子证书有效期 365 天；签发超过这个时长就重签。留 7 天余量，
-/// 免得常驻进程在第 366 天集体握手失败。
+/// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
 
 pub struct Authority {
@@ -38,17 +37,13 @@ impl Authority {
         {
             let leaves = self.leaves.lock().unwrap();
             if let Some((issued, c)) = leaves.get(host) {
-                // 快到期的不用: 命中也要看年龄。时钟回拨(elapsed 出错)同样按过期处理,
-                // 宁可多签一次, 也不要拿一张可能已过期的证书去握手。
+                // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
                 if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
                     return Ok(c.clone());
                 }
             }
         }
-        // 纵深防御：根证书本身是 Unconstrained、10 年有效，按 SNI 现签不受任何约束。
-        // MITM 入口只校验 CONNECT 的目标域，但握手时的 SNI 是客户端自己给的——
-        // 先 CONNECT github.com 再发 SNI=bank.com 就能借这张根证书签走别的域名。
-        // 这里把签发范围锁回受管域名，非受管一律拒绝。
+        // 签发范围锁回受管域名：MITM 只校验 CONNECT 目标域，SNI 是客户端自己给的，不锁就能借根证书签走别的域。
         if crate::config::pool_for(host).is_empty() {
             return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
         }
@@ -106,8 +101,7 @@ impl rustls::server::ResolvesServerCert for LeafResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        // SNI 在 TLS 里不区分大小写，而下面所有查表都是小写精确匹配——
-        // 客户端发 GitHub.com 也必须能签，否则会被"非受管域名"挡掉。
+        // SNI 大小写不敏感，查表统一转小写，否则 GitHub.com 会被当成非受管域名。
         let host = client_hello.server_name()?.to_lowercase();
         self.authority.leaf(&host).ok()
     }

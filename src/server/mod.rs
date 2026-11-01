@@ -1,5 +1,4 @@
-//! 代理服务 —— CONNECT 隧道（TLS 原样透传 / 池内域名 MITM）+ 明文 HTTP 转发。
-//! 上游一律按 plans.json 串发（按表重试）；非池域名交系统 DNS 直接连接。
+//! 代理服务：CONNECT 隧道（TLS 透传 / 池内域名 MITM）+ 明文 HTTP 转发。
 
 pub mod mitm;
 pub mod upstream;
@@ -99,8 +98,7 @@ impl ProxyServer {
         let _ = client.set_nodelay(true);
         upstream::note_activity();
         let head = read_head(&mut client).await?;
-        // 头块以 \r\n\r\n 收尾；之后的字节是同包到达的请求体首段，必须原样续传。
-        // 明文 HTTP 分发前先切开：体混进头重拼会把体当头行转发、真体丢失。
+        // 头块以空行收尾，之后的字节是同包到达的体首段，必须原样续传。
         let Some(end) = find_head_end(&head) else {
             return Ok(()); // 头块不完整(超时/EOF 截断): 成不了包, 直接断开
         };
@@ -124,8 +122,7 @@ impl ProxyServer {
 
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
-        // MITM 只拦 443：非 443 是明文协议(git:// 9418 / SSH 22)，TLS 终结必失败；
-        // 交下面的普通 TCP 隧道，端口照用。
+        // MITM 只拦 443；非 443 是明文协议，交普通 TCP 隧道，端口照用。
         if port == 443 && mitm::mitm_scope(self.authority.as_ref(), &host) {
             mitm::handle_connect_mitm(self, client, &host).await;
             return;
@@ -167,9 +164,7 @@ impl ProxyServer {
                 }
                 _ => {}
             }
-            // 曾经这里按"双向都 <8KB"猜风控小响应并垫底换 IP——304 与任意小响应都符合，
-            // 每开一个页面就把驻留记号挪一格（还带一次 settings 落盘）。透传看不见状态码，
-            // 这种猜测注定误判；风控页化解只在 MITM 下做。
+            // 曾经按“双向都小于 8KB”猜风控响应——304 也符合，每开一页就把驻留记号挪一格；透传看不见状态码，这种猜测注定误判。
         }
     }
 
@@ -198,8 +193,7 @@ impl ProxyServer {
                 .await;
             return;
         }
-        // 分块体过不去：transfer-encoding 是逐跳头，转发前就被剥掉，
-        // 块长度行会被上游当成正文——宁可 501 也不静默改坏数据。
+        // 分块体过不去：块长度行会被上游当成正文，宁可 501 也不静默改坏数据。
         if headers_have_chunked(headers) {
             (self.log)(&format!("[拒绝] {host} 明文 HTTP 分块请求体不支持, 回 501"));
             let _ = client
@@ -220,8 +214,7 @@ impl ProxyServer {
         for l in head_text.lines() {
             let l = l.trim_end_matches('\r');
             let low = l.to_lowercase();
-            // 逐跳头不过上游（与 MITM 路径同一份名单）：客户端转来的
-            // connection: close 会让上游收完即关，转发语义被带偏。
+            // 逐跳头不过上游（与 MITM 路径同一份名单）：connection: close 会带偏转发语义。
             let name = low.split(':').next().unwrap_or("").trim();
             if name.is_empty()
                 || name == "host"
@@ -234,8 +227,7 @@ impl ProxyServer {
             req.push_str("\r\n");
         }
         req.push_str("\r\n");
-        // 先写重拼后的头，再补"与头同包到达"的体首段（无则跳过），之后交给双向泵。
-        // 写失败 = 上游已坏，按 recv=0 垫底；与正常收尾共用同一条记账路径。
+        // 先写重拼后的头，再补同包到达的体首段，之后交给双向泵。
         let mut head_sent = upstream.write_all(req.as_bytes()).await.is_ok();
         if head_sent && !body_prefix.is_empty() {
             head_sent = upstream.write_all(body_prefix).await.is_ok();
@@ -339,13 +331,10 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
     (target.to_lowercase(), def)
 }
 
-/// 上游唯一入口：串发池域名(core/api/edge)按 plans.json 串发（按表重试）；
-/// 非串发池域名(fastly/codeload 等纯镜像池)与非池域名交系统 DNS 直接连接。
-/// 本函数是透传(真名)腿：CONNECT 隧道与明文转发共用，content 族放行 .154/.215。
+/// 上游唯一入口：串发池按 plans.json 串发，其余交系统 DNS 直连；这是真名透传腿。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     let name = config::pool_for(host);
-    // 非 443 不走 IP 表：串发恒拨 443(dial_port)，git:// 9418 / SSH 22 会被
-    // 连到 443 上对牛弹琴——按系统 DNS 普通 TCP 直连，端口照用。
+    // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::SERIAL_POOLS.contains(&name) {
         let (conn, ip, _shape) = pool::serial_dial_skip(
             pool::DialSkip {
@@ -371,8 +360,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     Ok((Dialed::Plain(tcp), "system-dns".to_string()))
 }
 
-/// 双向透传，任一方向结束即关闭两侧。返回 (a→b, b→a) 字节数。
-/// b→a 可选首字节看门狗（ClientHello 黑洞判死）；a→b 可选 TLS 握手首包分片（隧道反 SNI RST）。
+/// 双向透传，任一方向结束即关两侧；可选首字节看门狗与握手首包分片。
 async fn bidir_copy<A, B>(
     a: &mut A,
     b: &mut B,
@@ -406,8 +394,7 @@ fn split_delay() -> std::time::Duration {
     )
 }
 
-/// TLS 握手首段分片方案：返回切点列表（升序无缝，2~3 段，切点每连接随机）。
-/// 仅当总闸开启、首字节为 0x16(TLS 握手)且长度足够才拆——SSH/HTTP/过短流一律不碰。
+/// TLS 握手首段分片：2~3 段、切点随机；仅总闸开启且首字节为 0x16 才拆。
 fn hello_split_ranges(first_read: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
     if !config::HELLO_SPLIT_ENABLED || first_read.len() < 32 || first_read[0] != 0x16 {
         return None;
@@ -430,8 +417,7 @@ fn hello_split_ranges(first_read: &[u8]) -> Option<Vec<std::ops::Range<usize>>> 
     Some(vec![0..c1, c1..c2, c2..n])
 }
 
-/// 转发一路：可选首字节看门狗（超时 = 判死），其后普通泵；收尾 shutdown 让对端见 EOF。
-/// a→b 方向可拆 TLS 握手首包：记录头单独成段 + 间隔 + 余下，DPI 拼不齐 SNI（见 config 常量）。
+/// 转发一路：可选首字节看门狗（超时判死），其后普通泵，收尾 shutdown 让对端见 EOF。
 async fn copy_with_first_byte_timeout<R, W>(
     r: &mut R,
     w: &mut W,

@@ -1,5 +1,4 @@
-//! 握手执行器：SNI 与校验名解耦（set_hostname 只改 SNI，set_host 只改校验名），证书恒按目标 host 校验。
-//! GREASE + ALPN + BoringSSL 默认序 = Chrome 指纹；Rust 无 utls 绑定（rquest 全 yanked、wreq 解耦不了拨号 IP 与 SNI），用 boring。
+//! 握手执行器：SNI 与校验名解耦（SNI 可伪装，证书恒按目标 host 校验）；BoringSSL 造 Chrome 指纹。
 
 use crate::config::CONNECT_TIMEOUT_SECS;
 use boring::ssl::{NameType, Ssl, SslContextBuilder, SslMethod, SslSession, SslVerifyMode};
@@ -17,10 +16,7 @@ pub type BoringTls = tokio_boring::SslStream<TcpStream>;
 /// 白名单腿：底层 TCP 套了分片器，ClientHello 分三段发出。
 pub type BoringTlsSplit = tokio_boring::SslStream<SplitHello>;
 
-/// ClientHello 分片器：只拦第一个写（首字节 0x16 = TLS 握手记录），
-/// 按 `WHITELIST_SPLIT_SEGS` 段切开、段间等 `WHITELIST_SPLIT_GAP_MS` 再发下一段。
-/// DPI 要拼出完整 ClientHello 才能读 SNI，段间隔超过它的重组窗口就拼不齐。
-/// 握手完成后（`done`）一律直通，不碰应用数据帧。
+/// ClientHello 分片器：只拦首个写（0x16 开头），按段切开、段间等间隔；握手完一律直通。
 pub struct SplitHello {
     inner: TcpStream,
     segs_left: usize,
@@ -30,8 +26,7 @@ pub struct SplitHello {
     done: bool,
     /// 分片已开：首写通过资格判定后置位，续传段不再重判首字节(那是 0x03)。
     splitting: bool,
-    /// 实际发出的段数。握手后读它：>=2 说明分片真的生效了，
-    /// 1（或 0）说明首包太短、分片器直接退场——这是唯一能看出掩体没上成的信号。
+    /// 实际发出的段数：>=2 说明分片生效，1 或 0 说明首包太短直接退场。
     segs_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -76,10 +71,7 @@ impl AsyncWrite for SplitHello {
     ) -> std::task::Poll<std::io::Result<usize>> {
         use std::future::Future;
         let me = self.get_mut();
-        // 首写判资格：非 TLS 握手/过短 → 分片器退场。分片已开则不再重判——
-        // write_all 续传段的首字节是 0x03(版本号)，重判会把剩余字节一口气
-        // 直通、丢掉段间隔，掩体空转(2026-10-29 审计)。
-        // done = 握手帧发完：之后的帧是应用数据，直通且不再进分段计数。
+        // 首写判资格，分片已开就不再重判——续传段首字节是 0x03，重判会把剩余字节一口气直通。
         if me.done || (!me.splitting && (buf.len() < 32 || buf[0] != 0x16)) {
             me.done = true;
             return std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
@@ -206,12 +198,7 @@ fn io_err(msg: String) -> std::io::Error {
     std::io::Error::other(msg)
 }
 
-/// TLS 会话恢复缓存：键 = SNI 形态（伪装腿统一一个键，真名腿各 host 自键）。
-/// BoringSSL 在 NewSessionTicket 到达时触发 new_session_cb（TLS 1.2 为握手完成时），
-/// 每个 SNI 只留最近一张 ticket；重拨时经 set_session 走 1-RTT PSK 恢复——
-/// 省掉整条证书链的重传与验签（跨洋链路一次握手少传 ~4KB）。恢复被服务器拒绝时
-/// 协议自动回落完整握手，无副作用。仅存内存，进程重启自然失效；
-/// 不启用 0-RTT（重放面大，且要侵入 hyper 的首包路径）。
+/// TLS 会话恢复缓存：按键存最近一张 ticket，重拨走 1-RTT；仅内存，不启用 0-RTT。
 fn session_cache() -> &'static std::sync::Mutex<HashMap<String, SslSession>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, SslSession>>> =
         std::sync::OnceLock::new();
@@ -228,9 +215,7 @@ fn apply_cached_session(ssl: &mut Ssl, mode: &str) {
         .get(mode)
         .cloned();
     if let Some(s) = ticket {
-        // SAFETY: SSL_set_session 前置条件是 ssl 尚未开始握手——Ssl::new 之后立即调用；
-        // SslSession: Send+Sync（boring foreign_type_and_impl_send_sync），跨任务共享安全。
-        // 返回 Err 仅表示本轮无法注入，走完整握手。
+        // SAFETY: 必须在握手开始前注入；SslSession 是 Send+Sync，跨任务共享安全。
         unsafe {
             let _ = ssl.set_session(&s);
         }
@@ -277,10 +262,7 @@ fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::S
     ctx_b
         .set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
-    // 会话恢复：ticket 到手即入缓存（见 session_cache）。键取客户端实际发出的 SNI——
-    // 伪装腿全是同一 SNI，一张 ticket 管整个伪装族；真名腿各自成键。
-    // CLIENT 模式只为触发 new_session_cb（客户端默认 OFF，不开回调不触发）；
-    // BoringSSL 客户端不会自动从内部缓存取会话，注入恒由 apply_cached_session 显式做。
+    // 会话恢复：CLIENT 模式只为触发 new_session_cb，注入恒由 apply_cached_session 显式做。
     ctx_b.set_session_cache_mode(boring::ssl::SslSessionCacheMode::CLIENT);
     ctx_b.set_new_session_callback(|ssl, session| {
         if let Some(sni) = ssl.servername(NameType::HOST_NAME) {
@@ -367,8 +349,7 @@ pub async fn tls_connect(host: &str, mode: &str, tcp: TcpStream) -> std::io::Res
     Ok(tls)
 }
 
-/// 白名单腿 TLS：真名 SNI（mode 恒为 host）+ ClientHello 分片 + 必须协商 h2。
-/// IP 由 edge 池的白名单族选好，这里不再自己解析。
+/// 白名单腿 TLS：真名 SNI + ClientHello 分片 + 必须协商 h2。
 async fn tls_connect_split(host: &str, tcp: TcpStream) -> std::io::Result<BoringTlsSplit> {
     use std::sync::atomic::Ordering;
     let ssl = client_ssl(host, host, None)?;
@@ -411,8 +392,7 @@ async fn gate_acquire() -> tokio::sync::SemaphorePermit<'static> {
     gate.acquire().await.expect("信号量未关闭")
 }
 
-/// 拨号端口：生产恒 443。串发重试引擎要能在本地监听上跑测试，才留这个可覆盖的出口——
-/// 否则只能抢占本机 443，等于核心重试逻辑没法测。
+/// 拨号端口：生产恒 443；测试可覆盖，否则核心重试逻辑没法在本地跑。
 #[cfg(not(test))]
 fn dial_port() -> u16 {
     443
@@ -455,8 +435,7 @@ pub async fn dial_one(
         return Ok(Dialed::Plain(tcp));
     }
 
-    // 白名单：不管条目自带的 sni 是什么，一律真名 + ClientHello 分片。
-    // 这批域名靠真名换正确证书，伪装会被上游判非法（docs 实测 90ms 回 400 Whoa）。
+    // 白名单域名一律真名 + 分片，条目自带的 sni 不生效（伪装会被上游判非法）。
     if crate::config::is_whitelist(host) {
         let tls = tls_connect_split(host, tcp).await?;
         return Ok(Dialed::TlsSplit(tls));

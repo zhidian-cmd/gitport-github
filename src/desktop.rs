@@ -1,5 +1,4 @@
-//! 桌面框架：tao 窗口 + wry(WebView2) + 托盘。
-//! ✕ 收托盘 = 释放整个 WebView2（占用 ≈ headless）；外部销毁自愈重建；单实例 mutex；窗口矩形记忆。
+//! 桌面框架：tao 窗口 + wry(WebView2) + 托盘；✕ 收托盘即释放 WebView2，单实例 mutex。
 
 use crate::pool::LogFn;
 use crate::settings;
@@ -12,8 +11,7 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// 写系统剪贴板（WebView2 拒 JS 剪贴板 API 时的兜底）。
-/// 句柄所有权：SetClipboardData 失败仍归调用方（须 GlobalFree），成功则系统接管（禁释放）。
+/// 写系统剪贴板（WebView2 拒 JS 剪贴板 API 时的兜底）；失败时句柄仍归调用方，须自行释放。
 #[cfg(target_os = "windows")]
 fn write_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
@@ -73,8 +71,7 @@ fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> 
     builder.build().map_err(|e| e.to_string())
 }
 
-/// 单实例守卫：已有实例在跑则弹提示并返回 true。
-/// mutex HANDLE 必须活到进程退出，故存 static 锚住（字段永不读）。
+/// 单实例守卫：已有实例在跑则弹提示并返回 true；mutex 句柄须活到进程退出，用 static 锚住。
 #[allow(dead_code)]
 struct SingleMutexHandle(windows::Win32::Foundation::HANDLE);
 unsafe impl Send for SingleMutexHandle {}
@@ -167,8 +164,7 @@ fn create_window(
     }
     join_udf_cleanup(); // 上次收托盘的删除还没收尾：等它删完再建新 profile
     let mut g = slot.lock().unwrap();
-    // 窗口按 winRect 出生即在位（builder 直接定位，避免闪跳）；
-    // 无记录则居中偏下现算并立刻写回——settings.json 是窗口状态唯一来源。
+    // 窗口按 winRect 出生即在位（避免闪跳），无记录则居中偏下并写回。
     let (sw, sh) = elwt
         .primary_monitor()
         .map(|m| {
@@ -263,8 +259,7 @@ fn show_or_open(
     }
 }
 
-/// 删除 WebView2 用户数据目录(退出/收托盘清场)。浏览器进程刚被释放,
-/// 交还文件锁有延迟,300ms×10 重试兜底;超时留给下次启动的启动清理。
+/// 删 WebView2 用户数据目录：浏览器进程刚释放，文件锁有延迟，300ms×10 重试兜底。
 fn remove_webview_udf() {
     for _ in 0..10 {
         if std::fs::remove_dir_all("gitport-github.exe.WebView2").is_ok() {
@@ -274,8 +269,7 @@ fn remove_webview_udf() {
     }
 }
 
-/// 收托盘时的清场线程：不在界面线程上等，但重开窗口前必须等它结束——
-/// 否则新 WebView2 刚建的数据目录会被后台重试删掉。
+/// 收托盘时的清场线程：不在界面线程等，但重开窗口前必须等它结束。
 static UDF_CLEANUP: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 fn join_udf_cleanup() {
@@ -375,8 +369,7 @@ pub fn run(args: DesktopArgs) -> ! {
     };
 
     let mut created_once = false;
-    // 上次会话若退出未及清理，启动即删 WebView2 用户数据目录残留
-    // （此刻 WebView2 尚未创建，无锁；单实例已由 mutex 保证）。
+    // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
     let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -399,8 +392,7 @@ pub fn run(args: DesktopArgs) -> ! {
                 ..
             } => {
                 if settings::close_to_tray() {
-                    // 托盘化 = 彻底释放 WebView2（~286MB commit 全退，只剩代理核心 ~12MB）；
-                    // 先存矩形再放 WebView/窗口；随后 Destroyed 由 tray_hidden 拦截不自愈。
+                    // 托盘化 = 彻底释放 WebView2：先存矩形再放窗口，随后 Destroyed 由 tray_hidden 拦截不自愈。
                     save_window_rect(&slot);
                     tray_hidden.store(true, Ordering::SeqCst);
                     let mut g = slot.lock().unwrap();

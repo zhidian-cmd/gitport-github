@@ -1,6 +1,4 @@
-//! 镜像价值评估缓存：探测交分按时间戳落盘到 .cache/mirror_stats.json,
-//! 唯一用途是回答"这个镜像还配留在大文件链里吗"(镜像不是越多越好)。
-//! 真实下载派发路径不读这里——ECT 只用当次实测冻结分, 缓存与派发完全隔离。
+//! 镜像价值评估缓存：只回答“这面镜像还配留在大文件链里吗”，派发路径不读它。
 
 use crate::settings;
 use serde::{Deserialize, Serialize};
@@ -65,8 +63,7 @@ fn append(st: &mut Stats, mirror: &str, speed: u64, now: u64) -> bool {
     e.len().is_multiple_of(EVAL_EVERY)
 }
 
-/// 评估(纯函数): 各镜(≥MIN_RECORDS 条)取中位, 中位 × RATIO < 最快中位 → 停用。
-/// 相对判据自保护: 全员都慢时最快者即基准, 同质慢链不互杀。
+/// 评估(纯函数)：各镜取中位，中位 × RATIO < 最快中位 → 建议停用；全员都慢时最快者即基准，不互杀。
 fn evaluate(all: &HashMap<String, Vec<Rec>>) -> Vec<String> {
     let medians: Vec<(&String, u64)> = all
         .iter()
@@ -96,10 +93,7 @@ fn median(rs: &[Rec]) -> u64 {
     v[v.len() / 2]
 }
 
-/// 探测落账: 每会话每镜 1 条(流结束时的终值, 不是首帧的慢启动读数)。
-/// 到里程碑时评估——只产建议(日志一条), 绝不改动 settings/镜像链。
-/// `direct/` 是直连腿的记账键, 不是镜像: 不参评, 否则直连会当"最快基准"
-/// 把真实镜像全比下去。
+/// 落账：每会话每镜 1 条终值，到里程碑时评估，只产建议不动配置；`direct/` 不是镜像，不参评。
 pub(crate) fn record(mirror: &str, speed: u64) {
     if mirror.is_empty() || speed == 0 || mirror.starts_with("direct/") {
         return;

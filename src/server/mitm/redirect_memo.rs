@@ -1,10 +1,4 @@
-//! github.com 头像入口的 302 记忆。
-//!
-//! `github.com/<user>.png?size=N` 是 GitHub 设计的「302 + no-cache」入口：
-//! 浏览器每次渲染页面都必须重问一遍跳转（实测 20/20 头像恰好各 2 次 = 每看
-//! 一遍页面一次，260-310ms/个，十几个并行就是退出/翻页后内容"逐渐蹦出来"
-//! 的主要来源）。跳转目标按用户稳定，代理记住后本地直答 302——浏览器行为
-//! 不变（照样跟随跳转、照样用本地缓存的真图），只是那个来回归零。
+//! 头像入口 302 记忆：跳转目标按用户稳定，记住后本地直答，省掉每次渲染的来回。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -12,8 +6,7 @@ use std::time::{Duration, Instant};
 
 /// 记忆上限：条目按看过的用户数增长，超限整表重来（目标可随时重新学到）。
 const MEMO_CAP: usize = 4096;
-/// 目标保质期：用户换头像后入口 URL 不变（跳转目标里的版本号才变），
-/// 过期重学一次，把旧图的窗口限制在几小时内。
+/// 目标保质期：换头像后入口 URL 不变，过期重学一次，把旧图窗口限制在几小时内。
 const MEMO_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 fn memo() -> &'static std::sync::Mutex<HashMap<String, (String, Instant)>> {
@@ -51,8 +44,7 @@ pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Op
     Some(loc)
 }
 
-/// 从上游响应学习 302 目标：get_direct（拨号后）与 try_cached（复用快路径）
-/// 两个成功分支共用——头像请求几乎总走复用路径，只挂一处会漏学。
+/// 从上游响应学习 302 目标：拨号后与复用快路径两个分支共用，只挂一处会漏学（头像几乎都走复用）。
 pub(super) fn observe_response(
     host: &str,
     uri: &http::Uri,
