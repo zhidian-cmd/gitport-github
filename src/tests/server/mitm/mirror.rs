@@ -801,3 +801,67 @@ fn small_stream_never_touches_big_file_state() {
     assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 0, "小文件不写速度分");
     assert_eq!(ld.last_sample_ms.load(Ordering::Relaxed), 0, "评估缓存零记录");
 }
+
+// ---- 切片驱动：缺口自己续、失败只算空手、绝不提前收尾 ----
+
+/// 假镜像：要 [from, to) 就给 to−from 个同一字节。
+fn fake_fetch(byte: u8) -> Fetch {
+    Box::new(move |from: u64, to: u64| {
+        Box::pin(async move {
+            let n = (to - from) as usize;
+            let body: BoxBody = BoxBody::new(http_body_util::StreamBody::new(
+                futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                    hyper::body::Frame::data(Bytes::from(vec![byte; n])),
+                )]),
+            ));
+            Ok(body)
+        })
+    })
+}
+
+fn body_of(data: &'static [u8]) -> BoxBody {
+    BoxBody::new(http_body_util::StreamBody::new(
+        futures_util::stream::iter(vec![Ok::<_, std::io::Error>(hyper::body::Frame::data(
+            Bytes::from_static(data),
+        ))]),
+    ))
+}
+
+fn ctx_with(fetch: Fetch) -> SplitCtx {
+    SplitCtx {
+        fetch,
+        host: "split.test".into(),
+        log: Arc::new(|_: &str| {}),
+    }
+}
+
+/// 队首段早断：驱动自己起新流补上，整条河走完，绝不提前 EOF。
+#[tokio::test]
+async fn driver_rescues_early_eof_and_finishes() {
+    let now = Instant::now();
+    // 段 1 [0,10) 只给 4B 就 EOF；段 2 [10,20) 完整。
+    let mb = MergeBody::new(
+        vec![(0, 10, now, body_of(b"AAAA")), (10, 20, now, body_of(b"BBBBBBBBBB"))],
+        20,
+    );
+    let body = drive_split(mb, ctx_with(fake_fetch(b'C')));
+    let got = http_body_util::BodyExt::collect(body)
+        .await
+        .expect("不该报错")
+        .to_bytes();
+    assert_eq!(got.len(), 20, "缺口必须被补上，不能提前结束");
+    assert_eq!(&got[..4], b"AAAA");
+    assert_eq!(&got[4..10], b"CCCCCC", "缺口 [4,10) 由补发流续上");
+    assert_eq!(&got[10..], b"BBBBBBBBBB");
+}
+
+/// 补发一直起不来：连续空手若干次后报错，而不是无声无息地少传。
+#[tokio::test]
+async fn driver_gives_up_after_repeated_dead_fills() {
+    let now = Instant::now();
+    let dead = body_of(b"");
+    let mb = MergeBody::new(vec![(0, 10, now, dead)], 10);
+    let fetch: Fetch = Box::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
+    let res = http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))).await;
+    assert!(res.is_err(), "补不起来必须报错，不能假装下完");
+}

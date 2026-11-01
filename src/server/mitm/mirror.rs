@@ -205,8 +205,6 @@ pub(super) struct LoadGuard {
     head_at: Instant,
     /// 大文件链且镜像尚无速度样本 = 本流是探测片(小文件流恒 false)。
     pub(super) is_probe: bool,
-    /// 切片段：断的是代理自己发的请求，断了自有人补，必须判掐(不受"只掐探测流"限制)。
-    pub(super) force_cull: bool,
     /// 测量窗口起点：(时刻, 起点字节)。满 WARMUP_MS 时记一次。
     measure_from: Option<(Instant, u64)>,
     /// 已交卷：分数只写一次，之后冻结。
@@ -234,17 +232,10 @@ impl LoadGuard {
             head_bytes: 0,
             head_at: Instant::now(),
             is_probe,
-            force_cull: false,
             measure_from: None,
             measured: false,
             seg_start: None,
         }
-    }
-
-    /// 切片段标记：允许清场判掐。
-    pub(super) fn force_cull(mut self) -> Self {
-        self.force_cull = true;
-        self
     }
 
     /// 切片段：记下传输起点（响应头到达的时刻），段结束据此打吞吐。
@@ -483,20 +474,45 @@ struct CullState {
 
 /// 段收尾一行：多少字节 / 多少毫秒 / 合多少 MB/s。
 /// 日志此前只有“谁胜出”没有“跑多快”，判不出直连是真快还是只是抢到了位置。
-fn log_seg_end(st: &mut CullState, note: &str) {
-    let Some(t0) = st.guard.seg_start.take() else {
+fn log_seg_line(guard: &mut LoadGuard, label: &str, mirror: &str, log: &LogFn, note: &str) {
+    let Some(t0) = guard.seg_start.take() else {
         return;
     };
     // 建连耗时 = 打点时刻 − charge 时刻（charge 在发请求之前，段路径不重置表）。
-    let dial = t0.saturating_duration_since(st.guard.head_at).as_millis();
+    let dial = t0.saturating_duration_since(guard.head_at).as_millis();
     let ms = t0.elapsed().as_millis().max(1);
-    let mb = st.guard.raw_delivered as f64 / 1_048_576.0;
-    (st.log)(&format!(
-        "[段] {} {} {mb:.1}MB / {ms}ms = {:.2}MB/s (建连 {dial}ms){note}",
-        st.label,
-        st.mirror,
+    let mb = guard.raw_delivered as f64 / 1_048_576.0;
+    (log)(&format!(
+        "[段] {label} {mirror} {mb:.1}MB / {ms}ms = {:.2}MB/s (建连 {dial}ms){note}",
         mb * 1000.0 / ms as f64
     ));
+}
+
+fn log_seg_end(st: &mut CullState, note: &str) {
+    log_seg_line(&mut st.guard, &st.label, &st.mirror, &st.log, note);
+}
+
+/// 切片段只记账、只打吞吐，不判掐：慢段由合并层缩边界让位，掐了就是个洞。
+fn account_seg(body: BoxBody, guard: LoadGuard, label: String, mirror: String, log: LogFn) -> BoxBody {
+    let st = (body, guard, label, mirror, log);
+    let stream = futures_util::stream::unfold(st, |mut st| async move {
+        match http_body_util::BodyExt::frame(&mut st.0).await {
+            Some(Ok(frame)) => {
+                let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
+                st.1.on_frame(n);
+                Some((Ok(frame), st))
+            }
+            Some(Err(e)) => {
+                log_seg_line(&mut st.1, &st.2, &st.3, &st.4, " (上游断流)");
+                Some((Err(e), st))
+            }
+            None => {
+                log_seg_line(&mut st.1, &st.2, &st.3, &st.4, "");
+                None
+            }
+        }
+    });
+    BoxBody::new(http_body_util::StreamBody::new(stream))
 }
 
 /// 清场监视(仅带 Range 的流)：本镜像被盖纪元即断流；探测流交分后严劣于链内最快者时盖纪元。
@@ -535,7 +551,7 @@ fn cull_watched_body(
                 let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
                 st.guard.on_frame(n);
                 // 探测交分自检: 本镜像速度严格小于链内已交卷最大者 → 让位。
-                if !st.culled && (st.guard.is_probe || st.guard.force_cull) {
+                if !st.culled && st.guard.is_probe {
                     let my = st.load.speed_ewma.load(Ordering::Relaxed);
                     let top = st
                         .peers
@@ -965,7 +981,6 @@ async fn split_download(
         segs.len(),
         healthy.len()
     ));
-    let all_peers: Vec<Arc<MirrorLoad>> = healthy.iter().map(|m| mirror_load(m)).collect();
     // 段优先派给最空闲的镜像；同负载时保持链序（稳定排序）。否则会全压在最快的几家人身上，
     // 闲置的镜像照样闲着，切片就白切了。
     let mut pick: Vec<&str> = healthy.clone();
@@ -973,7 +988,7 @@ async fn split_download(
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let m = pick[i % pick.len()];
         async move {
-            let guard = LoadGuard::charge(mirror_load(m), e - s, true).force_cull();
+            let guard = LoadGuard::charge(mirror_load(m), e - s, true);
             let got = if m.starts_with("direct/") {
                 segment_direct(log, out, host, info, replay, s, e).await
             } else {
@@ -990,7 +1005,8 @@ async fn split_download(
             };
             match got {
                 Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                    Ok((guard.segment_from(Instant::now()), resp))
+                    let at = Instant::now();
+                    Ok((guard.segment_from(at), at, resp))
                 }
                 Ok(resp) => Err(format!("{m} 不支持分段(回 {})", resp.status())),
                 Err(err) => Err(err),
@@ -1002,13 +1018,13 @@ async fn split_download(
     // etag/last-modified 决定缓存语义，少了客户端行为会变。
     let mut extra: Option<Vec<(http::HeaderName, http::HeaderValue)>> = None;
     let mut total = known_total;
-    let mut bodies: Vec<(u64, BoxBody)> = Vec::with_capacity(segs.len());
+    let mut bodies: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len());
     let mut dead = 0usize;
     for (i, r) in results.into_iter().enumerate() {
         let (s, e) = segs[i];
         let end = e - base;
         match r {
-            Ok((guard, resp)) => {
+            Ok((guard, at, resp)) => {
                 if extra.is_none() {
                     extra = Some(
                         resp.headers()
@@ -1035,28 +1051,21 @@ async fn split_download(
                     });
                 }
                 let m = pick[i % pick.len()];
-                let peers = all_peers
-                    .iter()
-                    .filter(|p| p.url != m)
-                    .cloned()
-                    .collect();
-                let watched = cull_watched_body(
+                let body = account_seg(
                     resp.into_body(),
                     guard,
-                    mirror_load(m),
-                    peers,
                     format!("{host}{path}"),
                     m.to_string(),
                     log.clone(),
                 );
-                bodies.push((end, watched));
+                bodies.push((s - base, end, at, body));
             }
             Err(err) => {
                 dead += 1;
                 (log)(&format!(
                     "[切片] {host}{path} 段 [{s}..{e}) 失败({err}), 缺口留待补发"
                 ));
-                bodies.push((end, protocol::empty_body()));
+                bodies.push((s - base, end, Instant::now(), protocol::empty_body()));
             }
         }
     }
@@ -1083,102 +1092,161 @@ async fn split_download(
         }
     }
     builder = builder.header(http::header::CONTENT_LENGTH, len);
+    // 起流收口成闭包：驱动只管"要 [from,to)"，怎么发由这里决定，也便于单测替换。
+    let chain: Vec<String> = healthy.iter().map(|m| m.to_string()).collect();
+    let (orig, host_s, method, log_s) = (
+        orig_url.to_string(),
+        host.to_string(),
+        out.method().clone(),
+        log.clone(),
+    );
+    let fetch: Fetch = Box::new(move |from: u64, to: u64| {
+        let (chain, orig, host_s, method, log_s) =
+            (chain.clone(), orig.clone(), host_s.clone(), method.clone(), log_s.clone());
+        Box::pin(async move {
+            split_fetch(&chain, &orig, &method, &host_s, base, from, to, &log_s).await
+        })
+    });
     let ctx = SplitCtx {
-        chain: healthy.iter().map(|m| m.to_string()).collect(),
-        orig_url: orig_url.to_string(),
-        method: out.method().clone(),
+        fetch,
         host: host.to_string(),
-        base,
         log: log.clone(),
-        rescues: 0,
     };
-    let body = merge_with_rescue(MergeBody::new(bodies), ctx);
+    let body = drive_split(MergeBody::new(bodies, len), ctx);
     builder.body(body).map(Some).map_err(|e| e.to_string())
 }
 
-/// 切片补发上下文：缺口出现时向最空闲的健康镜像续拉。
-struct SplitCtx {
-    chain: Vec<String>,
-    orig_url: String,
-    method: http::Method,
-    host: String,
+/// 起一条拉 [from, to) 的新流。偏移相对区间起点，发出去要加 base。
+async fn split_fetch(
+    chain: &[String],
+    orig_url: &str,
+    method: &http::Method,
+    host: &str,
     base: u64,
-    log: LogFn,
-    rescues: u32,
-}
-
-impl SplitCtx {
-    /// 补拉 [from, to)：偏移相对区间起点，发出去要加 base。
-    async fn rescue(&self, from: u64, to: u64) -> Result<BoxBody, String> {
-        // 按 ECT（在途字节 ÷ 实测速度）挑最小者。不能挑"最空闲"：
-        // 刚被掐掉的镜像负载归零，正是最空闲的那个，补回去就是原地打转。
-        let mirrors: Vec<String> = self
-            .chain
-            .iter()
-            .filter(|m| !m.starts_with("direct/"))
-            .cloned()
-            .collect();
-        if mirrors.is_empty() {
-            return Err("无可用补发镜像".to_string());
-        }
-        let m = &mirrors[pick_mirror(&mirrors, to - from)];
-        let req = hyper::Request::builder()
-            .method(self.method.clone())
-            .uri(format!("{m}/{}", self.orig_url))
-            .header(http::header::USER_AGENT, MIRROR_UA)
-            .header(
-                http::header::RANGE,
-                format!("bytes={}-{}", self.base + from, self.base + to - 1),
-            )
-            .body(protocol::empty_body())
-            .map_err(|e| e.to_string())?;
-        let resp = mirror_do(req, m, &self.log).await?;
-        if resp.status() != http::StatusCode::PARTIAL_CONTENT {
-            return Err(format!("{m} 补发回 {} 而非 206", resp.status()));
-        }
-        Ok(resp.into_body())
+    from: u64,
+    to: u64,
+    log: &LogFn,
+) -> Result<BoxBody, String> {
+    // 按 ECT（在途字节 ÷ 实测速度）挑最小者。不能挑"最空闲"：
+    // 刚断流的那家负载归零，正是最空闲的那个，补回去就是原地打转。
+    let mirrors: Vec<String> = chain
+        .iter()
+        .filter(|m| !m.starts_with("direct/"))
+        .cloned()
+        .collect();
+    if mirrors.is_empty() {
+        return Err("无可用补发镜像".to_string());
     }
+    let m = &mirrors[pick_mirror(&mirrors, to - from)];
+    let req = hyper::Request::builder()
+        .method(method.clone())
+        .uri(format!("{m}/{orig_url}"))
+        .header(http::header::USER_AGENT, MIRROR_UA)
+        .header(
+            http::header::RANGE,
+            format!("bytes={}-{}", base + from, base + to - 1),
+        )
+        .body(protocol::empty_body())
+        .map_err(|e| e.to_string())?;
+    let resp = mirror_do(req, m, log).await?;
+    if resp.status() != http::StatusCode::PARTIAL_CONTENT {
+        return Err(format!("{m} 补发回 {} 而非 206 (host {host})", resp.status()));
+    }
+    Ok(resp.into_body())
 }
 
-/// 合并 + 缺口补发：段断了先记缺口、结束本轮，补发流续上后继续泵，最多两次。
-fn merge_with_rescue(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
-    let stream = futures_util::stream::unfold((mb, ctx), |(mut mb, mut ctx)| async move {
+/// 起流函数的返回：一条从 from 拉到 to 的流。
+type FetchFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<BoxBody, String>> + Send + Sync>,
+>;
+type Fetch = Box<dyn Fn(u64, u64) -> FetchFuture + Send + Sync>;
+
+/// 切片调度上下文：缺口、让位尾巴都往这里要新流。
+struct SplitCtx {
+    fetch: Fetch,
+    host: String,
+    log: LogFn,
+}
+
+/// 体检间隔：停滞是 5s 判据，500ms 看一眼足够，又不至于空转。
+const SPLIT_TICK: Duration = Duration::from_millis(500);
+/// 起流失败后的重试间隔：立刻重打同一家只会连撞同一堵墙。
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// 切片驱动：发缺口、收停滞、让位慢段，其余时间只泵数据。
+/// 补发没有全局次数上限——只要还在往前走就一直续，卡死才有上限。
+fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
+    let stream = futures_util::stream::unfold((mb, ctx), |(mut mb, ctx)| async move {
         loop {
-            if let Some(gap_end) = mb.gap.take() {
-                if ctx.rescues >= 2 {
-                    return Some((Err(std::io::Error::other("切片补发次数耗尽")), (mb, ctx)));
-                }
-                ctx.rescues += 1;
-                let from = mb.sent();
-                match ctx.rescue(from, gap_end).await {
-                    Ok(body) => {
+            if mb.exhausted() {
+                (ctx.log)(&format!(
+                    "[切片] {} 连续 {} 次补发一个字节都没下到, 放弃",
+                    ctx.host,
+                    merge::MAX_DEAD_FILLS
+                ));
+                return Some((
+                    Err(std::io::Error::other("切片补发连续失败")),
+                    (mb, ctx),
+                ));
+            }
+            // 有活先发：缺口或被让位的尾巴。
+            if let Some((from, to)) = mb.take_fill() {
+                match tokio::time::timeout(MIRROR_HEAD_TIMEOUT, (ctx.fetch)(from, to)).await {
+                    Ok(Ok(body)) => {
                         (ctx.log)(&format!(
-                            "[切片] {} 缺口 [{from}..{gap_end}) 补发(第 {} 次)",
-                            ctx.host, ctx.rescues
+                            "[切片] {} [{from}..{to}) 起新流 ({}KB)",
+                            ctx.host,
+                            (to - from) / 1024
                         ));
-                        mb.feed_rescue(gap_end, body);
+                        mb.feed(from, to, Instant::now(), body);
                     }
-                    Err(e) => {
-                        return Some((
-                            Err(std::io::Error::other(format!("切片补发失败: {e}"))),
-                            (mb, ctx),
-                        ));
+                    Ok(Err(e)) => {
+                        (ctx.log)(&format!("[切片] {} [{from}..{to}) 起流失败({e})", ctx.host));
+                        mb.retry_fill(from, to);
+                        tokio::time::sleep(RETRY_BACKOFF).await;
                     }
+                    Err(_) => {
+                        (ctx.log)(&format!("[切片] {} [{from}..{to}) 起流超时", ctx.host));
+                        mb.retry_fill(from, to);
+                        tokio::time::sleep(RETRY_BACKOFF).await;
+                    }
+                }
+                continue;
+            }
+            // 体检：停滞收尸、闲连接抢慢段。数据一直在流也要做——涓流不触发超时。
+            if mb.tick_due(Instant::now()) {
+                let now = Instant::now();
+                if mb.reap_stalled(now) {
+                    (ctx.log)(&format!("[切片] {} 有段停滞, 尾巴转补发", ctx.host));
+                    continue;
+                }
+                if let Some((from, to)) = mb.plan_cut(now) {
+                    (ctx.log)(&format!(
+                        "[切片] {} 慢段让位 [{from}..{to}) 交闲连接 ({}KB)",
+                        ctx.host,
+                        (to - from) / 1024
+                    ));
+                    continue;
                 }
             }
-            let poll = std::future::poll_fn(|cx| {
-                hyper::body::Body::poll_frame(std::pin::Pin::new(&mut mb), cx)
-            })
+            // 盯数据；顺带定时唤醒做体检。
+            let polled = tokio::time::timeout(
+                SPLIT_TICK,
+                std::future::poll_fn(|cx| {
+                    hyper::body::Body::poll_frame(std::pin::Pin::new(&mut mb), cx)
+                }),
+            )
             .await;
-            match poll {
-                Some(Ok(f)) => return Some((Ok(f), (mb, ctx))),
-                Some(Err(e)) => return Some((Err(e), (mb, ctx))),
-                None => {
-                    if mb.gap.is_some() {
-                        continue;
+            match polled {
+                Ok(Some(Ok(f))) => return Some((Ok(f), (mb, ctx))),
+                Ok(Some(Err(e))) => return Some((Err(e), (mb, ctx))),
+                Ok(None) => {
+                    if mb.sent() >= mb.total() {
+                        return None;
                     }
-                    return None;
+                    continue; // 缺口已排队，下一轮发
                 }
+                Err(_) => {}
             }
         }
     });

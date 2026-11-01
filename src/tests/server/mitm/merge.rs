@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 /// 平均切必须零缝覆盖整个区间，相邻段共享边界。
 #[test]
@@ -71,6 +72,24 @@ fn content_range_total_parse() {
     assert_eq!(content_range_total(None), None);
 }
 
+/// 让位份额：速率反比（3 倍速的帮手拿大头），并扣掉它建连期间的空转。
+#[test]
+fn split_keep_is_rate_proportional() {
+    const MB: u64 = 1024 * 1024;
+    let keep = split_keep(8 * MB, 1e6, 3e6);
+    // 1MB/s 的持有者约保留 (0.5×3MB + 8MB)/4 ≈ 2.37MB，不到一半
+    assert!(
+        (2 * MB..3 * MB).contains(&keep),
+        "持有者只该留一小截，实际 {keep}"
+    );
+    // 速率相同：各一半（建连成本让持有者略多留）
+    let even = split_keep(8 * MB, 2e6, 2e6);
+    assert!(even > 4 * MB && even < 5 * MB, "实际 {even}");
+    // 永远不能把一段切没
+    assert_eq!(split_keep(MIN_PIECE, 1e6, 9e6), MIN_PIECE / 2);
+    assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0) <= 3 * MIN_PIECE);
+}
+
 fn seg(data: &'static [u8]) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(
         futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(
@@ -79,33 +98,71 @@ fn seg(data: &'static [u8]) -> BoxBody {
     ))
 }
 
-/// 顺序泵：段 1 供完接段 2；段 1 早断登记缺口，补发流续到边界再接段 2。
-#[tokio::test]
-async fn merge_pumps_and_rescues() {
-    // 段 1 [0..6) 只供 2B 就 EOF（缺口 [2..6)）；段 2 [6..10) 完整。
-    let mut m = MergeBody::new(vec![(6, seg(b"AA")), (10, seg(b"BBBB"))]);
-    let mut out: Vec<u8> = Vec::new();
+/// 供 prefix 字节后装死（真停滞，不是 EOF）。
+fn stalled(prefix: &'static [u8]) -> BoxBody {
+    struct Stalled {
+        left: Option<Bytes>,
+    }
+    impl hyper::body::Body for Stalled {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            let me = self.get_mut();
+            match me.left.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    BoxBody::new(Stalled {
+        left: Some(Bytes::from_static(prefix)),
+    })
+}
+
+fn poll(
+    m: &mut MergeBody,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    hyper::body::Body::poll_frame(std::pin::Pin::new(m), cx)
+}
+
+/// 拉一次，返回是否已经全部交付。
+fn drain(m: &mut MergeBody, out: &mut Vec<u8>) -> bool {
+    let waker = futures_util::task::noop_waker_ref();
+    let mut cx = std::task::Context::from_waker(waker);
     loop {
-        let poll =
-            std::future::poll_fn(|cx| hyper::body::Body::poll_frame(std::pin::Pin::new(&mut m), cx))
-                .await;
-        match poll {
-            Some(Ok(f)) => {
+        match poll(m, &mut cx) {
+            std::task::Poll::Ready(Some(Ok(f))) => {
                 if let Some(d) = f.data_ref() {
                     out.extend_from_slice(d);
                 }
             }
-            Some(Err(e)) => panic!("不应出错: {e}"),
-            None => match m.gap.take() {
-                Some(gap_end) => {
-                    assert_eq!(m.sent(), 2, "缺口前交付线");
-                    m.feed_rescue(gap_end, seg(b"CCCC"));
-                }
-                None => break,
-            },
+            std::task::Poll::Ready(Some(Err(e))) => panic!("不应出错: {e}"),
+            std::task::Poll::Ready(None) => return m.sent() >= m.total(),
+            std::task::Poll::Pending => return false,
         }
     }
-    assert_eq!(out, b"AACCCCBBBB", "补发段续到边界后接段 2");
+}
+
+/// 顺序泵：段 1 供完接段 2；段 1 早断登记缺口，补发流续到边界再接段 2。
+#[test]
+fn merge_pumps_and_rescues() {
+    let now = Instant::now();
+    // 段 1 [0..6) 只供 2B 就 EOF（缺口 [2..6)）；段 2 [6..10) 完整。
+    let mut m = MergeBody::new(
+        vec![(0, 6, now, seg(b"AA")), (6, 10, now, seg(b"BBBB"))],
+        10,
+    );
+    let mut out = Vec::new();
+    assert!(!drain(&mut m, &mut out), "缺口在，交付不可能结束");
+    assert_eq!(out, b"AA");
+    assert_eq!(m.take_fill(), Some((2, 6)), "缺口 [2..6) 排进补发");
+    m.feed(2, 6, now, seg(b"CCCC"));
+    assert!(drain(&mut m, &mut out), "补上后应走完");
+    assert_eq!(out, b"AACCCCBBBB");
     assert_eq!(m.sent(), 10);
 }
 
@@ -149,21 +206,27 @@ fn segments_are_read_concurrently() {
         }
     }
 
+    let now = Instant::now();
     let stuck_polls = Arc::new(AtomicUsize::new(0));
     let tail_polls = Arc::new(AtomicUsize::new(0));
-    let mut m = MergeBody::new(vec![
-        (4, BoxBody::new(Stuck(stuck_polls.clone()))),
-        (
-            8,
-            BoxBody::new(Counted {
-                left: Some(Bytes::from_static(b"BBBB")),
-                polls: tail_polls.clone(),
-            }),
-        ),
-    ]);
+    let mut m = MergeBody::new(
+        vec![
+            (0, 4, now, BoxBody::new(Stuck(stuck_polls.clone()))),
+            (
+                4,
+                8,
+                now,
+                BoxBody::new(Counted {
+                    left: Some(Bytes::from_static(b"BBBB")),
+                    polls: tail_polls.clone(),
+                }),
+            ),
+        ],
+        8,
+    );
     let waker = futures_util::task::noop_waker_ref();
     let mut cx = std::task::Context::from_waker(waker);
-    let first = hyper::body::Body::poll_frame(std::pin::Pin::new(&mut m), &mut cx);
+    let first = poll(&mut m, &mut cx);
     assert!(first.is_pending(), "队首卡住时不可能有交付");
     assert_eq!(m.sent(), 0, "一个字节都不该出去");
     assert!(
@@ -178,26 +241,97 @@ fn segments_are_read_concurrently() {
 }
 
 /// 段边界吻合时直接接下一段，不登记缺口。
-#[tokio::test]
-async fn merge_no_gap_when_boundary_aligned() {
-    let mut m = MergeBody::new(vec![(4, seg(b"AAAA")), (8, seg(b"BBBB"))]);
-    let mut out: Vec<u8> = Vec::new();
-    loop {
-        let poll =
-            std::future::poll_fn(|cx| hyper::body::Body::poll_frame(std::pin::Pin::new(&mut m), cx))
-                .await;
-        match poll {
-            Some(Ok(f)) => {
-                if let Some(d) = f.data_ref() {
-                    out.extend_from_slice(d);
-                }
-            }
-            Some(Err(e)) => panic!("不应出错: {e}"),
-            None => {
-                assert!(m.gap.is_none(), "边界吻合不该有缺口");
-                break;
-            }
-        }
-    }
+#[test]
+fn merge_no_gap_when_boundary_aligned() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(
+        vec![(0, 4, now, seg(b"AAAA")), (4, 8, now, seg(b"BBBB"))],
+        8,
+    );
+    let mut out = Vec::new();
+    assert!(drain(&mut m, &mut out), "不该有缺口");
+    assert!(m.fill.is_empty(), "边界吻合不该排补发");
     assert_eq!(out, b"AAAABBBB");
+}
+
+/// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流。
+/// 多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
+#[test]
+fn cut_shrinks_boundary_and_hands_off_tail() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![(0, 100, now, seg(&[b'A'; 100]))], 100);
+    let cut = m.cut(0, 40, now).expect("应能切");
+    assert_eq!(cut, (40, 100));
+    assert_eq!(m.take_fill(), Some((40, 100)));
+    let mut out = Vec::new();
+    assert!(!drain(&mut m, &mut out), "尾巴还没人接");
+    assert_eq!(out.len(), 40, "父流交到新边界就停");
+    assert!(out.iter().all(|&b| b == b'A'));
+    m.feed(40, 100, now, seg(&[b'C'; 60]));
+    assert!(drain(&mut m, &mut out));
+    assert_eq!(out.len(), 100);
+    assert!(
+        out[40..].iter().all(|&b| b == b'C'),
+        "尾部必须来自接手的流"
+    );
+}
+
+/// 停滞只收自己没收到的那截，缓冲里的字节一个都不丢。
+#[test]
+fn reap_keeps_received_bytes() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![(0, 10, now, stalled(b"AAAA"))], 10);
+    let mut out = Vec::new();
+    assert!(!drain(&mut m, &mut out), "供完 4B 就该停住等");
+    assert_eq!(out, b"AAAA");
+    assert!(!m.reap_stalled(now), "才刚开始，不该收尸");
+    assert!(
+        m.reap_stalled(now + Duration::from_millis(STALL_MS + 1)),
+        "超时该收尸"
+    );
+    assert_eq!(m.take_fill(), Some((4, 10)), "只补没收到的那截");
+    assert!(!drain(&mut m, &mut out));
+    assert_eq!(out, b"AAAA");
+    m.feed(4, 10, now, seg(b"BBBBBB"));
+    assert!(drain(&mut m, &mut out));
+    assert_eq!(out, b"AAAABBBBBB");
+}
+
+/// 没闲连接不许切：切了只是给自己多开一条流，服务器可能直接惩罚。
+#[test]
+fn plan_cut_waits_for_idle_connection() {
+    let now = Instant::now();
+    let slow = 4 * MIN_PIECE;
+    let mut m = MergeBody::new(
+        vec![
+            (0, slow, now - Duration::from_secs(2), stalled(b"")),
+            (slow, 8 * MIN_PIECE, now - Duration::from_secs(2), stalled(b"")),
+        ],
+        8 * MIN_PIECE,
+    );
+    // 手工造两条速率样本：一条慢、一条快（并当作刚轮询过）。
+    for (k, got) in [(0u64, 10_000u64), (slow, MIN_PIECE)] {
+        let s = m.segs.get_mut(&k).unwrap();
+        s.got = got;
+        s.last_poll = now;
+    }
+    assert!(m.plan_cut(now).is_none(), "idle_credit=0 不该切");
+    m.idle_credit = 1;
+    let cut = m.plan_cut(now).expect("有闲连接 + 慢段 → 该切");
+    assert_eq!(cut.1, slow, "尾巴应到段尾为止");
+    assert!(cut.0 > 10_000 && cut.0 < slow, "切点 {cut:?}");
+}
+
+/// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。
+#[test]
+fn dead_fill_counter_resets_on_progress() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![(0, 4, now, seg(b"AAAA"))], 4);
+    for _ in 0..MAX_DEAD_FILLS {
+        m.fail_fill();
+    }
+    assert!(m.exhausted());
+    let mut out = Vec::new();
+    assert!(drain(&mut m, &mut out));
+    assert!(!m.exhausted(), "字节流动起来就该清零");
 }
