@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod defuse;
+mod merge;
 mod mirror;
 mod page_cache;
 mod redirect_memo;
@@ -499,7 +500,7 @@ async fn mirror_or_direct(
         info,
         replay,
     );
-    let resp = chain_fetch(log, out_body, host, fetch).await?;
+    let resp = chain_fetch(log, out_body, host, fetch, info, replay).await?;
     let route = resp
         .extensions()
         .get::<&'static str>()

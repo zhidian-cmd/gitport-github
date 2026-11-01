@@ -133,6 +133,8 @@ async fn chain_fetch_cred_locks_to_direct() {
         &req,
         "raw.githubusercontent.com",
         mirror_test_direct_leg(),
+        &Default::default(),
+        &None,
     )
     .await
     .unwrap_err();
@@ -189,7 +191,7 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
         .uri("https://cred-brk.test/f?sig=abc")
         .body(protocol::empty_body())
         .unwrap();
-    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
+    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg(), &Default::default(), &None)
         .await
         .unwrap_err();
     assert!(err.contains("仅直连"), "凭据串请求应仅派直连: {err}");
@@ -211,7 +213,7 @@ async fn breaker_spares_direct_only_requests() {
         .uri("https://brk-cred.test/f?sig=abc")
         .body(protocol::empty_body())
         .unwrap();
-    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
+    let err = chain_fetch(&log, &req, host, mirror_test_direct_leg(), &Default::default(), &None)
         .await
         .unwrap_err();
     assert!(!err.contains("熔断"), "直连独走不得撞镜像熔断: {err}");

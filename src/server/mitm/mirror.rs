@@ -1,9 +1,11 @@
 //! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护；派发走 ECT，清场断流交客户端重发。
+use super::merge::{self, MergeBody};
 use super::path_of;
 use crate::server::protocol::{self, BoxBody};
 use crate::pool;
 use crate::util::{now_ms, LogFn};
 use crate::server::upstream;
+use bytes::Bytes;
 use http::Method;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,6 +148,8 @@ pub(super) struct LoadGuard {
     head_at: Instant,
     /// 大文件链且镜像尚无速度样本 = 本流是探测片(小文件流恒 false)。
     pub(super) is_probe: bool,
+    /// 切片段：断的是代理自己发的请求，断了自有人补，必须判掐(不受"只掐探测流"限制)。
+    pub(super) force_cull: bool,
 }
 
 impl LoadGuard {
@@ -167,7 +171,14 @@ impl LoadGuard {
             head_bytes: 0,
             head_at: Instant::now(),
             is_probe,
+            force_cull: false,
         }
+    }
+
+    /// 切片段标记：允许清场判掐。
+    pub(super) fn force_cull(mut self) -> Self {
+        self.force_cull = true;
+        self
     }
 
 
@@ -413,7 +424,7 @@ fn cull_watched_body(
                 let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
                 st.guard.on_frame(n);
                 // 探测交分自检: 本镜像速度严格小于链内已交卷最大者 → 让位。
-                if !st.culled && st.guard.is_probe {
+                if !st.culled && (st.guard.is_probe || st.guard.force_cull) {
                     let my = st.load.speed_ewma.load(Ordering::Relaxed);
                     let top = st
                         .peers
@@ -463,6 +474,8 @@ pub(super) async fn chain_fetch(
     out: &hyper::Request<BoxBody>,
     host: &str,
     direct: DirectLeg<'_>,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     // 凭据查询串等价 bearer，交第三方镜像即外泄——标记后剥空镜像，仅派直连。
     let cred_locked = out.uri().query().is_some_and(has_credential_query);
@@ -528,7 +541,16 @@ pub(super) async fn chain_fetch(
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
     // 探测轮优先：有未交卷候选就一片一家实测，全员交卷后回 ECT；小文件不参与，只按链序从头试。
-    let big = pool::route::is_big_file_host(chain_host);
+    // 单字节探片是下载器探路，按小文件走：链头直通，不探测、不记账、不切分。
+    let big = pool::route::is_big_file_host(chain_host) && !merge::is_probe_range(range);
+    // 镜像有富余时切片并发拉；条件不满足(探片/开区间/不支持 Range/无空闲镜像)交回单流。
+    if big {
+        match split_download(log, out, &orig_url, host, &candidates, info, replay).await {
+            Ok(Some(resp)) => return Ok(resp),
+            Ok(None) => {}
+            Err(e) => (log)(&format!("[切片] {host}{path} 放弃切片({e}), 回单流")),
+        }
+    }
     let start = if big {
         match probe_pick(&candidates) {
             Some(i) => {
@@ -670,6 +692,347 @@ pub(super) async fn chain_fetch(
     };
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
+/// 无 Range 时探测文件总长：发 1 字节 Range，从 Content-Range 取分母。
+async fn probe_total(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    mirror: &str,
+    orig_url: &str,
+    host: &str,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
+) -> Result<u64, String> {
+    let resp = if mirror.starts_with("direct/") {
+        segment_direct(log, out, host, info, replay, 0, 1).await?
+    } else {
+        let mut req = mirror_request(out, mirror, orig_url)?;
+        req.headers_mut().insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-0"),
+        );
+        mirror_do(req, mirror, log).await?
+    };
+    merge::content_range_total(resp.headers().get("content-range").and_then(|v| v.to_str().ok()))
+        .ok_or_else(|| format!("{mirror} 未给 Content-Range 总长"))
+}
+
+/// 直连段请求：克隆原请求头换成本段 Range，再走直连腿。
+/// 直连只有一路，但配上 1 家镜像就是两段——这正是「镜像不满额」最常见的样子。
+async fn segment_direct(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
+    s: u64,
+    e: u64,
+) -> Result<hyper::Response<BoxBody>, String> {
+    let mut req = hyper::Request::builder()
+        .method(out.method())
+        .uri(out.uri())
+        .body(protocol::empty_body())
+        .map_err(|err| err.to_string())?;
+    *req.headers_mut() = out.headers().clone();
+    req.headers_mut().insert(
+        http::header::RANGE,
+        http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
+            .map_err(|err| err.to_string())?,
+    );
+    for h in [
+        http::header::ACCEPT_ENCODING,
+        http::header::IF_NONE_MATCH,
+        http::header::IF_MODIFIED_SINCE,
+        http::header::IF_RANGE,
+    ] {
+        req.headers_mut().remove(h);
+    }
+    super::get_direct(log, &req, host, info, true, replay).await
+}
+
+/// 切片下载：一条请求按镜像数平均切段、并发拉，按边界合并回单条字节流。
+/// 段数 = 空闲镜像数（候选 − 在途）；少于 2 段不切，交回单流派发。
+/// 探片、开区间 Range、上游不支持 Range 一律退回单流。
+async fn split_download(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    orig_url: &str,
+    host: &str,
+    candidates: &[String],
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
+) -> Result<Option<hyper::Response<BoxBody>>, String> {
+    if out.method() != http::Method::GET {
+        return Ok(None); // HEAD/其他方法没有体可切
+    }
+    let path = path_of(out.uri());
+    let now = now_ms();
+    let healthy: Vec<&str> = candidates
+        .iter()
+        .filter(|m| {
+            let lf = mirror_load(m).last_fail_ms.load(Ordering::Relaxed);
+            lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
+        })
+        .map(|m| m.as_str())
+        .collect();
+    // 空闲 = 此刻零在途的镜像数（不是流数总和：一家跑三条流也只算占一家）。
+    let busy = healthy
+        .iter()
+        .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) > 0)
+        .count();
+    let want = healthy.len().saturating_sub(busy);
+    if want < 2 {
+        return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
+    }
+    let range = out.headers().get("range").and_then(|v| v.to_str().ok());
+    let (base, len, known_total) = match range {
+        // 开区间/多区间/畸形：长度未知或语义不同，不切
+        Some(_) => match merge::parse_range(range) {
+            Some((a, Some(b))) if b >= a => (a, b - a + 1, None),
+            _ => return Ok(None),
+        },
+        None => match probe_total(log, out, healthy[0], orig_url, host, info, replay).await {
+            Ok(t) if t > 0 => (0, t, Some(t)),
+            Ok(_) => return Ok(None),
+            Err(e) => {
+                (log)(&format!("[切片] {host}{path} 探测总长失败({e}), 回单流"));
+                return Ok(None);
+            }
+        },
+    };
+    let segs = merge::split_even(base, len, want);
+    if segs.len() < 2 {
+        return Ok(None);
+    }
+    (log)(&format!(
+        "[切片] {host}{path} 切 {} 段(候选 {} 家, 空闲 {want}), 并发拉取",
+        segs.len(),
+        healthy.len()
+    ));
+    let all_peers: Vec<Arc<MirrorLoad>> = healthy.iter().map(|m| mirror_load(m)).collect();
+    // 段优先派给最空闲的镜像；同负载时保持链序（稳定排序）。否则会全压在最快的几家人身上，
+    // 闲置的镜像照样闲着，切片就白切了。
+    let mut pick: Vec<&str> = healthy.clone();
+    pick.sort_by_key(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed));
+    let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
+        let m = pick[i % pick.len()];
+        async move {
+            let guard = LoadGuard::charge(mirror_load(m), e - s, true).force_cull();
+            let got = if m.starts_with("direct/") {
+                segment_direct(log, out, host, info, replay, s, e).await
+            } else {
+                match mirror_request(out, m, orig_url) {
+                    Ok(mut req) => {
+                        let hv = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
+                            .map_err(|err| err.to_string())?;
+                        req.headers_mut().insert(http::header::RANGE, hv);
+                        // 分段必须拿原始字节：压缩会把每段各自压一遍，拼起来就是坏数据；
+                        // 条件请求会让镜像回 304，段请求要的是实体。
+                        for h in [
+                            http::header::ACCEPT_ENCODING,
+                            http::header::IF_NONE_MATCH,
+                            http::header::IF_MODIFIED_SINCE,
+                            http::header::IF_RANGE,
+                        ] {
+                            req.headers_mut().remove(h);
+                        }
+                        mirror_do(req, m, log).await
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            match got {
+                Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => Ok((guard, resp)),
+                Ok(resp) => Err(format!("{m} 不支持分段(回 {})", resp.status())),
+                Err(err) => Err(err),
+            }
+        }
+    });
+    let results = futures_util::future::join_all(futs).await;
+    // 段响应里除逐跳头/分段头之外的头统一搬过来：content-disposition 决定保存的文件名，
+    // etag/last-modified 决定缓存语义，少了客户端行为会变。
+    let mut extra: Option<Vec<(http::HeaderName, http::HeaderValue)>> = None;
+    let mut total = known_total;
+    let mut bodies: Vec<(u64, BoxBody)> = Vec::with_capacity(segs.len());
+    let mut dead = 0usize;
+    for (i, r) in results.into_iter().enumerate() {
+        let (s, e) = segs[i];
+        let end = e - base;
+        match r {
+            Ok((guard, resp)) => {
+                if extra.is_none() {
+                    extra = Some(
+                        resp.headers()
+                            .iter()
+                            .filter(|(k, _)| {
+                                !matches!(
+                                    k.as_str(),
+                                    "content-range"
+                                        | "content-length"
+                                        | "transfer-encoding"
+                                        | "connection"
+                                        | "content-encoding"
+                                )
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    );
+                    total = total.or_else(|| {
+                        merge::content_range_total(
+                            resp.headers()
+                                .get("content-range")
+                                .and_then(|v| v.to_str().ok()),
+                        )
+                    });
+                }
+                let m = pick[i % pick.len()];
+                let peers = all_peers
+                    .iter()
+                    .filter(|p| p.url != m)
+                    .cloned()
+                    .collect();
+                let watched = cull_watched_body(
+                    resp.into_body(),
+                    guard,
+                    mirror_load(m),
+                    peers,
+                    format!("{host}{path}"),
+                    m.to_string(),
+                    log.clone(),
+                );
+                bodies.push((end, watched));
+            }
+            Err(err) => {
+                dead += 1;
+                (log)(&format!(
+                    "[切片] {host}{path} 段 [{s}..{e}) 失败({err}), 缺口留待补发"
+                ));
+                bodies.push((end, protocol::empty_body()));
+            }
+        }
+    }
+    if dead == segs.len() {
+        return Ok(None); // 全灭：退回单流，别让一次切片失败毁掉整个请求
+    }
+    let total_hdr = total
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "*".to_string());
+    let mut builder = hyper::Response::builder();
+    builder = if range.is_some() {
+        builder
+            .status(http::StatusCode::PARTIAL_CONTENT)
+            .header(
+                http::header::CONTENT_RANGE,
+                format!("bytes {}-{}/{total_hdr}", base, base + len - 1),
+            )
+    } else {
+        builder.status(http::StatusCode::OK)
+    };
+    if let Some(hs) = extra {
+        for (k, v) in hs {
+            builder = builder.header(k, v);
+        }
+    }
+    builder = builder.header(http::header::CONTENT_LENGTH, len);
+    let ctx = SplitCtx {
+        chain: healthy.iter().map(|m| m.to_string()).collect(),
+        orig_url: orig_url.to_string(),
+        method: out.method().clone(),
+        host: host.to_string(),
+        base,
+        log: log.clone(),
+        rescues: 0,
+    };
+    let body = merge_with_rescue(MergeBody::new(bodies), ctx);
+    builder.body(body).map(Some).map_err(|e| e.to_string())
+}
+
+/// 切片补发上下文：缺口出现时向最空闲的健康镜像续拉。
+struct SplitCtx {
+    chain: Vec<String>,
+    orig_url: String,
+    method: http::Method,
+    host: String,
+    base: u64,
+    log: LogFn,
+    rescues: u32,
+}
+
+impl SplitCtx {
+    /// 补拉 [from, to)：偏移相对区间起点，发出去要加 base。
+    async fn rescue(&self, from: u64, to: u64) -> Result<BoxBody, String> {
+        let now = now_ms();
+        let m = self
+            .chain
+            .iter()
+            .filter(|m| {
+                let lf = mirror_load(m).last_fail_ms.load(Ordering::Relaxed);
+                lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
+            })
+            .min_by_key(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed))
+            .ok_or_else(|| "无可用补发镜像".to_string())?;
+        let req = hyper::Request::builder()
+            .method(self.method.clone())
+            .uri(format!("{m}/{}", self.orig_url))
+            .header(http::header::USER_AGENT, MIRROR_UA)
+            .header(
+                http::header::RANGE,
+                format!("bytes={}-{}", self.base + from, self.base + to - 1),
+            )
+            .body(protocol::empty_body())
+            .map_err(|e| e.to_string())?;
+        let resp = mirror_do(req, m, &self.log).await?;
+        if resp.status() != http::StatusCode::PARTIAL_CONTENT {
+            return Err(format!("{m} 补发回 {} 而非 206", resp.status()));
+        }
+        Ok(resp.into_body())
+    }
+}
+
+/// 合并 + 缺口补发：段断了先记缺口、结束本轮，补发流续上后继续泵，最多两次。
+fn merge_with_rescue(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
+    let stream = futures_util::stream::unfold((mb, ctx), |(mut mb, mut ctx)| async move {
+        loop {
+            if let Some(gap_end) = mb.gap.take() {
+                if ctx.rescues >= 2 {
+                    return Some((Err(std::io::Error::other("切片补发次数耗尽")), (mb, ctx)));
+                }
+                ctx.rescues += 1;
+                let from = mb.sent();
+                match ctx.rescue(from, gap_end).await {
+                    Ok(body) => {
+                        (ctx.log)(&format!(
+                            "[切片] {} 缺口 [{from}..{gap_end}) 补发(第 {} 次)",
+                            ctx.host, ctx.rescues
+                        ));
+                        mb.feed_rescue(gap_end, body);
+                    }
+                    Err(e) => {
+                        return Some((
+                            Err(std::io::Error::other(format!("切片补发失败: {e}"))),
+                            (mb, ctx),
+                        ));
+                    }
+                }
+            }
+            let poll = std::future::poll_fn(|cx| {
+                hyper::body::Body::poll_frame(std::pin::Pin::new(&mut mb), cx)
+            })
+            .await;
+            match poll {
+                Some(Ok(f)) => return Some((Ok(f), (mb, ctx))),
+                Some(Err(e)) => return Some((Err(e), (mb, ctx))),
+                None => {
+                    if mb.gap.is_some() {
+                        continue;
+                    }
+                    return None;
+                }
+            }
+        }
+    });
+    BoxBody::new(http_body_util::StreamBody::new(stream))
+}
+
 fn mirror_request(
     out: &hyper::Request<BoxBody>,
     mirror: &str,
