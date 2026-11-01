@@ -199,18 +199,44 @@ impl Authority {
 }
 
 /// 把根证书装入当前用户的受信任根存储(免管理员)；浏览器与 schannel 重启后即信任。
+/// 直接走证书存储 API：不起外部进程，也就不受 PATH/控制台/子进程环境影响，失败能拿到错误码。
 pub fn install_ca(dir: &str) -> Result<(), String> {
+    use windows::Win32::Security::Cryptography::{
+        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore,
+        CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_ADD_REPLACE_EXISTING,
+        CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING,
+        X509_ASN_ENCODING,
+    };
+
     let cert_path = std::path::Path::new(dir).join("ca.crt");
-    let out = std::process::Command::new("certutil")
-        .args(["-user", "-f", "-addstore", "Root"])
-        .arg(&cert_path)
-        .output()
-        .map_err(|e| format!("certutil 执行失败: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "certutil 安装证书失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let file = std::fs::File::open(&cert_path)
+        .map_err(|e| format!("打开 {} 失败: {e}", cert_path.display()))?;
+    let der = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .next()
+        .transpose()
+        .map_err(|e| format!("ca.crt 解析失败: {e}"))?
+        .ok_or_else(|| "ca.crt 里没有 PEM 证书".to_string())?;
+
+    // "ROOT" 必须是宽字符：SYSTEM provider 的 pvpara 收的是 store 名的 LPCWSTR。
+    let store_name = windows::core::w!("ROOT");
+    unsafe {
+        let store = CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W,
+            CERT_QUERY_ENCODING_TYPE(0),
+            None,
+            CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_CURRENT_USER),
+            Some(store_name.0 as *const core::ffi::c_void),
+        )
+        .map_err(|e| format!("打开当前用户根存储失败: {e}"))?;
+        let added = CertAddEncodedCertificateToStore(
+            Some(store),
+            CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+            der.as_ref(),
+            CERT_STORE_ADD_REPLACE_EXISTING,
+            None,
+        );
+        let _ = CertCloseStore(Some(store), 0);
+        added.map_err(|e| format!("写入根存储失败: {e}"))?;
     }
     Ok(())
 }

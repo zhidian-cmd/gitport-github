@@ -57,18 +57,86 @@ const WIN_W: f64 = 1250.0;
 const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
-fn build_tray(show_id: MenuItem, quit_id: MenuItem) -> Result<TrayIcon, String> {
+fn build_tray(show_id: MenuItem, quit_id: MenuItem, log: &LogFn) -> Result<TrayIcon, String> {
     let menu = Menu::new();
     menu.append_items(&[&show_id, &quit_id])
         .map_err(|e| e.to_string())?;
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("GitPort GitHub");
-    // 图标取 exe 内嵌资源（assets/app.rc 的 `1 ICON`），无需解码 ico；取不到也不阻断托盘。
-    if let Ok(icon) = Icon::from_resource(1, None) {
-        builder = builder.with_icon(icon);
+    // 图标取 exe 内嵌资源（assets/app.rc 的 `1 ICON`）。ico 里小尺寸是 BMP 条目，
+    // 取不到就逐级降级，最后画一个，绝不让托盘空着。
+    let mut note = String::new();
+    let icon = match Icon::from_resource(1, Some((32, 32))) {
+        Ok(i) => {
+            note.push_str("内嵌 32x32");
+            i
+        }
+        Err(e) => {
+            note.push_str(&format!("32x32 失败({e}), "));
+            match Icon::from_resource(1, None) {
+                Ok(i) => {
+                    note.push_str("内嵌默认尺寸");
+                    i
+                }
+                Err(e2) => {
+                    note.push_str(&format!("默认尺寸也失败({e2}), 用内置图标"));
+                    fallback_icon()
+                }
+            }
+        }
+    };
+    builder = builder.with_icon(icon);
+    let built = builder.build().map_err(|e| e.to_string());
+    let line = format!(
+        "[启动] 托盘: {note}; 注册{}",
+        match &built {
+            Ok(_) => "成功",
+            Err(e) => e.as_str(),
+        }
+    );
+    log(&line);
+    tray_log(&line);
+    built
+}
+
+/// 托盘兜底图标：蓝底白环的圆盘。内嵌 ico 取不到时用它，保证托盘里一定有东西。
+fn fallback_icon() -> Icon {
+    const N: u32 = 32;
+    let mut px = vec![0u8; (N * N * 4) as usize];
+    let c = (N as f32 - 1.0) / 2.0;
+    for y in 0..N {
+        for x in 0..N {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > c {
+                continue; // 圆外留透明
+            }
+            let i = ((y * N + x) * 4) as usize;
+            let ring = (c - 3.0..=c - 1.0).contains(&d);
+            let rgb: [u8; 4] = if ring {
+                [0xFF, 0xFF, 0xFF, 0xFF]
+            } else {
+                [0x2F, 0x6F, 0xEB, 0xFF]
+            };
+            px[i..i + 4].copy_from_slice(&rgb);
+        }
     }
-    builder.build().map_err(|e| e.to_string())
+    Icon::from_rgba(px, N, N).expect("32x32 RGBA 恒定合法")
+}
+
+/// 托盘失败是静默的（GUI 版没有 stdout），留一行到 .cache/tray.log 备查。
+fn tray_log(line: &str) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".cache/tray.log")
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{line}");
 }
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true；mutex 句柄须活到进程退出，用 static 锚住。
@@ -309,7 +377,8 @@ pub fn run(args: DesktopArgs) -> ! {
     let quit_item = MenuItem::new("退出", true, None);
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
-    let mut _tray = build_tray(show_item, quit_item).ok();
+    // 托盘留到窗口建好后注册：WebView2 初始化会动 shell，先挂上去的图标会被吞掉。
+    let mut pending_tray = Some((show_item, quit_item));
     // 托盘事件 → 全事件驱动（crossbeam recv 无事件即内核级睡眠，零周期唤醒）。
     {
         let proxy = proxy.clone();
@@ -371,6 +440,7 @@ pub fn run(args: DesktopArgs) -> ! {
     let mut created_once = false;
     // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
     let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
+    let mut tray: Option<TrayIcon> = None;
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -442,6 +512,12 @@ pub fn run(args: DesktopArgs) -> ! {
         if open_window && !created_once {
             created_once = true;
             show_or_open(&slot, elwt, &url, &log);
+        }
+        // 窗口已就位（或 -tray 模式第一拍）再挂托盘图标。
+        if tray.is_none() {
+            if let Some((s, q)) = pending_tray.take() {
+                tray = build_tray(s, q, &log).ok();
+            }
         }
     });
 }

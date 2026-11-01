@@ -461,7 +461,10 @@ async fn api_github_pac(
         return write_json(&serde_json::json!({"ok": false, "error": e}));
     }
     if crate::server::running() {
-        settings::ensure_system_proxy();
+        match settings::ensure_system_proxy() {
+            Ok(note) => st.logs.log(&format!("系统代理: {note}")),
+            Err(e) => st.logs.log(&format!("系统代理应用失败: {e}")),
+        }
     } else {
         settings::remove_system_proxy();
     }

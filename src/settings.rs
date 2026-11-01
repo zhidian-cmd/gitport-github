@@ -12,6 +12,9 @@ use windows::Win32::Networking::WinInet::{
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "gitport-github";
 const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+/// WinINET 把"每条连接"的代理配置存在这个二进制值里（AutoConfigURL 只是给人和旧程序看的镜像）。
+const CONNECTIONS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+const CONN_SETTINGS_VALUE: &str = "DefaultConnectionSettings";
 
 struct SettingsState {
     close_to_tray: std::sync::atomic::AtomicBool,
@@ -82,9 +85,28 @@ pub fn pac_url() -> String {
 }
 
 fn internet_settings_key() -> Result<RegKey, String> {
+    // 只要求读权限：改代理必须走 InternetSetOption。这台机器上该键对普通进程是只读的，
+    // 拿 KEY_SET_VALUE 会直接"拒绝访问"——PAC 一直不生效就是卡在这一步。
     RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ | KEY_SET_VALUE)
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ)
         .map_err(|e| format!("打开 Internet Settings 失败: {e}"))
+}
+
+/// AutoConfigURL 只是给人看的镜像值，写不进去不算错误（真实配置由 InternetSetOption 落）。
+fn mirror_auto_config_url(value: Option<&str>) {
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ | KEY_SET_VALUE)
+    else {
+        return;
+    };
+    match value {
+        Some(v) => {
+            let _ = key.set_value("AutoConfigURL", &v);
+        }
+        None => {
+            mirror_auto_config_url(None);
+        }
+    }
 }
 
 fn get_auto_config_url(key: &RegKey) -> String {
@@ -153,7 +175,8 @@ fn refresh_wininet() {
 }
 
 /// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉。
-fn apply_conn_options(flags: u32, pac: Option<&str>) -> bool {
+/// 失败返回 Win32 错误码——调用方要原样报出来，别再吞成"什么都没发生"。
+fn apply_conn_options(flags: u32, pac: Option<&str>) -> Result<(), u32> {
     use windows::core::PWSTR;
     use windows::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS,
@@ -184,21 +207,54 @@ fn apply_conn_options(flags: u32, pac: Option<&str>) -> bool {
         pOptions: opts.as_mut_ptr(),
     };
     unsafe {
-        InternetSetOptionW(
+        match InternetSetOptionW(
             None,
             INTERNET_OPTION_PER_CONNECTION_OPTION,
             Some(&mut list as *mut _ as *const std::ffi::c_void),
             std::mem::size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
-        )
-        .is_ok()
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.code().0 as u32),
+        }
     }
 }
 
+/// 兜底：WinINET 已经存着我们的 PAC URL、只是标志位没置上时，直接补这一位。
+/// 只改 flags 这 4 个字节，不碰 blob 里的字符串，写坏了也不会。
+fn force_pac_flag() -> Result<(), String> {
+    let conn = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(CONNECTIONS_KEY, KEY_READ | KEY_SET_VALUE)
+        .map_err(|e| format!("打开 Connections 失败: {e}"))?;
+    let raw: winreg::RegValue = conn
+        .get_raw_value(CONN_SETTINGS_VALUE)
+        .map_err(|e| format!("读 {CONN_SETTINGS_VALUE} 失败: {e}"))?;
+    if raw.bytes.len() < 12 {
+        return Err(format!("{CONN_SETTINGS_VALUE} 长度异常"));
+    }
+    let mut bytes: Vec<u8> = raw.bytes.to_vec();
+    let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if flags & (PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_DIRECT)
+        == (PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_DIRECT)
+    {
+        return Ok(()); // 已经是 直连+PAC
+    }
+    let fixed = flags | PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_DIRECT;
+    bytes[8..12].copy_from_slice(&fixed.to_le_bytes());
+    conn.set_raw_value(
+        CONN_SETTINGS_VALUE,
+        &winreg::RegValue {
+            bytes: bytes.into(),
+            vtype: raw.vtype,
+        },
+    )
+    .map_err(|e| format!("写 {CONN_SETTINGS_VALUE} 失败: {e}"))?;
+    Ok(())
+}
+
 /// 按开关接管/还原系统代理（幂等）。只备份用户自己的配置——把我们的旧残留当原配置会让自愈还原死 PAC。
-pub fn ensure_system_proxy() {
-    let Ok(key) = internet_settings_key() else {
-        return;
-    };
+/// 返回一句可读的结果（供启动日志与界面日志原样打印），失败带 Win32 错误码。
+pub fn ensure_system_proxy() -> Result<String, String> {
+    let key = internet_settings_key()?;
     let cur = get_auto_config_url(&key);
     let pac = pac_url();
     if github_pac() {
@@ -208,16 +264,28 @@ pub fn ensure_system_proxy() {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
         // 不走 cur == pac 早退：字符串在、标志位没开正是要修的状态，重复设一遍无副作用。
-        if apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&pac)) {
-            // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
-            let _ = key.set_value("AutoConfigURL", &pac);
-            *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
-            refresh_wininet();
-            let _ = save();
-        }
-        return;
+        let note = match apply_conn_options(
+            PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL,
+            Some(&pac),
+        ) {
+            Ok(()) => "已接管".to_string(),
+            Err(code) => {
+                // 系统不认这次调用时，退一步直接补连接配置里的 PAC 位。
+                force_pac_flag().map_err(|e| {
+                    format!("InternetSetOption 失败(Win32 {code})，补 PAC 位也失败: {e}")
+                })?;
+                format!("已接管(InternetSetOption 返回 Win32 {code}，用注册表补的 PAC 位)")
+            }
+        };
+        // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
+        mirror_auto_config_url(Some(&pac));
+        *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
+        refresh_wininet();
+        let _ = save();
+        return Ok(note);
     }
     clear_if_ours(&key, &cur);
+    Ok("未开启分流, 已还原".to_string())
 }
 
 /// 还原系统代理：只动我们上次写进去的那条 PAC（last_pac 精确比较），别家的不碰。
@@ -237,7 +305,7 @@ fn restore_or_clear(key: &RegKey) {
     if !backup.is_empty() && !backup_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
         let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
-        let _ = key.set_value("AutoConfigURL", &backup);
+        mirror_auto_config_url(Some(&backup));
     } else {
         // 没有备份就关掉「启用自动配置脚本」，只删字符串会留下半截状态。
         let flags = if keep_manual {
@@ -527,6 +595,14 @@ fn autostart_exe_exists(cmdline: &str) -> bool {
         Some(p) if !p.is_empty() => Path::new(p).exists(),
         _ => false,
     }
+}
+
+/// 读回开机自启登记的命令行（启动日志用）：空串 = 没登记。
+pub fn autostart_state() -> Result<String, String> {
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN_KEY, KEY_READ)
+        .map_err(|e| format!("打开 Run 键失败: {e}"))?;
+    Ok(key.get_value::<String, _>(RUN_VALUE).unwrap_or_default())
 }
 
 pub fn set_autostart(on: bool) -> Result<(), String> {

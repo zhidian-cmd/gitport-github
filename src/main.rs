@@ -85,7 +85,16 @@ fn run() {
     if let Err(e) = server::start_proxy_with(&rt, srv, config::proxy_port()) {
         log_fn(&format!("代理启动失败: {e}"));
     } else {
-        settings::ensure_system_proxy(); // 分流开关接管系统代理(全关 = no-op)
+        // 分流开关接管系统代理(全关 = no-op)。结果原样留痕：静默失败最坑人。
+        match settings::ensure_system_proxy() {
+            Ok(note) => log_fn(&format!("[启动] 系统代理: {note}")),
+            Err(e) => log_fn(&format!("[启动] 系统代理: 未接管 —— {e}")),
+        }
+    }
+    match settings::autostart_state() {
+        Ok(v) if v.is_empty() => log_fn("[启动] 开机自启: 未登记"),
+        Ok(v) => log_fn(&format!("[启动] 开机自启: {v}")),
+        Err(e) => log_fn(&format!("[启动] 开机自启: 读不到 —— {e}")),
     }
 
     let app = Arc::new(webui::App {
