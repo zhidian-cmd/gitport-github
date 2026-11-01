@@ -1,4 +1,4 @@
-﻿//! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
+//! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
 use super::protocol::{self, BoxBody, Incoming, REQUEST_BUDGET};
 use super::upstream;
 use crate::certgen::Authority;
@@ -16,6 +16,7 @@ mod defuse;
 mod merge;
 mod mirror;
 mod page_cache;
+mod quiet;
 mod redirect_memo;
 
 pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CALIB_RUNNING};
@@ -70,9 +71,11 @@ pub async fn handle_connect_mitm(
         b"http/1.1" => "http/1.1",
         _ => "none",
     };
-    (srv.log)(&format!(
-        "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
-    ));
+    if quiet::first_time("tunnel", host) {
+        (srv.log)(&format!(
+            "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
+        ));
+    }
     let log = srv.log.clone();
     let svc = hyper::service::service_fn(move |req| {
         let log = log.clone();
@@ -535,7 +538,7 @@ async fn try_cached(
             }
             // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
             redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-            (log)(&format!("[上游] {host}{path} 复用连接#{}, {ms}ms", up.id));
+            quiet::note_reuse(log, host, ms);
             Some(Ok(resp))
         }
         Err(why) => {

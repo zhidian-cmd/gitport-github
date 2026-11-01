@@ -596,17 +596,21 @@ fn range_size_parsing() {
 
 #[test]
 fn mirror_response_validation() {
-    assert!(validate_mirror_response(true, 206, "application/octet-stream").is_ok());
-    assert!(validate_mirror_response(true, 304, "text/html").is_ok());
-    assert!(validate_mirror_response(false, 304, "").is_ok());
-    assert!(validate_mirror_response(false, 200, "application/octet-stream").is_ok());
+    assert!(validate_mirror_response(true, 206, "application/octet-stream", false).is_ok());
+    assert!(validate_mirror_response(true, 304, "text/html", false).is_ok());
+    assert!(validate_mirror_response(false, 304, "", false).is_ok());
+    assert!(validate_mirror_response(false, 200, "application/octet-stream", false).is_ok());
     assert!(
-        validate_mirror_response(true, 200, "application/octet-stream").is_err(),
+        validate_mirror_response(true, 200, "application/octet-stream", false).is_err(),
         "带 Range 回 200：镜像不认 Range, 必须换家"
     );
-    assert!(validate_mirror_response(true, 403, "text/html").is_err());
-    assert!(validate_mirror_response(false, 302, "text/html").is_err());
-    assert!(validate_mirror_response(false, 200, "text/html; charset=utf-8").is_err());
+    // 探测轮例外：200 全量放行，body 由调用方当单流接管；HTML 仍然拦。
+    assert!(validate_mirror_response(true, 200, "application/zip", true).is_ok());
+    assert!(validate_mirror_response(true, 200, "text/html", true).is_err());
+    assert!(validate_mirror_response(true, 206, "application/zip", true).is_ok());
+    assert!(validate_mirror_response(true, 403, "text/html", false).is_err());
+    assert!(validate_mirror_response(false, 302, "text/html", false).is_err());
+    assert!(validate_mirror_response(false, 200, "text/html; charset=utf-8", false).is_err());
 }
 
 /// 派发加、逐帧归还、Drop 清残余；超额交付封顶不下溢。

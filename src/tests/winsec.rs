@@ -12,8 +12,17 @@ fn acl_keeps_only_user_and_system() {
 
     let out = Command::new("icacls").arg(&p).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(text.matches(":(").count(), 2, "应只剩两条 ACE: {text}");
-    assert!(!text.contains("(I)"), "继承 ACE 应已断开: {text}");
+    // 完整性标签(Mandatory Label)不是权限 ACE：低 IL 环境（沙箱、下载目录）会给文件挂一条，
+    // 既不该算进"两条 ACE"，也不该因为带 (I) 就算成继承未断。
+    let aces: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(":(") && !l.contains("Mandatory Label"))
+        .collect();
+    assert_eq!(aces.len(), 2, "应只剩两条权限 ACE: {text}");
+    assert!(
+        aces.iter().all(|l| !l.contains("(I)")),
+        "继承 ACE 应已断开: {text}"
+    );
     assert!(
         text.contains("SYSTEM") || text.contains("S-1-5-18"),
         "SYSTEM 应保留: {text}"

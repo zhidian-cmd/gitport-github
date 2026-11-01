@@ -45,6 +45,8 @@ diag*.txt
 .sessions/
 
 .workbuddy/
+.dsh-shots/
+.tmp/
 .zread
 deliverables
 /dist/*.exe.old*

@@ -59,6 +59,14 @@ pub fn init_exe_dir(dir: &Path) {
     let _ = EXE_DIR.set(dir.to_path_buf());
 }
 
+/// 本进程 exe 的文件名，用来判断自启登记项指向的是不是自己。
+pub fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_default()
+}
+
 /// exe 所在目录（缓存/配置落盘基准）。供页面缓存等模块取 .cache 基准路径。
 pub fn exe_dir() -> PathBuf {
     EXE_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("."))

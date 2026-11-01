@@ -91,9 +91,12 @@ fn run() {
             Err(e) => log_fn(&format!("[启动] 系统代理: 未接管 —— {e}")),
         }
     }
+    let me = settings::exe_name();
     match settings::autostart_state() {
         Ok(v) if v.is_empty() => log_fn("[启动] 开机自启: 未登记"),
-        Ok(v) => log_fn(&format!("[启动] 开机自启: {v}")),
+        // 登记的是本 exe 就只说"已登记"；指向别处才需要原样打出来（那是真问题）。
+        Ok(v) if !me.is_empty() && v.contains(me.as_str()) => log_fn("[启动] 开机自启: 已登记"),
+        Ok(v) => log_fn(&format!("[启动] 开机自启: 指向别处 —— {v}")),
         Err(e) => log_fn(&format!("[启动] 开机自启: 读不到 —— {e}")),
     }
 

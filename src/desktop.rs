@@ -241,7 +241,6 @@ fn spawn_tray(
                 thread_log(&s);
                 tray_log(&s);
             };
-            note(format!("[启动] 托盘: 线程起来, 进程完整性={}", unsafe { current_il() }));
             *TRAY_PROXY.lock().unwrap() = Some(proxy);
             unsafe {
                 let Ok(hmod) = GetModuleHandleW(None) else {
@@ -285,7 +284,7 @@ fn spawn_tray(
                 // 图标取 exe 内嵌资源 1（assets/app.rc）；取不到退系统默认，绝不留空。
                 let hicon: HICON = match LoadImageW(
                     Some(hinst),
-                    windows::core::PCWSTR(1 as *const u16),
+                    windows::core::PCWSTR(std::ptr::without_provenance(1)),
                     IMAGE_ICON,
                     32,
                     32,
@@ -298,10 +297,6 @@ fn spawn_tray(
                 };
                 TRAY_ICON.store(hicon.0 as isize, Ordering::Relaxed);
                 let (mut ok, mut err) = tray_add(hwnd, hicon);
-                note(format!(
-                    "[启动] 托盘: 内嵌图标 hicon={:?} NIM_ADD={ok} err={err}",
-                    hicon.0
-                ));
                 if !ok {
                     // 图标句柄有问题时换系统默认图标再试：能分开"图标坏"和"进程被拒"。
                     let sys_icon =
@@ -309,26 +304,31 @@ fn spawn_tray(
                             .map(|h| HICON(h.0))
                             .unwrap_or_default();
                     let (ok2, err2) = tray_add(hwnd, sys_icon);
-                    note(format!(
-                        "[启动] 托盘: 系统图标 hicon={:?} NIM_ADD={ok2} err={err2}",
-                        sys_icon.0
-                    ));
                     if ok2 {
                         TRAY_ICON.store(sys_icon.0 as isize, Ordering::Relaxed);
                         ok = true;
                         err = 0;
+                    } else {
+                        err = err2; // 两次都失败时报后一次，才是当前真实原因
                     }
                 }
                 let _ = tx.send((ok, err));
-                let immediate = tray_rect(hwnd);
-                let missed = immediate.starts_with("GetRect 失败");
-                note(format!("[启动] 托盘: {immediate}"));
+                // 成功只说结果一行；失败才把错误码和完整性一起抛出来。
+                let rect = tray_rect(hwnd);
+                if ok {
+                    note(format!("[启动] 托盘: 已注册 {rect}"));
+                } else {
+                    note(format!(
+                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {rect}",
+                        current_il()
+                    ));
+                }
                 TASKBAR_CREATED.store(
                     RegisterWindowMessageW(windows::core::w!("TaskbarCreated")),
                     Ordering::Relaxed,
                 );
-                if missed {
-                    // 刚发的瞬间查不到是正常的，等 shell 收下再问一次。
+                if !ok {
+                    // 刚发的瞬间查不到是正常的，等 shell 收下再复问一次。
                     std::thread::sleep(std::time::Duration::from_millis(1500));
                     note(format!("[启动] 托盘: 1.5s 后 {}", tray_rect(hwnd)));
                 }
@@ -622,10 +622,9 @@ pub fn run(args: DesktopArgs) -> ! {
     // 托盘先挂、拿到回执再往下走：WebView2 起来之后 Shell_NotifyIcon 会被系统拒
     // （err=5 拒绝访问），所以顺序必须是先托盘后窗口，且要等它真的注册上。
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
-    match tray_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-        Ok((true, _)) => (log)("[启动] 托盘: 回执 注册成功"),
-        Ok((false, err)) => (log)(&format!("[启动] 托盘: 回执 被拒 err={err}")),
-        Err(_) => (log)("[启动] 托盘: 回执超时"),
+    // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。
+    if tray_rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
+        (log)("[启动] 托盘: 回执超时");
     }
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;

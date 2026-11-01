@@ -1,6 +1,7 @@
 //! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护；派发走 ECT，清场断流交客户端重发。
 use super::merge::{self, MergeBody};
 use super::path_of;
+use super::quiet;
 use crate::server::protocol::{self, BoxBody};
 use crate::pool;
 use crate::util::{now_ms, LogFn};
@@ -444,12 +445,18 @@ pub(super) fn range_bytes(range: Option<&str>) -> u64 {
 }
 
 /// 非 3xx、非 HTML；带 Range 必须 206；304 无正文放行。
-fn validate_mirror_response(had_range: bool, status: u16, content_type: &str) -> Result<(), String> {
+/// `allow_full`：探测轮专用——上游忽略 Range 回 200 全量时放行，body 由调用方当单流接管。
+fn validate_mirror_response(
+    had_range: bool,
+    status: u16,
+    content_type: &str,
+    allow_full: bool,
+) -> Result<(), String> {
     if status == 304 {
         return Ok(());
     }
     let ct = content_type.to_lowercase();
-    if had_range && status != 206 {
+    if had_range && status != 206 && !(allow_full && status == 200) {
         return Err(format!("状态 {status}(请求带 Range, 未回 206)"));
     }
     if status >= 300 || ct.contains("text/html") {
@@ -622,7 +629,7 @@ pub(super) async fn chain_fetch(
     let path = path_of(out.uri());
     // release 附件走专属链；URL 仍用原 host（镜像自己跟随 302 落点）。
     let chain_host = pool::route::mirror_chain_host(host, &path);
-    if chain_host != host {
+    if chain_host != host && quiet::first_time("chain", host) {
         (log)(&format!(
             "[镜像] {host}{path} 归属链 {chain_host}（不用 {host} 自己的链）"
         ));
@@ -633,7 +640,7 @@ pub(super) async fn chain_fetch(
         .get("if-none-match")
         .or_else(|| out.headers().get("if-modified-since"))
         .and_then(|v| v.to_str().ok());
-    if let Some(r) = range {
+    if let Some(r) = range.filter(|_| quiet::first_time("range", host)) {
         (log)(&format!("[镜像] {host}{path} 客户端 Range: {r}"));
     }
     if let Some(c) = cond {
@@ -763,14 +770,19 @@ pub(super) async fn chain_fetch(
                 if big {
                     mirror_load(m).last_fail_ms.store(0, Ordering::Relaxed);
                 }
-                (log)(&format!(
-                    "[镜像] {host}{path} via {m} (链位 {}/{len}, {} #{}, 头 {ms}ms)",
-                    i + 1,
-                    if big { "ECT起点" } else { "链序起点" },
-                    start + 1,
-                    len = chain.len(),
-                    ms = t0.elapsed().as_millis()
-                ));
+                // 只在「首次用这家 / 换链 / 头过慢」时出声：正常派发不再每请求一条。
+                let first = quiet::first_time("mirror", m);
+                let rotated = quiet::mirror_rotated(chain_host, m);
+                let ms = t0.elapsed().as_millis();
+                if first || rotated || ms > 800 {
+                    (log)(&format!(
+                        "[镜像] {host}{path} via {m} (链位 {}/{len}, {} #{}, 头 {ms}ms)",
+                        i + 1,
+                        if big { "ECT起点" } else { "链序起点" },
+                        start + 1,
+                        len = chain.len(),
+                    ));
+                }
                 pool::MIRROR_BREAKER.clear(chain_host);
                 // 带 Range 挂清场监视(纪元核对+探测让位)；无 Range 只记账(浏览器断流是用户可见失败)。
                 let (mut parts, body) = resp.into_parts();
@@ -826,6 +838,13 @@ pub(super) async fn chain_fetch(
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
 /// 无 Range 时探测文件总长：发 1 字节 Range，从 Content-Range 取分母。
+enum Probe {
+    /// 上游回了 206 + Content-Range：拿到了总长，可以切。
+    Total(u64),
+    /// 上游忽略 Range 直接回 200 全量：body 就是整份文件，直接当单流交出去，别丢。
+    NotSliceable(hyper::Response<BoxBody>),
+}
+
 async fn probe_total(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -834,8 +853,9 @@ async fn probe_total(
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
-) -> Result<u64, String> {
-    let resp = if mirror.starts_with("direct/") {
+) -> Result<Probe, String> {
+    let tag = if mirror.starts_with("direct/") { "direct" } else { "mirror" };
+    let mut resp = if mirror.starts_with("direct/") {
         segment_direct(log, out, host, info, replay, 0, 1).await?
     } else {
         let mut req = mirror_request(out, mirror, orig_url)?;
@@ -843,10 +863,44 @@ async fn probe_total(
             http::header::RANGE,
             http::HeaderValue::from_static("bytes=0-0"),
         );
-        mirror_do(req, mirror, log).await?
+        mirror_do_probe(req, mirror, log).await?
     };
-    merge::content_range_total(resp.headers().get("content-range").and_then(|v| v.to_str().ok()))
-        .ok_or_else(|| format!("{mirror} 未给 Content-Range 总长"))
+    if let Some(t) = merge::content_range_total(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return Ok(Probe::Total(t));
+    }
+    if resp.status() == http::StatusCode::OK {
+        resp.extensions_mut().insert(tag);
+        return Ok(Probe::NotSliceable(resp));
+    }
+    Err(format!(
+        "{mirror} 未给 Content-Range 总长(回 {})",
+        resp.status()
+    ))
+}
+
+/// 不可切片标记：host+path → 时刻。10 分钟内同一 URL 不再为探测白跑一趟。
+const UNSLICEABLE_TTL: Duration = Duration::from_secs(600);
+static UNSLICEABLE: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(Default::default);
+
+fn marked_unsliceable(key: &str) -> bool {
+    UNSLICEABLE
+        .lock()
+        .unwrap()
+        .get(key)
+        .is_some_and(|t| t.elapsed() < UNSLICEABLE_TTL)
+}
+
+fn mark_unsliceable(key: String) {
+    let mut g = UNSLICEABLE.lock().unwrap();
+    if g.len() >= 256 {
+        g.retain(|_, t| t.elapsed() < UNSLICEABLE_TTL);
+    }
+    g.insert(key, Instant::now());
 }
 
 /// 直连段请求：克隆原请求头换成本段 Range，再走直连腿。
@@ -938,6 +992,11 @@ async fn split_download(
         return Ok(None); // HEAD/其他方法没有体可切
     }
     let path = out.uri().path().to_string();
+    // 刚探过、上游明确不给 Range 的 URL：10 分钟内不再探测，直接走单流。
+    let slice_key = format!("{host}{path}");
+    if marked_unsliceable(&slice_key) {
+        return Ok(None);
+    }
     let now = now_ms();
     let healthy: Vec<&str> = candidates
         .iter()
@@ -964,8 +1023,17 @@ async fn split_download(
             _ => return Ok(None),
         },
         None => match probe_total(log, out, healthy[0], orig_url, host, info, replay).await {
-            Ok(t) if t > 0 => (0, t, Some(t)),
-            Ok(_) => return Ok(None),
+            Ok(Probe::Total(t)) if t > 0 => (0, t, Some(t)),
+            Ok(Probe::Total(_)) => return Ok(None),
+            // 上游忽略 Range(回 200 全量)：探测那次的 body 就是整份文件，直接交出去，
+            // 省掉「丢掉 + 重发单流」的一次完整往返（codeload 大归档正是这条路径）。
+            Ok(Probe::NotSliceable(resp)) => {
+                mark_unsliceable(slice_key.clone());
+                (log)(&format!(
+                    "[切片] {host}{path} 上游忽略 Range(回 200), 探测响应直接按单流交出"
+                ));
+                return Ok(Some(resp));
+            }
             Err(e) => {
                 (log)(&format!("[切片] {host}{path} 探测总长失败({e}), 回单流"));
                 return Ok(None);
@@ -1094,17 +1162,12 @@ async fn split_download(
     builder = builder.header(http::header::CONTENT_LENGTH, len);
     // 起流收口成闭包：驱动只管"要 [from,to)"，怎么发由这里决定，也便于单测替换。
     let chain: Vec<String> = healthy.iter().map(|m| m.to_string()).collect();
-    let (orig, host_s, method, log_s) = (
-        orig_url.to_string(),
-        host.to_string(),
-        out.method().clone(),
-        log.clone(),
-    );
+    let (orig, host_s, log_s) = (orig_url.to_string(), host.to_string(), log.clone());
     let fetch: Fetch = Box::new(move |from: u64, to: u64| {
-        let (chain, orig, host_s, method, log_s) =
-            (chain.clone(), orig.clone(), host_s.clone(), method.clone(), log_s.clone());
+        let (chain, orig, host_s, log_s) =
+            (chain.clone(), orig.clone(), host_s.clone(), log_s.clone());
         Box::pin(async move {
-            split_fetch(&chain, &orig, &method, &host_s, base, from, to, &log_s).await
+            split_fetch(&chain, &orig, &host_s, base, from, to, &log_s).await
         })
     });
     let ctx = SplitCtx {
@@ -1120,7 +1183,6 @@ async fn split_download(
 async fn split_fetch(
     chain: &[String],
     orig_url: &str,
-    method: &http::Method,
     host: &str,
     base: u64,
     from: u64,
@@ -1138,8 +1200,9 @@ async fn split_fetch(
         return Err("无可用补发镜像".to_string());
     }
     let m = &mirrors[pick_mirror(&mirrors, to - from)];
+    // 只有 GET 会走到切片（split_download 早退挡掉其它方法），补发一律 GET。
     let req = hyper::Request::builder()
-        .method(method.clone())
+        .method(http::Method::GET)
         .uri(format!("{m}/{orig_url}"))
         .header(http::header::USER_AGENT, MIRROR_UA)
         .header(
@@ -1286,6 +1349,24 @@ async fn mirror_do(
     mirror: &str,
     log: &LogFn,
 ) -> Result<hyper::Response<BoxBody>, String> {
+    mirror_do_inner(req, mirror, log, false).await
+}
+
+/// 探测专用：允许上游忽略 Range 回 200，把整份 body 交还调用方当单流用。
+async fn mirror_do_probe(
+    req: hyper::Request<BoxBody>,
+    mirror: &str,
+    log: &LogFn,
+) -> Result<hyper::Response<BoxBody>, String> {
+    mirror_do_inner(req, mirror, log, true).await
+}
+
+async fn mirror_do_inner(
+    req: hyper::Request<BoxBody>,
+    mirror: &str,
+    log: &LogFn,
+    allow_full: bool,
+) -> Result<hyper::Response<BoxBody>, String> {
     let had_range = req.headers().get("range").is_some();
     let client = upstream::mirror_client(log);
     let timed = tokio::time::timeout(MIRROR_HEAD_TIMEOUT, client.request(req));
@@ -1299,7 +1380,7 @@ async fn mirror_do(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    validate_mirror_response(had_range, resp.status().as_u16(), ct)
+    validate_mirror_response(had_range, resp.status().as_u16(), ct, allow_full)
         .map_err(|e| format!("{mirror} {e}"))?;
     let (parts, body) = resp.into_parts();
     let body = BoxBody::new(http_body_util::BodyExt::map_err(

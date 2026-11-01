@@ -371,7 +371,7 @@ impl MergeBody {
             if etc <= best_etc + SPLIT_SETUP_SECS {
                 continue; // 抢过来也快不了多少
             }
-            if victim.map_or(true, |(_, _, _, v)| etc > v) {
+            if victim.is_none_or(|(_, _, _, v)| etc > v) {
                 victim = Some((s.start, pos, remaining, etc));
             }
         }
