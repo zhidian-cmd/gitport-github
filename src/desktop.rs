@@ -1,6 +1,6 @@
 //! 桌面框架：tao 窗口 + wry(WebView2) + 托盘；✕ 收托盘即释放 WebView2，单实例 mutex。
 
-use crate::pool::LogFn;
+use crate::util::LogFn;
 use crate::settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;

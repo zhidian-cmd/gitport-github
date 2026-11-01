@@ -1,8 +1,10 @@
 ﻿//! MITM：池内域名本地终结 TLS，按 route::master_route 分流；拦截页本地识别 gh_defuse。
-use super::upstream::{self, BoxBody, Incoming, REQUEST_BUDGET};
+use super::protocol::{self, BoxBody, Incoming, REQUEST_BUDGET};
+use super::upstream;
 use crate::certgen::Authority;
 use crate::config;
-use crate::pool::{self, LogFn};
+use crate::pool;
+use crate::util::LogFn;
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
@@ -138,7 +140,7 @@ async fn mitm_http(
                 .status(StatusCode::FOUND)
                 .header("location", loc)
                 .header("cache-control", "no-cache")
-                .body(upstream::full_body(Bytes::new()))
+                .body(protocol::full_body(Bytes::new()))
                 .unwrap();
             return write_upstream(resp, "302memo", &info);
         }
@@ -187,7 +189,7 @@ async fn mitm_http(
         return stream_passthrough(&log, &out, &host, &info, body, reason).await;
     }
     let out_body = match &replay {
-        Some(b) => out.map(|_| upstream::full_body(b.clone())),
+        Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
     if is_simple
@@ -305,7 +307,7 @@ fn incoming_to_body(body: Incoming) -> BoxBody {
 fn plain_502() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(upstream::full_body(Bytes::from_static(b"upstream unavailable")))
+        .body(protocol::full_body(Bytes::from_static(b"upstream unavailable")))
         .unwrap()
 }
 /// 流式直通：体不进缓冲边收边泵，响应头一到立即交付，泵失败不覆盖已交付的响应。
@@ -394,7 +396,7 @@ fn is_telemetry(host: &str, path: &str) -> bool {
 fn no_content() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap()
 }
 
@@ -709,7 +711,7 @@ code{{font-family:Consolas,monospace;color:#3fb950}}a{{color:#3fb950;text-decora
         .status(StatusCode::BAD_GATEWAY)
         .header("content-type", "text/html; charset=utf-8")
         .header("retry-after", "8")
-        .body(upstream::full_body(Bytes::from(html)))
+        .body(protocol::full_body(Bytes::from(html)))
         .unwrap()
 }
 /// 串发+镜像全灭后按系统解析真名 SNI 直拨（池表漂移自愈）；仅 GET/HEAD，成功入缓存。

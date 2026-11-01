@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::protocol::full_body;
 
 /// gzip;q=0 是明确拒绝：别再把压缩体塞给手写客户端(浏览器不受影响)。
 #[test]

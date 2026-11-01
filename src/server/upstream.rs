@@ -1,5 +1,7 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
-use crate::pool::{self, dial::Dialed, LogFn};
+use super::protocol::{empty_body, BoxBody};
+use crate::pool::{self, dial::Dialed};
+use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
 use http::Uri;
@@ -12,17 +14,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tower_service::Service;
-pub type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
-pub type Incoming = hyper::body::Incoming;
-
-/// BoxBody 构造收口：全仓的 Empty/Full + io 错误映射统一走这两个入口。
-pub fn empty_body() -> BoxBody {
-    BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other))
-}
-
-pub fn full_body(b: Bytes) -> BoxBody {
-    BoxBody::new(http_body_util::Full::new(b).map_err(std::io::Error::other))
-}
 /// 每 host 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
 #[derive(Clone)]
 pub struct H2Upstream {
@@ -74,7 +65,7 @@ static LAST_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static ACTIVITY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 fn now_secs() -> u64 {
-    pool::now_ms() / 1000
+    now_ms() / 1000
 }
 
 pub fn note_activity() {
@@ -105,7 +96,7 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
 
 async fn keepalive_pass() {
     let conns: Vec<(String, H2Upstream)> = {
-        let g = pool::lock(conn_pool());
+        let g = lock(conn_pool());
         g.iter()
             .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
             .collect()
@@ -132,7 +123,7 @@ pub fn cached_h2(host: &str) -> Option<H2Upstream> {
 
 /// 带槽位过滤取连接：搜索接口只回主通道（会话跨 IP 漂移会被降级成无结果骨架）。
 pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
-    let mut g = pool::lock(conn_pool());
+    let mut g = lock(conn_pool());
     let h = g.get_mut(host)?;
     let n = h.conns.len();
     if n == 0 {
@@ -168,7 +159,7 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
 pub fn note_latency(host: &str, id: u64, ms: u64) {
-    let mut g = pool::lock(conn_pool());
+    let mut g = lock(conn_pool());
     let Some(h) = g.get_mut(host) else { return };
     let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) else {
         return;
@@ -179,7 +170,7 @@ pub fn note_latency(host: &str, id: u64, ms: u64) {
 }
 
 pub fn store_h2(host: &str, up: H2Upstream) {
-    let mut g = pool::lock(conn_pool());
+    let mut g = lock(conn_pool());
     let h = g.entry(host.to_string()).or_default();
     h.filling = false;
     // 同 IP 也允许并存：服务端并发上限是按连接算的，两条同 IP 的 TCP 同样能摊开。
@@ -191,7 +182,7 @@ pub fn store_h2(host: &str, up: H2Upstream) {
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
 pub fn drop_h2_id(host: &str, id: u64) {
-    let mut g = pool::lock(conn_pool());
+    let mut g = lock(conn_pool());
     let empty = match g.get_mut(host) {
         Some(h) => {
             if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
@@ -209,7 +200,7 @@ pub fn drop_h2_id(host: &str, id: u64) {
 /// 只有 IP 没有句柄时用（gh_defuse 从响应头拿到的是 IP）：查到 id 交 drop_h2_id 摘除。
 pub fn drop_h2(host: &str, ip: &str) {
     let id = {
-        let g = pool::lock(conn_pool());
+        let g = lock(conn_pool());
         g.get(host)
             .and_then(|h| h.conns.iter().find(|c| c.up.ip == ip))
             .map(|c| c.up.id)
@@ -225,7 +216,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         return;
     }
     {
-        let mut g = pool::lock(conn_pool());
+        let mut g = lock(conn_pool());
         let Some(h) = g.get_mut(host) else { return };
         if h.conns.len() >= MAX_CONNS_PER_HOST || h.filling {
             return;
@@ -241,7 +232,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
-                if let Some(h) = pool::lock(conn_pool()).get_mut(&host) {
+                if let Some(h) = lock(conn_pool()).get_mut(&host) {
                     h.filling = false;
                 }
             }
@@ -289,7 +280,7 @@ pub async fn h2_from_dialed(
 }
 /// 池中该 host 活连接占用的 IP(供拨号 skip:两条通道不落同一地址)。
 fn occupied_ips(host: &str) -> Vec<String> {
-    pool::lock(conn_pool())
+    lock(conn_pool())
         .get(host)
         .map(|h| h.conns.iter().map(|c| c.up.ip.clone()).collect())
         .unwrap_or_default()
@@ -570,7 +561,6 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
         b.build(MirrorConnector { log: log.clone() })
     })
 }
-pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
 /// 客户端是否接受 gzip：强制压缩与缓存分桶的唯一判定，两处各写一份必有一边漏改。
 pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {

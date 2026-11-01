@@ -36,7 +36,7 @@ fn mirror_request_strips_identity_and_hop_by_hop() {
         .header("range", "bytes=0-1023")
         .header("accept-encoding", "gzip")
         .header("user-agent", "UA/1.0")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap();
     let req = mirror_request(
         &out,
@@ -126,7 +126,7 @@ async fn chain_fetch_cred_locks_to_direct() {
     let log: LogFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
     let req = hyper::Request::builder()
         .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap();
     let err = chain_fetch(
         &log,
@@ -187,7 +187,7 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
     pool::MIRROR_BREAKER.clear(host);
     let req = hyper::Request::builder()
         .uri("https://cred-brk.test/f?sig=abc")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap();
     let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
         .await
@@ -209,7 +209,7 @@ async fn breaker_spares_direct_only_requests() {
     pool::MIRROR_BREAKER.set(host);
     let req = hyper::Request::builder()
         .uri("https://brk-cred.test/f?sig=abc")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap();
     let err = chain_fetch(&log, &req, host, mirror_test_direct_leg())
         .await
@@ -302,7 +302,7 @@ fn probe_round_hands_each_candidate_one_shard() {
     for m in &chain {
         mirror_load(m)
             .last_sample_ms
-            .store(pool::now_ms(), Ordering::Relaxed);
+            .store(now_ms(), Ordering::Relaxed);
     }
     assert!(probe_pick(&chain).is_none(), "全员交卷应退出探测态");
     for m in &chain {
@@ -322,8 +322,8 @@ fn probe_skips_failed_unprobed_and_yields_to_ect() {
     b.last_fail_ms.store(0, Ordering::Relaxed);
     b.last_sample_ms.store(0, Ordering::Relaxed);
     // a 未交卷但刚失败 → 跳过；b 已交卷 → 无探测目标。
-    a.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
-    b.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
+    a.last_fail_ms.store(now_ms(), Ordering::Relaxed);
+    b.last_sample_ms.store(now_ms(), Ordering::Relaxed);
     assert!(
         probe_pick(&chain).is_none(),
         "失败窗内的未交卷候选不应被探测"
@@ -366,7 +366,7 @@ fn direct_competes_as_candidate() {
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(all[pick], direct_load_key("cand-host.test"), "直连快时应胜出");
     // 直连失败降权后 → 轮到镜像。
-    d.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
+    d.last_fail_ms.store(now_ms(), Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(all[pick], "cand-m.test", "直连降权后应选镜像");
     d.speed_ewma.store(0, Ordering::Relaxed);
@@ -489,10 +489,10 @@ fn recent_failure_deprioritized() {
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["fail-a.test".to_string(), "fail-b.test".to_string()];
-    a.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
+    a.last_fail_ms.store(now_ms(), Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 1024), 1);
     // 全体都在窗内：放开过滤回链序。
-    b.last_fail_ms.store(pool::now_ms(), Ordering::Relaxed);
+    b.last_fail_ms.store(now_ms(), Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 1024), 0);
     a.last_fail_ms.store(0, Ordering::Relaxed);
     b.last_fail_ms.store(0, Ordering::Relaxed);

@@ -295,7 +295,7 @@ impl Drop for CalibDone {
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
     let logs = st.logs.clone();
-    let log: pool::LogFn = Arc::new(move |m: &str| logs.log(m));
+    let log: crate::util::LogFn = Arc::new(move |m: &str| logs.log(m));
     if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return (
             [
@@ -360,9 +360,13 @@ struct WorkerMirrorsBody {
 /// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
 async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
-        Ok(_) => write_json(
-            &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
-        ),
+        Ok((_, removed)) => {
+            // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
+            pool::sync_custom_mirrors(&removed);
+            write_json(
+                &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
+            )
+        }
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }

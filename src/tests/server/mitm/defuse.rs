@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::protocol;
 
 #[test]
 fn defuse_retry_decision() {
@@ -23,7 +24,7 @@ async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
     html.extend_from_slice(&vec![b'a'; 2000]);
     html.extend_from_slice(b"</h1><p>Whoa there, pardner!</p></body></html>");
     let compressed = gzip(&html);
-    let body = upstream::full_body(Bytes::from(compressed.clone()));
+    let body = protocol::full_body(Bytes::from(compressed.clone()));
     let (parts, _) = hyper::Response::builder()
         .header("content-type", "text/html; charset=utf-8")
         .header("content-encoding", "gzip")
@@ -45,7 +46,7 @@ async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
         "写回前缀必须是原始压缩流的真前缀"
     );
     let normal = gzip(b"<!doctype html><html><body>hello</body></html>");
-    let body2 = upstream::full_body(Bytes::from(normal));
+    let body2 = protocol::full_body(Bytes::from(normal));
     let (parts2, _) = hyper::Response::builder()
         .header("content-type", "text/html")
         .header("content-encoding", "gzip")

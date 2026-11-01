@@ -1,6 +1,8 @@
 //! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护；派发走 ECT，清场断流交客户端重发。
-use super::{path_of, BoxBody};
-use crate::pool::{self, LogFn};
+use super::path_of;
+use crate::server::protocol::{self, BoxBody};
+use crate::pool;
+use crate::util::{now_ms, LogFn};
 use crate::server::upstream;
 use http::Method;
 use std::collections::HashMap;
@@ -62,7 +64,7 @@ fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
     }
     let score = (bytes * 1_000_000 / us).max(1);
     load.speed_ewma.store(score, Ordering::Relaxed);
-    load.last_sample_ms.store(pool::now_ms(), Ordering::Relaxed);
+    load.last_sample_ms.store(now_ms(), Ordering::Relaxed);
     // 链序按速度重排落盘: 链头恒为实测最快(IDM 首片/非下载器直接受益)。
     resort_throttled(&load.url);
     score
@@ -91,7 +93,7 @@ const RESORT_MIN_INTERVAL_MS: u64 = 1000;
 static LAST_RESORT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn resort_throttled(scored_url: &str) {
-    let now = pool::now_ms();
+    let now = now_ms();
     let last = LAST_RESORT_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) < RESORT_MIN_INTERVAL_MS {
         return;
@@ -113,7 +115,7 @@ fn resort_chain_by_speed(scored_url: &str) {
     if targets.is_empty() {
         return;
     }
-    let now = pool::now_ms();
+    let now = now_ms();
     let speed_of = |m: &str| -> u64 {
         let ld = mirror_load(m);
         let lf = ld.last_fail_ms.load(Ordering::Relaxed);
@@ -223,7 +225,7 @@ impl Drop for LoadGuard {
 
 /// ECT 绝对最小者胜，无容差；完全相等才看流数、再相等才轮转。失败窗内的跳过，全在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
-    let now = pool::now_ms();
+    let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
     // ECT 取毫秒；.max(1) 是防御：零样本的候选 ECT 无穷大，稳定态里垫底。
     let ect_of = |ld: &MirrorLoad| -> u64 {
@@ -286,7 +288,7 @@ static PROBE_CURSOR: AtomicU64 = AtomicU64::new(0);
 
 /// 探测轮选家：未交卷且健康的候选按原子游标轮转领取，并发分片天然一片一家；没有则交回 ECT。
 fn probe_pick(candidates: &[String]) -> Option<usize> {
-    let now = pool::now_ms();
+    let now = now_ms();
     let unprobed: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -553,7 +555,7 @@ pub(super) async fn chain_fetch(
         } else {
             0
         },
-        pool::now_ms(),
+        now_ms(),
     );
     for i in order {
         let m = candidates[i].as_str();
@@ -580,7 +582,7 @@ pub(super) async fn chain_fetch(
                     if big {
                         mirror_load(&direct_key)
                             .last_fail_ms
-                            .store(pool::now_ms(), Ordering::Relaxed);
+                            .store(now_ms(), Ordering::Relaxed);
                     }
                     (log)(&format!(
                         "[直连] {host}{path} 失败({e}, {}ms), 链内下一个",
@@ -648,7 +650,7 @@ pub(super) async fn chain_fetch(
                 if big {
                     mirror_load(m)
                         .last_fail_ms
-                        .store(pool::now_ms(), Ordering::Relaxed);
+                        .store(now_ms(), Ordering::Relaxed);
                 }
                 (log)(&format!(
                     "[镜像] {host} {m} 失败({e}, {}ms), 链内下一个",
@@ -694,7 +696,7 @@ fn mirror_request(
     }
     // CF 系镜像拦非浏览器 UA；剥原 UA 统一注入，防 builder 追加出两个 UA。
     builder = builder.header(http::header::USER_AGENT, http::HeaderValue::from_static(MIRROR_UA));
-    builder.body(upstream::empty_body()).map_err(|e| e.to_string())
+    builder.body(protocol::empty_body()).map_err(|e| e.to_string())
 }
 async fn mirror_do(
     req: hyper::Request<BoxBody>,
@@ -811,7 +813,7 @@ fn mirror_get(uri: http::Uri) -> Result<hyper::Request<BoxBody>, String> {
         .uri(uri)
         .header("user-agent", MIRROR_UA)
         .header("accept", "*/*")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .map_err(|e| e.to_string())
 }
 

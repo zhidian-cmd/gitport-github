@@ -1,7 +1,9 @@
 //! gh_defuse：GitHub 风控拦截页(403 restricted / 400 Whoa)本地嗅探与 IP 轮换化解。
-use super::{get_direct, BoxBody, PeekRaw, UpstreamInfo};
+use crate::server::protocol::BoxBody;
+use super::{get_direct, PeekRaw, UpstreamInfo};
 use crate::server::upstream;
-use crate::pool::{self, LogFn};
+use crate::pool;
+use crate::util::LogFn;
 use bytes::Bytes;
 
 /// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。

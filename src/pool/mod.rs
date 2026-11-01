@@ -3,25 +3,12 @@ pub mod dial;
 pub mod route;
 pub(crate) mod mirror_stats;
 
+use crate::util::{lock, LogFn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
-
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// 锁中毒自愈：表只有内容语义，无半写坏中间态，取内层值继续。
-pub(crate) fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SerialPlan {

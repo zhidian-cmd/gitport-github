@@ -9,6 +9,7 @@ mod logger;
 mod pool;
 mod server;
 mod settings;
+mod util;
 mod webui;
 mod winsec;
 
@@ -58,7 +59,7 @@ fn run() {
 
     // 日志 stdout 回显仅 headless: GUI 构建的 stdout 重定向会把访问域名等浏览痕迹落盘
     let logs = Arc::new(logger::Logger::new(headless));
-    let log_fn: pool::LogFn = {
+    let log_fn: util::LogFn = {
         let l = logs.clone();
         Arc::new(move |msg: &str| l.log(msg))
     };

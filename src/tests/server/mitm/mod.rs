@@ -8,7 +8,7 @@ fn direct_leg_unpolled_leaves_zero_debt() {
     load.in_flight_streams.store(0, std::sync::atomic::Ordering::Relaxed);
     let out = hyper::Request::builder()
         .uri("https://debt.test/f")
-        .body(upstream::empty_body())
+        .body(protocol::empty_body())
         .unwrap();
     let log: LogFn = Arc::new(|_: &str| {});
     let info = UpstreamInfo::default();

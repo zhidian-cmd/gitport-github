@@ -555,7 +555,8 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
 }
 
 /// 整表保存：规范化校验后与旧表做差集，删除即彻底消失；前端提交前必须先 GET 合并。
-pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String> {
+/// 返回 (启用清单, 被删除的地址)——链对齐由调用方用 removed 触发，本模块只管存。
+pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<String>), String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {
         let u = w.url.trim().trim_end_matches('/').to_string();
@@ -579,8 +580,7 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<Vec<String>, String
     let enabled: Vec<String> = norm.iter().filter(|w| w.on).map(|w| w.url.clone()).collect();
     *state().worker_mirrors.lock().unwrap() = norm;
     save()?;
-    crate::pool::sync_custom_mirrors(&removed);
-    Ok(enabled)
+    Ok((enabled, removed))
 }
 
 /// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。

@@ -1,7 +1,8 @@
 //! 列表页缓存：只缓存 github.com 列表页与跟班 XHR，按会话存活；存 pages/<hash>，不做后台 SWR，闸门页/未登录页/跨账号不缓存。
 use super::BoxBody;
-use crate::pool::{now_ms, LogFn};
-use crate::server::upstream::{self, Incoming};
+use crate::util::{now_ms, LogFn};
+use crate::server::protocol::{self, Incoming};
+use crate::server::upstream;
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -406,7 +407,7 @@ fn rebuild_cached_response(
     }
     let mut resp = hyper::Response::builder()
         .status(status)
-        .body(upstream::full_body(body))
+        .body(protocol::full_body(body))
         .unwrap();
     *resp.headers_mut() = hdrmap;
     resp.headers_mut().insert(
@@ -889,7 +890,7 @@ async fn collect_and_submit(
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
-                .body(upstream::full_body(bytes))
+                .body(protocol::full_body(bytes))
                 .unwrap();
             *rebuilt.headers_mut() = parts.headers;
             rebuilt
@@ -904,7 +905,7 @@ async fn collect_and_submit(
             // 收集失败：无内容可交付，回 502
             hyper::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(upstream::full_body(Bytes::from_static(b"page collect failed")))
+                .body(protocol::full_body(Bytes::from_static(b"page collect failed")))
                 .unwrap()
         }
     }

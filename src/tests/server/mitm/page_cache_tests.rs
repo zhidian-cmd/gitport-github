@@ -238,7 +238,7 @@ async fn roundtrip_gates_and_self_heal() {
     let resp = hyper::Response::builder()
         .status(200)
         .header("content-type", "application/json")
-        .body(upstream::full_body(Bytes::from_static(b"{}")))
+        .body(protocol::full_body(Bytes::from_static(b"{}")))
         .unwrap();
     let _ = collect_and_submit(&log, "GET github.com/api/x", false, false, false, resp).await;
     assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
@@ -292,7 +292,7 @@ async fn roundtrip_gates_and_self_heal() {
     let mut sniffed = hyper::Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
-        .body(upstream::full_body(Bytes::from_static(b"world</html>")))
+        .body(protocol::full_body(Bytes::from_static(b"world</html>")))
         .unwrap();
     sniffed
         .extensions_mut()
@@ -525,7 +525,7 @@ async fn keys_invalidation_and_pollution() {
     let poisoned = hyper::Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
-        .body(upstream::full_body(Bytes::from_static(
+        .body(protocol::full_body(Bytes::from_static(
             b"<html><body class=\"logged-out env-production\">sign in</body></html>",
         )))
         .unwrap();
@@ -574,7 +574,7 @@ async fn keys_invalidation_and_pollution() {
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
         .header("content-encoding", "gzip")
-        .body(upstream::full_body(Bytes::from(gzbody)))
+        .body(protocol::full_body(Bytes::from(gzbody)))
         .unwrap();
     let _ = collect_and_submit(
         &log,
@@ -606,7 +606,7 @@ async fn keys_invalidation_and_pollution() {
     let gate = hyper::Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
-        .body(upstream::full_body(Bytes::from_static(gate_html)))
+        .body(protocol::full_body(Bytes::from_static(gate_html)))
         .unwrap();
     let _ = collect_and_submit(&log, "GET github.com/o/r-gate", false, false, false, gate).await;
     assert!(

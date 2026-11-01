@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 
-use crate::pool::LogFn;
+use crate::util::LogFn;
 
 /// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);

@@ -17,6 +17,13 @@ fn reset_state(dir: &Path) {
     serial_load(dir, Vec::new(), None);
 }
 
+/// 生产路径：settings 只存注册表，存完由调用方用 removed 触发链对齐。
+fn apply_worker_mirrors(list: Vec<crate::settings::WorkerMirror>) -> Result<(), String> {
+    let (_, removed) = crate::settings::set_worker_mirrors(list)?;
+    sync_custom_mirrors(&removed);
+    Ok(())
+}
+
 #[test]
 fn breakers_open_set_clear_by_host() {
     let raw = "raw.githubusercontent.com";
@@ -527,7 +534,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
         "仅旧字典有的 host 照常并入: {legacy:?}"
     );
     // 清场：正规路径删除自建镜像（注册表 + 全部链），不给后续测试留全局残留。
-    crate::settings::set_worker_mirrors(Vec::new()).ok();
+    apply_worker_mirrors(Vec::new()).ok();
 }
 
 /// 全新安装(链全空) + 添加镜像 → 启用中的镜像必须落进全部 8 条链。
@@ -543,8 +550,8 @@ fn fresh_install_mirror_lands_in_all_chains() {
         mirror_chain("raw.githubusercontent.com").is_empty(),
         "前置: 全新安装链应为空"
     );
-    // 模拟 UI 添加并启用一个镜像(整表保存走 sync_custom_mirrors)。
-    crate::settings::set_worker_mirrors(vec![crate::settings::WorkerMirror {
+    // 模拟 UI 添加并启用一个镜像：settings 存 + 调用方触发链对齐。
+    apply_worker_mirrors(vec![crate::settings::WorkerMirror {
         url: "https://my-worker.example.com".to_string(),
         on: true,
         trusted: false,
@@ -558,7 +565,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
         );
     }
     // 清场：正规路径删除，注册表与全部链恢复空。
-    crate::settings::set_worker_mirrors(Vec::new()).ok();
+    apply_worker_mirrors(Vec::new()).ok();
 }
 
 #[test]

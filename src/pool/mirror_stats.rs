@@ -106,12 +106,12 @@ pub(crate) fn record(mirror: &str, speed: u64) {
         }
     }
     let mut st = load();
-    let milestone = append(&mut st, mirror, speed, super::now_ms());
+    let milestone = append(&mut st, mirror, speed, crate::util::now_ms());
     save(&st);
     if milestone {
         let to_off = evaluate(&st.mirrors);
         for u in to_off {
-            if let Some(log) = super::lock(&super::SERIAL_LOG).as_ref() {
+            if let Some(log) = crate::util::lock(&super::SERIAL_LOG).as_ref() {
                 log(&format!(
                     "[评估] {u} 历史中位速率垫底(近 {EVAL_EVERY} 次), 建议停用(手动处理)"
                 ));

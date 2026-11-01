@@ -31,7 +31,7 @@ async fn slot_filter_pins_search_to_primary() {
     }
     // 主通道被摘后:Some(1) -> None(交拨号按主键重建),绝不误用第二通道
     drop_h2_id(host, {
-        let g = pool::lock(conn_pool());
+        let g = lock(conn_pool());
         g.get(host).unwrap().conns.iter().find(|c| c.up.slot == 1).unwrap().up.id
     });
     assert!(
@@ -41,7 +41,7 @@ async fn slot_filter_pins_search_to_primary() {
     // None = 原语义:池里剩下的第二通道照常服务
     let up = cached_h2_in(host, None).expect("无过滤应命中");
     assert_eq!(up.ip, "9.9.9.2");
-    let _ = pool::lock(conn_pool()).remove(host);
+    let _ = lock(conn_pool()).remove(host);
 }
 
 #[tokio::test]
@@ -59,5 +59,5 @@ async fn slot_filter_prefers_fastest_primary() {
     }
     let up = cached_h2_in(host, Some(1)).expect("主通道应在池");
     assert_eq!(up.id, fid, "槽位过滤应在主通道内取 EWMA 最快者");
-    let _ = pool::lock(conn_pool()).remove(host);
+    let _ = lock(conn_pool()).remove(host);
 }

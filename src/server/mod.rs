@@ -1,11 +1,13 @@
 //! 代理服务：CONNECT 隧道（TLS 透传 / 池内域名 MITM）+ 明文 HTTP 转发。
 
 pub mod mitm;
+pub mod protocol;
 pub mod upstream;
 
 use crate::certgen::Authority;
 use crate::config::{self, HEAD_TIMEOUT_SECS};
-use crate::pool::{self, dial::Dialed, LogFn};
+use crate::pool::{self, dial::Dialed};
+use crate::util::LogFn;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
