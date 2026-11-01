@@ -8,8 +8,6 @@ use std::sync::{Arc, Mutex};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// 写系统剪贴板（WebView2 拒 JS 剪贴板 API 时的兜底）；失败时句柄仍归调用方，须自行释放。
 #[cfg(target_os = "windows")]
@@ -57,73 +55,296 @@ const WIN_W: f64 = 1250.0;
 const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
-fn build_tray(show_id: MenuItem, quit_id: MenuItem, log: &LogFn) -> Result<TrayIcon, String> {
-    let menu = Menu::new();
-    menu.append_items(&[&show_id, &quit_id])
-        .map_err(|e| e.to_string())?;
-    let mut builder = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("GitPort GitHub");
-    // 图标取 exe 内嵌资源（assets/app.rc 的 `1 ICON`）。ico 里小尺寸是 BMP 条目，
-    // 取不到就逐级降级，最后画一个，绝不让托盘空着。
-    let mut note = String::new();
-    let icon = match Icon::from_resource(1, Some((32, 32))) {
-        Ok(i) => {
-            note.push_str("内嵌 32x32");
-            i
-        }
-        Err(e) => {
-            note.push_str(&format!("32x32 失败({e}), "));
-            match Icon::from_resource(1, None) {
-                Ok(i) => {
-                    note.push_str("内嵌默认尺寸");
-                    i
-                }
-                Err(e2) => {
-                    note.push_str(&format!("默认尺寸也失败({e2}), 用内置图标"));
-                    fallback_icon()
-                }
-            }
-        }
-    };
-    builder = builder.with_icon(icon);
-    let built = builder.build().map_err(|e| e.to_string());
-    let line = format!(
-        "[启动] 托盘: {note}; 注册{}",
-        match &built {
-            Ok(_) => "成功",
-            Err(e) => e.as_str(),
-        }
-    );
-    log(&line);
-    tray_log(&line);
-    built
+// ---- 托盘 ----
+// 自己做窗口 + 自己的消息泵，不用 tray-icon：那个库把 Shell_NotifyIcon 的返回值
+// 丢掉了，注册失败也报"成功"，出问题时只能干瞪眼。这里每一步都记真实结果。
+
+const TRAY_CLASS: windows::core::PCWSTR = windows::core::w!("GitPortTrayWnd");
+const TRAY_UID: u32 = 1;
+const WM_TRAY_NOTIFY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
+const ID_TRAY_SHOW: usize = 1;
+const ID_TRAY_QUIT: usize = 2;
+
+static TRAY_PROXY: Mutex<Option<tao::event_loop::EventLoopProxy<AppEvent>>> = Mutex::new(None);
+static TRAY_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TRAY_ICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn tray_send(ev: AppEvent) {
+    if let Some(p) = TRAY_PROXY.lock().unwrap().as_ref() {
+        let _ = p.send_event(ev);
+    }
 }
 
-/// 托盘兜底图标：蓝底白环的圆盘。内嵌 ico 取不到时用它，保证托盘里一定有东西。
-fn fallback_icon() -> Icon {
-    const N: u32 = 32;
-    let mut px = vec![0u8; (N * N * 4) as usize];
-    let c = (N as f32 - 1.0) / 2.0;
-    for y in 0..N {
-        for x in 0..N {
-            let dx = x as f32 - c;
-            let dy = y as f32 - c;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d > c {
-                continue; // 圆外留透明
-            }
-            let i = ((y * N + x) * 4) as usize;
-            let ring = (c - 3.0..=c - 1.0).contains(&d);
-            let rgb: [u8; 4] = if ring {
-                [0xFF, 0xFF, 0xFF, 0xFF]
-            } else {
-                [0x2F, 0x6F, 0xEB, 0xFF]
-            };
-            px[i..i + 4].copy_from_slice(&rgb);
+
+/// 当前进程的完整性级别（4096=Low 8192=Medium 12288=High）。
+/// Shell_NotifyIcon 在比 shell 低的级别下会被 UIPI 拒掉（err=5），所以这行必须记。
+unsafe fn current_il() -> u32 {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetTokenInformation, SID_AND_ATTRIBUTES, TOKEN_QUERY,
+        TokenIntegrityLevel,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).is_err() {
+            return 0;
+        }
+        let mut need = 0u32;
+        let _ = GetTokenInformation(tok, TokenIntegrityLevel, None, 0, &mut need);
+        if need == 0 {
+            return 0;
+        }
+        let mut buf = vec![0u8; need as usize];
+        if GetTokenInformation(
+            tok,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut _),
+            need,
+            &mut need,
+        )
+        .is_err()
+        {
+            return 0;
+        }
+        let sa = &*(buf.as_ptr() as *const SID_AND_ATTRIBUTES);
+        *GetSidSubAuthority(sa.Sid, 0)
+    }
+}
+
+/// 挂图标，返回 (成功, GetLastError)。
+unsafe fn tray_add(
+    hwnd: windows::Win32::Foundation::HWND,
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> (bool, u32) {
+    use windows::Win32::UI::Shell::{
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAY_NOTIFY,
+        hIcon: hicon,
+        ..Default::default()
+    };
+    for (i, c) in "GitPort GitHub".encode_utf16().enumerate() {
+        nid.szTip[i] = c;
+    }
+    let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
+    let err = unsafe { windows::Win32::Foundation::GetLastError() }.0;
+    (ok.as_bool(), err)
+}
+
+/// 问系统要图标矩形：拿到才算真进了通知区。
+fn tray_rect(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
+    let id = NOTIFYICONIDENTIFIER {
+        cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        guidItem: Default::default(),
+    };
+    match unsafe { Shell_NotifyIconGetRect(&id) } {
+        Ok(r) => format!("已入通知区 ({}, {})", r.left, r.top),
+        Err(e) => format!("GetRect 失败 {e}"),
+    }
+}
+
+/// 右键菜单：先置前再弹，弹完补一条空消息，否则点空白处关不掉。
+unsafe fn tray_popup(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, GetCursorPos, HMENU, MF_STRING, PostMessageW,
+        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+    };
+    unsafe {
+        let mut menu = HMENU(TRAY_MENU.load(Ordering::Relaxed) as *mut _);
+        if TRAY_MENU.load(Ordering::Relaxed) == 0 {
+            let Ok(m) = CreatePopupMenu() else { return };
+            let _ = AppendMenuW(m, MF_STRING, ID_TRAY_SHOW, windows::core::w!("显示工作台"));
+            let _ = AppendMenuW(m, MF_STRING, ID_TRAY_QUIT, windows::core::w!("退出"));
+            TRAY_MENU.store(m.0 as isize, Ordering::Relaxed);
+            menu = m;
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        match cmd.0 as usize {
+            ID_TRAY_SHOW => tray_send(AppEvent::ShowWindow),
+            ID_TRAY_QUIT => tray_send(AppEvent::RequestQuit),
+            _ => {}
         }
     }
-    Icon::from_rgba(px, N, N).expect("32x32 RGBA 恒定合法")
+}
+
+unsafe extern "system" fn tray_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wp: windows::Win32::Foundation::WPARAM,
+    lp: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_LBUTTONUP, WM_RBUTTONUP};
+    unsafe {
+        if msg == WM_TRAY_NOTIFY {
+            match lp.0 as u32 {
+                WM_LBUTTONUP => tray_send(AppEvent::ShowWindow),
+                WM_RBUTTONUP => tray_popup(hwnd),
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+        let restart = TASKBAR_CREATED.load(Ordering::Relaxed);
+        if restart != 0 && msg == restart {
+            // 资源管理器重启：旧图标已被清空，重新挂一次。
+            let (ok, err) = tray_add(hwnd, windows::Win32::UI::WindowsAndMessaging::HICON(
+                TRAY_ICON.load(Ordering::Relaxed) as *mut _,
+            ));
+            tray_log(&format!("[托盘] explorer 重启后重挂: {ok} err={err}"));
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+/// 托盘独立线程：建窗、挂图标、泵自己的消息队列。
+/// 回执通道：注册结果一出来就发回来，调用方据此决定要不要继续建窗口。
+fn spawn_tray(
+    proxy: tao::event_loop::EventLoopProxy<AppEvent>,
+    log: LogFn,
+) -> std::sync::mpsc::Receiver<(bool, u32)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_log = log.clone();
+    let spawned = std::thread::Builder::new()
+        .name("gitport-tray".to_string())
+        .spawn(move || {
+            use windows::Win32::Foundation::{HINSTANCE, HWND};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DispatchMessageW, GetMessageW, HICON, IDI_APPLICATION, IMAGE_ICON,
+                LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MSG, RegisterClassW,
+                RegisterWindowMessageW, TranslateMessage, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+            };
+            let note = |s: String| {
+                thread_log(&s);
+                tray_log(&s);
+            };
+            note(format!("[启动] 托盘: 线程起来, 进程完整性={}", unsafe { current_il() }));
+            *TRAY_PROXY.lock().unwrap() = Some(proxy);
+            unsafe {
+                let Ok(hmod) = GetModuleHandleW(None) else {
+                    note("[启动] 托盘: 取模块句柄失败".to_string());
+                    return;
+                };
+                let hinst = HINSTANCE(hmod.0);
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(tray_proc),
+                    hInstance: hinst,
+                    lpszClassName: TRAY_CLASS,
+                    ..std::mem::zeroed()
+                };
+                if RegisterClassW(&wc) == 0 {
+                    note(format!(
+                        "[启动] 托盘: 注册窗口类失败 err={}",
+                        windows::Win32::Foundation::GetLastError().0
+                    ));
+                    return;
+                }
+                let hwnd: HWND = match CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    TRAY_CLASS,
+                    windows::core::w!("GitPort GitHub"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(hinst),
+                    None,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        note(format!("[启动] 托盘: 建窗失败 {e}"));
+                        return;
+                    }
+                };
+                // 图标取 exe 内嵌资源 1（assets/app.rc）；取不到退系统默认，绝不留空。
+                let hicon: HICON = match LoadImageW(
+                    Some(hinst),
+                    windows::core::PCWSTR(1 as *const u16),
+                    IMAGE_ICON,
+                    32,
+                    32,
+                    LR_DEFAULTCOLOR,
+                ) {
+                    Ok(h) => HICON(h.0),
+                    Err(_) => LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)
+                        .map(|h| HICON(h.0))
+                        .unwrap_or_default(),
+                };
+                TRAY_ICON.store(hicon.0 as isize, Ordering::Relaxed);
+                let (mut ok, mut err) = tray_add(hwnd, hicon);
+                note(format!(
+                    "[启动] 托盘: 内嵌图标 hicon={:?} NIM_ADD={ok} err={err}",
+                    hicon.0
+                ));
+                if !ok {
+                    // 图标句柄有问题时换系统默认图标再试：能分开"图标坏"和"进程被拒"。
+                    let sys_icon =
+                        LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_SHARED)
+                            .map(|h| HICON(h.0))
+                            .unwrap_or_default();
+                    let (ok2, err2) = tray_add(hwnd, sys_icon);
+                    note(format!(
+                        "[启动] 托盘: 系统图标 hicon={:?} NIM_ADD={ok2} err={err2}",
+                        sys_icon.0
+                    ));
+                    if ok2 {
+                        TRAY_ICON.store(sys_icon.0 as isize, Ordering::Relaxed);
+                        ok = true;
+                        err = 0;
+                    }
+                }
+                let _ = tx.send((ok, err));
+                let immediate = tray_rect(hwnd);
+                let missed = immediate.starts_with("GetRect 失败");
+                note(format!("[启动] 托盘: {immediate}"));
+                TASKBAR_CREATED.store(
+                    RegisterWindowMessageW(windows::core::w!("TaskbarCreated")),
+                    Ordering::Relaxed,
+                );
+                if missed {
+                    // 刚发的瞬间查不到是正常的，等 shell 收下再问一次。
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    note(format!("[启动] 托盘: 1.5s 后 {}", tray_rect(hwnd)));
+                }
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        let line = format!("[启动] 托盘: 线程起不来 {e}");
+        log(&line);
+        tray_log(&line);
+    }
+    rx
 }
 
 /// 托盘失败是静默的（GUI 版没有 stdout），留一行到 .cache/tray.log 备查。
@@ -373,49 +594,7 @@ pub fn run(args: DesktopArgs) -> ! {
         wv: None,
     }));
 
-    let show_item = MenuItem::new("显示工作台", true, None);
-    let quit_item = MenuItem::new("退出", true, None);
-    let show_id = show_item.id().clone();
-    let quit_id = quit_item.id().clone();
     // 托盘留到窗口建好后注册：WebView2 初始化会动 shell，先挂上去的图标会被吞掉。
-    let mut pending_tray = Some((show_item, quit_item));
-    // 托盘事件 → 全事件驱动（crossbeam recv 无事件即内核级睡眠，零周期唤醒）。
-    {
-        let proxy = proxy.clone();
-        std::thread::spawn(move || {
-            let tray_rx = TrayIconEvent::receiver();
-            while let Ok(ev) = tray_rx.recv() {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    ..
-                } = ev
-                {
-                    if proxy.send_event(AppEvent::ShowWindow).is_err() {
-                        break; // 事件循环已退出：进程行将结束
-                    }
-                }
-            }
-        });
-    }
-    {
-        let proxy = proxy.clone();
-        std::thread::spawn(move || {
-            let menu_rx = MenuEvent::receiver();
-            while let Ok(ev) = menu_rx.recv() {
-                let ev = if *ev.id() == show_id {
-                    AppEvent::ShowWindow
-                } else if *ev.id() == quit_id {
-                    AppEvent::RequestQuit
-                } else {
-                    continue;
-                };
-                if proxy.send_event(ev).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     let quitting = Arc::new(AtomicBool::new(false));
     // 主动收起到托盘的标记: 供 Destroyed 事件区分"自己收的"与"外部销毁"。
     let tray_hidden = Arc::new(AtomicBool::new(false));
@@ -440,7 +619,14 @@ pub fn run(args: DesktopArgs) -> ! {
     let mut created_once = false;
     // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
     let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
-    let mut tray: Option<TrayIcon> = None;
+    // 托盘先挂、拿到回执再往下走：WebView2 起来之后 Shell_NotifyIcon 会被系统拒
+    // （err=5 拒绝访问），所以顺序必须是先托盘后窗口，且要等它真的注册上。
+    let tray_rx = spawn_tray(proxy.clone(), log.clone());
+    match tray_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok((true, _)) => (log)("[启动] 托盘: 回执 注册成功"),
+        Ok((false, err)) => (log)(&format!("[启动] 托盘: 回执 被拒 err={err}")),
+        Err(_) => (log)("[启动] 托盘: 回执超时"),
+    }
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -512,12 +698,6 @@ pub fn run(args: DesktopArgs) -> ! {
         if open_window && !created_once {
             created_once = true;
             show_or_open(&slot, elwt, &url, &log);
-        }
-        // 窗口已就位（或 -tray 模式第一拍）再挂托盘图标。
-        if tray.is_none() {
-            if let Some((s, q)) = pending_tray.take() {
-                tray = build_tray(s, q, &log).ok();
-            }
         }
     });
 }
