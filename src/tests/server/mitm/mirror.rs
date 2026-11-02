@@ -266,81 +266,52 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     }
 }
 
-/// 运行期窗口：有流在跑就跟着实测走（多流合并 + 真 EWMA 平滑），停流后停在最后一次；帧距 55ms < FRAME_GAP(300ms)，不触发读停顿扣除。
+/// ECT 时间槽：on_frame 只累计本窗实收，ect_sweep 快照进 window_prev；
+/// 有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——零 sleep，确定性验证。
 #[test]
-fn live_window_tracks_busy_mirror_and_freezes_when_idle() {
-    let ld = mirror_load("live-window.test");
-    ld.speed_ewma.store(0, Ordering::Relaxed);
-    ld.bytes_total.store(0, Ordering::Relaxed);
-    ld.win_base_bytes.store(0, Ordering::Relaxed);
-    ld.win_base_ms.store(0, Ordering::Relaxed);
-    ld.in_flight_streams.store(0, Ordering::Relaxed);
-
-    let mut a = LoadGuard::charge(ld.clone(), 64 * 1024 * 1024, true);
-    let mut b = LoadGuard::charge(ld.clone(), 64 * 1024 * 1024, true);
-    a.on_frame(512 * 1024); // 忙期第一帧只建基线
+fn ect_window_slots_snapshot_stall_and_idle() {
+    let ld = mirror_load("ect-slot.test");
+    let mut g = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
+    g.on_frame(3 * 1024 * 1024);
+    ect_sweep();
     assert_eq!(
-        ld.speed_ewma.load(Ordering::Relaxed),
+        ld.window_prev.load(Ordering::Relaxed),
+        3 * 1024 * 1024,
+        "本窗实收快照进 prev"
+    );
+    assert_eq!(
+        ld.window_bytes.load(Ordering::Relaxed),
         0,
-        "建基线那一帧不写分"
+        "快照后本窗清零重开"
     );
 
-    // 连续小帧跑满第一窗（帧距 55ms）：~1MB / 550ms ≈ 1.9MB/s
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(55));
-        a.on_frame(100 * 1024);
-    }
-    let first = ld.speed_ewma.load(Ordering::Relaxed);
-    assert!(
-        (1300 * 1024..2500 * 1024).contains(&first),
-        "第一窗应按实测写分(≈1.9MB/s): {first}B/s"
-    );
+    // 下一窗有债零收：卡死 → prev 清零，派发立即避开。
+    ect_sweep();
+    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 0, "有债零收 = 卡死清零");
 
-    // 同一窗里两条流各自出字节：结算必须合并成这家的总吞吐，不能各算各的。
-    a.on_frame(1024 * 1024);
-    b.on_frame(1024 * 1024);
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(55));
-        b.on_frame(200 * 1024);
-    }
-    let agg = ld.speed_ewma.load(Ordering::Relaxed);
-    assert!(
-        agg > first,
-        "两条流的字节要合并结算, 分数应随负载上升: {first} -> {agg}"
-    );
+    // 恢复出货：prev 换新值。
+    g.on_frame(4 * 1024 * 1024);
+    ect_sweep();
+    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 4 * 1024 * 1024);
 
-    drop(a);
-    drop(b);
-    let frozen = ld.speed_ewma.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(600));
+    // 空闲窗（还清债务后无债无收）：沿用旧值，别把歇着的快家当死腿。
+    drop(g);
+    ect_sweep();
     assert_eq!(
-        ld.speed_ewma.load(Ordering::Relaxed),
-        frozen,
-        "没有流在跑就停在最后一次, 不得改分"
+        ld.window_prev.load(Ordering::Relaxed),
+        4 * 1024 * 1024,
+        "无债零收沿用旧值"
     );
-
-    // 再次转忙：第一帧只重建基线，待机那 600ms 不能算进分母拉低分数。
-    let mut c = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
-    c.on_frame(1024);
-    assert_eq!(
-        ld.speed_ewma.load(Ordering::Relaxed),
-        frozen,
-        "忙期第一帧不得改分"
-    );
-    drop(c);
-
-    ld.speed_ewma.store(0, Ordering::Relaxed);
-    ld.bytes_total.store(0, Ordering::Relaxed);
-    ld.win_base_ms.store(0, Ordering::Relaxed);
+    ld.window_prev.store(0, Ordering::Relaxed);
 }
 
 /// 先验退役：未交卷候选在 ECT 里按无穷大垫底——已交卷的慢腿也胜过它。
 #[test]
 fn ect_after_retirement_unprobed_loses_to_probed_slow() {
     let slow = mirror_load("retire-slow.test");
-    slow.speed_ewma.store(100 * 1024, Ordering::Relaxed); // 100KB/s 已交卷
+    slow.window_prev.store(100 * 1024, Ordering::Relaxed); // 100KB/s 已交卷
     let unprobed = mirror_load("retire-unprobed.test");
-    unprobed.speed_ewma.store(0, Ordering::Relaxed);
+    unprobed.window_prev.store(0, Ordering::Relaxed);
     let chain = vec![
         "retire-slow.test".to_string(),
         "retire-unprobed.test".to_string(),
@@ -350,7 +321,7 @@ fn ect_after_retirement_unprobed_loses_to_probed_slow() {
         0,
         "未交卷者 ECT 无穷大, 已交卷的慢腿也胜出(先验不再掺和)"
     );
-    slow.speed_ewma.store(0, Ordering::Relaxed);
+    slow.window_prev.store(0, Ordering::Relaxed);
 }
 
 /// 直连同台：candidates = 镜像 + direct/{host}，ECT 统一派发。
@@ -361,7 +332,7 @@ fn direct_competes_as_candidate() {
     let all: Vec<String> = cands.concat();
     // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
     let d = mirror_load_for(&direct_load_key("cand-host.test"));
-    d.speed_ewma.store(8 * 1024 * 1024, Ordering::Relaxed);
+    d.window_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(
         all[pick],
@@ -372,7 +343,7 @@ fn direct_competes_as_candidate() {
     mark_fail(&d, false);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(all[pick], "cand-m.test", "直连降权后应选镜像");
-    d.speed_ewma.store(0, Ordering::Relaxed);
+    d.window_prev.store(0, Ordering::Relaxed);
     d.fail_until.store(0, Ordering::Relaxed);
     // 零镜像: candidates 只有直连, pick 恒 0(直连键)。
     let only_direct = vec![direct_load_key("cand-host.test")];
@@ -386,9 +357,9 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     let a = mirror_load("ect-a.test");
     let b = mirror_load("ect-b.test");
     a.in_flight_bytes.store(512 * 1024, Ordering::Relaxed);
-    a.speed_ewma.store(5 * 1024 * 1024, Ordering::Relaxed);
+    a.window_prev.store(5 * 1024 * 1024, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(512 * 1024, Ordering::Relaxed);
+    b.window_prev.store(512 * 1024, Ordering::Relaxed);
     let chain = vec!["ect-a.test".to_string(), "ect-b.test".to_string()];
     // A (0.5+10)/5 ≈ 2s < B 10/0.5 = 20s → A。
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 0);
@@ -397,8 +368,8 @@ fn ect_prefers_busy_fast_over_idle_slow() {
         .store(100 * 1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 1);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.speed_ewma.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(0, Ordering::Relaxed);
+    a.window_prev.store(0, Ordering::Relaxed);
+    b.window_prev.store(0, Ordering::Relaxed);
 }
 
 /// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
@@ -406,8 +377,8 @@ fn ect_prefers_busy_fast_over_idle_slow() {
 fn cold_start_falls_back_to_chain_order() {
     let a = mirror_load("cold-a.test");
     let b = mirror_load("cold-b.test");
-    a.speed_ewma.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(0, Ordering::Relaxed);
+    a.window_prev.store(0, Ordering::Relaxed);
+    b.window_prev.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
@@ -437,8 +408,8 @@ fn tie_prefers_fewer_inflight_streams() {
     let b = mirror_load("streams-b.test");
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
+    a.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
+    b.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
     let chain = vec!["streams-a.test".to_string(), "streams-b.test".to_string()];
@@ -460,8 +431,8 @@ fn tie_prefers_fewer_inflight_streams() {
     // 清场。
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
-    a.speed_ewma.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(0, Ordering::Relaxed);
+    a.window_prev.store(0, Ordering::Relaxed);
+    b.window_prev.store(0, Ordering::Relaxed);
 }
 
 /// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废；仅 ECT 完全相等才走二级(流数/轮转)。
@@ -473,8 +444,8 @@ fn ect_strict_minimum_no_tolerance() {
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["tie-a.test".to_string(), "tie-b.test".to_string()];
     // 速度差 4% → 恒选快者 b(容差时代会轮转)。
-    a.speed_ewma.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.speed_ewma.store(2088 * 1024, Ordering::Relaxed); // +4%
+    a.window_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
+    b.window_prev.store(2088 * 1024, Ordering::Relaxed); // +4%
     for _ in 0..10 {
         assert_eq!(
             pick_mirror(&chain, 8 * 1024 * 1024),
@@ -482,24 +453,25 @@ fn ect_strict_minimum_no_tolerance() {
             "无容差: 4% 差距也严格选快"
         );
     }
-    a.speed_ewma.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(0, Ordering::Relaxed);
+    a.window_prev.store(0, Ordering::Relaxed);
+    b.window_prev.store(0, Ordering::Relaxed);
 }
 
 #[test]
 fn recent_failure_deprioritized() {
     let a = mirror_load("fail-a.test");
     let b = mirror_load("fail-b.test");
-    a.speed_ewma.store(0, Ordering::Relaxed);
-    b.speed_ewma.store(0, Ordering::Relaxed);
+    a.window_prev.store(0, Ordering::Relaxed);
+    b.window_prev.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["fail-a.test".to_string(), "fail-b.test".to_string()];
     mark_fail(&a, false);
     assert_eq!(pick_mirror(&chain, 1024), 1);
-    // 全体都在窗内：放开过滤回链序。
+    // 全体都在窗内：放开过滤，ECT 照常按吞吐选（b 有历史胜过零历史的 a）。
     mark_fail(&b, false);
-    assert_eq!(pick_mirror(&chain, 1024), 0);
+    b.window_prev.store(1024 * 1024, Ordering::Relaxed);
+    assert_eq!(pick_mirror(&chain, 1024), 1);
     a.fail_until.store(0, Ordering::Relaxed);
     b.fail_until.store(0, Ordering::Relaxed);
 }
@@ -585,17 +557,17 @@ fn byte_accounting_lifecycle() {
     assert_eq!(ld.in_flight_bytes.load(Ordering::Relaxed), 0);
 }
 
-/// 小文件流与大文件机器绝对解耦: 零充值零归还零采样。
+/// 小文件流与大文件机器绝对解耦: 零充值零归还，不进 ECT 时间槽。
 #[test]
 fn small_stream_never_touches_big_file_state() {
     let ld = mirror_load("small-decoupled.test");
     ld.in_flight_bytes.store(0, Ordering::Relaxed);
     ld.in_flight_streams.store(0, Ordering::Relaxed);
-    ld.speed_ewma.store(0, Ordering::Relaxed);
+    ld.window_prev.store(0, Ordering::Relaxed);
     let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024, false); // 小文件流
     g.on_frame(1024 * 1024);
     std::thread::sleep(Duration::from_millis(120));
-    g.on_frame(64 * 1024); // 再多帧也不得交分
+    g.on_frame(64 * 1024); // 再多帧也不得进时间槽
     drop(g);
     assert_eq!(
         ld.in_flight_bytes.load(Ordering::Relaxed),
@@ -607,12 +579,12 @@ fn small_stream_never_touches_big_file_state() {
         0,
         "流数零接触"
     );
-    assert_eq!(ld.speed_ewma.load(Ordering::Relaxed), 0, "小文件不写速度分");
     assert_eq!(
-        ld.last_sample_ms.load(Ordering::Relaxed),
+        ld.window_bytes.load(Ordering::Relaxed),
         0,
-        "零采样记录"
+        "小文件不进时间槽"
     );
+    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 0, "零历史保持垫底");
 }
 
 // ---- 切片驱动：缺口自己续、失败只算空手、绝不提前收尾 ----
@@ -680,78 +652,4 @@ async fn driver_gives_up_after_repeated_dead_fills() {
     let fetch: Fetch = Arc::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
     let res = http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))).await;
     assert!(res.is_err(), "补不起来必须报错，不能假装下完");
-}
-
-// ---- 测量与派发的纯函数：不碰时钟、不碰全局 ----
-
-/// 真 EWMA：平滑跟踪 + 突变钳制；首样本直接落地（旧值为 0 无从平滑）。
-#[test]
-fn ewma_smooths_and_clamps_outliers() {
-    assert_eq!(ewma_next(0, 1_000_000), 1_000_000, "首样本直接落地");
-    assert_eq!(ewma_next(1000, 1100), 1030, "常规样本 α=0.3");
-    // 单窗 10 倍突刺：只走一半差距，不把派发带偏。
-    assert_eq!(ewma_next(1000, 10_000), 2350);
-    // 单窗塌到 1/3 以下（GC 停顿/丢包窗）：同样只走一半。
-    let down = ewma_next(9000, 1000);
-    assert!(down > 3000 && down < 9000, "塌窗半步收敛: {down}");
-    // 塌到 0 也是塌窗：只走半步，地板保证不写 0(0=未交卷语义)。
-    assert_eq!(ewma_next(1000, 0), 850);
-}
-
-/// 失败降权分类：超时(慢)短窗 15s，硬错误(死)长窗 45s。
-#[test]
-fn fail_windows_split_timeout_from_hard_error() {
-    let ld = mirror_load("failwin.test");
-    ld.fail_until.store(0, Ordering::Relaxed);
-    let now = now_ms();
-    mark_fail(&ld, true);
-    let t = ld.fail_until.load(Ordering::Relaxed) - now;
-    assert!(
-        (10_000..=20_000).contains(&t),
-        "超时降权应 ≈15s: {t}ms"
-    );
-    mark_fail(&ld, false);
-    let h = ld.fail_until.load(Ordering::Relaxed) - now_ms();
-    assert!(
-        (40_000..=50_000).contains(&h),
-        "硬错误降权应 ≈45s: {h}ms"
-    );
-    // 归类：拨号/首包/预算超时算「慢」，拒绝/断流/坏包算「死」。
-    assert!(is_timeout_err("直连首包超时(2000ms)"));
-    assert!(is_timeout_err("起流超时"));
-    assert!(is_timeout_err("Os { code: 10060, kind: TimedOut }"));
-    assert!(!is_timeout_err("连接被拒"));
-    assert!(!is_timeout_err("状态 403"));
-    ld.fail_until.store(0, Ordering::Relaxed);
-}
-
-/// 读停顿扣除：帧间空档超过 FRAME_GAP 时窗口基线平移，空档不进分母。
-#[test]
-fn frame_gap_excluded_from_window() {
-    let ld = mirror_load("gap.test");
-    ld.win_base_ms.store(0, Ordering::Relaxed);
-    ld.bytes_total.store(0, Ordering::Relaxed);
-    ld.win_base_bytes.store(0, Ordering::Relaxed);
-    let t0 = now_ms();
-    // 首帧建基线。
-    mark_frame(&ld, t0);
-    ld.win_base_ms.store(t0, Ordering::Relaxed);
-    ld.win_base_bytes.store(1000, Ordering::Relaxed);
-    ld.bytes_total.store(1000, Ordering::Relaxed);
-    // 模拟代理背压：2s 没人读，然后一帧。
-    let t1 = t0 + 2_000;
-    mark_frame(&ld, t1);
-    // 基线应平移到 t0 + (2000 - 300)，dt 只含活跃时长。
-    assert_eq!(
-        ld.win_base_ms.load(Ordering::Relaxed),
-        t0 + (2_000 - FRAME_GAP_MS),
-        "空档应从窗口时长里扣除"
-    );
-    // 小于阈值的帧距不动基线。
-    mark_frame(&ld, t1 + 100);
-    assert_eq!(
-        ld.win_base_ms.load(Ordering::Relaxed),
-        t0 + (2_000 - FRAME_GAP_MS),
-        "正常帧距不平移"
-    );
 }

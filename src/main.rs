@@ -77,6 +77,7 @@ fn run() {
     );
 
     server::upstream::start_keepalive(&rt);
+    server::mitm::mirror::start_ect_ticker();
 
     let srv = Arc::new(server::ProxyServer {
         log: log_fn.clone(),

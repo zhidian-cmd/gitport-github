@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 mod defuse;
 mod merge;
-mod mirror;
 mod page_cache;
 mod quiet;
 mod redirect_memo;
+
+pub(crate) mod mirror;
 
 pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, CALIB_RUNNING};
 

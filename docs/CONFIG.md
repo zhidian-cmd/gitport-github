@@ -47,11 +47,11 @@
 }
 ```
 
-- 镜像链分两个字典：`mirrors_big` = 大文件域（codeload / objects / release-assets），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
+- 镜像链分两个字典：`mirrors_big` = 大文件域（objects / release-assets，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media / **codeload**）；分类权在域名，条目放错字典启动时也会被归位
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 plans.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
 - 默认安装**不带任何镜像**（双字典为空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502——502 页面会指引补镜像
 - 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
-- 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT）；链序只决定失败时的顺延次序
+- 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT 时间槽）；链序只决定失败时的顺延次序。codeload 已并入小文件派发：**直连优先**，失败按校准链序逐家
 - 条目顺序 = 优先级，第一行是表头；**`sni` 原样透传进 TLS 握手，代理不解释**：带点域名 = 伪装（SNI=所写值，哪怕碰巧写真名）；`""` = 无 SNI（ClientHello 不带扩展）；要真名就把 host 名写进 sni。非法字符（防注入）该条剥除
 - **表序固定、运行时零重排**：串发从 settings.json 记忆的游标（上次驻留 IP）起步，沿表顺序转圈——成功驻留、失败沿圈前进（dead 表跳过死位）；想让某条先被试，把它排到前面即可。运行时唯一写盘 = 故障转移时 settings.json 里几字节的游标更新
 - 手改**重启生效**；运行中的轮换 2 秒内自动写回（手改请先关代理，避免被写回覆盖）
@@ -74,7 +74,7 @@
 | `185.199.x.215` | Fastly 静态边缘（新） | githubassets 的 CSS/JS | 伪装 |
 | `185.199.x.154` | Fastly 静态边缘（旧代，状态波动以实测为准） | 同上 | 伪装 |
 | `185.199.x.153` | Fastly Pages 边缘 | github.io 站点 | 伪装 |
-| `140.82.x.9`、`20.205.243.165`、`20.27.177.114` | codeload 专用边缘 | 源码包打包服务（GitPort 走镜像，直连腿未启用；2026-10-19 测绘发现） | 伪装 |
+| `140.82.x.9`、`20.205.243.165`、`20.27.177.114` | codeload 专用边缘 | 源码包打包服务（2026-11-02 起 codeload **直连优先**，失败走校准镜像链；2026-10-19 测绘发现） | 伪装 |
 | `4.249.131.160` | Azure（Copilot 代理） | copilot-proxy.githubusercontent.com | **真名 + 分片**（wl_azure 族专用） |
 
 > **白名单域名例外**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` 也落在上面这几个 Fastly 段，但它们**不用伪装**——走真名 SNI + ClientHello 分 3 片，由 edge 的 `wl*` 四族接管（见 [路由表](ROUTING.md) 第 3 节）。同一段 IP 被两组族共用，各按自己判据筛。
@@ -93,7 +93,8 @@
 | viewscreen.githubusercontent.com | **直连白名单**（mermaid 渲染） |
 | githubapp.com、githubassets、github.io | edge 池直连串发 |
 | avatars/camo/gist/raw 等内容域 | edge 直连优先 → 熔断后镜像链 |
-| codeload / objects / release-assets | 镜像 only |
+| codeload | **直连优先**，失败按校准镜像链逐家（已并入小文件派发） |
+| objects / release-assets | 镜像 only（分片竞速，ECT 时间槽派发） |
 | github.com 的 `/archive`、`/releases/download`（含 latest） | release-assets / codeload 专属镜像链，全灭 502 |
 | objects-origin.* | **直连白名单**（该 vhost 仅 GLB 族服务，主站边缘对其 301 无 CORS） |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | **主路由白名单**：进 edge 池，真名 SNI + 首包分片；段内 IP 连不上自动换候选，全灭退回系统 DNS |

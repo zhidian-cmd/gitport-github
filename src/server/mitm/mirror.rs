@@ -27,29 +27,21 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 帧间空档超过此值视为「这面镜像全体没人读」，从窗口时长扣除——交付线帧距毫秒级、背压停顿秒级，分得开。
-const FRAME_GAP_MS: u64 = 300;
-/// 测量窗口：有流在跑时每这么久按「本镜像全流合计字节 ÷ 实际活跃时长」更新一次分数。
-/// 活越多越贴近真实总吞吐、ECT 才跟着涨——否则快家被压到几百 KB/s、分数停在单流峰值，补发一直往它堆。
-const RATE_WINDOW_MS: u64 = 500;
+/// ECT 时间槽：每这么久把「本窗实收字节」快照给派发器并清零重开，分数 = 债务 ÷ 上一窗字节。
+const ECT_WINDOW_MS: u64 = 500;
 
-/// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败窗与采样时刻。
+/// 每面镜像的记账：在途字节/流数、ECT 时间槽（本窗实收 + 上一窗快照）、失败降权窗。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
     pub(super) in_flight_streams: AtomicU64,
-    /// 这家的吞吐：有流在跑时按窗口跟着实测走，没有流就停在最后一次。
-    pub(super) speed_ewma: AtomicU64,
-    /// 大文件交付字节的镜像级累计（所有流合并），窗口速率的分子。
-    bytes_total: AtomicU64,
-    /// 窗口基线：(字节, 时刻)。`win_base_ms == 0` = 当前没有流在跑，下一帧重新起算。
-    win_base_bytes: AtomicU64,
-    win_base_ms: AtomicU64,
-    /// 最近一帧到达时刻：窗口结算据此扣除「全体没人读」的空档。
-    last_frame_ms: AtomicU64,
+    /// 本时间槽实收字节：on_frame 累加，ect_sweep 每 ECT_WINDOW_MS 快照进 window_prev 后清零。
+    window_bytes: AtomicU64,
+    /// 上一时间槽实收字节（派发器的吞吐分母）；0 = 零历史，派发时按 +∞ 垫底。
+    /// 快照规则：有字节 → 换新值；零收且有债 → 卡死清零；零收无债 → 空闲，沿用旧值。
+    pub(super) window_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
-    pub(super) last_sample_ms: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -96,74 +88,26 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// 帧到达记账：把「全体没人读」的空档从窗口时长扣除——交付线堵住（合并层缓冲顶格）时镜像一字节不产，墙钟照走会稀释成假慢。
-fn mark_frame(load: &MirrorLoad, now: u64) {
-    let last = load.last_frame_ms.swap(now, Ordering::Relaxed);
-    if last != 0 && load.win_base_ms.load(Ordering::Relaxed) != 0 {
-        let gap = now.saturating_sub(last);
-        if gap > FRAME_GAP_MS {
-            // 平移窗口基线：等效于这段空档没发生。
-            load.win_base_ms
-                .fetch_add(gap - FRAME_GAP_MS, Ordering::Relaxed);
+/// ECT 时间槽结算（后台定时器每 ECT_WINDOW_MS 调一次）：本窗实收快照进 window_prev 后清零。
+/// 零收分两断：有债 = 卡死（清零，派发立即避开）；无债 = 空闲（沿用旧窗值，别把歇着的快家当死腿）。
+fn ect_sweep() {
+    let g = crate::util::lock(&MIRROR_LOAD);
+    for ld in g.values() {
+        let w = ld.window_bytes.swap(0, Ordering::Relaxed);
+        if w > 0 {
+            ld.window_prev.store(w, Ordering::Relaxed);
+        } else if ld.in_flight_bytes.load(Ordering::Relaxed) > 0 {
+            ld.window_prev.store(0, Ordering::Relaxed);
         }
     }
 }
 
-/// 真 EWMA(α=0.3) + 单窗突变钳制：新样本越过旧值 3 倍边界只走一半差距。
-/// 旧实现直接存 500ms 原始窗口率，一个抖动窗就带偏派发，流在源间来回跳、每跳重新慢启动，聚合速率抖着掉。
-fn ewma_next(old: u64, rate: u64) -> u64 {
-    if old == 0 {
-        return rate.max(1);
-    }
-    let blended = (old * 7 + rate * 3) / 10;
-    let clamped = if rate > old * 3 {
-        (old + blended) / 2
-    } else if rate * 3 < old {
-        (old + blended) / 2
-    } else {
-        blended
-    };
-    clamped.max(1)
-}
-
-/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际活跃时长」更新分数；一窗只让一条流结算（CAS 抢占），重复调用直接返回。
-/// 无帧不会走到这里——待机镜像分数自然停在最后一次，无需冻结逻辑。
-fn settle_window(load: &MirrorLoad, now: u64) {
-    let base = load.win_base_ms.load(Ordering::Relaxed);
-    if base == 0 {
-        // 待机转忙：从第一帧起算，拨号和待机时长都不进分母。
-        if load
-            .win_base_ms
-            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            load.win_base_bytes
-                .store(load.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        return;
-    }
-    let dt = now.saturating_sub(base);
-    if dt < RATE_WINDOW_MS {
-        return;
-    }
-    if load
-        .win_base_ms
-        .compare_exchange(base, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return; // 这一窗刚被别的流结算过
-    }
-    let total = load.bytes_total.load(Ordering::Relaxed);
-    let prev = load.win_base_bytes.load(Ordering::Relaxed);
-    load.win_base_bytes.store(total, Ordering::Relaxed);
-    let bytes = total.saturating_sub(prev);
-    if bytes == 0 {
-        return; // 这一窗没数据：保留上次分数，不写成 0
-    }
-    let rate = bytes.saturating_mul(1000) / dt.max(1);
-    let next = ewma_next(load.speed_ewma.load(Ordering::Relaxed), rate);
-    load.speed_ewma.store(next, Ordering::Relaxed);
-    load.last_sample_ms.store(now, Ordering::Relaxed);
+/// 启动 ECT 时间槽定时器：独立线程 500ms 一拍，零锁争用（快照只碰各镜像自己的原子量）。
+pub(crate) fn start_ect_ticker() {
+    crate::logger::spawn("ect-tick", || loop {
+        std::thread::sleep(Duration::from_millis(ECT_WINDOW_MS));
+        ect_sweep();
+    });
 }
 
 /// 记账守卫：派发记在途、逐帧归还、Drop 清残余；归还封顶于记账额，采样走原始字节。
@@ -227,11 +171,8 @@ impl LoadGuard {
         if !self.big {
             return;
         }
-        // 镜像级累计：ECT 的分母是这家的总吞吐，不是某一条流自己的均速。
-        let now = now_ms();
-        self.load.bytes_total.fetch_add(n, Ordering::Relaxed);
-        mark_frame(&self.load, now);
-        settle_window(&self.load, now);
+        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。
+        self.load.window_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -252,25 +193,29 @@ impl Drop for LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/断开都走这里)；最后一条流关窗：待机不累计时间，下个忙期从第一帧重新起算。
+        // 流数随流终结归位(正常读完/断开都走这里)。
         if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.load.win_base_ms.store(0, Ordering::Relaxed);
+            self.load.window_bytes.store(0, Ordering::Relaxed);
         }
     }
 }
 
-/// ECT 绝对最小者胜，无容差；完全相等才看流数、再相等才轮转。失败窗内的跳过，全在窗内则放开。
+/// ECT 派发：score = (在途 + 新增) ÷ 上一窗实收，即「还需几个时间槽跑完」，最小者胜、无容差；
+/// 零历史（window_prev=0）按 +∞ 垫底，全零并列才看流数、再并列才轮转。失败窗内的跳过，全在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
-    // ECT 取毫秒；.max(1) 是防御：零样本的候选 ECT 无穷大，稳定态里垫底。
     let ect_of = |ld: &MirrorLoad| -> u64 {
-        let speed = ld.speed_ewma.load(Ordering::Relaxed).max(1);
+        let w = ld.window_prev.load(Ordering::Relaxed);
+        if w == 0 {
+            // 零历史：整体 +∞ 垫底，档内按在途字节排梯度（闲者先试），仍高于任何有历史者。
+            return u64::MAX / 2 + ld.in_flight_bytes.load(Ordering::Relaxed);
+        }
         ld.in_flight_bytes
             .load(Ordering::Relaxed)
             .saturating_add(new_bytes)
-            * 1000
-            / speed
+            * 1024
+            / w
     };
 
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
@@ -915,8 +860,8 @@ async fn split_download(
                 let mut probe_cands: Vec<&str> = healthy.clone();
                 probe_cands.sort_by_key(|m| {
                     let ld = mirror_load(m);
-                    ld.in_flight_bytes.load(Ordering::Relaxed) * 1000
-                        / ld.speed_ewma.load(Ordering::Relaxed).max(1)
+                    ld.in_flight_bytes.load(Ordering::Relaxed) * 1024
+                        / ld.window_prev.load(Ordering::Relaxed).max(1)
                 });
                 probe_cands.truncate(2);
                 match probe_total(log, out, &probe_cands, orig_url, host, info, replay, &tpl).await
