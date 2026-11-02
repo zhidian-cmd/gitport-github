@@ -43,6 +43,12 @@ async fn slot_filter_pins_search_to_primary() {
     let _ = lock(conn_pool()).remove(host);
 }
 
+/// 借道用例都要扫全局连接池，串行跑，免得互相挑到对方塞进去的 donor。
+fn pool_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// 造一条真能用的 donor：对端是本地 h2 服务，回 200 并把收到的 `:authority` 回显到响应头，
 /// 用它才能断言"借来的连接确实按目标 host 路由"。
 async fn live_donor(ip: &str) -> H2Upstream {
@@ -86,6 +92,7 @@ async fn live_donor(ip: &str) -> H2Upstream {
 /// 3) 借失败要进冷却，后续请求直接回落，不再逐条空等。
 #[tokio::test]
 async fn borrow_contract_end_to_end() {
+    let _g = pool_lock();
     let target = "avatars.test-borrow.githubusercontent.com";
     let donor_host = "github.test-borrow.githubassets.com";
     let content_host = "raw.test-borrow.githubusercontent.com";
@@ -148,6 +155,72 @@ async fn borrow_contract_end_to_end() {
         borrow_donor(target).is_none(),
         "池空时借不到, 必须回 None 而不是新建"
     );
+}
+
+/// 两条通道要摊开：前一条已经挂着借出的流，下一条请求就该走另一条；
+/// 归还后计数必须回到 0，否则那条连接会一直"在忙"，再也挑不中。
+#[tokio::test]
+async fn borrow_spreads_over_two_channels() {
+    let _g = pool_lock();
+    let target = "avatars.test-spread.githubusercontent.com";
+    let donor_host = "github.test-spread.githubassets.com";
+    let a = live_donor("9.9.4.1").await;
+    let b = live_donor("9.9.4.2").await;
+    let (aid, bid) = (a.id, b.id);
+    store_h2(donor_host, a);
+    store_h2(donor_host, b);
+
+    let (_, first) = borrow_donor(target).expect("第一条应借到");
+    let (_, second) = borrow_donor(target).expect("第二条应借到");
+    assert_ne!(
+        first.id, second.id,
+        "两条都空闲时，第二条请求要换另一条通道，不能全堆在一根 TCP 上"
+    );
+    borrow_done(donor_host, first.id);
+    borrow_done(donor_host, second.id);
+    let (_, third) = borrow_donor(target).expect("归还后应还能借到");
+    assert!(
+        third.id == aid || third.id == bid,
+        "归还后计数应清零，池里还是那两条"
+    );
+    borrow_done(donor_host, third.id);
+    let _ = lock(conn_pool()).remove(donor_host);
+}
+
+/// 一条通道坏了不该拖死请求：同一次调用里换另一条，响应照拿；
+/// 借出的配额在响应体丢弃时要还回去。
+#[tokio::test]
+async fn borrow_fails_over_to_second_channel() {
+    let _g = pool_lock();
+    let target = "avatars.test-failover.githubusercontent.com";
+    let donor_host = "github.test-failover.githubassets.com";
+    // 先入池的先被选中：坏的那条排前面，才能真的走到"换一条再试"。
+    store_h2(donor_host, mk_up("9.9.3.1", 1).await); // 握手后对端即走
+    store_h2(donor_host, live_donor("9.9.3.2").await);
+
+    let log: LogFn = Arc::new(|_: &str| {});
+    let out = hyper::Request::builder()
+        .method("GET")
+        .uri(format!("https://{target}/u/1?s=40"))
+        .body(empty_body())
+        .unwrap();
+    let info = crate::server::mitm::UpstreamInfo::default();
+    let got = crate::server::mitm::try_borrow(&log, &out, target, &info, &None)
+        .await
+        .expect("有 donor 就该尝试借道")
+        .expect("一条坏了要自动换另一条，不能让请求陪它一起失败");
+    assert_eq!(got.status(), 200);
+    assert_eq!(
+        *info.lock().unwrap(),
+        "9.9.3.2",
+        "响应应来自健康的那条通道"
+    );
+
+    drop(got); // 体丢弃 -> 借出配额归还
+    let (_, again) = borrow_donor(target).expect("健康通道应已归还配额");
+    assert_eq!(again.ip, "9.9.3.2", "还回来的应是那条健康的");
+    borrow_done(donor_host, again.id);
+    let _ = lock(conn_pool()).remove(donor_host);
 }
 
 /// 纯连接级契约（不碰全局池，可与上面并行）：换连接不换 `:authority`。

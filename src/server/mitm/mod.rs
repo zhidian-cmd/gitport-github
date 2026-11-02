@@ -445,14 +445,44 @@ async fn send_once(
     }
 }
 
-/// 借道冷却：donor 借不出去（连接已死 / 421 Misdirected）就先歇半分钟，
-/// 免得每个头像请求都白等一次。冷却期内照旧走镜像链。
+/// 借道被服务端拒绝（421）后的冷却：这不是某条连接坏了，而是跨 `:authority` 不被收，
+/// 换一条也一样，所以停的是整条借道路径。
 static BORROW_BREAKER: pool::Breaker = pool::Breaker::new(30);
+
+/// 一次请求最多换几条 donor 重试（assets 通常一条 host 两条连接）。
+const MAX_BORROW_TRIES: usize = 2;
+
+/// 借来的响应体带着"借出中"计数：流走完或中途被丢弃都要归还，
+/// 否则那条 donor 会一直显示在忙，下一轮再也挑不中它。
+struct BorrowGuard(Option<(String, u64)>);
+
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        if let Some((host, id)) = self.0.take() {
+            upstream::borrow_done(&host, id);
+        }
+    }
+}
+
+fn borrow_guard_body(host: String, id: u64, body: BoxBody) -> BoxBody {
+    let stream = http_body_util::BodyExt::into_data_stream(body);
+    let guarded = futures_util::stream::unfold(
+        (stream, BorrowGuard(Some((host, id)))),
+        |(mut s, g)| async move {
+            let item = futures_util::StreamExt::next(&mut s).await?;
+            Some((item.map(hyper::body::Frame::data), (s, g)))
+        },
+    );
+    BoxBody::new(http_body_util::StreamBody::new(guarded))
+}
 
 /// 内容域候选全灭时的最后一条路：借 assets 已建好的伪装连接发同一个请求。
 ///
 /// 全程零握手——`out` 里的 URI 就是目标 host，h2 直接用它生成 `:authority`，
 /// Fastly 按它路由。所以这条路上既没有真名 ClientHello，也不会连累 donor 的通道。
+///
+/// 一条 donor 失败就换另一条再试（最多 [`MAX_BORROW_TRIES`] 条）：坏的那条只冷藏自己，
+/// 不连坐同 host 的另一条，也不会让这个请求白白落到镜像链。
 pub(super) async fn try_borrow(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -463,26 +493,45 @@ pub(super) async fn try_borrow(
     if BORROW_BREAKER.open(host) {
         return None;
     }
-    let (donor_host, donor) = upstream::borrow_donor(host)?;
-    match send_once(&donor, out, body, request_budget(true)).await {
-        Ok((resp, ms)) => {
-            // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
-            // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
-            *info.lock().unwrap() = donor.ip.clone();
-            if quiet::first_time("borrow", host) {
-                (log)(&format!(
-                    "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
-                    donor.ip
-                ));
+    let mut last = String::new();
+    for _ in 0..MAX_BORROW_TRIES {
+        let Some((donor_host, donor)) = upstream::borrow_donor(host) else {
+            break; // 没有现成通道，或都在冷却：交回原回退路径
+        };
+        match send_once(&donor, out, body, request_budget(true)).await {
+            Ok((resp, _)) if resp.status() == StatusCode::MISDIRECTED_REQUEST => {
+                // 连接本身没坏，只是服务端不收跨 :authority：归还配额，整条路先歇一会。
+                upstream::borrow_done(&donor_host, donor.id);
+                BORROW_BREAKER.set(host);
+                return Some(Err("借道被 421 拒绝(服务端不收跨 :authority)".to_string()));
             }
-            Some(Ok(resp))
+            Ok((resp, ms)) => {
+                // 借用请求的耗时也记在这条连接上：下次挑 donor 时快的那条更受青睐。
+                upstream::note_latency(&donor_host, donor.id, ms);
+                // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
+                // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
+                *info.lock().unwrap() = donor.ip.clone();
+                if quiet::first_time("borrow", host) {
+                    (log)(&format!(
+                        "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
+                        donor.ip
+                    ));
+                }
+                let (parts, body) = resp.into_parts();
+                let body = borrow_guard_body(donor_host, donor.id, body);
+                return Some(Ok(hyper::Response::from_parts(parts, body)));
+            }
+            Err(e) => {
+                // 这条坏了就冷藏它，换同 host 的另一条继续——两条通道的意义就在这。
+                upstream::borrow_poison(&donor_host, donor.id);
+                last = format!("{donor_host}({}) {e}", donor.ip);
+            }
         }
-        Err(e) => {
-            // 不摘 donor：借出的请求失败多半是流级（REFUSED_STREAM / 421），
-            // 掐掉连接会连累 assets 自己的流量；真死了由 30s 一次的 keepalive 收。
-            BORROW_BREAKER.set(host);
-            Some(Err(format!("借道 {donor_host}({}) 失败({e})", donor.ip)))
-        }
+    }
+    if last.is_empty() {
+        None
+    } else {
+        Some(Err(format!("借道失败: {last}")))
     }
 }
 

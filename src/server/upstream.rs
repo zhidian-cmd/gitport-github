@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tower_service::Service;
 /// 每 host 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
 #[derive(Clone)]
@@ -33,7 +34,14 @@ struct ConnSlot {
     up: H2Upstream,
     ewma: f64,
     n: u32,
+    /// 借出去、响应体还没走完的流数：挑下一条 donor 靠它摊开，别把并发全堆到一根 TCP。
+    borrowed: u32,
+    /// 借失败后的冷却：坏的是这一条，同 host 的另一条照常服务。
+    borrow_cool: Option<Instant>,
 }
+
+/// 借道失败冷却时长；到期自动重新参与挑选。
+const BORROW_COOL: Duration = Duration::from_secs(30);
 
 /// 单 host 的连接组：按耗时择优取用（偶尔轮转做探索）+ 补第二条时防重入。
 #[derive(Default)]
@@ -157,9 +165,6 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     Some(h.conns[idx].up.clone())
 }
 
-/// 借道轮转序号：一条内容域请求借一条 donor，别把整页头像压在同一根 TCP 上。
-static BORROW_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// 借道 donor：assets 域已建好的伪装连接。
 ///
 /// 证书只覆盖 `*.githubassets.com`，但 h2 的路由依据是 `:authority` 而不是 SNI——
@@ -167,19 +172,65 @@ static BORROW_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 ///
 /// 只返回池里**现成**的连接：新建一条就得选 SNI，真名会暴露目标域，伪装又过不了内容域的证书校验，
 /// 两条都是死路。所以这里没有"借不到就建一条"的分支，借不到就返回 None，让调用方走回退。
+///
+/// 挑法：先看这条连接上还挂着几条借出的流（少的优先），同负载再取 EWMA 快的；
+/// 冷却中的直接跳过。借出的计数要由调用方在响应体走完（或失败）时归还，
+/// 否则一条连接会越借越"忙"，最后谁也选不中它。
 pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
-    let cands: Vec<(String, H2Upstream)> = {
-        let g = lock(conn_pool());
-        g.iter()
-            .filter(|(h, _)| h.as_str() != exclude_host && h.ends_with("githubassets.com"))
-            .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
-            .collect()
-    };
-    if cands.is_empty() {
-        return None;
+    let mut g = lock(conn_pool());
+    let now = Instant::now();
+    let mut pick: Option<(String, u64, (u32, f64))> = None;
+    for (h, hc) in g.iter() {
+        if h.as_str() == exclude_host || !h.ends_with("githubassets.com") {
+            continue;
+        }
+        for c in &hc.conns {
+            if c.borrow_cool.is_some_and(|t| now < t) {
+                continue;
+            }
+            let key = (c.borrowed, c.ewma);
+            let better = match &pick {
+                None => true,
+                Some((_, _, k)) => key.0 < k.0 || (key.0 == k.0 && key.1 < k.1),
+            };
+            if better {
+                pick = Some((h.clone(), c.up.id, key));
+            }
+        }
     }
-    let i = BORROW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cands.len();
-    cands.into_iter().nth(i)
+    let (host, id, _) = pick?;
+    let c = g
+        .get_mut(&host)?
+        .conns
+        .iter_mut()
+        .find(|c| c.up.id == id)?;
+    c.borrow_cool = None; // 冷却到期：这次选中即复位
+    c.borrowed = c.borrowed.saturating_add(1);
+    Some((host, c.up.clone()))
+}
+
+/// 借出的流走完了（正常或中途被丢弃）：把配额还回去。
+pub fn borrow_done(host: &str, id: u64) {
+    let mut g = lock(conn_pool());
+    if let Some(c) = g
+        .get_mut(host)
+        .and_then(|h| h.conns.iter_mut().find(|c| c.up.id == id))
+    {
+        c.borrowed = c.borrowed.saturating_sub(1);
+    }
+}
+
+/// 借失败：归还配额并把**这一条**冷藏 30 秒。同 host 的另一条不动——
+/// 两条通道的意义就在于一条坏了另一条还能顶上。
+pub fn borrow_poison(host: &str, id: u64) {
+    let mut g = lock(conn_pool());
+    if let Some(c) = g
+        .get_mut(host)
+        .and_then(|h| h.conns.iter_mut().find(|c| c.up.id == id))
+    {
+        c.borrowed = c.borrowed.saturating_sub(1);
+        c.borrow_cool = Some(Instant::now() + BORROW_COOL);
+    }
 }
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
@@ -202,7 +253,13 @@ pub fn store_h2(host: &str, up: H2Upstream) {
     if h.conns.len() >= MAX_CONNS_PER_HOST {
         h.conns.remove(0); // 只留最新的两条，避免旧连接占位
     }
-    h.conns.push(ConnSlot { up, ewma: 0.0, n: 0 });
+    h.conns.push(ConnSlot {
+        up,
+        ewma: 0.0,
+        n: 0,
+        borrowed: 0,
+        borrow_cool: None,
+    });
 }
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
@@ -385,7 +442,9 @@ async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upst
     tokio::spawn(async move {
         while let Some(r) = rx.recv().await {
             match r {
-                Ok(up) => store_h2(&host, up),
+                // 晚成者已在它自己的拨号任务里入过库（见上面 store_h2）：
+                // 这里再存一次会变成两条同 id 的槽位，把真正的另一条挤掉。
+                Ok(_) => {}
                 Err(_) => maybe_spawn_second(&host, &log),
             }
         }
