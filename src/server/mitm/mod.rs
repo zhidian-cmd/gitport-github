@@ -49,10 +49,10 @@ pub async fn handle_connect_mitm(
     let Some(authority) = &srv.authority else {
         return;
     };
-    let cfg = crate::certgen::tls_config_of(authority);
+    let acceptor = crate::certgen::tls_acceptor_of(authority);
     let accept = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio_rustls::TlsAcceptor::from(cfg).accept(client),
+        tokio_boring::accept(&acceptor, client),
     )
     .await;
     let Ok(Ok(tls)) = accept else {
@@ -60,9 +60,8 @@ pub async fn handle_connect_mitm(
         return;
     };
     let alpn = tls
-        .get_ref()
-        .1
-        .alpn_protocol()
+        .ssl()
+        .selected_alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
 // ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
@@ -587,7 +586,7 @@ pub(super) async fn get_direct(
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 拿到拨号锁后再看一眼池子：等锁期间竞速的第二个任务可能已建成，排队者直接复用。
+        // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
         let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
             Some(up) => (up, false),
             None => match upstream::dial_upstream(name, host, log).await {
