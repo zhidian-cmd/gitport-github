@@ -10,8 +10,7 @@ fn dial_crew_claim_excludes_peer() {
     assert!(crew.claim("5.6.7.8"), "不同 IP 不受同组互避影响");
 }
 
-/// 并发竞争:两个线程对同一 IP 各认领 5000 次,成功总数恰为 1。
-/// 这是冷启动双任务"不同 IP"保证的根基——互斥坏了会静默退化成同 IP 双连。
+/// 并发竞争：两线程对同一 IP 各认领 5000 次，成功总数恰为 1——冷启动双任务"不同 IP"保证的根基，互斥坏了会静默退化成同 IP 双连。
 #[test]
 fn dial_crew_claim_race_yields_exactly_one_winner() {
     let crew = DialCrew::new();

@@ -236,7 +236,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     *lock(&SERIAL_LOG) = log.clone();
     let path = plans_path();
     let raw = std::fs::read_to_string(&path).ok();
-    // 容错解析：坏段只丢那一段，不连坐整表。
     let parsed = raw
         .as_deref()
         .and_then(|b| parse_plans_tolerant(b, log.as_ref()));

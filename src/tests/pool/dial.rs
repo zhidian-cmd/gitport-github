@@ -211,9 +211,7 @@ async fn fake_mode_rejects_wrong_host() {
     let _ = server.await;
 }
 
-/// 会话恢复：第一次拨号完整握手并把 ticket 存入缓存，第二次注入后必须命中恢复。
-/// SNI 用唯一键防与其他测试的缓存竞争；acceptor 复用同一个（ticket key 随 SSL_CTX
-/// 随机生成，换 acceptor 旧 ticket 解不开会回落完整握手，测试就失去意义）。
+/// 会话恢复：首拨完整握手存 ticket、二拨注入后必须命中；SNI 用唯一键防缓存竞争，acceptor 复用同一个（ticket key 随 ctx 随机生成，换 acceptor 旧 ticket 解不开就测不到恢复）。
 #[tokio::test]
 async fn session_resumed_on_second_dial() {
     let Some(material) = official_material() else {

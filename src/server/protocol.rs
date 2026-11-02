@@ -1,5 +1,4 @@
-//! 服务层共用类型：请求/响应体别名与构造器、请求预算。
-//! mitm 各子模块与 upstream 都从这里取，彼此不依赖对方的实现。
+//! 服务层共用类型：请求/响应体别名与构造器、请求预算；mitm 子模块与 upstream 由此取用，互不依赖对方实现。
 
 use bytes::Bytes;
 use http_body_util::BodyExt;

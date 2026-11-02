@@ -152,12 +152,10 @@ async fn chain_fetch_cred_locks_to_direct() {
     );
 }
 
-/// 可信镜像白名单：用户标记 trusted 的镜像，凭据串请求放行给它(知情授权);
-/// 未标记的镜像仍被剥除。放行名单为空时行为与旧版一致(仅直连)。
+/// 可信镜像白名单：用户标记 trusted 的镜像，凭据串请求放行给它(知情授权)；未标记的镜像仍被剥除。放行名单为空时行为与旧版一致(仅直连)。
 #[test]
 fn cred_authorized_trusted_mirrors_only() {
-    // settings 全局态无法按测隔离——直接验证放行集合的过滤逻辑:
-    // trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
+    // settings 全局态无法按测隔离——直接验证放行集合的过滤逻辑: trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
     use crate::settings::WorkerMirror;
     let mirrors = [
         WorkerMirror {
@@ -218,8 +216,7 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
     );
 }
 
-/// 审计 #3 回归: 熔断只拦有镜像候选的请求——凭据串剥空镜像后直连独走,
-/// 不得撞为镜像设的熔断(哪怕熔断正开着)。
+/// 审计 #3 回归: 熔断只拦有镜像候选的请求——凭据串剥空镜像后直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
 #[tokio::test]
 async fn breaker_spares_direct_only_requests() {
     let log: LogFn = Arc::new(|_: &str| {});
@@ -245,8 +242,7 @@ async fn breaker_spares_direct_only_requests() {
     pool::MIRROR_BREAKER.clear(host);
 }
 
-/// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 失败窗未过的不追加;
-/// 已在窗内不重复。
+/// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 失败窗未过的不追加, 已在窗内不重复。
 #[test]
 fn append_direct_gated_by_health_and_presence() {
     let mut order = vec![0usize, 1, 2, 3, 4];
@@ -270,8 +266,7 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     }
 }
 
-/// 运行期窗口：有流在跑就跟着实测走（多流合并 + 真 EWMA 平滑），停流后停在最后一次。
-/// 帧距 55ms < FRAME_GAP(300ms)，不触发读停顿扣除。
+/// 运行期窗口：有流在跑就跟着实测走（多流合并 + 真 EWMA 平滑），停流后停在最后一次；帧距 55ms < FRAME_GAP(300ms)，不触发读停顿扣除。
 #[test]
 fn live_window_tracks_busy_mirror_and_freezes_when_idle() {
     let ld = mirror_load("live-window.test");
@@ -435,8 +430,7 @@ fn cold_start_falls_back_to_chain_order() {
     b.in_flight_streams.store(0, Ordering::Relaxed);
 }
 
-/// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转。
-/// 高压镜像(流多)不再被继续堆片，从源头减少掐断误判。
+/// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转——高压镜像(流多)不再被继续堆片，从源头减少掐断误判。
 #[test]
 fn tie_prefers_fewer_inflight_streams() {
     let a = mirror_load("streams-a.test");
@@ -470,8 +464,7 @@ fn tie_prefers_fewer_inflight_streams() {
     b.speed_ewma.store(0, Ordering::Relaxed);
 }
 
-/// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废。
-/// 仅 ECT 完全相等才走二级(流数/轮转)。
+/// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废；仅 ECT 完全相等才走二级(流数/轮转)。
 #[test]
 fn ect_strict_minimum_no_tolerance() {
     let a = mirror_load("tie-a.test");

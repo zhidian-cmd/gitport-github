@@ -6,13 +6,10 @@
 <title>GitPort GitHub 工作台</title>
 <link rel="stylesheet" href="/style.css">
 <script>
-// 渲染自愈看门狗(治两类"整块内容消失"):
-// 1) DOM 截断: WebView2 网络栈随系统代理刷新重启时可能把正在浏览的页面
-//    拦腰截断半截重载, 断处之后的 DOM 整块丢失。body 尾部的 app.js 不会执行,
-//    所以看门狗放 head —— 截断后仍会跑, 发现哨兵元素缺失就整页重载。
-// 2) 合成器停帧(2026-10-10 CDP 实锤): 窗口隐藏到托盘再恢复后, 合成器卡在旧画面
-//    不再重绘 —— DOM 完整但下半截永远是旧画面。药方: 轻推布局(zoom 1.0001 再
-//    复原)强制全量失效重绘。加载/恢复可见/获得焦点时各查一次, 60s 内最多重载 3 次。
+// 渲染自愈看门狗（治"整块内容消失"）：
+// ① DOM 截断——WebView2 网络栈随系统代理刷新重启时可能拦腰截断页面，断处 DOM 整块丢失且 body 尾的 app.js 不执行 → 看门狗放 head，哨兵缺失即整页重载；
+// ② 合成器停帧（2026-10-10 CDP 实锤）——托盘恢复后合成器卡旧画面，DOM 完整但下半截不重绘 → 轻推 zoom(1.0001 再复原) 强制全量重绘。
+// 加载/恢复可见/获得焦点各查一次，60s 内最多重载 3 次。
 (function () {
   var KEY = "fp_dom_heal", N = 3, WIN = 60000;
   function nudgePaint() {
@@ -140,9 +137,7 @@
     headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
     const target = new URL(rest);
-    // GET/HEAD 无 Range 的请求走 CF 边缘缓存：命中即免回源，未命中回源一次后入缓存。
-    // 带凭据的请求绝不入缓存(私有响应以公共 URL 为键会被任何人取走)；也不读缓存
-    // (他人可能以同 URL 存过脏数据)。带 Range 的下载流直通(缓存副本无法 206 切片)。
+    // GET/HEAD 无 Range 且无凭据才走 CF 边缘缓存（带凭据的绝不入缓存也不读——私有响应以公共 URL 为键会被任何人取走/污染）；带 Range 的下载直通（缓存副本无法 206 切片）。
     const hasCreds = request.headers.has("authorization") || request.headers.has("cookie");
     const cacheable = !hasCreds && (request.method === "GET" || request.method === "HEAD")
       && !request.headers.get("range");
@@ -230,8 +225,7 @@
 
       <!-- 运行日志 -->
       <section id="view-logs" class="view">
-        <!-- 2026-10-18：去掉外层 panel —— 页面标题已有“运行日志”，再套一个同名
-             外框 + 内层日志框是三层框套框。工具栏单列一行，日志框直接填满。 -->
+        <!-- 2026-10-18 去掉外层 panel：页面标题已有“运行日志”，再套就是三层框套框；工具栏单列一行，日志框直接填满。 -->
         <div class="view-toolbar">
           <label class="check"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
           <div class="row head-row">

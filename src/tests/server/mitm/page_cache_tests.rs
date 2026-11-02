@@ -1,6 +1,4 @@
-/// 骨架拦截三态:正常结果页与真实零结果页恒含 embeddedData(缓存),
-/// blackbird 限流骨架恒缺(拦截)。GitHub 改 payload 封装名时这里会红,
-/// 避免搜索页缓存静默失效。
+/// 骨架拦截三态:正常结果页与真实零结果页恒含 embeddedData(缓存),blackbird 限流骨架恒缺(拦截);GitHub 改 payload 封装名时这里会红,避免搜索页缓存静默失效。
 #[test]
 fn search_skeleton_gate() {
     let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
@@ -43,8 +41,7 @@ fn search_skeleton_gate_gzip() {
 
 use super::*;
 
-/// Ctrl+F5 直通：带 no-cache 的请求必须回源，哪怕路径是列表页。
-/// max-age=0 不算——浏览器后退/前进也带它，当成强制刷新会让缓存永远命不中。
+/// Ctrl+F5 直通：带 no-cache 的请求必须回源（哪怕列表页）；max-age=0 不算——浏览器后退/前进也带它，当成强制刷新会让缓存永远命不中。
 #[test]
 fn no_cache_header_bypasses_cache() {
     let list = "/octocat/repo/issues";
@@ -84,8 +81,7 @@ fn no_cache_header_bypasses_cache() {
     ));
 }
 
-/// /search 查询串归一化：p=1 与无 p 同键、参数重排同键；
-/// 其他路径的查询串一个字符都不动（参数顺序可能有语义）。
+/// /search 查询串归一化：p=1 与无 p、参数重排均同键；其他路径的查询串一个字符都不动（参数顺序可能有语义）。
 #[test]
 fn search_query_normalization() {
     let mk = |path: &str, q: Option<&str>| {
@@ -117,9 +113,7 @@ fn search_query_normalization() {
     );
 }
 
-/// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：
-/// GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存。
-/// 非 /search 路径的软导航照旧不收（维持原有防杂收口）。
+/// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
 #[test]
 fn search_page_eligible_regardless_of_nav_kind() {
     assert!(
@@ -328,8 +322,7 @@ async fn roundtrip_gates_and_self_heal() {
         "会话条目应被清掉"
     );
 
-    // ⑤ gzip 条目读回：头/正文仍是压缩态，且读侧的解压判断不瞎
-    // （只测"解压函数认得出来"不够，得把存→读整条链走一遍）
+    // ⑤ gzip 条目读回：头/正文仍是压缩态，且读侧的解压判断不瞎（只测"解压函数认得出来"不够，得把存→读整条链走一遍）
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut enc, b"<html><body>list</body></html>").unwrap();
     let gz = enc.finish().unwrap();
@@ -535,9 +528,7 @@ async fn keys_invalidation_and_pollution() {
         "会话死亡期间的未登录页不得进缓存"
     );
 
-    // ⑪d 匿名页双向判定：未登录浏览存下的页面，匿名请求必须能命中；
-    // 同一份正文被带会话的请求拿到才算污染。少了前者，未登录用户的缓存全废
-    // （线上症状：缓存写进去了却永远不命中）。
+    // ⑪d 匿名页双向判定：未登录浏览存下的页面，匿名请求必须能命中；同一份正文被带会话的请求拿到才算污染。少了前者，未登录用户的缓存全废（线上症状：缓存写进去了却永远不命中）。
     let anon = b"<html><body class=\"logged-out env-production\">results</body></html>";
     let _ = persist_page_entry_blocking(
         &dir,

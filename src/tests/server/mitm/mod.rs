@@ -1,5 +1,4 @@
-/// 审计 #1 回归: 镜像胜出时直连 future 未钧即弃——charge 在 future 内,
-/// 零残留, 账面不得出现幽灵在途字节/流数。
+/// 审计 #1 回归：镜像胜出时直连 future 未钧即弃（charge 在 future 内）——零残留，账面不得出现幽灵在途字节/流数。
 #[test]
 fn direct_leg_unpolled_leaves_zero_debt() {
     let key = mirror::direct_load_key("debt.test");

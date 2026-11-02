@@ -45,7 +45,7 @@ struct HostConns {
 
 static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 值得开两条连接的 host（高频入口）。长尾 host 多一条只是白占 socket。
+/// 值得开两条连接的高频 host；长尾 host 多一条只是白占 socket。
 const DUAL_CONN_HOSTS: &[&str] = &[
     "github.com",
     "api.github.com",

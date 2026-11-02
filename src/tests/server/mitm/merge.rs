@@ -166,8 +166,7 @@ fn merge_pumps_and_rescues() {
     assert_eq!(m.sent(), 10);
 }
 
-/// 九段必须并发读：队首卡住时，后面的段也要被推、数据进各自缓冲。
-/// 旧实现只 poll 队首，排队的段在队列里烂掉，轮到它们时只剩一帧就断。
+/// 九段必须并发读：队首卡住时，后面的段也要被推、数据进各自缓冲（旧实现只 poll 队首，排队的段在队列里烂掉，轮到它们时只剩一帧就断）。
 #[test]
 fn segments_are_read_concurrently() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -251,8 +250,7 @@ fn merge_no_gap_when_boundary_aligned() {
     assert_eq!(out, b"AAAABBBB");
 }
 
-/// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流。
-/// 多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
+/// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流；多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
 #[test]
 fn cut_shrinks_boundary_and_hands_off_tail() {
     let now = Instant::now();
@@ -346,8 +344,7 @@ fn plan_cut_spares_when_no_faster_peer() {
     assert!(m.plan_cut(now).is_none(), "同样快，没有抢的收益");
 }
 
-/// 比最快慢就切，但只剩 0.1MB 时抢过去反而更久（要付建连）——这时候不动刀，
-/// 是算术不是门槛：remaining/best + 建连 >= remaining/我。
+/// 比最快慢就切，但只剩 0.1MB 时抢过去反而更久（要付建连）——这时候不动刀，是算术不是门槛：remaining/best + 建连 >= remaining/我。
 #[test]
 fn plan_cut_skips_when_handoff_costs_more() {
     let now = Instant::now();
@@ -400,8 +397,7 @@ fn plan_cut_caps_handoff_size() {
     );
 }
 
-/// 刀口随帮手速率缩放：10MB/s 的快源该拿到比 4MB 旧常数大得多的刀口，
-/// 否则快源下完自己的份额后只能以旧常数的龟速捡尾巴，聚合速率上不去。
+/// 刀口随帮手速率缩放：10MB/s 的快源该拿到比 4MB 旧常数大得多的刀口，否则快源下完自己的份额后只能以旧常数的龟速捡尾巴，聚合速率上不去。
 #[test]
 fn handoff_cap_scales_with_helper_speed() {
     assert_eq!(handoff_cap(1024.0), MIN_PIECE, "太小的速率钳在下限");

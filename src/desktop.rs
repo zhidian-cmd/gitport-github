@@ -56,8 +56,7 @@ const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
 // ---- 托盘 ----
-// 自己做窗口 + 自己的消息泵，不用 tray-icon：那个库把 Shell_NotifyIcon 的返回值
-// 丢掉了，注册失败也报"成功"，出问题时只能干瞪眼。这里每一步都记真实结果。
+// 不用 tray-icon（它丢掉 Shell_NotifyIcon 返回值，注册失败也报"成功"）：自做窗口+消息泵，每步记真实结果。
 
 const TRAY_CLASS: windows::core::PCWSTR = windows::core::w!("GitPortTrayWnd");
 const TRAY_UID: u32 = 1;
@@ -77,8 +76,7 @@ fn tray_send(ev: AppEvent) {
 }
 
 
-/// 当前进程的完整性级别（4096=Low 8192=Medium 12288=High）。
-/// Shell_NotifyIcon 在比 shell 低的级别下会被 UIPI 拒掉（err=5），所以这行必须记。
+/// 当前进程完整性级别（4096=Low 8192=Medium 12288=High）；低于 shell 时 Shell_NotifyIcon 会被 UIPI 拒（err=5），必须记。
 unsafe fn current_il() -> u32 {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
@@ -219,8 +217,7 @@ unsafe extern "system" fn tray_proc(
     }
 }
 
-/// 托盘独立线程：建窗、挂图标、泵自己的消息队列。
-/// 回执通道：注册结果一出来就发回来，调用方据此决定要不要继续建窗口。
+/// 托盘独立线程：建窗、挂图标、泵消息；注册结果经回执通道立即发回，调用方据此决定是否继续建窗口。
 fn spawn_tray(
     proxy: tao::event_loop::EventLoopProxy<AppEvent>,
     log: LogFn,
@@ -616,8 +613,7 @@ pub fn run(args: DesktopArgs) -> ! {
     let mut created_once = false;
     // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
     let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
-    // 托盘先挂、拿到回执再往下走：WebView2 起来之后 Shell_NotifyIcon 会被系统拒
-    // （err=5 拒绝访问），所以顺序必须是先托盘后窗口，且要等它真的注册上。
+    // 托盘先挂、拿到回执再往下走：WebView2 起来后 Shell_NotifyIcon 会被系统拒（err=5），必须先托盘后窗口且等它真的注册上。
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
     // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。
     if tray_rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {

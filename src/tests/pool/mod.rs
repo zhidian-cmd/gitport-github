@@ -47,8 +47,7 @@ fn breakers_open_set_clear_by_host() {
 
 #[test]
 fn breaker_expired_entry_lazily_removed() {
-    // ttl=0：set 后立即过期。open 必须判 false 并把条目清掉——
-    // 过期条目沉淀在表里只进不出（修复前 open 只读不删）。
+    // ttl=0：set 后立即过期。open 必须判 false 并把条目清掉——过期条目沉淀在表里只进不出（修复前 open 只读不删）。
     let b = Breaker::new(0);
     b.set("expired.example");
     assert!(!b.open("expired.example"), "过期条目不得判熔断中");
@@ -67,13 +66,10 @@ fn breaker_expired_entry_lazily_removed() {
 
 #[test]
 fn plans_json_single_bad_pool_does_not_wipe_table() {
-    // 单池写坏只丢该池（按种子补缺），其余池与镜像链原样保留——
-    // 旧行为是 flatten 全有或全无：一处笔误 → 整表按种子重建。
+    // 单池写坏只丢该池（按种子补缺），其余池与镜像链原样保留——旧行为是 flatten 全有或全无：一处笔误 → 整表按种子重建。
     let _guard = TEST_LOCK.lock().unwrap();
     let dir = tmpdir();
-    // 隔离：自定义镜像注册表经 settings.json 跨测试/跨轮次持久化，别处收养的
-    // 自建镜像会被 sync_custom_mirrors 追加回既有链——先清空，本断言只验
-    // plans.json 里的链是否原样保留，不掺注册表状态。
+    // 隔离：自定义镜像注册表经 settings.json 跨测试/跨轮次持久化，别处收养的自建镜像会被 sync_custom_mirrors 追加回既有链——先清空，本断言只验 plans.json 里的链是否原样保留，不掺注册表状态。
     crate::settings::save_worker_mirrors(Vec::new());
     std::fs::write(
         dir.join("plans.json"),
@@ -481,8 +477,7 @@ fn toggle_gates_big_file_chains_only() {
     crate::settings::save_worker_mirrors(Vec::new());
 }
 
-/// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；
-/// 仅旧字典有的 host 照常并入（升级兼容的钉子）。
+/// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；仅旧字典有的 host 照常并入（升级兼容的钉子）。
 #[test]
 fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     let _guard = TEST_LOCK.lock().unwrap();
@@ -504,10 +499,8 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     )
     .unwrap();
     serial_load(&dir, Vec::new(), None);
-    // 断言只锁"优先级"这一点：自建镜像收编(sync_custom_mirrors)会把非内置
-    // 镜像追加进所有链尾，属既有设计，不在本测试射程。
-    // ① 旧 mirrors 不得覆盖新字典 → codeload 链里绝不允许出现 legacy-wrong。
-    // ② 新字典成员在前 → 链头必须是 big/small；旧字典独有成员追加在尾。
+    // 断言只锁"优先级"这一点：自建镜像收编(sync_custom_mirrors)会把非内置镜像追加进所有链尾，属既有设计，不在本测试射程。
+    // ① 旧 mirrors 不得覆盖新字典 → codeload 链里绝不允许出现 legacy-wrong；② 新字典成员在前 → 链头必须是 big/small，旧字典独有成员追加在尾。
     let big = mirror_chain("codeload.github.com");
     assert_eq!(
         big.first(),
@@ -537,8 +530,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     apply_worker_mirrors(Vec::new()).ok();
 }
 
-/// 全新安装(链全空) + 添加镜像 → 启用中的镜像必须落进全部 8 条链。
-/// v0.5.0 回归：values_mut() 对空表遍历不到任何东西，镜像只进注册表不进链。
+/// 全新安装+添加镜像 → 启用镜像必须落进全部 8 条链（v0.5.0 回归：空表遍历不到，镜像只进注册表）。
 #[test]
 fn fresh_install_mirror_lands_in_all_chains() {
     let _guard = TEST_LOCK.lock().unwrap();
@@ -571,8 +563,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
 #[test]
 fn mirror_chain_load_and_topup() {
     let _guard = TEST_LOCK.lock().unwrap();
-    // 隔离：自定义镜像注册表经 settings.json 跨进程持久化（上一轮 serial_load 收养的
-    // 自建镜像会留在里面），不清空的话 sync_custom_mirrors 会把它们追加进本测试的链。
+    // 隔离：自定义镜像注册表经 settings.json 跨进程持久化（上一轮 serial_load 收养的自建镜像会留在里面），不清空的话 sync_custom_mirrors 会把它们追加进本测试的链。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
@@ -600,8 +591,7 @@ fn mirror_chain_load_and_topup() {
         ],
         "用户链原样保留(含自部署镜像): {raw_chain:?}"
     );
-    // 缺链 host：注册表有启用镜像时按 CONTENT_HOSTS 铺键并对齐全量
-    // (自建镜像进所有链是既有设计)；无启用镜像时该 host 真正无链。
+    // 缺链 host：注册表有启用镜像时按 CONTENT_HOSTS 铺键并对齐全量(自建镜像进所有链是既有设计)；无启用镜像时该 host 真正无链。
     let media = mirror_chain("media.githubusercontent.com");
     assert_eq!(
         media,

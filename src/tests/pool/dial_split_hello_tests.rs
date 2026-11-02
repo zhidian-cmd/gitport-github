@@ -1,9 +1,7 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 真网端到端：白名单域名必须走 TlsSplit（真名 + 分片），且分片计数真的涨了。
-/// 默认不跑（要能连 GitHub）：`cargo test -- --ignored whitelist_e2e`
-/// IP 取 docs 实测的 Fastly .154；若该 IP 失效，换 plans.json 里任一 185.199.x.154。
+/// 真网端到端（默认不跑，要连 GitHub：`cargo test -- --ignored whitelist_e2e`）：白名单域必须走 TlsSplit（真名 + 分片）且分片计数真的涨了；IP 取 docs 实测的 Fastly .154，失效则换 plans.json 里任一 185.199.x.154。
 #[tokio::test]
 #[ignore]
 async fn whitelist_e2e_through_pool() {
@@ -22,9 +20,7 @@ async fn whitelist_e2e_through_pool() {
     );
 }
 
-/// 300 字节假 ClientHello 必须分三段发出，首末段间隔 ≥ 两个段间隔。
-/// TCP 可能把小段合并到一次 read，所以断言的是时间差不是段数——
-/// 合并恰恰说明分片没生效（间隔够大时内核不会攒到一起）。
+/// 300 字节假 ClientHello 必须分三段发出，首末段间隔 ≥ 两个段间隔；断言时间差而非段数——TCP 可能把小段合并成一次 read，合并恰恰说明分片没生效（间隔够大内核不会攒）。
 #[tokio::test]
 async fn sends_segments_with_gap() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -74,9 +70,7 @@ async fn sends_segments_with_gap() {
         want
     );
 }
-/// 真实 ClientHello 形态：续传段首字节是 0x03(版本号)，不是 0x16——
-/// 曾因 poll_write 重判首字节，第二刀直接直通、段间隔全丢，掩体空转。
-/// (旧实现跑这条必红：stamps 只有 1 个。)
+/// 真实 ClientHello 续传段首字节是 0x03(版本号) 非 0x16——曾因 poll_write 重判首字节，第二刀直通、段间隔全丢、掩体空转（旧实现跑这条必红：stamps 只有 1 个）。
 #[tokio::test]
 async fn splits_real_clienthello_prefix() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

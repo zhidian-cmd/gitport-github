@@ -19,8 +19,7 @@ fn split_target_parses_and_defaults() {
     );
 }
 
-/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发、真体丢失）。
-/// 127.0.0.1 非池域名走系统直连腿，恰好落在本进程起的假上游上，全程无外网。
+/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发、真体丢失）；127.0.0.1 非池域名走系统直连腿，恰好落在本进程起的假上游上，全程无外网。
 #[tokio::test]
 async fn plain_http_post_body_forwarded_intact() {
     // 假上游：读满 头 + Content-Length 体，校验体原样、头无混入，然后回 200。
@@ -64,8 +63,7 @@ async fn plain_http_post_body_forwarded_intact() {
             1,
             "Content-Length 不应重复: {head_text}"
         );
-        // 逐跳头不过上游：客户端发来的 connection 必须在转发前剥掉
-        // （connection 白名单里的逐跳头与 proxy-*/host 一并在此兜底）。
+        // 逐跳头不过上游：客户端发来的 connection 必须在转发前剥掉（connection 白名单里的逐跳头与 proxy-*/host 一并在此兜底）。
         assert!(
             !head_text.to_lowercase().contains("connection:"),
             "connection 逐跳头泄漏到上游: {head_text}"
@@ -89,9 +87,7 @@ async fn plain_http_post_body_forwarded_intact() {
     let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .unwrap();
-    // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI。
-    // 顺带带 Connection/Keep-Alive 逐跳头：假上游断言它们被剥除（曾原样泄漏，
-    // 上游收完即关导致代理转发语义被逐跳头带偏）。
+    // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI。顺带带 Connection/Keep-Alive 逐跳头：假上游断言它们被剥除（曾原样泄漏，上游收完即关导致代理转发语义被逐跳头带偏）。
     let req = format!(
         "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
     );
@@ -128,8 +124,7 @@ fn chunked_request_body_is_refused() {
     assert!(!headers_have_chunked(b""));
 }
 
-/// 分片门槛：TLS 握手(0x16)且够长才拆；SSH/HTTP/过短流不拆。
-/// 拆分形态：2~3 段、无缝覆盖全量、首刀 1..=16。
+/// 分片门槛：TLS 握手(0x16)且够长才拆；SSH/HTTP/过短流不拆。拆分形态：2~3 段、无缝覆盖全量、首刀 1..=16。
 #[test]
 fn hello_split_ranges_gate() {
     let tls_long: Vec<u8> = std::iter::once(0x16u8)

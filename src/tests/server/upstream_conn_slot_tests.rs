@@ -1,7 +1,6 @@
 use super::*;
 
-/// 造一条合法 H2Upstream:h2 握手用本机 duplex 对拉(无需真网络),
-/// server 端由 h2::server 驱动回 SETTINGS,client 端即完成。
+/// 造一条合法 H2Upstream：h2 握手用本机 duplex 对拉（无需真网），server 端由 h2::server 回 SETTINGS 即完成。
 async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
     let (client_io, server_io) = tokio::io::duplex(4096);
     tokio::spawn(async move {

@@ -1,6 +1,5 @@
-//! 切片合并：一条请求按镜像数切段并发拉，按边界序泵成单条字节河。
-//! 段是**可缩的边界**，不是一条命的连接：慢段把尾巴让给闲下来的镜像，
-//! 断了从自己收到的位置续，绝不整段判死。交付线只认相对偏移，与边界同域。
+//! 切片合并：一条请求按镜像数切段并发拉，按边界序泵成单条字节河；段是可缩的边界而非一条命的连接——慢段把尾巴让给闲镜像，断了从已收位置续，绝不整段判死。
+//! 交付线只认相对偏移，与边界同域。
 
 use super::protocol::{self, BoxBody};
 use bytes::Bytes;
@@ -18,18 +17,16 @@ pub(super) const STALL_MS: u64 = 5_000;
 pub(super) const SPLIT_SETUP_SECS: f64 = 0.5;
 /// 速率至少观察这么久才算样本，首包前的 0 不当慢。
 const RATE_WARMUP: Duration = Duration::from_millis(400);
-/// 同一段两次让位的最小间隔，防抖。
+/// 同段两次让位最小间隔 1.5s，防抖。
 const CUT_COOLDOWN: Duration = Duration::from_millis(1_500);
 /// 两次让位之间的全局间隔：多段同时"偏慢"时轮着切就是抖动。
 const CUT_ANY_COOLDOWN: Duration = Duration::from_millis(2_500);
-/// 一刀的刀口上限按帮手实测速率折算：≈ 它 3 秒能啃下的量，钳在 [MIN_PIECE, 64MB]。
-/// 旧常数 4MB 对 2MB/s 的源够用，对 10MB/s 的快源就是把再平衡钉死在 ~1.6MB/s——
-/// 快源下完自己的份额后只能以这个龟速捡慢段的尾巴，整条河的聚合速率上不去。
+/// 刀口上限按帮手实测速率折算：≈ 它 3 秒能啃下的量，钳在 [MIN_PIECE, 64MB]。
+/// 旧常数 4MB 对 2MB/s 源够用，对 10MB/s 快源是把再平衡钉死在 ~1.6MB/s——快源下完份额只能龟速捡慢段尾巴，聚合速率上不去。
 fn handoff_cap(best_rate: f64) -> u64 {
     ((best_rate * 3.0) as u64).clamp(MIN_PIECE, 64 * 1024 * 1024)
 }
-/// 帮手爬坡：新流慢启动到稳态要跨几个 RTT（跨境单程 0.2~0.4s），按 1s 空转折算。
-/// 这是让位判据的建模参数，不是测量值——测量只来自真实流。
+/// 帮手爬坡：新流慢启动到稳态要跨几个 RTT（跨境单程 0.2~0.4s），按 1s 空转折算；让位判据的建模参数，非测量值（测量只来自真实流）。
 const HELPER_RAMP_SECS: f64 = 1.0;
 /// 让位判据看近期速率：样本窗与 POLL_GAP 对齐（没在看的不算），历史慢启动/停顿不拖累当下判断。
 const RECENT_WIN: Duration = Duration::from_millis(1_500);
@@ -40,8 +37,7 @@ const POLL_GAP: Duration = Duration::from_millis(1_500);
 /// 体检间隔：停滞是 5s 判据，500ms 看一眼足够。
 const TICK_MS: u64 = 500;
 
-/// 平均切 [base, base+len) 为 n 段：相邻共享边界，零重叠零缝，余数归最后一段。
-/// n 超过字节数时收缩到字节数，保证每段至少 1 字节。
+/// 平均切 [base, base+len) 为 n 段：相邻共享边界，零重叠零缝，余数归最后一段；n 超字节数时收缩到字节数，每段至少 1 字节。
 pub(super) fn split_even(base: u64, len: u64, n: usize) -> Vec<(u64, u64)> {
     if len == 0 {
         return Vec::new();
@@ -87,8 +83,7 @@ pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
     t.parse().ok()
 }
 
-/// 让位时持有者该留多少：按两者速率反比切，使双方同时完成（DEMS），
-/// 并把帮手的建连+爬坡耗时折进分母——`helper × setup` 是它在起跑期间白下的字节。
+/// 让位时持有者该留多少：按两者速率反比切使双方同时完成（DEMS），帮手的建连+爬坡耗时折进分母——`helper × setup` 是它起跑期间白下的字节。
 /// 结果钳在 [MIN_PIECE, remaining − MIN_PIECE]，保证两边都不是碎渣。
 pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64, setup_secs: f64) -> u64 {
     if remaining < 2 * MIN_PIECE {
@@ -157,8 +152,7 @@ impl Seg {
         self.start + self.got
     }
 
-    /// 收尾时把均速定格：之后 begin 继续走，现算只会越来越"慢"。
-    /// 定格值优先取近期速率（收尾前最后 1.5s 的实测），样本不足退回全片均速。
+    /// 收尾时把均速定格（begin 还在走，现算只会越来越"慢"）：优先取近期速率（最后 1.5s 实测），样本不足退回全片均速。
     fn freeze(&mut self, now: Instant) {
         if self.frozen_rate.is_none() {
             let r = self.recent_rate(now);
@@ -178,8 +172,7 @@ impl Seg {
         self.got as f64 / el.as_secs_f64().max(0.001)
     }
 
-    /// 近期速率（最后 RECENT_WIN 的实测）：让位判据用它，慢启动与历史停顿不进分母。
-    /// 滑窗样本不足 RATE_WARMUP 时退回全片均速——短段没有近期可言，全片就是全部真相。
+    /// 近期速率（最后 RECENT_WIN 的实测）：让位判据用它，慢启动与历史停顿不进分母；样本不足 RATE_WARMUP 时退回全片均速——短段没有近期可言。
     fn recent_rate(&self, now: Instant) -> f64 {
         if let Some(r) = self.frozen_rate {
             return r;
@@ -285,8 +278,7 @@ impl MergeBody {
         self.fill.push_back((from, to));
     }
 
-    /// 把还在跑的段各推一轮，填进各自缓冲。返回是否有进展（拿到数据或某段结束）。
-    /// 缓冲满的段暂时不推——它的 waker 也就不再注册；等交付线推进后自然会再推它。
+    /// 把还在跑的段各推一轮填进各自缓冲，返回是否有进展（拿到数据或某段结束）；缓冲满的段暂不推——waker 不再注册，等交付线推进后自然会再推它。
     fn fill_all(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         let now = Instant::now();
         let mut progressed = false;
@@ -343,8 +335,7 @@ impl MergeBody {
         progressed
     }
 
-    /// 收尸：真停滞的段，把已收到的留下、没收到的那截排进补发。
-    /// 这是"缩边界"，不是"整段重下"——缓冲里的字节一个都不丢。
+    /// 收尸真停滞的段：已收到的留下、没收到的那截排进补发——是"缩边界"不是"整段重下"，缓冲里的字节一个都不丢。
     pub(super) fn reap_stalled(&mut self, now: Instant) -> bool {
         let mut any = false;
         for seg in self.segs.values_mut() {
@@ -378,10 +369,8 @@ impl MergeBody {
         any
     }
 
-    /// 让位：把预计最晚完成的段切掉尾巴，交给最快的镜像。
-    /// 判据是「抢过来能提前多少」——剩余 ÷ 我的速度 对 剩余 ÷ 最快速度 + 建连。
-    /// 没有空闲连接也可以抢：新开一条流的代价就是那次建连，已折进判据里。
-    /// 返回被切出去的区间。
+    /// 让位：把预计最晚完成的段切掉尾巴，交给最快的镜像，返回被切出去的区间。
+    /// 判据是「抢过来能提前多少」——剩余÷我的速度 对 剩余÷最快速度+建连；没有空闲连接也可抢：新开一条流的代价就是那次建连，已折进判据里。
     pub(super) fn plan_cut(&mut self, now: Instant) -> Option<(u64, u64)> {
         if !self.fill.is_empty() {
             return None;
@@ -393,8 +382,7 @@ impl MergeBody {
         {
             return None;
         }
-        // 有闲连接 = 复用，不花建连；没有 = 新开一条。爬坡两者都有：
-        // 新流（哪怕复用连接）都要跨几个 RTT 才到稳态，这段空转折进收益判据。
+        // 有闲连接 = 复用，不花建连；没有 = 新开一条。爬坡两者都有：新流（哪怕复用连接）要跨几个 RTT 才到稳态，这段空转折进收益判据。
         let setup = if self.idle_credit > 0 {
             0.0
         } else {
@@ -403,8 +391,7 @@ impl MergeBody {
         // 基准取「链内最快实测」：已收尾的段用冻结值，仍在跑的用近期速率。
         let mut best_rate: f64 = 0.0;
         for s in self.segs.values() {
-            // 没在看着的（我们在忙队首）和缓冲顶格的（我们自己不读）不算慢——
-            // 但已收尾的段没有轮询了，它的冻结值就是最可信的证据。
+            // 没在看着的（我们在忙队首）和缓冲顶格的（我们自己不读）不算慢；已收尾的段没有轮询了，冻结值就是最可信的证据。
             let watched = now.saturating_duration_since(s.last_poll) <= POLL_GAP
                 && s.buffered < SEG_BUFFER_MAX;
             if s.done || watched {
@@ -437,8 +424,7 @@ impl MergeBody {
                 continue;
             }
             let etc = remaining as f64 / r;
-            // 比最快那家慢就算慢，交给最快的接手；只有"抢过去反而更久"才不动
-            // （remaining/best + 建连+爬坡 >= remaining/我），这是算术，不是门槛。
+            // 比最快那家慢就算慢，交给最快的接手；只有"抢过去反而更久"才不动（remaining/best + 建连+爬坡 >= remaining/我），这是算术，不是门槛。
             let steal = remaining as f64 / best_rate + setup;
             if etc <= steal {
                 continue;
@@ -449,9 +435,8 @@ impl MergeBody {
         }
         let (start, pos, remaining, _) = victim?;
         let holder = self.segs.get(&start).map_or(best_rate, |s| s.recent_rate(now));
-        // 切口按两家的速度比例分，让两边差不多同时跑完；刀口上限按帮手实测速率
-        // 折算——接手的家是 ECT 挑的没错，可它的"快"是上一轮的实测，新流起步那段
-        // 速度是 0，刀口再大，下一轮越容易又被判慢、再切一刀，来回抖。
+        // 切口按两家的速度比例分，让两边差不多同时跑完；刀口上限按帮手实测速率折算——
+        // 接手的家是 ECT 挑的没错，可它的"快"是上一轮实测、新流起步速度是 0，刀口越大下一轮越易再被判慢、再切一刀，来回抖。
         let keep =
             split_keep(remaining, holder, best_rate, setup).max(remaining.saturating_sub(handoff_cap(best_rate)));
         let out = self.cut(start, pos + keep, now);
@@ -550,8 +535,7 @@ impl hyper::body::Body for MergeBody {
                 me.segs.remove(&k);
                 continue;
             }
-            // 队首还没货：把其余段各推一轮（它们的数据先进各自缓冲），
-            // 只要有进展就回头再看队首；全体没动静才是真的 Pending。
+            // 队首还没货：把其余段各推一轮（数据先进各自缓冲），有进展就回头再看队首；全体没动静才是真的 Pending。
             if me.fill_all(cx) {
                 continue;
             }

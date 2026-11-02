@@ -21,8 +21,7 @@ fn accepts_gzip_respects_explicit_reject() {
     assert!(!accepts_gzip(&mk("br, gzip;q=0")));
 }
 
-/// 上行泵（git push 的请求体通道）：2MB 体必须一字节不差送到对端。
-/// 这条路径此前没有任何测试——窗口/背压改错不会让别的测试变红，只会让 push 卡住。
+/// 上行泵（git push 请求体通道）：2MB 体必须一字节不差送达——此前无测试，窗口/背压改错只会让 push 卡住不会变红。
 #[tokio::test]
 async fn h2_body_pump_delivers_every_byte() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

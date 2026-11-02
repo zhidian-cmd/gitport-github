@@ -1,5 +1,4 @@
-/// 备份判定: 别家同形态 PAC(127.0.0.1:port/proxy.pac)必须备份, 我们
-/// 上次写的(last_pac)和正要写的不算。
+/// 备份判定: 别家同形态 PAC(127.0.0.1:port/proxy.pac)必须备份, 我们上次写的(last_pac)和正要写的不算。
 #[test]
 fn should_backup_foreign_pac_shapes() {
     let pac = "http://127.0.0.1:7811/proxy.pac";
@@ -111,8 +110,7 @@ fn last_ip_object_form_expands_to_full_schema() {
             ("core/all~2".to_string(), String::new()),
             ("api/all".to_string(), "140.82.114.6".to_string()),
             ("api/all~2".to_string(), String::new()),
-            // 白名单四族（edge 族表最前），旧配置没有这些键，读入补空串。
-            // 每族两把钥匙:主键给第一通道,~2 给第二通道,恒相邻。
+            // 白名单四族（edge 族表最前）：旧配置没有这些键，读入补空串；每族两把钥匙:主键给第一通道,~2 给第二通道,恒相邻。
             ("edge/wl154".to_string(), String::new()),
             ("edge/wl154~2".to_string(), String::new()),
             ("edge/wl153".to_string(), String::new()),

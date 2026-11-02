@@ -93,8 +93,7 @@ pub fn pac_url() -> String {
 }
 
 fn internet_settings_key() -> Result<RegKey, String> {
-    // 只要求读权限：改代理必须走 InternetSetOption。这台机器上该键对普通进程是只读的，
-    // 拿 KEY_SET_VALUE 会直接"拒绝访问"——PAC 一直不生效就是卡在这一步。
+    // 只开读权限：改代理必须走 InternetSetOption；该键对普通进程只读，KEY_SET_VALUE 会直接"拒绝访问"——PAC 不生效就卡在这步。
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(INTERNET_SETTINGS_KEY, KEY_READ)
         .map_err(|e| format!("打开 Internet Settings 失败: {e}"))
@@ -182,8 +181,7 @@ fn refresh_wininet() {
     }
 }
 
-/// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉。
-/// 失败返回 Win32 错误码——调用方要原样报出来，别再吞成"什么都没发生"。
+/// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉；失败返回 Win32 错误码，调用方原样报出别吞。
 fn apply_conn_options(flags: u32, pac: Option<&str>) -> Result<(), u32> {
     use windows::core::PWSTR;
     use windows::Win32::Networking::WinInet::{
@@ -227,8 +225,7 @@ fn apply_conn_options(flags: u32, pac: Option<&str>) -> Result<(), u32> {
     }
 }
 
-/// 兜底：WinINET 已经存着我们的 PAC URL、只是标志位没置上时，直接补这一位。
-/// 只改 flags 这 4 个字节，不碰 blob 里的字符串，写坏了也不会。
+/// 兜底：WinINET 已存我们的 PAC URL 但标志位没置上时补置该位；只改 flags 这 4 字节，不碰 blob 里的字符串。
 fn force_pac_flag() -> Result<(), String> {
     let conn = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(CONNECTIONS_KEY, KEY_READ | KEY_SET_VALUE)
@@ -259,8 +256,7 @@ fn force_pac_flag() -> Result<(), String> {
     Ok(())
 }
 
-/// 按开关接管/还原系统代理（幂等）。只备份用户自己的配置——把我们的旧残留当原配置会让自愈还原死 PAC。
-/// 返回一句可读的结果（供启动日志与界面日志原样打印），失败带 Win32 错误码。
+/// 按开关接管/还原系统代理（幂等）：只备份用户自己的配置（残留当原配置会让自愈还原死 PAC）；返回供启动/界面日志原样打印的可读结果，失败带 Win32 错误码。
 pub fn ensure_system_proxy() -> Result<String, String> {
     let key = internet_settings_key()?;
     let cur = get_auto_config_url(&key);
@@ -638,8 +634,7 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     let _ = save();
 }
 
-/// 整表保存：规范化校验后与旧表做差集，删除即彻底消失；前端提交前必须先 GET 合并。
-/// 返回 (启用清单, 被删除的地址)——链对齐由调用方用 removed 触发，本模块只管存。
+/// 整表保存：规范化校验+与旧表差集，删除即彻底消失，前端须先 GET 合并；返回 (启用清单, 被删地址)，链对齐由调用方用 removed 触发，本模块只管存。
 pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<String>), String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {

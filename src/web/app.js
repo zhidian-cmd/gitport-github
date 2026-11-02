@@ -1,10 +1,7 @@
-/* GitPort GitHub 工作台前端: 状态轮询 + 连通性探针 + 日志增量 + 规则/池/设置管理。
-   所有开关一律由状态对象 S 驱动, 不解析按钮文字(双击/慢响应下会串状态)。 */
+/* GitPort GitHub 工作台前端: 状态轮询 + 连通性探针 + 日志增量 + 规则/池/设置管理；开关一律由状态对象 S 驱动，不解析按钮文字（双击/慢响应下会串状态）。 */
 const $ = id => document.getElementById(id);
 
-/* toast 提示（2026-10-18 补：函数定义此前丢失，所有 toast 调用抛
-   ReferenceError——copyText 的 try/catch 把它静默吞掉，校准/MITM 路径上
-   则暴露为"TypeError: toast is not a function"） */
+/* toast（2026-10-18 补：此前函数定义丢失，toast 调用抛 ReferenceError 被 copyText 的 try/catch 静默吞掉） */
 let toastTimer = null;
 function toast(msg) {
   const el = $('toast');
@@ -25,9 +22,7 @@ const titles = {
 
 async function copyText(t) {
   if (!t) return;
-  // 桌面壳内: window.ipc 由 wry 注入, Rust 侧直接写系统剪贴板 —— WebView2
-  // 的 clipboard API/execCommand 会被权限假成功, 所以壳内一律 IPC 优先;
-  // 浏览器直接打开时(无 window.ipc)才走网页 API。
+  // 壳内 window.ipc 由 wry 注入、Rust 直写剪贴板（WebView2 的 clipboard API/execCommand 会权限假成功）；浏览器无 ipc 才走网页 API。
   if (window.ipc) {
     try { window.ipc.postMessage('copy:' + t); toast('已复制'); }
     catch (e) { toast('复制失败'); }
@@ -95,8 +90,7 @@ async function refreshStatus() {
 /* ---------- 日志增量 ---------- */
 /* 日志行着色：按关键字分级（纯前端，零额外请求） */
 function logTone(l) {
-  // 顺序即优先级：降级类（冷却/垫底/拦截）先判黄 —— 这些行常同时含“超时/失败”，
-  // 若红先判，黄色永远走不到（2026-10-18 实测：用户只看到红绿）。
+  // 顺序即优先级：降级类（冷却/垫底/拦截）先判黄——红先判则黄永远走不到（2026-10-18 实测只看到红绿）。
   if (/冷却|垫底|降权|拦截|假页|退化|注入/.test(l)) return 'warn';
   if (/失败|错误|全灭|超时|拒绝|状态 [45]\d\d/.test(l)) return 'err';
   if (/via |握手|复用连接|新连接|已解密|成功|已保存/.test(l)) return 'ok';
@@ -171,8 +165,7 @@ $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked
    启动/关闭只增删 plans.json 镜像链成员，注册表不受影响。 */
 let MIRRORS = [];
 const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
-// HTML 属性转义：五个预定义字符实体一个都不能少——少一个就是一条注入面
-// （曾把 & < > " 原样返回，镜像 URL 里的 "><script> 直接逃逸 value="" 属性执行）。
+// HTML 属性转义五个字符实体缺一不可——曾把 & < > " 原样返回，镜像 URL 里的 "><script> 逃逸 value="" 执行（注入面）。
 const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'\u0026amp;','<':'\u0026lt;','>':'\u0026gt;','"':'\u0026quot;',"'":'\u0026#39;'}[c]));
 
 function renderMirrors() {
@@ -195,9 +188,7 @@ function mirrorRow(m, i) {
 }
 
 async function commitMirrors(opts = {}) {
-  // 合并模式(启停/编辑/删除):先拉最新清单,服务端新增条目并入本地,防旧页面
-  // 覆盖新收编条目。drop = 本次被删的 URL:合并时跳过,刚删的不会被补回,
-  // 双窗口下别家新增的条目也保得住。
+  // 合并模式(启停/编辑/删除)：先拉最新清单把服务端新增条目并入本地（防旧页面覆盖新收编条目、双窗口下别家新增也保得住）；drop=本次被删 URL，合并时跳过防刚删的被补回。
   const { merge = true, drop = null } = opts;
   if (merge) {
     try {
@@ -263,9 +254,8 @@ $('mirrorRows').addEventListener('input', e => {
 });
 
 /* ---------- 图片链校准 ---------- */
-// 半自动: 点击 -> 后端按内置模板对图片(小文件)链逐镜像串行实测 TTFB -> 按成绩重排
-// 链序并写盘 -> 返回人读报告。全程约 30~90s, 期间按钮禁用。
-// 大文件链不校准: 其速度学习由代理的实时流量调度(ECT)自动完成, 无需手动。
+// 半自动校准：点击 → 后端按内置模板对图片(小文件)链逐镜像串行实测 TTFB → 按成绩重排链序写盘 → 返回人读报告（约 30~90s，期间按钮禁用）。
+// 大文件链不校准：速度学习由代理的实时流量调度(ECT)自动完成，无需手动。
 async function runCal(btn) {
   const box = $('calResult');
   btn.disabled = true;

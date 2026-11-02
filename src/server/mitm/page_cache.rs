@@ -328,7 +328,7 @@ struct CacheTask {
 
 static WORKER_SENDER: OnceLock<mpsc::SyncSender<CacheTask>> = OnceLock::new();
 
-/// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志（缓存写是 best-effort）。
+/// 向管家投递任务；筐满/管家不可用 = 丢弃并打日志。
 fn worker_send(msg: CacheMsg, log: &LogFn) -> bool {
     let msg = CacheTask {
         dir: page_cache_dir(),
@@ -635,7 +635,6 @@ fn load_disk_entry_reason(
 ) -> Result<DiskEntry, &'static str> {
     let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
-    // 长寿命条目按 mtime 判保质期（GitHub 改版后旧骨架就是坏的）。
     if key.ends_with("-k") {
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())

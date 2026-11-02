@@ -1,6 +1,5 @@
 //! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护。
-//! 大文件竞速：按候选数均分切段（测速只来自代理自己分的段），慢段让位回收，
-//! 补发按 ECT 挑家——给最快的镜像加片，看 ECT 直到不再改善；故障/变慢无缝衔接。
+//! 大文件竞速：按候选数均分切段（测速只来自代理自己分的段）、慢段让位、补发按 ECT 挑家直到不再改善，故障/变慢无缝衔接。
 use super::merge::{self, MergeBody};
 use super::path_of;
 use super::quiet;
@@ -16,8 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// 直连每跳的响应头预算：好 IP 建连 0.6s、首包再 1s；单跳超过 2s 基本是坏 IP。
-/// 按跳记，不罩整段——release 直连要跟 302（两跳两拨），拿 2s 罩全程等于把好腿掐成必死。
+/// 直连按跳记响应头预算（每跳 2s，不罩整段）：release 要跟 302 两跳，罩全程会把好腿掐死。
 const DIRECT_HOP_HEAD: Duration = Duration::from_secs(2);
 /// 直连整段预算：≤2 跳 × 每跳 2s。没有镜像兜底时不设预算（直连是唯一的路）。
 const DIRECT_SEG_TOTAL: Duration = Duration::from_secs(4);
@@ -28,12 +26,10 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 帧间空档超过此值视为「这面镜像全体没人读」，窗口时长把空档扣除。
-/// 交付线推进时帧距是毫秒级；合并层背压造成的停顿是秒级，两者分得开。
+/// 帧间空档超过此值视为「这面镜像全体没人读」，从窗口时长扣除——交付线帧距毫秒级、背压停顿秒级，分得开。
 const FRAME_GAP_MS: u64 = 300;
-/// 测量窗口：有流在跑时，每这么久按「本镜像全流合计字节 ÷ 实际活跃时长」更新一次分数。
-/// 接的活越多分数越贴近真实总吞吐，ECT 才会跟着涨——否则快的那家被压到几百 KB/s，
-/// 分数还停在单流峰值，补发会一直往它身上堆。
+/// 测量窗口：有流在跑时每这么久按「本镜像全流合计字节 ÷ 实际活跃时长」更新一次分数。
+/// 活越多越贴近真实总吞吐、ECT 才跟着涨——否则快家被压到几百 KB/s、分数停在单流峰值，补发一直往它堆。
 const RATE_WINDOW_MS: u64 = 500;
 
 /// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败窗与采样时刻。
@@ -74,8 +70,7 @@ fn fail_window_active(load: &MirrorLoad, now: u64) -> bool {
     until != 0 && now < until
 }
 
-/// 超时类错误识别：拨号/首包/预算超时都是「慢」，不是「死」。
-/// `kind: TimedOut` 是 io::Error 调试形态（免解析 OS 码）。
+/// 超时类识别：拨号/首包/预算超时都是「慢」不是「死」；`kind: TimedOut` 是 io::Error 调试形态，免解析 OS 码。
 fn is_timeout_err(e: &str) -> bool {
     e.contains("超时")
         || e.contains("timeout")
@@ -100,8 +95,7 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// 帧到达记账：把「全体没人读」的空档从窗口时长里扣除。
-/// 交付线堵住时（合并层缓冲顶格）镜像一字节不产，墙钟照走会把分数稀释成假慢。
+/// 帧到达记账：把「全体没人读」的空档从窗口时长扣除——交付线堵住（合并层缓冲顶格）时镜像一字节不产，墙钟照走会稀释成假慢。
 fn mark_frame(load: &MirrorLoad, now: u64) {
     let last = load.last_frame_ms.swap(now, Ordering::Relaxed);
     if last != 0 && load.win_base_ms.load(Ordering::Relaxed) != 0 {
@@ -114,9 +108,8 @@ fn mark_frame(load: &MirrorLoad, now: u64) {
     }
 }
 
-/// 真 EWMA(α=0.3) + 单窗突变钳制：新样本越过旧值 3 倍边界时只走一半差距。
-/// 旧实现直接存 500ms 原始窗口率，一个抖动窗就把派发带偏，流在源间来回跳，
-/// 每跳一次都要重新慢启动，聚合速率抖着往下掉。
+/// 真 EWMA(α=0.3) + 单窗突变钳制：新样本越过旧值 3 倍边界只走一半差距。
+/// 旧实现直接存 500ms 原始窗口率，一个抖动窗就带偏派发，流在源间来回跳、每跳重新慢启动，聚合速率抖着掉。
 fn ewma_next(old: u64, rate: u64) -> u64 {
     if old == 0 {
         return rate.max(1);
@@ -132,9 +125,8 @@ fn ewma_next(old: u64, rate: u64) -> u64 {
     clamped.max(1)
 }
 
-/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际活跃时长」更新分数。
-/// 一个窗口只让一条流结算（CAS 抢占），重复调用直接返回。
-/// 没有帧就不会走到这里——待机镜像的分数自然停在最后一次，不需要额外冻结逻辑。
+/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际活跃时长」更新分数；一窗只让一条流结算（CAS 抢占），重复调用直接返回。
+/// 无帧不会走到这里——待机镜像分数自然停在最后一次，无需冻结逻辑。
 fn settle_window(load: &MirrorLoad, now: u64) {
     let base = load.win_base_ms.load(Ordering::Relaxed);
     if base == 0 {
@@ -259,8 +251,7 @@ impl Drop for LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/客户端断开全走这里)。
-        // 最后一条流关闭窗口：待机期间不累计时间，下个忙期从第一帧重新起算。
+        // 流数随流终结归位(正常读完/断开都走这里)；最后一条流关窗：待机不累计时间，下个忙期从第一帧重新起算。
         if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.load.win_base_ms.store(0, Ordering::Relaxed);
         }
@@ -361,8 +352,7 @@ pub(super) fn range_bytes(range: Option<&str>) -> u64 {
     }
 }
 
-/// 非 3xx、非 HTML；带 Range 必须 206；304 无正文放行。
-/// `allow_full`：总长探测专用——上游忽略 Range 回 200 全量时放行，body 由调用方当单流接管。
+/// 非 3xx、非 HTML；带 Range 必须 206，304 放行；`allow_full` 仅总长探测——上游无视 Range 回 200 全量时放行，body 由调用方当单流接管。
 fn validate_mirror_response(
     had_range: bool,
     status: u16,
@@ -384,8 +374,7 @@ fn validate_mirror_response(
 
 // ---- 段日志：只记账、只打吞吐，慢段由合并层缩边界让位，掐了就是个洞 ----
 
-/// 段收尾一行：多少字节 / 多少毫秒 / 合多少 MB/s。
-/// 日志此前只有“谁胜出”没有“跑多快”，判不出直连是真快还是只是抢到了位置。
+/// 段收尾一行：字节/毫秒/MB/s——此前日志只有“谁胜出”没有“跑多快”，判不出直连是真快还是只抢到了位置。
 fn log_seg_line(guard: &mut LoadGuard, label: &str, mirror: &str, log: &LogFn, note: &str) {
     let Some(t0) = guard.seg_start.take() else {
         return;
@@ -653,8 +642,7 @@ pub(super) async fn chain_fetch(
     };
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
-/// 直连段请求模板：原请求的方法/URI/头。补发起流跑在旁路任务里，
-/// 原请求不能跨任务借用——模板克隆一次，各自拼 Range。
+/// 直连段请求模板：原请求的方法/URI/头。补发起流跑在旁路任务里，原请求不能跨任务借用——克隆一次，各自拼 Range。
 #[derive(Clone)]
 pub(super) struct DirectTpl {
     method: http::Method,
@@ -670,8 +658,7 @@ fn direct_tpl(out: &hyper::Request<BoxBody>) -> DirectTpl {
     }
 }
 
-/// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 的下一条无 Range 请求
-/// 不用再为拿分母白跑一趟。只存 206 Content-Range 给出的权威总长。
+/// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 下一条无 Range 请求不必再白跑探测；只存 206 Content-Range 的权威总长。
 static TOTAL_MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
     LazyLock::new(Default::default);
 
@@ -690,9 +677,8 @@ fn total_memo_put(key: &str, total: u64) {
     g.insert(key.to_string(), (total, Instant::now()));
 }
 
-/// 无 Range 时探测文件总长：发 1 字节 Range，从 Content-Range 取分母。
-/// 旧实现单点押注链头——链头挂了，每个下载都先白付一轮探测超时。
-/// 现在头两家各试一次（都是真实请求，不合成测速），谁先给总长用谁。
+/// 无 Range 时发 1 字节 Range 探测总长，从 Content-Range 取分母。
+/// 旧实现单点押注链头，链头挂了每个下载先白付一轮探测超时；现在头两家各试一次（真实请求、不合成测速），谁先给总长用谁。
 enum Probe {
     /// 上游回了 206 + Content-Range：拿到了总长，可以切。
     Total(u64),
@@ -785,11 +771,8 @@ fn mark_unsliceable(key: String) {
     g.insert(key, Instant::now());
 }
 
-/// 直连段请求：用模板克隆原请求头换成本段 Range，再走直连腿。
-/// release 的下载地址本身不放文件，会 302 到 release-assets——跟一跳，
-/// 把 Range 带过去。跳转目标的 IP 与原 host 无关，用独立记账。
-/// 预算按跳记：有镜像兜底时每跳 2s 拿不到响应头就当这条路是死的——
-/// 好 IP 建连 0.6s、首包再 1s；没有镜像（用户没配/链全灭）时不设预算。
+/// 直连段请求：模板克隆原请求头换本段 Range 走直连腿；release 下载地址 302 到 release-assets，跟一跳把 Range 带过去，跳转目标 IP 与原 host 无关、用独立记账。
+/// 预算按跳记：有镜像兜底时每跳 2s 拿不到响应头即死路（好 IP 建连 0.6s、首包再 1s）；没镜像（用户没配/链全灭）时不设预算。
 async fn segment_direct(
     log: &LogFn,
     tpl: &DirectTpl,
@@ -862,8 +845,7 @@ async fn segment_direct(
     Ok(resp)
 }
 
-/// 分段请求统一剥掉这两类头：压缩会把每段各压一遍拼起来就是坏数据，
-/// 条件请求会让上游回 304 而段请求要的是实体。
+/// 分段请求统一剥掉这两类头：压缩每段各压一遍拼起来是坏数据；条件请求让上游回 304，而段请求要的是实体。
 fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     for h in [
         http::header::ACCEPT_ENCODING,
@@ -875,8 +857,7 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     }
 }
 
-/// 切片下载：一条请求按镜像数平均切段、并发拉，按边界合并回单条字节流。
-/// 段数 = 空闲镜像数（候选 − 在途）；少于 2 段不切，交回单流派发。
+/// 切片下载：一条请求按镜像数平均切段并发拉，按边界合并回单条字节流；段数=空闲镜像数（候选 − 在途），少于 2 段不切、交回单流。
 /// 探片、开区间 Range、上游不支持 Range 一律退回单流。
 async fn split_download(
     log: &LogFn,
@@ -902,8 +883,7 @@ async fn split_download(
         .filter(|m| !fail_window_active(&mirror_load(m), now))
         .map(|m| m.as_str())
         .collect();
-    // 空闲优先：切片段只分给零在途的源（链序内稳定序）。旧实现按链序取前 want 家，
-    // 忙的链头能凭位置再蹭一段，链尾的闲源反而落选——白白浪费一路带宽。
+    // 空闲优先：切段只分给零在途的源（链序内稳定序）——旧实现按链序取前 want 家，忙链头凭位置蹭段、链尾闲源落选，白浪费一路带宽。
     let idle: Vec<&str> = healthy
         .iter()
         .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) == 0)
@@ -934,8 +914,7 @@ async fn split_download(
                         (0, t, Some(t))
                     }
                     Ok(Probe::Total(_)) => return Ok(None),
-                    // 上游忽略 Range(回 200 全量)：探测那次的 body 就是整份文件，直接交出去，
-                    // 省掉「丢掉 + 重发单流」的一次完整往返（codeload 大归档正是这条路径）。
+                    // 上游忽略 Range(回 200 全量)：探测的 body 就是整份文件，直接交出，省掉「丢掉+重发单流」一次完整往返（codeload 大归档走这条）。
                     Ok(Probe::NotSliceable(resp)) => {
                         mark_unsliceable(slice_key.clone());
                         (log)(&format!(
@@ -964,8 +943,7 @@ async fn split_download(
         segs.len(),
         healthy.len()
     ));
-    // 有镜像兜底才给直连设按跳预算；没有镜像（用户没配 / 链全灭）时直连是唯一的路，
-    // 这时不能掐它，交给它按 IP 表自己换、自己等。
+    // 有镜像兜底才给直连设按跳预算；没镜像（用户没配/链全灭）时直连是唯一的路，不能掐，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let m = idle[i % idle.len()];
@@ -975,8 +953,7 @@ async fn split_download(
             let guard = LoadGuard::charge(mirror_load(m), e - s, true);
             let is_direct = m.starts_with("direct/");
             let got = if is_direct {
-                // 直连分段：预算按跳记（每跳 2s），整段 ≤2 跳。拿 2s 罩两跳两拨，
-                // 好腿也会被掐死——release 直连要跟 302，这正是旧实现丢速率的地方。
+                // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
                 let attempt =
                     segment_direct(log, &tpl, &host, info, replay, s, e, has_mirror.then_some(DIRECT_HOP_HEAD));
                 if has_mirror {
@@ -999,8 +976,7 @@ async fn split_download(
                     Err(err) => Err(err),
                 }
             };
-            // 直连没打出 206（超时/4xx/连不上）：记一次失败，ECT 下次绕开它。
-            // 超时(慢)与硬错误(死)分开降权——慢不等于死，别踢太久。
+            // 直连没打出 206（超时/4xx/连不上）记一次失败，ECT 下次绕开；超时(慢)与硬错误(死)分开降权，别把慢腿踢太久。
             if is_direct
                 && !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT)
             {
@@ -1041,8 +1017,7 @@ async fn split_download(
         }
     });
     let results = futures_util::future::join_all(futs).await;
-    // 段响应里除逐跳头/分段头之外的头统一搬过来：content-disposition 决定保存的文件名，
-    // etag/last-modified 决定缓存语义，少了客户端行为会变。
+    // 段响应除逐跳头/分段头外的头统一搬过来：content-disposition 定保存文件名，etag/last-modified 定缓存语义，少了客户端行为会变。
     let mut extra: Option<Vec<(http::HeaderName, http::HeaderValue)>> = None;
     let mut total = known_total;
     let mut bodies: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len());
@@ -1119,8 +1094,7 @@ async fn split_download(
         }
     }
     builder = builder.header(http::header::CONTENT_LENGTH, len);
-    // 起流收口成闭包：驱动只管"要 [from,to)"，怎么发由这里决定，也便于单测替换。
-    // 直连段的模板/上游信息/重放体一并捕获——补发现在两条路都走（ECT 挑）。
+    // 起流收口成闭包：驱动只管"要 [from,to)"、怎么发由这里决定，也便于单测替换；模板/上游信息/重放体一并捕获——补发两条路都走（ECT 挑）。
     let chain: Vec<String> = healthy.iter().map(|m| m.to_string()).collect();
     let (orig, host_s, log_s) = (orig_url.to_string(), host.to_string(), log.clone());
     let tpl2 = std::sync::Arc::new(tpl);
@@ -1165,8 +1139,7 @@ async fn split_download(
     builder.body(body).map(Some).map_err(|e| e.to_string())
 }
 
-/// 起一条拉 [from, to) 的新流。偏移相对区间起点，发出去要加 base。
-/// 候选 = 镜像 + 直连（健康时），ECT 挑最小者；两条路都 charge 记账、都采样——
+/// 起一条拉 [from, to) 的新流，偏移相对区间起点、发出去要加 base；候选=镜像+直连（健康时），ECT 挑最小者，两条路都 charge 记账、都采样。
 /// 旧实现补发裸奔：ECT 看不见补发的在途字节会过量堆活，直连被永久排除在补发外。
 async fn split_fetch(
     chain: &[String],
@@ -1180,8 +1153,7 @@ async fn split_fetch(
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
 ) -> Result<BoxBody, String> {
-    // 按 ECT（在途字节 ÷ 实测速度）挑最小者。不能挑"最空闲"：
-    // 刚断流的那家负载归零，正是最空闲的那个，补回去就是原地打转。
+    // 按 ECT（在途字节 ÷ 实测速度）挑最小者，不能挑"最空闲"——刚断流那家负载归零恰是最空闲，补回去就是原地打转。
     let mut cands: Vec<String> = chain
         .iter()
         .filter(|m| !m.starts_with("direct/"))
@@ -1334,9 +1306,8 @@ fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
     }
 }
 
-/// 切片驱动：发缺口、收停滞、让位慢段，其余时间只泵数据。
-/// 起流走旁路任务：建连/等首包再久，也不挡泵数据、不挡下一次让位。
-/// 补发没有全局次数上限——只要还在往前走就一直续，卡死才有上限。
+/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连/等首包再久也不挡泵数据与让位。
+/// 补发没有全局次数上限——还在往前走就一直续，卡死才有上限。
 fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Fetched>(8);
     // tx 每个状态机实例克隆一份：unfold 的闭包是 FnMut，不能把 tx 移出去。
