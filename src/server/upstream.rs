@@ -157,6 +157,31 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     Some(h.conns[idx].up.clone())
 }
 
+/// 借道轮转序号：一条内容域请求借一条 donor，别把整页头像压在同一根 TCP 上。
+static BORROW_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 借道 donor：assets 域已建好的伪装连接。
+///
+/// 证书只覆盖 `*.githubassets.com`，但 h2 的路由依据是 `:authority` 而不是 SNI——
+/// 同一条连接换 `:authority` 就能取内容域（实测 avatars/raw 都是 200 整包）。
+///
+/// 只返回池里**现成**的连接：新建一条就得选 SNI，真名会暴露目标域，伪装又过不了内容域的证书校验，
+/// 两条都是死路。所以这里没有"借不到就建一条"的分支，借不到就返回 None，让调用方走回退。
+pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
+    let cands: Vec<(String, H2Upstream)> = {
+        let g = lock(conn_pool());
+        g.iter()
+            .filter(|(h, _)| h.as_str() != exclude_host && h.ends_with("githubassets.com"))
+            .flat_map(|(h, hc)| hc.conns.iter().map(move |c| (h.clone(), c.up.clone())))
+            .collect()
+    };
+    if cands.is_empty() {
+        return None;
+    }
+    let i = BORROW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cands.len();
+    cands.into_iter().nth(i)
+}
+
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
 pub fn note_latency(host: &str, id: u64, ms: u64) {
     let mut g = lock(conn_pool());

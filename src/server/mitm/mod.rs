@@ -445,6 +445,47 @@ async fn send_once(
     }
 }
 
+/// 借道冷却：donor 借不出去（连接已死 / 421 Misdirected）就先歇半分钟，
+/// 免得每个头像请求都白等一次。冷却期内照旧走镜像链。
+static BORROW_BREAKER: pool::Breaker = pool::Breaker::new(30);
+
+/// 内容域候选全灭时的最后一条路：借 assets 已建好的伪装连接发同一个请求。
+///
+/// 全程零握手——`out` 里的 URI 就是目标 host，h2 直接用它生成 `:authority`，
+/// Fastly 按它路由。所以这条路上既没有真名 ClientHello，也不会连累 donor 的通道。
+pub(super) async fn try_borrow(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
+    host: &str,
+    info: &UpstreamInfo,
+    body: &Option<Bytes>,
+) -> Option<Result<hyper::Response<BoxBody>, String>> {
+    if BORROW_BREAKER.open(host) {
+        return None;
+    }
+    let (donor_host, donor) = upstream::borrow_donor(host)?;
+    match send_once(&donor, out, body, request_budget(true)).await {
+        Ok((resp, ms)) => {
+            // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
+            // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
+            *info.lock().unwrap() = donor.ip.clone();
+            if quiet::first_time("borrow", host) {
+                (log)(&format!(
+                    "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
+                    donor.ip
+                ));
+            }
+            Some(Ok(resp))
+        }
+        Err(e) => {
+            // 不摘 donor：借出的请求失败多半是流级（REFUSED_STREAM / 421），
+            // 掐掉连接会连累 assets 自己的流量；真死了由 30s 一次的 keepalive 收。
+            BORROW_BREAKER.set(host);
+            Some(Err(format!("借道 {donor_host}({}) 失败({e})", donor.ip)))
+        }
+    }
+}
+
 /// 直连腿组装（两条路径共用）：charge 在 future 首行，镜像胜出丢弃 future 时零残留。
 #[allow(clippy::too_many_arguments)] // 直连腿组装的字面清单, 强行并参只会丢语义
 fn direct_leg<'a>(
@@ -566,6 +607,10 @@ pub(super) async fn get_direct(
     // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
     let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+        // 熔断期间不干等：内容域候选全灭时借 assets 的现成通道，借不到才回镜像链。
+        if let Some(r) = try_borrow(log, out, host, info, body).await {
+            return r;
+        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
@@ -575,6 +620,10 @@ pub(super) async fn get_direct(
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
     if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+        // 等锁期间别人可能刚把熔断补上：同样先试借道，借不到才回镜像链。
+        if let Some(r) = try_borrow(log, out, host, info, body).await {
+            return r;
+        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
@@ -601,7 +650,12 @@ pub(super) async fn get_direct(
                         return Err(format!("POST 等非简单方法不重发({e})"));
                     }
                     if is_content {
+                        // 候选确实全灭：先把熔断记上，后续请求直接抄借道这条近路，
+                        // 不再挨个等拨号超时。
                         pool::CONTENT_BREAKER.set(host);
+                        if let Some(r) = try_borrow(log, out, host, info, body).await {
+                            return r;
+                        }
                         return Err(format!("内容域直连全灭({e})"));
                     }
                     continue;
@@ -645,7 +699,11 @@ pub(super) async fn get_direct(
             return Err(format!("POST 等非简单方法不重发({e})"));
         }
         if is_content {
+            // 同上：先熔断再借道，让下一条请求少走一轮必败的拨号。
             pool::CONTENT_BREAKER.set(host);
+            if let Some(r) = try_borrow(log, out, host, info, body).await {
+                return r;
+            }
             return Err(format!("内容域直连全灭({e})"));
         }
         continue; // GET/HEAD: 换下一个候选重发完整请求

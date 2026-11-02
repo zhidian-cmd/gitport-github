@@ -758,7 +758,7 @@ pub struct Breaker {
     map: std::sync::OnceLock<Mutex<HashMap<String, Instant>>>,
 }
 impl Breaker {
-    const fn new(ttl_secs: u64) -> Self {
+    pub const fn new(ttl_secs: u64) -> Self {
         Self {
             ttl_secs,
             map: std::sync::OnceLock::new(),
