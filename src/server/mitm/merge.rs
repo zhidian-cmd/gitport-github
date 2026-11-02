@@ -20,6 +20,10 @@ pub(super) const SPLIT_SETUP_SECS: f64 = 0.5;
 const RATE_WARMUP: Duration = Duration::from_millis(400);
 /// 同一段两次让位的最小间隔，防抖。
 const CUT_COOLDOWN: Duration = Duration::from_millis(1_500);
+/// 两次让位之间的全局间隔：多段同时"偏慢"时轮着切就是抖动。
+const CUT_ANY_COOLDOWN: Duration = Duration::from_millis(2_500);
+/// 一次最多挪这么多尾巴：新流起步速度是 0，挪得越多越容易被下一轮再判慢。
+const MAX_HANDOFF: u64 = 4 * 1024 * 1024;
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
 /// 轮询断档超过这么久，回来后重新起算停滞——那是我们自己在忙队首，不是上游死了。
@@ -176,6 +180,8 @@ pub(super) struct MergeBody {
     dead_fills: u32,
     /// 上次体检时刻。
     last_tick: Instant,
+    /// 上次让位时刻（全局，不按段），用来给让位整体限速。
+    last_cut_any: Option<Instant>,
     finished: bool,
 }
 
@@ -193,6 +199,7 @@ impl MergeBody {
             idle_credit: 0,
             dead_fills: 0,
             last_tick: Instant::now(),
+            last_cut_any: None,
             finished: false,
         }
     }
@@ -338,6 +345,13 @@ impl MergeBody {
         if !self.fill.is_empty() {
             return None;
         }
+        // 全局节流：两次让位之间留足间隔，别让几段轮着抖。
+        if self
+            .last_cut_any
+            .is_some_and(|t| now.saturating_duration_since(t) < CUT_ANY_COOLDOWN)
+        {
+            return None;
+        }
         // 有闲连接 = 复用，不花建连；没有 = 新开一条，收益要盖过建连才算划算。
         let setup = if self.idle_credit > 0 {
             0.0
@@ -381,10 +395,11 @@ impl MergeBody {
                 continue;
             }
             let etc = remaining as f64 / r;
-            // 抢过来要多久：按链内最快速度跑完，再加可能的建连成本。
+            // 比最快那家慢就算慢，交给最快的接手；只有"抢过去反而更久"才不动
+            // （remaining/best + 建连 >= remaining/我），这是算术，不是门槛。
             let steal = remaining as f64 / best_rate + setup;
             if etc <= steal {
-                continue; // 抢过来也快不了多少
+                continue;
             }
             if victim.is_none_or(|(_, _, _, v)| etc > v) {
                 victim = Some((s.start, pos, remaining, etc));
@@ -392,8 +407,16 @@ impl MergeBody {
         }
         let (start, pos, remaining, _) = victim?;
         let holder = self.segs.get(&start).map_or(best_rate, |s| s.rate(now));
-        let cut = pos + split_keep(remaining, holder, best_rate);
-        self.cut(start, cut, now)
+        // 切口按两家的速度比例分，让两边差不多同时跑完；但一刀最多挪 MAX_HANDOFF——
+        // 接手的家是 ECT 挑的没错，可它的"快"是上一轮的实测，新流起步那段速度是 0，
+        // 挪得越多，下一轮越容易又被判慢、再切一刀，来回抖。
+        let keep =
+            split_keep(remaining, holder, best_rate).max(remaining.saturating_sub(MAX_HANDOFF));
+        let out = self.cut(start, pos + keep, now);
+        if out.is_some() {
+            self.last_cut_any = Some(now);
+        }
+        out
     }
 
     /// 把某段的边界缩到 cut，尾巴排进补发。父流不必断，交到新边界自然放手。

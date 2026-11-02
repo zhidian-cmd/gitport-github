@@ -1079,22 +1079,21 @@ async fn split_download(
         segs.len(),
         healthy.len()
     ));
-    // 段优先派给最空闲的镜像；同负载时保持链序（稳定排序）。否则会全压在最快的几家人身上，
-    // 闲置的镜像照样闲着，切片就白切了。
-    let mut pick: Vec<&str> = healthy.clone();
-    pick.sort_by_key(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed));
+    // 初始派发没有 ECT 可言——速度分要等流跑起来才有。这里只按链序摊开，
+    // 这一批段兼任测速器；真正的 ECT 从待交段和让位开始起作用。
     // 有镜像兜底才给直连设 2s 预算；没有镜像（用户没配 / 链全灭）时直连是唯一的路，
     // 这时不能掐它，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
-        let m = pick[i % pick.len()];
+        let m = healthy[i % healthy.len()];
+        let host = host.to_string();
         async move {
             let guard = LoadGuard::charge(mirror_load(m), e - s, true);
             let is_direct = m.starts_with("direct/");
             let got = if is_direct {
                 // 直连分段：有兜底时 2s 拿不到响应头就当这条路是死的——好 IP 建连 0.6s、
                 // 首包再 1s，超过 2s 基本是坏 IP，等它只会拖住整条下载。
-                let attempt = segment_direct(log, out, host, info, replay, s, e);
+                let attempt = segment_direct(log, out, &host, info, replay, s, e);
                 if has_mirror {
                     match tokio::time::timeout(DIRECT_SEG_HEAD, attempt).await {
                         Ok(r) => r,
@@ -1194,7 +1193,7 @@ async fn split_download(
                         )
                     });
                 }
-                let m = pick[i % pick.len()];
+                let m = healthy[i % healthy.len()];
                 let body = account_seg(
                     resp.into_body(),
                     guard,

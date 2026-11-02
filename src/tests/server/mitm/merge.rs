@@ -346,6 +346,58 @@ fn plan_cut_spares_when_no_faster_peer() {
     assert!(m.plan_cut(now).is_none(), "同样快，没有抢的收益");
 }
 
+/// 比最快慢就切，但只剩 0.1MB 时抢过去反而更久（要付建连）——这时候不动刀，
+/// 是算术不是门槛：remaining/best + 建连 >= remaining/我。
+#[test]
+fn plan_cut_skips_when_handoff_costs_more() {
+    let now = Instant::now();
+    let half = 2 * MIN_PIECE;
+    let mut m = MergeBody::new(
+        vec![
+            (0, half, now - Duration::from_secs(2), stalled(b"")),
+            (
+                half,
+                4 * MIN_PIECE,
+                now - Duration::from_secs(2),
+                stalled(b""),
+            ),
+        ],
+        4 * MIN_PIECE,
+    );
+    // 慢家 0.95MB/s、快家 1.5MB/s：慢家只剩 0.1MB，抢过去还得付 0.5s 建连，不划算。
+    for (k, got) in [(0u64, 1_900_000u64), (half, 3_000_000u64)] {
+        let s = m.segs.get_mut(&k).unwrap();
+        s.got = got;
+        s.last_poll = now;
+    }
+    assert!(m.plan_cut(now).is_none(), "抢过去更久就不该抢");
+}
+
+/// 一刀最多挪 MAX_HANDOFF：接手的家再快，新流起步那段也是 0 速度，
+/// 挪得越多越容易被下一轮再判慢，来回抖。
+#[test]
+fn plan_cut_caps_handoff_size() {
+    let now = Instant::now();
+    let big = 40 * 1024 * 1024;
+    let mut m = MergeBody::new(
+        vec![
+            (0, big / 2, now - Duration::from_secs(2), stalled(b"")),
+            (big / 2, big, now - Duration::from_secs(2), stalled(b"")),
+        ],
+        big,
+    );
+    // 慢家 0.5MB/s（还剩 19MB）；快家 2MB/s。快家该接走大头。
+    for (k, got) in [(0u64, 1_048_576u64), (big / 2, 4 * 1024 * 1024u64)] {
+        let s = m.segs.get_mut(&k).unwrap();
+        s.got = got;
+        s.last_poll = now;
+    }
+    let (from, to) = m.plan_cut(now).expect("38 秒太久，该抢");
+    let handoff = to - from;
+    assert!(handoff >= MIN_PIECE, "刀口太小不值一次建连");
+    assert!(handoff <= MAX_HANDOFF, "刀口 {handoff} 超过封顶");
+}
+
 /// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。
 #[test]
 fn dead_fill_counter_resets_on_progress() {
