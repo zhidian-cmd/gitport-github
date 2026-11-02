@@ -12,14 +12,17 @@ pub enum Route {
     Tunnel,
 }
 
-/// 大文件下载域（整域镜像）：codeload=源码包；objects/release-assets=附件 302 落点。
+/// 大文件下载域（分片竞速）：objects/release-assets=附件 302 落点。
 pub fn is_big_file_host(host: &str) -> bool {
     matches!(
         host,
-        "codeload.github.com"
-            | "objects.githubusercontent.com"
-            | "release-assets.githubusercontent.com"
+        "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
     )
+}
+
+/// 整域镜像域：大文件域 + codeload（小文件派发：直连优先，失败按校准链序逐家）。
+pub fn is_whole_domain_mirror(host: &str) -> bool {
+    is_big_file_host(host) || host == "codeload.github.com"
 }
 
 /// 走镜像的大文件路径：`/releases/download` 与 `/archive`；路由与镜像链归属共用同一个解析器。
@@ -48,7 +51,7 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
 
 /// 镜像链归属：请求 host → 实际内容 host 的专属链；release 附件必须用 release-assets 链。
 pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
-    if is_big_file_host(host) {
+    if is_whole_domain_mirror(host) {
         return host;
     }
     match release_asset_kind(host, path) {
@@ -65,7 +68,7 @@ pub fn master_route(host: &str, method: &str, path: &str) -> Route {
         return Route::System;
     }
     if matches!(method, "GET" | "HEAD")
-        && (is_big_file_host(host) || is_release_asset_path(host, path))
+        && (is_whole_domain_mirror(host) || is_release_asset_path(host, path))
     {
         return Route::Mirror;
     }

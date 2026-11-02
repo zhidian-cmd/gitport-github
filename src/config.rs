@@ -136,6 +136,13 @@ pub fn is_direct(host: &str) -> bool {
     DIRECT_HOSTS.contains(&host)
 }
 
+/// 直连优先域：先试直连，失败按链序逐家；codeload 已并入小文件派发并享受 TTFB 校准。
+pub const DIRECT_FIRST_HOSTS: &[&str] = &["codeload.github.com"];
+
+pub fn is_direct_first(host: &str) -> bool {
+    DIRECT_FIRST_HOSTS.contains(&host)
+}
+
 /// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
 pub fn pool_for(host: &str) -> &'static str {
     // 白名单必须先于 GROUPS 遍历：objects-origin 会被 edge 通配符吞掉（Fastly 500）。

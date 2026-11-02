@@ -10,11 +10,11 @@ fn mirror_chain_cap_scope() {
         "user-images.githubusercontent.com",
         "media.githubusercontent.com",
         "gist.githubusercontent.com",
+        "codeload.github.com",
     ] {
         assert_eq!(mirror_chain_cap(h), Some(5), "{h} 应限长 5 家");
     }
     for h in [
-        "codeload.github.com",
         "objects.githubusercontent.com",
         "release-assets.githubusercontent.com",
     ] {

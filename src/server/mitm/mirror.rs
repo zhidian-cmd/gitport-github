@@ -3,6 +3,7 @@
 use super::merge::{self, MergeBody};
 use super::path_of;
 use super::quiet;
+use crate::config;
 use crate::pool;
 use crate::server::protocol::{self, BoxBody};
 use crate::server::upstream;
@@ -498,6 +499,11 @@ pub(super) async fn chain_fetch(
     let direct_key = format!("direct/{chain_host}");
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
+    // 直连优先域（codeload）：direct 提到队首，失败再按校准链序逐家。
+    if config::is_direct_first(chain_host) {
+        let n = candidates.len();
+        candidates.rotate_left(n - 1);
+    }
     // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
     if !chain.is_empty() && pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
@@ -725,7 +731,7 @@ async fn probe_total_one(
         "mirror"
     };
     let mut resp = if mirror.starts_with("direct/") {
-        segment_direct(log, tpl, host, info, replay, 0, 1, None).await?
+        segment_direct(log, tpl, host, info, replay, Some(http::HeaderValue::from_static("bytes=0-0")), None).await?
     } else {
         let mut req = mirror_request(out, mirror, orig_url)?;
         req.headers_mut().insert(
@@ -779,19 +785,18 @@ async fn segment_direct(
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
-    s: u64,
-    e: u64,
+    range: Option<http::HeaderValue>,
     hop_budget: Option<Duration>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
-        .map_err(|err| err.to_string())?;
     let mut req = hyper::Request::builder()
         .method(tpl.method.clone())
         .uri(tpl.uri.clone())
         .body(protocol::empty_body())
         .map_err(|err| err.to_string())?;
     *req.headers_mut() = tpl.headers.clone();
-    req.headers_mut().insert(http::header::RANGE, range.clone());
+    if let Some(range) = &range {
+        req.headers_mut().insert(http::header::RANGE, range.clone());
+    }
     strip_body_headers(&mut req);
     let mut resp = match hop_budget {
         Some(b) => tokio::time::timeout(b, super::get_direct(log, &req, host, info, true, replay))
@@ -829,8 +834,9 @@ async fn segment_direct(
             }
             req2.headers_mut().insert(k.clone(), v.clone());
         }
-        req2.headers_mut()
-            .insert(http::header::RANGE, range.clone());
+        if let Some(range) = &range {
+            req2.headers_mut().insert(http::header::RANGE, range.clone());
+        }
         let fresh = super::UpstreamInfo::default();
         resp = match hop_budget {
             Some(b) => {
@@ -905,8 +911,14 @@ async fn split_download(
             // 总长记忆命中：省掉探测往返（探测本身是真实请求，结果只记 10 分钟）。
             Some(t) => (0, t, Some(t)),
             None => {
-                let probe_cands: Vec<&str> =
-                    healthy.iter().copied().take(healthy.len().min(2)).collect();
+                // 探测候选按 ECT 择优、不按链序：大文件域若不支持 Range，整包从探测腿单流出，链头盲选会把大下载砸在慢镜像上；冷启动 ECT 全零时稳定排序退化回链序。
+                let mut probe_cands: Vec<&str> = healthy.clone();
+                probe_cands.sort_by_key(|m| {
+                    let ld = mirror_load(m);
+                    ld.in_flight_bytes.load(Ordering::Relaxed) * 1000
+                        / ld.speed_ewma.load(Ordering::Relaxed).max(1)
+                });
+                probe_cands.truncate(2);
                 match probe_total(log, out, &probe_cands, orig_url, host, info, replay, &tpl).await
                 {
                     Ok(Probe::Total(t)) if t > 0 => {
@@ -914,12 +926,9 @@ async fn split_download(
                         (0, t, Some(t))
                     }
                     Ok(Probe::Total(_)) => return Ok(None),
-                    // 上游忽略 Range(回 200 全量)：探测的 body 就是整份文件，直接交出，省掉「丢掉+重发单流」一次完整往返（codeload 大归档走这条）。
+                    // 上游忽略 Range(回 200 全量)：探测的 body 就是整份文件，直接按单流交出。
                     Ok(Probe::NotSliceable(resp)) => {
                         mark_unsliceable(slice_key.clone());
-                        (log)(&format!(
-                            "[切片] {host}{path} 上游忽略 Range(回 200), 探测响应直接按单流交出"
-                        ));
                         return Ok(Some(resp));
                     }
                     Err(e) => {
@@ -954,8 +963,17 @@ async fn split_download(
             let is_direct = m.starts_with("direct/");
             let got = if is_direct {
                 // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
-                let attempt =
-                    segment_direct(log, &tpl, &host, info, replay, s, e, has_mirror.then_some(DIRECT_HOP_HEAD));
+                let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
+                    .map_err(|err| err.to_string())?;
+                let attempt = segment_direct(
+                    log,
+                    &tpl,
+                    &host,
+                    info,
+                    replay,
+                    Some(range),
+                    has_mirror.then_some(DIRECT_HOP_HEAD),
+                );
                 if has_mirror {
                     match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
                         Ok(r) => r,
@@ -1170,14 +1188,15 @@ async fn split_fetch(
     if m.starts_with("direct/") {
         let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
         let has_mirror = cands.len() > 1;
+        let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
+            .map_err(|err| err.to_string())?;
         let attempt = segment_direct(
             log,
             tpl,
             host,
             info,
             replay,
-            s,
-            e,
+            Some(range),
             has_mirror.then_some(DIRECT_HOP_HEAD),
         );
         let got = if has_mirror {
@@ -1553,6 +1572,10 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
     (
         "raw.githubusercontent.com",
         "https://raw.githubusercontent.com/torvalds/linux/master/README",
+    ),
+    (
+        "codeload.github.com",
+        "https://codeload.github.com/octocat/Hello-World/tar.gz/refs/heads/master",
     ),
     (
         "gist.githubusercontent.com",

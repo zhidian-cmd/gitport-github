@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// 单段缓冲上限：快段先到先存，超过就暂时不读它，等交付线推进再读。
-const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
+pub(super) const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
 /// 让位/补发的最小片：小到不值一次建连就不切。
 pub(super) const MIN_PIECE: u64 = 512 * 1024;
 /// 多久没收到字节算死。5s 忍得住 CDN 抖动，又不让死连接白占位置。

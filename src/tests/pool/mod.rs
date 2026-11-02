@@ -446,7 +446,7 @@ fn toggle_gates_big_file_chains_only() {
         dir.join("plans.json"),
         r#"{
   "core": [],
-  "mirrors_big":   {"codeload.github.com": ["https://on.example", "https://off.example"]},
+  "mirrors_big":   {"objects.githubusercontent.com": ["https://on.example", "https://off.example"]},
   "mirrors_small": {"raw.githubusercontent.com": ["https://on.example"]}
 }"#,
     )
@@ -465,7 +465,7 @@ fn toggle_gates_big_file_chains_only() {
     ]);
     serial_load(&dir, Vec::new(), None);
     sync_custom_mirrors(&[]);
-    let big = mirror_chain("codeload.github.com");
+    let big = mirror_chain("objects.githubusercontent.com");
     assert!(big.contains(&"https://on.example".to_string()), "启用镜留在大文件链: {big:?}");
     assert!(!big.contains(&"https://off.example".to_string()), "关闭镜从大文件链摘除: {big:?}");
     let small = mirror_chain("raw.githubusercontent.com");
