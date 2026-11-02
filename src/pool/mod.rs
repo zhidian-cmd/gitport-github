@@ -1,7 +1,6 @@
 //! 串发拨号：plans.json 唯一权威。成功驻留游标、失败前移；SNI 文件权威、与校验名解耦。
 pub mod dial;
 pub mod route;
-pub(crate) mod mirror_stats;
 
 use crate::util::{lock, LogFn};
 use serde::{Deserialize, Serialize};

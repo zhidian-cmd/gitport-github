@@ -22,8 +22,17 @@ const RATE_WARMUP: Duration = Duration::from_millis(400);
 const CUT_COOLDOWN: Duration = Duration::from_millis(1_500);
 /// 两次让位之间的全局间隔：多段同时"偏慢"时轮着切就是抖动。
 const CUT_ANY_COOLDOWN: Duration = Duration::from_millis(2_500);
-/// 一次最多挪这么多尾巴：新流起步速度是 0，挪得越多越容易被下一轮再判慢。
-const MAX_HANDOFF: u64 = 4 * 1024 * 1024;
+/// 一刀的刀口上限按帮手实测速率折算：≈ 它 3 秒能啃下的量，钳在 [MIN_PIECE, 64MB]。
+/// 旧常数 4MB 对 2MB/s 的源够用，对 10MB/s 的快源就是把再平衡钉死在 ~1.6MB/s——
+/// 快源下完自己的份额后只能以这个龟速捡慢段的尾巴，整条河的聚合速率上不去。
+fn handoff_cap(best_rate: f64) -> u64 {
+    ((best_rate * 3.0) as u64).clamp(MIN_PIECE, 64 * 1024 * 1024)
+}
+/// 帮手爬坡：新流慢启动到稳态要跨几个 RTT（跨境单程 0.2~0.4s），按 1s 空转折算。
+/// 这是让位判据的建模参数，不是测量值——测量只来自真实流。
+const HELPER_RAMP_SECS: f64 = 1.0;
+/// 让位判据看近期速率：样本窗与 POLL_GAP 对齐（没在看的不算），历史慢启动/停顿不拖累当下判断。
+const RECENT_WIN: Duration = Duration::from_millis(1_500);
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
 /// 轮询断档超过这么久，回来后重新起算停滞——那是我们自己在忙队首，不是上游死了。
@@ -79,14 +88,14 @@ pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
 }
 
 /// 让位时持有者该留多少：按两者速率反比切，使双方同时完成（DEMS），
-/// 并把帮手的建连耗时折进分母——`helper × setup` 是它在建连期间白下的字节。
+/// 并把帮手的建连+爬坡耗时折进分母——`helper × setup` 是它在起跑期间白下的字节。
 /// 结果钳在 [MIN_PIECE, remaining − MIN_PIECE]，保证两边都不是碎渣。
-pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64) -> u64 {
+pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64, setup_secs: f64) -> u64 {
     if remaining < 2 * MIN_PIECE {
         return remaining / 2;
     }
     let keep = if holder > 0.0 && helper > 0.0 && holder.is_finite() && helper.is_finite() {
-        holder * (SPLIT_SETUP_SECS * helper + remaining as f64) / (holder + helper)
+        holder * (setup_secs * helper + remaining as f64) / (holder + helper)
     } else {
         remaining as f64 / 2.0
     };
@@ -119,6 +128,8 @@ struct Seg {
     err: Option<std::io::Error>,
     /// 收尾时冻结的均速：断了之后 begin 还在走，现算会一路衰减成假慢。
     frozen_rate: Option<f64>,
+    /// 近期速率样本 (时刻, 已收字节)：让位判据用滑窗，全片均速会被慢启动拖累。
+    recent: VecDeque<(Instant, u64)>,
 }
 
 impl Seg {
@@ -137,6 +148,7 @@ impl Seg {
             done: false,
             err: None,
             frozen_rate: None,
+            recent: VecDeque::new(),
         }
     }
 
@@ -146,9 +158,11 @@ impl Seg {
     }
 
     /// 收尾时把均速定格：之后 begin 继续走，现算只会越来越"慢"。
+    /// 定格值优先取近期速率（收尾前最后 1.5s 的实测），样本不足退回全片均速。
     fn freeze(&mut self, now: Instant) {
         if self.frozen_rate.is_none() {
-            self.frozen_rate = Some(self.rate(now));
+            let r = self.recent_rate(now);
+            self.frozen_rate = Some(if r > 0.0 { r } else { self.rate(now) });
         }
     }
 
@@ -162,6 +176,23 @@ impl Seg {
             return 0.0;
         }
         self.got as f64 / el.as_secs_f64().max(0.001)
+    }
+
+    /// 近期速率（最后 RECENT_WIN 的实测）：让位判据用它，慢启动与历史停顿不进分母。
+    /// 滑窗样本不足 RATE_WARMUP 时退回全片均速——短段没有近期可言，全片就是全部真相。
+    fn recent_rate(&self, now: Instant) -> f64 {
+        if let Some(r) = self.frozen_rate {
+            return r;
+        }
+        let Some((t0, b0)) = self.recent.front() else {
+            return self.rate(now);
+        };
+        let el = now.saturating_duration_since(*t0);
+        if el < RATE_WARMUP {
+            return self.rate(now);
+        }
+        let bytes = self.got.saturating_sub(*b0);
+        bytes as f64 / el.as_secs_f64().max(0.001)
     }
 }
 
@@ -269,6 +300,16 @@ impl MergeBody {
                 seg.stalled_since = Some(now);
             }
             seg.last_poll = now;
+            // 记近期速率样本点：判让位用滑窗，全片均速的历史包袱不进判据。
+            seg.recent.push_back((now, seg.got));
+            while seg.recent.len() > 64
+                || seg
+                    .recent
+                    .front()
+                    .is_some_and(|(t, _)| now.saturating_duration_since(*t) > RECENT_WIN)
+            {
+                seg.recent.pop_front();
+            }
             match std::pin::Pin::new(&mut seg.body).poll_frame(cx) {
                 std::task::Poll::Ready(Some(Ok(f))) => {
                     progressed = true;
@@ -352,13 +393,14 @@ impl MergeBody {
         {
             return None;
         }
-        // 有闲连接 = 复用，不花建连；没有 = 新开一条，收益要盖过建连才算划算。
+        // 有闲连接 = 复用，不花建连；没有 = 新开一条。爬坡两者都有：
+        // 新流（哪怕复用连接）都要跨几个 RTT 才到稳态，这段空转折进收益判据。
         let setup = if self.idle_credit > 0 {
             0.0
         } else {
             SPLIT_SETUP_SECS
-        };
-        // 基准取「链内最快实测」：已收尾的段用冻结值，仍在跑的用现算。
+        } + HELPER_RAMP_SECS;
+        // 基准取「链内最快实测」：已收尾的段用冻结值，仍在跑的用近期速率。
         let mut best_rate: f64 = 0.0;
         for s in self.segs.values() {
             // 没在看着的（我们在忙队首）和缓冲顶格的（我们自己不读）不算慢——
@@ -366,7 +408,7 @@ impl MergeBody {
             let watched = now.saturating_duration_since(s.last_poll) <= POLL_GAP
                 && s.buffered < SEG_BUFFER_MAX;
             if s.done || watched {
-                best_rate = best_rate.max(s.rate(now));
+                best_rate = best_rate.max(s.recent_rate(now));
             }
         }
         if best_rate <= 0.0 {
@@ -390,13 +432,13 @@ impl MergeBody {
             if remaining < 2 * MIN_PIECE {
                 continue; // 已经碎到不值一次建连
             }
-            let r = s.rate(now);
+            let r = s.recent_rate(now);
             if r <= 0.0 {
                 continue;
             }
             let etc = remaining as f64 / r;
             // 比最快那家慢就算慢，交给最快的接手；只有"抢过去反而更久"才不动
-            // （remaining/best + 建连 >= remaining/我），这是算术，不是门槛。
+            // （remaining/best + 建连+爬坡 >= remaining/我），这是算术，不是门槛。
             let steal = remaining as f64 / best_rate + setup;
             if etc <= steal {
                 continue;
@@ -406,12 +448,12 @@ impl MergeBody {
             }
         }
         let (start, pos, remaining, _) = victim?;
-        let holder = self.segs.get(&start).map_or(best_rate, |s| s.rate(now));
-        // 切口按两家的速度比例分，让两边差不多同时跑完；但一刀最多挪 MAX_HANDOFF——
-        // 接手的家是 ECT 挑的没错，可它的"快"是上一轮的实测，新流起步那段速度是 0，
-        // 挪得越多，下一轮越容易又被判慢、再切一刀，来回抖。
+        let holder = self.segs.get(&start).map_or(best_rate, |s| s.recent_rate(now));
+        // 切口按两家的速度比例分，让两边差不多同时跑完；刀口上限按帮手实测速率
+        // 折算——接手的家是 ECT 挑的没错，可它的"快"是上一轮的实测，新流起步那段
+        // 速度是 0，刀口再大，下一轮越容易又被判慢、再切一刀，来回抖。
         let keep =
-            split_keep(remaining, holder, best_rate).max(remaining.saturating_sub(MAX_HANDOFF));
+            split_keep(remaining, holder, best_rate, setup).max(remaining.saturating_sub(handoff_cap(best_rate)));
         let out = self.cut(start, pos + keep, now);
         if out.is_some() {
             self.last_cut_any = Some(now);

@@ -406,20 +406,14 @@ struct SettingsResp {
     #[serde(rename = "githubPAC")]
     github_pac: bool,
     worker_mirrors: Vec<crate::settings::WorkerMirror>,
-    mirror_stats: serde_json::Value,
 }
 
 async fn api_settings() -> Response {
-    let stats: serde_json::Map<String, serde_json::Value> = crate::pool::mirror_stats::snapshot()
-        .into_iter()
-        .map(|(u, advise)| (u, serde_json::json!({ "adviseOff": advise })))
-        .collect();
     write_json(&SettingsResp {
         autostart: settings::autostart_enabled(),
         close_to_tray: settings::close_to_tray(),
         github_pac: settings::github_pac(),
         worker_mirrors: settings::worker_mirrors(),
-        mirror_stats: serde_json::Value::Object(stats),
     })
 }
 

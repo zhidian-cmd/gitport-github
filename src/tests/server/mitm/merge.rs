@@ -72,22 +72,22 @@ fn content_range_total_parse() {
     assert_eq!(content_range_total(None), None);
 }
 
-/// 让位份额：速率反比（3 倍速的帮手拿大头），并扣掉它建连期间的空转。
+/// 让位份额：速率反比（3 倍速的帮手拿大头），并扣掉它建连+爬坡期间的空转。
 #[test]
 fn split_keep_is_rate_proportional() {
     const MB: u64 = 1024 * 1024;
-    let keep = split_keep(8 * MB, 1e6, 3e6);
+    let keep = split_keep(8 * MB, 1e6, 3e6, SPLIT_SETUP_SECS);
     // 1MB/s 的持有者约保留 (0.5×3MB + 8MB)/4 ≈ 2.37MB，不到一半
     assert!(
         (2 * MB..3 * MB).contains(&keep),
         "持有者只该留一小截，实际 {keep}"
     );
     // 速率相同：各一半（建连成本让持有者略多留）
-    let even = split_keep(8 * MB, 2e6, 2e6);
+    let even = split_keep(8 * MB, 2e6, 2e6, SPLIT_SETUP_SECS);
     assert!(even > 4 * MB && even < 5 * MB, "实际 {even}");
     // 永远不能把一段切没
-    assert_eq!(split_keep(MIN_PIECE, 1e6, 9e6), MIN_PIECE / 2);
-    assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0) <= 3 * MIN_PIECE);
+    assert_eq!(split_keep(MIN_PIECE, 1e6, 9e6, SPLIT_SETUP_SECS), MIN_PIECE / 2);
+    assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0, SPLIT_SETUP_SECS) <= 3 * MIN_PIECE);
 }
 
 fn seg(data: &'static [u8]) -> BoxBody {
@@ -373,8 +373,7 @@ fn plan_cut_skips_when_handoff_costs_more() {
     assert!(m.plan_cut(now).is_none(), "抢过去更久就不该抢");
 }
 
-/// 一刀最多挪 MAX_HANDOFF：接手的家再快，新流起步那段也是 0 速度，
-/// 挪得越多越容易被下一轮再判慢，来回抖。
+/// 刀口上限按帮手实测速率折算（≈3 秒的量）：快源被钉死的再平衡上限随速度放开。
 #[test]
 fn plan_cut_caps_handoff_size() {
     let now = Instant::now();
@@ -395,7 +394,43 @@ fn plan_cut_caps_handoff_size() {
     let (from, to) = m.plan_cut(now).expect("38 秒太久，该抢");
     let handoff = to - from;
     assert!(handoff >= MIN_PIECE, "刀口太小不值一次建连");
-    assert!(handoff <= MAX_HANDOFF, "刀口 {handoff} 超过封顶");
+    assert!(
+        handoff <= handoff_cap(2.0 * 1024.0 * 1024.0),
+        "刀口 {handoff} 超过按速折算的封顶"
+    );
+}
+
+/// 刀口随帮手速率缩放：10MB/s 的快源该拿到比 4MB 旧常数大得多的刀口，
+/// 否则快源下完自己的份额后只能以旧常数的龟速捡尾巴，聚合速率上不去。
+#[test]
+fn handoff_cap_scales_with_helper_speed() {
+    assert_eq!(handoff_cap(1024.0), MIN_PIECE, "太小的速率钳在下限");
+    assert_eq!(handoff_cap(1e7), 30_000_000, "10MB/s 帮手 ≈ 3s 的量");
+    assert_eq!(
+        handoff_cap(1e9),
+        64 * 1024 * 1024,
+        "再快也钳在 64MB，防一次让位掏空整段"
+    );
+}
+
+/// 近期速率：滑窗有样本按滑窗算，样本不足退回全片均速（短段的全片就是全部真相）。
+#[test]
+fn recent_rate_prefers_sliding_window() {
+    let now = Instant::now();
+    let mut s = Seg::new(0, 1 << 20, now, seg(b""));
+    s.begin = now - Duration::from_secs(2);
+    s.got = 1000;
+    assert!(
+        (s.recent_rate(now) - 500.0).abs() < 1.0,
+        "无近期样本退回全片均速(1000B/2s): {}",
+        s.recent_rate(now)
+    );
+    // 滑窗内 1.2s 收 1200B → 1000B/s；全片均速的历史包袱不进判据。
+    s.recent.push_back((now - Duration::from_millis(1200), 1000));
+    s.got = 2200; // 生产里 recent 样本就是 (时刻, got) 快照，末样本恒等于 got
+    s.recent.push_back((now, s.got));
+    let r = s.recent_rate(now);
+    assert!((r - 1000.0).abs() < 1.0, "近期速率应按滑窗折算: {r}");
 }
 
 /// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。

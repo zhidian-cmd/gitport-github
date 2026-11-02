@@ -1,4 +1,6 @@
-//! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护；派发走 ECT，清场断流交客户端重发。
+//! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护。
+//! 大文件竞速：按候选数均分切段（测速只来自代理自己分的段），慢段让位回收，
+//! 补发按 ECT 挑家——给最快的镜像加片，看 ECT 直到不再改善；故障/变慢无缝衔接。
 use super::merge::{self, MergeBody};
 use super::path_of;
 use super::quiet;
@@ -14,28 +16,27 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// 直连分段的响应头预算：好 IP 建连 0.6s、首包再 1s；超过 2s 基本是坏 IP，
-/// 等它只会把整条下载拖住，不如立刻记坏、改走镜像。
-const DIRECT_SEG_HEAD: Duration = Duration::from_secs(2);
+/// 直连每跳的响应头预算：好 IP 建连 0.6s、首包再 1s；单跳超过 2s 基本是坏 IP。
+/// 按跳记，不罩整段——release 直连要跟 302（两跳两拨），拿 2s 罩全程等于把好腿掐成必死。
+const DIRECT_HOP_HEAD: Duration = Duration::from_secs(2);
+/// 直连整段预算：≤2 跳 × 每跳 2s。没有镜像兜底时不设预算（直连是唯一的路）。
+const DIRECT_SEG_TOTAL: Duration = Duration::from_secs(4);
 const MIRROR_CHAIN_CAP: usize = 5;
-/// 失败降权窗；全体都在窗内则放开过滤。
+/// 硬错误(拒连/RST/回包坏)的失败降权窗；全体都在窗内则放开过滤。
 const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
+/// 超时类失败的降权窗：慢不等于死，一次抖动别把腿踢出局太久。
+const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 评估缓存的最低存活门槛：流活满这么久才值得记一条样本。
-const SAMPLE_TIME_FLOOR_MS: u64 = 100;
-/// 预热：响应头到达后先跑这么久，让慢启动过去，这段不计入速度。
-const WARMUP_MS: u64 = 100;
-/// 测量窗口：预热结束后取这么长的吞吐当分数。100ms 分不出 6MB/s 和 300KB/s——
-/// 那测的是首包反应；500ms 窗口慢家也有 150KB 样本，快家有 3MB，排序不会错。
-const MEASURE_MS: u64 = 500;
-
-/// 运行期窗口：有流在跑时，每这么久按「本镜像全流合计字节 ÷ 实际耗时」更新一次分数。
+/// 帧间空档超过此值视为「这面镜像全体没人读」，窗口时长把空档扣除。
+/// 交付线推进时帧距是毫秒级；合并层背压造成的停顿是秒级，两者分得开。
+const FRAME_GAP_MS: u64 = 300;
+/// 测量窗口：有流在跑时，每这么久按「本镜像全流合计字节 ÷ 实际活跃时长」更新一次分数。
 /// 接的活越多分数越贴近真实总吞吐，ECT 才会跟着涨——否则快的那家被压到几百 KB/s，
 /// 分数还停在单流峰值，补发会一直往它身上堆。
 const RATE_WINDOW_MS: u64 = 500;
 
-/// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败与采样时刻、清场纪元。
+/// 每面镜像的记账：在途字节/流数、速度分(0=未交卷)、失败窗与采样时刻。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
@@ -47,25 +48,45 @@ pub(super) struct MirrorLoad {
     /// 窗口基线：(字节, 时刻)。`win_base_ms == 0` = 当前没有流在跑，下一帧重新起算。
     win_base_bytes: AtomicU64,
     win_base_ms: AtomicU64,
-    pub(super) last_fail_ms: AtomicU64,
+    /// 最近一帧到达时刻：窗口结算据此扣除「全体没人读」的空档。
+    last_frame_ms: AtomicU64,
+    /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
+    pub(super) fail_until: AtomicU64,
     pub(super) last_sample_ms: AtomicU64,
-    pub(super) cull_epoch: AtomicU64,
-    /// 镜像 URL(评估缓存键; mirror_load 创建时填)。
-    url: String,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 硬错误降权 45s；超时类(拨号/首包/起流超时)降权 15s——慢不等于死。
+fn mark_fail(load: &MirrorLoad, timeout_only: bool) {
+    let win = if timeout_only {
+        TIMEOUT_FAIL_WINDOW_MS
+    } else {
+        MIRROR_FAIL_WINDOW_MS
+    };
+    load.fail_until
+        .store(now_ms().saturating_add(win), Ordering::Relaxed);
+}
+
+fn fail_window_active(load: &MirrorLoad, now: u64) -> bool {
+    let until = load.fail_until.load(Ordering::Relaxed);
+    until != 0 && now < until
+}
+
+/// 超时类错误识别：拨号/首包/预算超时都是「慢」，不是「死」。
+/// `kind: TimedOut` 是 io::Error 调试形态（免解析 OS 码）。
+fn is_timeout_err(e: &str) -> bool {
+    e.contains("超时")
+        || e.contains("timeout")
+        || e.contains("TimedOut")
+        || e.to_lowercase().contains("timed out")
+}
+
 fn mirror_load(mirror: &str) -> Arc<MirrorLoad> {
     let mut g = MIRROR_LOAD.lock().unwrap_or_else(|p| p.into_inner());
     g.entry(mirror.to_string())
-        .or_insert_with(|| {
-            Arc::new(MirrorLoad {
-                url: mirror.to_string(),
-                ..Default::default()
-            })
-        })
+        .or_insert_with(|| Arc::new(MirrorLoad::default()))
         .clone()
 }
 
@@ -79,11 +100,42 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际耗时」更新分数。
+/// 帧到达记账：把「全体没人读」的空档从窗口时长里扣除。
+/// 交付线堵住时（合并层缓冲顶格）镜像一字节不产，墙钟照走会把分数稀释成假慢。
+fn mark_frame(load: &MirrorLoad, now: u64) {
+    let last = load.last_frame_ms.swap(now, Ordering::Relaxed);
+    if last != 0 && load.win_base_ms.load(Ordering::Relaxed) != 0 {
+        let gap = now.saturating_sub(last);
+        if gap > FRAME_GAP_MS {
+            // 平移窗口基线：等效于这段空档没发生。
+            load.win_base_ms
+                .fetch_add(gap - FRAME_GAP_MS, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 真 EWMA(α=0.3) + 单窗突变钳制：新样本越过旧值 3 倍边界时只走一半差距。
+/// 旧实现直接存 500ms 原始窗口率，一个抖动窗就把派发带偏，流在源间来回跳，
+/// 每跳一次都要重新慢启动，聚合速率抖着往下掉。
+fn ewma_next(old: u64, rate: u64) -> u64 {
+    if old == 0 {
+        return rate.max(1);
+    }
+    let blended = (old * 7 + rate * 3) / 10;
+    let clamped = if rate > old * 3 {
+        (old + blended) / 2
+    } else if rate * 3 < old {
+        (old + blended) / 2
+    } else {
+        blended
+    };
+    clamped.max(1)
+}
+
+/// 运行期窗口结算：有流在跑就按「本窗全镜像交付字节 ÷ 实际活跃时长」更新分数。
 /// 一个窗口只让一条流结算（CAS 抢占），重复调用直接返回。
 /// 没有帧就不会走到这里——待机镜像的分数自然停在最后一次，不需要额外冻结逻辑。
-fn settle_window(load: &MirrorLoad) {
-    let now = now_ms();
+fn settle_window(load: &MirrorLoad, now: u64) {
     let base = load.win_base_ms.load(Ordering::Relaxed);
     if base == 0 {
         // 待机转忙：从第一帧起算，拨号和待机时长都不进分母。
@@ -115,106 +167,24 @@ fn settle_window(load: &MirrorLoad) {
     if bytes == 0 {
         return; // 这一窗没数据：保留上次分数，不写成 0
     }
-    load.speed_ewma.store(
-        (bytes.saturating_mul(1000) / dt.max(1)).max(1),
-        Ordering::Relaxed,
-    );
+    let rate = bytes.saturating_mul(1000) / dt.max(1);
+    let next = ewma_next(load.speed_ewma.load(Ordering::Relaxed), rate);
+    load.speed_ewma.store(next, Ordering::Relaxed);
     load.last_sample_ms.store(now, Ordering::Relaxed);
-}
-
-/// 按 head_at 起算的全片均速落分；返回分数供评估缓存记账。
-fn store_probe_score(load: &MirrorLoad, bytes: u64, us: u64) -> u64 {
-    if bytes == 0 || us == 0 {
-        return 0;
-    }
-    let score = (bytes * 1_000_000 / us).max(1);
-    load.speed_ewma.store(score, Ordering::Relaxed);
-    load.last_sample_ms.store(now_ms(), Ordering::Relaxed);
-    // 链序按速度重排落盘: 链头恒为实测最快(IDM 首片/非下载器直接受益)。
-    resort_throttled(&load.url);
-    score
-}
-
-/// 按速度降序重排链；无分/失败窗者保持原相对顺序缀尾（稳定排序，幂等）。
-fn speed_sorted_chain(chain: &[String], speed_of: &dyn Fn(&str) -> u64) -> Vec<String> {
-    let mut idx: Vec<usize> = (0..chain.len()).collect();
-    idx.sort_by_key(|&i| std::cmp::Reverse(speed_of(&chain[i])));
-    idx.into_iter().map(|i| chain[i].clone()).collect()
-}
-
-/// 取出含该镜像的全部大文件链（一个镜像同挂三条，漏一条就永不更新）。
-fn big_chains_with<'a>(
-    chains: &'a HashMap<String, Vec<String>>,
-    url: &str,
-) -> Vec<(&'a String, &'a Vec<String>)> {
-    chains
-        .iter()
-        .filter(|(h, c)| pool::route::is_big_file_host(h.as_str()) && c.iter().any(|m| m == url))
-        .collect()
-}
-
-/// 重排节流：链序只影响探测顺序、并列轮转和失败兜底，晚一秒无代价；每帧重排却要复制整张链表。
-const RESORT_MIN_INTERVAL_MS: u64 = 1000;
-static LAST_RESORT_MS: AtomicU64 = AtomicU64::new(0);
-
-fn resort_throttled(scored_url: &str) {
-    let now = now_ms();
-    let last = LAST_RESORT_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < RESORT_MIN_INTERVAL_MS {
-        return;
-    }
-    // 抢占: 并发写分时只有一个线程进重排, 其余直接返回。
-    if LAST_RESORT_MS
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    resort_chain_by_speed(scored_url);
-}
-
-/// 按最新速度重排该镜像所属的大文件链并落盘；小文件链序归校准管，这里不碰。
-fn resort_chain_by_speed(scored_url: &str) {
-    let chains = pool::mirror_chains_snapshot();
-    let targets = big_chains_with(&chains, scored_url);
-    if targets.is_empty() {
-        return;
-    }
-    let now = now_ms();
-    let speed_of = |m: &str| -> u64 {
-        let ld = mirror_load(m);
-        let lf = ld.last_fail_ms.load(Ordering::Relaxed);
-        let failed = lf != 0 && now.saturating_sub(lf) < MIRROR_FAIL_WINDOW_MS;
-        if failed {
-            0
-        } else {
-            ld.speed_ewma.load(Ordering::Relaxed)
-        }
-    };
-    for (host, chain) in targets {
-        let new_chain = speed_sorted_chain(chain, &speed_of);
-        pool::set_mirror_chain(host, &new_chain, "测速");
-    }
 }
 
 /// 记账守卫：派发记在途、逐帧归还、Drop 清残余；归还封顶于记账额，采样走原始字节。
 pub(super) struct LoadGuard {
     load: Arc<MirrorLoad>,
-    /// 大文件机器标记: false = 小文件流, 与速度分/在途/失败窗/评估缓存零接触。
+    /// 大文件机器标记: false = 小文件流, 与速度分/在途/失败窗零接触。
     big: bool,
     charged: u64,
     delivered: u64,
     raw_delivered: u64,
     /// head_at 时的 raw_delivered 基准(全片均速的字节分母起点)。
     head_bytes: u64,
-    /// 体流起点(响应头到达)：探测判分用全片体速率, 不随区间采样重置。
+    /// 体流起点(响应头到达)：建连耗时打点与段速率分母都从这里起算。
     head_at: Instant,
-    /// 大文件链且镜像尚无速度样本 = 本流是探测片(小文件流恒 false)。
-    pub(super) is_probe: bool,
-    /// 测量窗口起点：(时刻, 起点字节)。满 WARMUP_MS 时记一次。
-    measure_from: Option<(Instant, u64)>,
-    /// 已交卷：分数只写一次，之后冻结。
-    measured: bool,
     /// 切片段传输起点（收到 206 的时刻，不含建连）：段结束时据此打实测吞吐。
     seg_start: Option<Instant>,
     /// 首包时刻：首包与收尾的差值能分清"握手慢"和"传输慢"。
@@ -229,7 +199,6 @@ impl LoadGuard {
             load.in_flight_bytes.fetch_add(charged, Ordering::Relaxed);
             load.in_flight_streams.fetch_add(1, Ordering::Relaxed);
         }
-        let is_probe = big && load.speed_ewma.load(Ordering::Relaxed) == 0;
         LoadGuard {
             load,
             big,
@@ -238,9 +207,6 @@ impl LoadGuard {
             raw_delivered: 0,
             head_bytes: 0,
             head_at: Instant::now(),
-            is_probe,
-            measure_from: None,
-            measured: false,
             seg_start: None,
             seg_first: None,
         }
@@ -252,7 +218,7 @@ impl LoadGuard {
         self
     }
 
-    /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；满 100ms 即按全片均速落分。
+    /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；大文件流顺带喂窗口采样。
     pub(super) fn on_frame(&mut self, n: u64) {
         if n > 0 && self.seg_first.is_none() {
             self.seg_first = Some(Instant::now());
@@ -269,30 +235,10 @@ impl LoadGuard {
             return;
         }
         // 镜像级累计：ECT 的分母是这家的总吞吐，不是某一条流自己的均速。
+        let now = now_ms();
         self.load.bytes_total.fetch_add(n, Ordering::Relaxed);
-        settle_window(&self.load);
-        // 探测流只负责冷启动的初值；之后的分数由窗口在运行中持续更新。
-        if !self.is_probe || self.measured {
-            return;
-        }
-        // 预热：先跑满 WARMUP_MS，这段是慢启动，不计入速度。
-        let Some((t0, b0)) = self.measure_from else {
-            if self.head_at.elapsed() >= Duration::from_millis(WARMUP_MS) {
-                self.measure_from = Some((Instant::now(), self.raw_delivered));
-            }
-            return;
-        };
-        // 窗口满才交卷：取这 MEASURE_MS 内的吞吐，不看首包反应。
-        if t0.elapsed() < Duration::from_millis(MEASURE_MS) {
-            return;
-        }
-        let bytes = self.raw_delivered.saturating_sub(b0);
-        if bytes == 0 {
-            self.measured = true; // 窗口内一个字节都没有：不记分，等下次
-            return;
-        }
-        store_probe_score(&self.load, bytes, MEASURE_MS * 1000);
-        self.measured = true;
+        mark_frame(&self.load, now);
+        settle_window(&self.load, now);
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -307,23 +253,13 @@ impl Drop for LoadGuard {
         if !self.big {
             return; // 小文件流: 零充值零归还, 与大文件机器零接触。
         }
-        // 探测片终值：全片均速定稿，被清场提前断流的也在此记分；活不满 100ms 的不记。
-        if self.is_probe && !self.measured {
-            let since_bytes = self.raw_delivered - self.head_bytes;
-            let since_us = self.head_at.elapsed().as_micros() as u64;
-            if since_us >= SAMPLE_TIME_FLOOR_MS * 1000 && since_bytes > 0 {
-                let score = store_probe_score(&self.load, since_bytes, since_us);
-                // 评估缓存只吃终值：首帧的慢启动读数只用于当次派发，不能用来判镜像去留。
-                pool::mirror_stats::record(&self.load.url, score);
-            }
-        }
         let residual = self.charged.saturating_sub(self.delivered);
         if residual > 0 {
             self.load
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/客户端断开/清场断流全走这里)。
+        // 流数随流终结归位(正常读完/客户端断开全走这里)。
         // 最后一条流关闭窗口：待机期间不累计时间，下个忙期从第一帧重新起算。
         if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.load.win_base_ms.store(0, Ordering::Relaxed);
@@ -346,10 +282,7 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     };
 
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
-        allow_recent_failures || {
-            let lf = ld.last_fail_ms.load(Ordering::Relaxed);
-            lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
-        }
+        allow_recent_failures || !fail_window_active(ld, now)
     };
     for allow_recent_failures in [false, true] {
         let elig: Vec<usize> = (0..loads.len())
@@ -393,31 +326,6 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
 /// 轮转计数器：并列候选间均摊。
 static TIE_ROTATOR: AtomicU64 = AtomicU64::new(0);
 
-/// 探测轮游标：并发派发下连续领取必命中不同候选(连续整数 mod n 两两不同)。
-static PROBE_CURSOR: AtomicU64 = AtomicU64::new(0);
-
-/// 探测轮选家：未交卷且健康的候选按原子游标轮转领取，并发分片天然一片一家；没有则交回 ECT。
-fn probe_pick(candidates: &[String]) -> Option<usize> {
-    let now = now_ms();
-    let unprobed: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| {
-            let ld = mirror_load(m);
-            ld.last_sample_ms.load(Ordering::Relaxed) == 0 && {
-                let lf = ld.last_fail_ms.load(Ordering::Relaxed);
-                lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
-            }
-        })
-        .map(|(i, _)| i)
-        .collect();
-    if unprobed.is_empty() {
-        return None;
-    }
-    let n = PROBE_CURSOR.fetch_add(1, Ordering::Relaxed);
-    Some(unprobed[(n % unprobed.len() as u64) as usize])
-}
-
 fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
     if chain_len == 0 {
         return Vec::new();
@@ -427,17 +335,12 @@ fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
         .take(limit)
         .collect()
 }
-/// cap 窗口没轮到直连时把它追加为最后一棒；已在列表或刚失败的不追加。
-fn append_direct_if_missed(
-    order: &mut Vec<usize>,
-    direct_idx: usize,
-    last_fail_ms: u64,
-    now_ms: u64,
-) {
+/// cap 窗口没轮到直连时把它追加为最后一棒；已在列表或失败窗未过的 不追加。
+fn append_direct_if_missed(order: &mut Vec<usize>, direct_idx: usize, fail_until: u64, now_ms: u64) {
     if order.contains(&direct_idx) {
         return;
     }
-    if last_fail_ms != 0 && now_ms.saturating_sub(last_fail_ms) < MIRROR_FAIL_WINDOW_MS {
+    if fail_until != 0 && now_ms < fail_until {
         return;
     }
     order.push(direct_idx);
@@ -459,7 +362,7 @@ pub(super) fn range_bytes(range: Option<&str>) -> u64 {
 }
 
 /// 非 3xx、非 HTML；带 Range 必须 206；304 无正文放行。
-/// `allow_full`：探测轮专用——上游忽略 Range 回 200 全量时放行，body 由调用方当单流接管。
+/// `allow_full`：总长探测专用——上游忽略 Range 回 200 全量时放行，body 由调用方当单流接管。
 fn validate_mirror_response(
     had_range: bool,
     status: u16,
@@ -479,19 +382,7 @@ fn validate_mirror_response(
     Ok(())
 }
 
-// ---- 清场：探测交卷后严劣于链内最快者让位, 在途断流交客户端重发 ----
-
-struct CullState {
-    body: BoxBody,
-    guard: LoadGuard,
-    load: Arc<MirrorLoad>,
-    peers: Vec<Arc<MirrorLoad>>,
-    my_epoch: u64,
-    culled: bool,
-    label: String,
-    mirror: String,
-    log: LogFn,
-}
+// ---- 段日志：只记账、只打吞吐，慢段由合并层缩边界让位，掐了就是个洞 ----
 
 /// 段收尾一行：多少字节 / 多少毫秒 / 合多少 MB/s。
 /// 日志此前只有“谁胜出”没有“跑多快”，判不出直连是真快还是只是抢到了位置。
@@ -512,10 +403,6 @@ fn log_seg_line(guard: &mut LoadGuard, label: &str, mirror: &str, log: &LogFn, n
         "[段] {label} {mirror} {mb:.1}MB / {ms}ms = {:.2}MB/s (建连 {dial}ms, 首包 {first}ms){note}",
         mb * 1000.0 / ms as f64
     ));
-}
-
-fn log_seg_end(st: &mut CullState, note: &str) {
-    log_seg_line(&mut st.guard, &st.label, &st.mirror, &st.log, note);
 }
 
 /// 切片段只记账、只打吞吐，不判掐：慢段由合并层缩边界让位，掐了就是个洞。
@@ -540,77 +427,6 @@ fn account_seg(
             }
             None => {
                 log_seg_line(&mut st.1, &st.2, &st.3, &st.4, "");
-                None
-            }
-        }
-    });
-    BoxBody::new(http_body_util::StreamBody::new(stream))
-}
-
-/// 清场监视(仅带 Range 的流)：本镜像被盖纪元即断流；探测流交分后严劣于链内最快者时盖纪元。
-fn cull_watched_body(
-    body: BoxBody,
-    guard: LoadGuard,
-    load: Arc<MirrorLoad>,
-    peers: Vec<Arc<MirrorLoad>>,
-    label: String,
-    mirror: String,
-    log: LogFn,
-) -> BoxBody {
-    let my_epoch = load.cull_epoch.load(Ordering::Relaxed);
-    let st = CullState {
-        body,
-        guard,
-        load,
-        peers,
-        my_epoch,
-        culled: false,
-        label,
-        mirror,
-        log,
-    };
-    let stream = futures_util::stream::unfold(st, |mut st| async move {
-        // 纪元不匹配: 本镜像已被清场(含本流上一帧触发的让位), 断流重发。
-        if st.load.cull_epoch.load(Ordering::Relaxed) != st.my_epoch {
-            log_seg_end(&mut st, " (清场断流)");
-            return Some((
-                Err(std::io::Error::other("镜像已清场让位, 断流交客户端重发")),
-                st,
-            ));
-        }
-        match http_body_util::BodyExt::frame(&mut st.body).await {
-            Some(Ok(frame)) => {
-                let n = frame.data_ref().map(|d| d.len() as u64).unwrap_or(0);
-                st.guard.on_frame(n);
-                // 探测交分自检: 本镜像速度严格小于链内已交卷最大者 → 让位。
-                if !st.culled && st.guard.is_probe {
-                    let my = st.load.speed_ewma.load(Ordering::Relaxed);
-                    let top = st
-                        .peers
-                        .iter()
-                        .map(|p| p.speed_ewma.load(Ordering::Relaxed))
-                        .max()
-                        .unwrap_or(0);
-                    if my > 0 && top > my {
-                        st.culled = true;
-                        st.load.cull_epoch.fetch_add(1, Ordering::Relaxed);
-                        (st.log)(&format!(
-                            "[清场] {} {} 探测交分 {}KB/s 严劣于链内最快 {}KB/s, 在途让位重发",
-                            st.label,
-                            st.mirror,
-                            my / 1024,
-                            top / 1024
-                        ));
-                    }
-                }
-                Some((Ok(frame), st))
-            }
-            Some(Err(e)) => {
-                log_seg_end(&mut st, " (上游断流)");
-                Some((Err(e), st))
-            }
-            None => {
-                log_seg_end(&mut st, "");
                 None
             }
         }
@@ -701,8 +517,7 @@ pub(super) async fn chain_fetch(
         .unwrap_or(candidates.len())
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
-    // 探测轮优先：有未交卷候选就一片一家实测，全员交卷后回 ECT；小文件不参与，只按链序从头试。
-    // 单字节探片是下载器探路，按小文件走：链头直通，不探测、不记账、不切分。
+    // 单字节探片是下载器探路，按小文件走：链头直通，不切分、不记账。
     let big = pool::route::is_big_file_host(chain_host) && !merge::is_probe_range(range);
     // 镜像有富余时切片并发拉；条件不满足(探片/开区间/不支持 Range/无空闲镜像)交回单流。
     if big {
@@ -713,18 +528,7 @@ pub(super) async fn chain_fetch(
         }
     }
     let start = if big {
-        match probe_pick(&candidates) {
-            Some(i) => {
-                (log)(&format!(
-                    "[探测] {host}{path} 探测轮领取 {} (候选 {}/{}), 交卷后回 ECT",
-                    candidates[i],
-                    i + 1,
-                    candidates.len()
-                ));
-                i
-            }
-            None => pick_mirror(&candidates, new_bytes),
-        }
+        pick_mirror(&candidates, new_bytes)
     } else {
         0
     };
@@ -734,9 +538,7 @@ pub(super) async fn chain_fetch(
         &mut order,
         candidates.len() - 1,
         if big {
-            mirror_load(&direct_key)
-                .last_fail_ms
-                .load(Ordering::Relaxed)
+            mirror_load(&direct_key).fail_until.load(Ordering::Relaxed)
         } else {
             0
         },
@@ -752,7 +554,7 @@ pub(super) async fn chain_fetch(
                     resp.extensions_mut().insert("direct");
                     if big {
                         mirror_load(&direct_key)
-                            .last_fail_ms
+                            .fail_until
                             .store(0, Ordering::Relaxed);
                     }
                     (log)(&format!(
@@ -767,9 +569,8 @@ pub(super) async fn chain_fetch(
                 }
                 Err(e) => {
                     if big {
-                        mirror_load(&direct_key)
-                            .last_fail_ms
-                            .store(now_ms(), Ordering::Relaxed);
+                        // 超时(慢)与硬错误(死)分开降权：一次抖动别把好腿踢太久。
+                        mark_fail(&mirror_load(&direct_key), is_timeout_err(&e));
                     }
                     (log)(&format!(
                         "[直连] {host}{path} 失败({e}, {}ms), 链内下一个",
@@ -793,7 +594,7 @@ pub(super) async fn chain_fetch(
                 // 头已到：码表重跑，建连/等待耗时留在墙钟不进速度样本。
                 guard.restart_mark();
                 if big {
-                    mirror_load(m).last_fail_ms.store(0, Ordering::Relaxed);
+                    mirror_load(m).fail_until.store(0, Ordering::Relaxed);
                 }
                 // 只在「首次用这家 / 换链 / 头过慢」时出声：正常派发不再每请求一条。
                 let first = quiet::first_time("mirror", m);
@@ -809,20 +610,12 @@ pub(super) async fn chain_fetch(
                     ));
                 }
                 pool::MIRROR_BREAKER.clear(chain_host);
-                // 带 Range 挂清场监视(纪元核对+探测让位)；无 Range 只记账(浏览器断流是用户可见失败)。
                 let (mut parts, body) = resp.into_parts();
                 parts.extensions.insert("mirror");
-                let body = if range.is_some() && big {
-                    let peers: Vec<Arc<MirrorLoad>> = chain
-                        .iter()
-                        .filter(|x| x.as_str() != m)
-                        .map(|x| mirror_load(x))
-                        .collect();
-                    cull_watched_body(
+                let body = if big {
+                    account_seg(
                         body,
                         guard,
-                        mirror_load(m),
-                        peers,
                         format!("{host}{path}"),
                         m.to_string(),
                         log.clone(),
@@ -840,9 +633,7 @@ pub(super) async fn chain_fetch(
             }
             Err(e) => {
                 if big {
-                    mirror_load(m)
-                        .last_fail_ms
-                        .store(now_ms(), Ordering::Relaxed);
+                    mark_fail(&mirror_load(m), is_timeout_err(&e));
                 }
                 (log)(&format!(
                     "[镜像] {host} {m} 失败({e}, {}ms), 链内下一个",
@@ -862,7 +653,46 @@ pub(super) async fn chain_fetch(
     };
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
+/// 直连段请求模板：原请求的方法/URI/头。补发起流跑在旁路任务里，
+/// 原请求不能跨任务借用——模板克隆一次，各自拼 Range。
+#[derive(Clone)]
+pub(super) struct DirectTpl {
+    method: http::Method,
+    uri: http::Uri,
+    headers: http::HeaderMap,
+}
+
+fn direct_tpl(out: &hyper::Request<BoxBody>) -> DirectTpl {
+    DirectTpl {
+        method: out.method().clone(),
+        uri: out.uri().clone(),
+        headers: out.headers().clone(),
+    }
+}
+
+/// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 的下一条无 Range 请求
+/// 不用再为拿分母白跑一趟。只存 206 Content-Range 给出的权威总长。
+static TOTAL_MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
+    LazyLock::new(Default::default);
+
+fn total_memo_get(key: &str) -> Option<u64> {
+    let mut g = TOTAL_MEMO.lock().unwrap();
+    if g.len() >= 256 {
+        g.retain(|_, (_, at)| at.elapsed() < UNSLICEABLE_TTL);
+    }
+    g.get(key)
+        .filter(|(_, at)| at.elapsed() < UNSLICEABLE_TTL)
+        .map(|(t, _)| *t)
+}
+
+fn total_memo_put(key: &str, total: u64) {
+    let mut g = TOTAL_MEMO.lock().unwrap();
+    g.insert(key.to_string(), (total, Instant::now()));
+}
+
 /// 无 Range 时探测文件总长：发 1 字节 Range，从 Content-Range 取分母。
+/// 旧实现单点押注链头——链头挂了，每个下载都先白付一轮探测超时。
+/// 现在头两家各试一次（都是真实请求，不合成测速），谁先给总长用谁。
 enum Probe {
     /// 上游回了 206 + Content-Range：拿到了总长，可以切。
     Total(u64),
@@ -873,11 +703,35 @@ enum Probe {
 async fn probe_total(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
+    cands: &[&str],
+    orig_url: &str,
+    host: &str,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
+    tpl: &DirectTpl,
+) -> Result<Probe, String> {
+    let mut last = "无健康候选".to_string();
+    for m in cands {
+        match probe_total_one(log, out, m, orig_url, host, info, replay, tpl).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                (log)(&format!("[切片] {host} 探测总长 {m} 失败({e}), 换下一家"));
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+async fn probe_total_one(
+    log: &LogFn,
+    out: &hyper::Request<BoxBody>,
     mirror: &str,
     orig_url: &str,
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
+    tpl: &DirectTpl,
 ) -> Result<Probe, String> {
     let tag = if mirror.starts_with("direct/") {
         "direct"
@@ -885,7 +739,7 @@ async fn probe_total(
         "mirror"
     };
     let mut resp = if mirror.starts_with("direct/") {
-        segment_direct(log, out, host, info, replay, 0, 1).await?
+        segment_direct(log, tpl, host, info, replay, 0, 1, None).await?
     } else {
         let mut req = mirror_request(out, mirror, orig_url)?;
         req.headers_mut().insert(
@@ -931,31 +785,39 @@ fn mark_unsliceable(key: String) {
     g.insert(key, Instant::now());
 }
 
-/// 直连段请求：克隆原请求头换成本段 Range，再走直连腿。
+/// 直连段请求：用模板克隆原请求头换成本段 Range，再走直连腿。
 /// release 的下载地址本身不放文件，会 302 到 release-assets——跟一跳，
 /// 把 Range 带过去。跳转目标的 IP 与原 host 无关，用独立记账。
+/// 预算按跳记：有镜像兜底时每跳 2s 拿不到响应头就当这条路是死的——
+/// 好 IP 建连 0.6s、首包再 1s；没有镜像（用户没配/链全灭）时不设预算。
 async fn segment_direct(
     log: &LogFn,
-    out: &hyper::Request<BoxBody>,
+    tpl: &DirectTpl,
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
     s: u64,
     e: u64,
+    hop_budget: Option<Duration>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
         .map_err(|err| err.to_string())?;
     let mut req = hyper::Request::builder()
-        .method(out.method())
-        .uri(out.uri())
+        .method(tpl.method.clone())
+        .uri(tpl.uri.clone())
         .body(protocol::empty_body())
         .map_err(|err| err.to_string())?;
-    *req.headers_mut() = out.headers().clone();
+    *req.headers_mut() = tpl.headers.clone();
     req.headers_mut().insert(http::header::RANGE, range.clone());
     strip_body_headers(&mut req);
-    let mut resp = super::get_direct(log, &req, host, info, true, replay).await?;
+    let mut resp = match hop_budget {
+        Some(b) => tokio::time::timeout(b, super::get_direct(log, &req, host, info, true, replay))
+            .await
+            .map_err(|_| format!("直连首包超时({}ms)", b.as_millis()))??,
+        None => super::get_direct(log, &req, host, info, true, replay).await?,
+    };
 
-    // 3xx：内容在别处。最多跟两跳（release 实测一跳到位）。
+    // 3xx：内容在别处。最多跟两跳（release 实测一跳到位），每跳各付各的预算。
     let mut hops = 0;
     while resp.status().is_redirection() && hops < 2 {
         let Some(loc) = resp
@@ -987,7 +849,14 @@ async fn segment_direct(
         req2.headers_mut()
             .insert(http::header::RANGE, range.clone());
         let fresh = super::UpstreamInfo::default();
-        resp = super::get_direct(log, &req2, &next_host, &fresh, true, replay).await?;
+        resp = match hop_budget {
+            Some(b) => {
+                tokio::time::timeout(b, super::get_direct(log, &req2, &next_host, &fresh, true, replay))
+                    .await
+                    .map_err(|_| format!("直连跳转首包超时({}ms)", b.as_millis()))??
+            }
+            None => super::get_direct(log, &req2, &next_host, &fresh, true, replay).await?,
+        };
         (log)(&format!("[切片] 直连 {next_host} 回 {}", resp.status()));
     }
     Ok(resp)
@@ -1030,21 +899,21 @@ async fn split_download(
     let now = now_ms();
     let healthy: Vec<&str> = candidates
         .iter()
-        .filter(|m| {
-            let lf = mirror_load(m).last_fail_ms.load(Ordering::Relaxed);
-            lf == 0 || now.saturating_sub(lf) >= MIRROR_FAIL_WINDOW_MS
-        })
+        .filter(|m| !fail_window_active(&mirror_load(m), now))
         .map(|m| m.as_str())
         .collect();
-    // 空闲 = 此刻零在途的镜像数（不是流数总和：一家跑三条流也只算占一家）。
-    let busy = healthy
+    // 空闲优先：切片段只分给零在途的源（链序内稳定序）。旧实现按链序取前 want 家，
+    // 忙的链头能凭位置再蹭一段，链尾的闲源反而落选——白白浪费一路带宽。
+    let idle: Vec<&str> = healthy
         .iter()
-        .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) > 0)
-        .count();
-    let want = healthy.len().saturating_sub(busy);
-    if want < 2 {
+        .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) == 0)
+        .copied()
+        .collect();
+    if idle.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
+    // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用。
+    let tpl = direct_tpl(out);
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
     let (base, len, known_total) = match range {
         // 开区间/多区间/畸形：长度未知或语义不同，不切
@@ -1052,24 +921,40 @@ async fn split_download(
             Some((a, Some(b))) if b >= a => (a, b - a + 1, None),
             _ => return Ok(None),
         },
-        None => match probe_total(log, out, healthy[0], orig_url, host, info, replay).await {
-            Ok(Probe::Total(t)) if t > 0 => (0, t, Some(t)),
-            Ok(Probe::Total(_)) => return Ok(None),
-            // 上游忽略 Range(回 200 全量)：探测那次的 body 就是整份文件，直接交出去，
-            // 省掉「丢掉 + 重发单流」的一次完整往返（codeload 大归档正是这条路径）。
-            Ok(Probe::NotSliceable(resp)) => {
-                mark_unsliceable(slice_key.clone());
-                (log)(&format!(
-                    "[切片] {host}{path} 上游忽略 Range(回 200), 探测响应直接按单流交出"
-                ));
-                return Ok(Some(resp));
-            }
-            Err(e) => {
-                (log)(&format!("[切片] {host}{path} 探测总长失败({e}), 回单流"));
-                return Ok(None);
+        None => match total_memo_get(&slice_key) {
+            // 总长记忆命中：省掉探测往返（探测本身是真实请求，结果只记 10 分钟）。
+            Some(t) => (0, t, Some(t)),
+            None => {
+                let probe_cands: Vec<&str> =
+                    healthy.iter().copied().take(healthy.len().min(2)).collect();
+                match probe_total(log, out, &probe_cands, orig_url, host, info, replay, &tpl).await
+                {
+                    Ok(Probe::Total(t)) if t > 0 => {
+                        total_memo_put(&slice_key, t);
+                        (0, t, Some(t))
+                    }
+                    Ok(Probe::Total(_)) => return Ok(None),
+                    // 上游忽略 Range(回 200 全量)：探测那次的 body 就是整份文件，直接交出去，
+                    // 省掉「丢掉 + 重发单流」的一次完整往返（codeload 大归档正是这条路径）。
+                    Ok(Probe::NotSliceable(resp)) => {
+                        mark_unsliceable(slice_key.clone());
+                        (log)(&format!(
+                            "[切片] {host}{path} 上游忽略 Range(回 200), 探测响应直接按单流交出"
+                        ));
+                        return Ok(Some(resp));
+                    }
+                    Err(e) => {
+                        (log)(&format!("[切片] {host}{path} 探测总长失败({e}), 回单流"));
+                        return Ok(None);
+                    }
+                }
             }
         },
     };
+    // 段数按可用字节收缩：len 不够分时少切几段，派发表与段表保持对齐。
+    let want = ((idle.len() as u64).min(len)).max(1) as usize;
+    let idle = &idle[..want];
+    // 竞速切段：每家同等材料，快慢由段自己说话；慢段让位、补发走 ECT。
     let segs = merge::split_even(base, len, want);
     if segs.len() < 2 {
         return Ok(None);
@@ -1079,25 +964,25 @@ async fn split_download(
         segs.len(),
         healthy.len()
     ));
-    // 初始派发没有 ECT 可言——速度分要等流跑起来才有。这里只按链序摊开，
-    // 这一批段兼任测速器；真正的 ECT 从待交段和让位开始起作用。
-    // 有镜像兜底才给直连设 2s 预算；没有镜像（用户没配 / 链全灭）时直连是唯一的路，
+    // 有镜像兜底才给直连设按跳预算；没有镜像（用户没配 / 链全灭）时直连是唯一的路，
     // 这时不能掐它，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
-        let m = healthy[i % healthy.len()];
+        let m = idle[i % idle.len()];
         let host = host.to_string();
+        let tpl = tpl.clone();
         async move {
             let guard = LoadGuard::charge(mirror_load(m), e - s, true);
             let is_direct = m.starts_with("direct/");
             let got = if is_direct {
-                // 直连分段：有兜底时 2s 拿不到响应头就当这条路是死的——好 IP 建连 0.6s、
-                // 首包再 1s，超过 2s 基本是坏 IP，等它只会拖住整条下载。
-                let attempt = segment_direct(log, out, &host, info, replay, s, e);
+                // 直连分段：预算按跳记（每跳 2s），整段 ≤2 跳。拿 2s 罩两跳两拨，
+                // 好腿也会被掐死——release 直连要跟 302，这正是旧实现丢速率的地方。
+                let attempt =
+                    segment_direct(log, &tpl, &host, info, replay, s, e, has_mirror.then_some(DIRECT_HOP_HEAD));
                 if has_mirror {
-                    match tokio::time::timeout(DIRECT_SEG_HEAD, attempt).await {
+                    match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
                         Ok(r) => r,
-                        Err(_) => Err("直连 2s 内没给响应头".to_string()),
+                        Err(_) => Err("直连整段预算耗尽(含 302 跳)".to_string()),
                     }
                 } else {
                     attempt.await
@@ -1114,13 +999,13 @@ async fn split_download(
                     Err(err) => Err(err),
                 }
             };
-            // 直连没打出 206（超时/4xx/连不上）：这个 IP 记一次失败，ECT 下次绕开它。
+            // 直连没打出 206（超时/4xx/连不上）：记一次失败，ECT 下次绕开它。
+            // 超时(慢)与硬错误(死)分开降权——慢不等于死，别踢太久。
             if is_direct
                 && !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT)
             {
-                mirror_load(m)
-                    .last_fail_ms
-                    .store(now_ms(), Ordering::Relaxed);
+                let timeout_only = matches!(got.as_ref(), Err(e) if is_timeout_err(e));
+                mark_fail(&mirror_load(m), timeout_only);
             }
             match got {
                 Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
@@ -1193,7 +1078,7 @@ async fn split_download(
                         )
                     });
                 }
-                let m = healthy[i % healthy.len()];
+                let m = idle[i % idle.len()];
                 let body = account_seg(
                     resp.into_body(),
                     guard,
@@ -1235,12 +1120,36 @@ async fn split_download(
     }
     builder = builder.header(http::header::CONTENT_LENGTH, len);
     // 起流收口成闭包：驱动只管"要 [from,to)"，怎么发由这里决定，也便于单测替换。
+    // 直连段的模板/上游信息/重放体一并捕获——补发现在两条路都走（ECT 挑）。
     let chain: Vec<String> = healthy.iter().map(|m| m.to_string()).collect();
     let (orig, host_s, log_s) = (orig_url.to_string(), host.to_string(), log.clone());
+    let tpl2 = std::sync::Arc::new(tpl);
+    let (info2, replay2) = (info.clone(), replay.clone());
     let fetch: Fetch = Arc::new(move |from: u64, to: u64| {
-        let (chain, orig, host_s, log_s) =
-            (chain.clone(), orig.clone(), host_s.clone(), log_s.clone());
-        Box::pin(async move { split_fetch(&chain, &orig, &host_s, base, from, to, &log_s).await })
+        let (chain, orig, host_s, log_s, tpl, info, replay) = (
+            chain.clone(),
+            orig.clone(),
+            host_s.clone(),
+            log_s.clone(),
+            tpl2.clone(),
+            info2.clone(),
+            replay2.clone(),
+        );
+        Box::pin(async move {
+            split_fetch(
+                &chain,
+                &orig,
+                &host_s,
+                base,
+                from,
+                to,
+                &log_s,
+                &tpl,
+                &info,
+                &replay,
+            )
+            .await
+        })
     });
     let ctx = SplitCtx {
         fetch,
@@ -1257,6 +1166,8 @@ async fn split_download(
 }
 
 /// 起一条拉 [from, to) 的新流。偏移相对区间起点，发出去要加 base。
+/// 候选 = 镜像 + 直连（健康时），ECT 挑最小者；两条路都 charge 记账、都采样——
+/// 旧实现补发裸奔：ECT 看不见补发的在途字节会过量堆活，直连被永久排除在补发外。
 async fn split_fetch(
     chain: &[String],
     orig_url: &str,
@@ -1265,37 +1176,102 @@ async fn split_fetch(
     from: u64,
     to: u64,
     log: &LogFn,
+    tpl: &DirectTpl,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
 ) -> Result<BoxBody, String> {
     // 按 ECT（在途字节 ÷ 实测速度）挑最小者。不能挑"最空闲"：
     // 刚断流的那家负载归零，正是最空闲的那个，补回去就是原地打转。
-    let mirrors: Vec<String> = chain
+    let mut cands: Vec<String> = chain
         .iter()
         .filter(|m| !m.starts_with("direct/"))
         .cloned()
         .collect();
-    if mirrors.is_empty() {
-        return Err("无可用补发镜像".to_string());
+    if let Some(d) = chain.iter().find(|m| m.starts_with("direct/")) {
+        cands.push(d.clone());
     }
-    let m = &mirrors[pick_mirror(&mirrors, to - from)];
-    // 只有 GET 会走到切片（split_download 早退挡掉其它方法），补发一律 GET。
-    let req = hyper::Request::builder()
-        .method(http::Method::GET)
-        .uri(format!("{m}/{orig_url}"))
-        .header(http::header::USER_AGENT, MIRROR_UA)
-        .header(
-            http::header::RANGE,
-            format!("bytes={}-{}", base + from, base + to - 1),
-        )
-        .body(protocol::empty_body())
-        .map_err(|e| e.to_string())?;
-    let resp = mirror_do(req, m, log).await?;
-    if resp.status() != http::StatusCode::PARTIAL_CONTENT {
-        return Err(format!(
-            "{m} 补发回 {} 而非 206 (host {host})",
-            resp.status()
-        ));
+    if cands.is_empty() {
+        return Err("无可用补发源".to_string());
     }
-    Ok(resp.into_body())
+    let m = cands[pick_mirror(&cands, to - from)].clone();
+    let (s, e) = (base + from, base + to - 1);
+    if m.starts_with("direct/") {
+        let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
+        let has_mirror = cands.len() > 1;
+        let attempt = segment_direct(
+            log,
+            tpl,
+            host,
+            info,
+            replay,
+            s,
+            e,
+            has_mirror.then_some(DIRECT_HOP_HEAD),
+        );
+        let got = if has_mirror {
+            match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
+                Ok(r) => r,
+                Err(_) => Err("直连整段预算耗尽(含 302 跳)".to_string()),
+            }
+        } else {
+            attempt.await
+        };
+        if !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT) {
+            mark_fail(
+                &mirror_load(&m),
+                matches!(got.as_ref(), Err(err) if is_timeout_err(err)),
+            );
+        }
+        match got {
+            Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                let at = Instant::now();
+                let guard = guard.segment_from(at);
+                Ok(account_seg(
+                    resp.into_body(),
+                    guard,
+                    format!("{host} 补发"),
+                    m,
+                    log.clone(),
+                ))
+            }
+            Ok(resp) => Err(format!(
+                "{m} 补发回 {} 而非 206 (host {host})",
+                resp.status()
+            )),
+            Err(err) => Err(err),
+        }
+    } else {
+        let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
+        // 只有 GET 会走到切片（split_download 早退挡掉其它方法），补发一律 GET。
+        let req = hyper::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("{m}/{orig_url}"))
+            .header(http::header::USER_AGENT, MIRROR_UA)
+            .header(
+                http::header::RANGE,
+                format!("bytes={s}-{}", base + to - 1),
+            )
+            .body(protocol::empty_body())
+            .map_err(|e| e.to_string())?;
+        match mirror_do(req, &m, log).await {
+            Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                let at = Instant::now();
+                let guard = guard.segment_from(at);
+                Ok(account_seg(
+                    resp.into_body(),
+                    guard,
+                    format!("{host} 补发"),
+                    m,
+                    log.clone(),
+                ))
+            }
+            Ok(resp) => Err(format!(
+                "{m} 补发回 {} 而非 206 (host {host})",
+                resp.status()
+            )),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// 起流函数的返回：一条从 from 拉到 to 的流。
