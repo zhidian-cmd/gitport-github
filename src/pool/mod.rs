@@ -330,6 +330,11 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     };
     topup_from_seeds(&mut specs, &seed_rows, log.as_ref());
     if migrated {
+        // 迁移会原地改写文件：先留一份旧格式，用户手排的 IP 随时能翻回去对。
+        let bak = path.with_extension("json.bak");
+        if !bak.exists() {
+            let _ = std::fs::copy(&path, &bak);
+        }
         if let Some(l) = log.as_ref() {
             l(&format!(
                 "[串发] plans.json 迁移为 routes 表({} 条路由), 旧三池格式不再使用",
