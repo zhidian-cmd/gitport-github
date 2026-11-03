@@ -31,8 +31,7 @@ fn acl_keeps_only_user_and_system() {
 /// 契约（目录版）：授权带 (OI)(CI) 继承标志——曾因目录授权无继承 + 断继承，子目录被剥成空 DACL，cacache 临时文件全部创建失败。
 #[test]
 fn acl_dir_grants_inheritable_access() {
-    let dir =
-        std::env::temp_dir().join(format!("gitport_acl_dir_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("gitport_acl_dir_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     restrict_dir_to_current_user(&dir.to_string_lossy()).unwrap();
     let child = dir.join("writable.txt");

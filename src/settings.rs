@@ -3,17 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
-use winreg::RegKey;
 use windows::Win32::Networking::WinInet::{
     PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
 };
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "gitport-github";
 const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 /// WinINET 把"每条连接"的代理配置存在这个二进制值里（AutoConfigURL 只是给人和旧程序看的镜像）。
-const CONNECTIONS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+const CONNECTIONS_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
 const CONN_SETTINGS_VALUE: &str = "DefaultConnectionSettings";
 
 struct SettingsState {
@@ -71,7 +72,6 @@ pub fn exe_name() -> String {
 pub fn exe_dir() -> PathBuf {
     EXE_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("."))
 }
-
 
 pub fn github_pac() -> bool {
     state()
@@ -185,9 +185,9 @@ fn refresh_wininet() {
 fn apply_conn_options(flags: u32, pac: Option<&str>) -> Result<(), u32> {
     use windows::core::PWSTR;
     use windows::Win32::Networking::WinInet::{
-        InternetSetOptionW, INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS,
-        INTERNET_PER_CONN_OPTION_LISTW, INTERNET_PER_CONN_OPTIONW,
-        INTERNET_OPTION_PER_CONNECTION_OPTION,
+        InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
+        INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS, INTERNET_PER_CONN_OPTIONW,
+        INTERNET_PER_CONN_OPTION_LISTW,
     };
 
     // 字符串在调用期间必须保持有效且可写
@@ -268,19 +268,17 @@ pub fn ensure_system_proxy() -> Result<String, String> {
             *state().proxy_backup.lock().unwrap() = cur.clone(); // 备份用户自己的设置
         }
         // 不走 cur == pac 早退：字符串在、标志位没开正是要修的状态，重复设一遍无副作用。
-        let note = match apply_conn_options(
-            PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL,
-            Some(&pac),
-        ) {
-            Ok(()) => "已接管".to_string(),
-            Err(code) => {
-                // 系统不认这次调用时，退一步直接补连接配置里的 PAC 位。
-                force_pac_flag().map_err(|e| {
-                    format!("InternetSetOption 失败(Win32 {code})，补 PAC 位也失败: {e}")
-                })?;
-                format!("已接管(InternetSetOption 返回 Win32 {code}，用注册表补的 PAC 位)")
-            }
-        };
+        let note =
+            match apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&pac)) {
+                Ok(()) => "已接管".to_string(),
+                Err(code) => {
+                    // 系统不认这次调用时，退一步直接补连接配置里的 PAC 位。
+                    force_pac_flag().map_err(|e| {
+                        format!("InternetSetOption 失败(Win32 {code})，补 PAC 位也失败: {e}")
+                    })?;
+                    format!("已接管(InternetSetOption 返回 Win32 {code}，用注册表补的 PAC 位)")
+                }
+            };
         // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
         mirror_auto_config_url(Some(&pac));
         *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
@@ -329,7 +327,9 @@ fn restore_or_clear(key: &RegKey) {
 /// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空），还原时决定要不要保留。
 fn manual_proxy_active(key: &RegKey) -> bool {
     let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
-    let server = key.get_value::<String, _>("ProxyServer").unwrap_or_default();
+    let server = key
+        .get_value::<String, _>("ProxyServer")
+        .unwrap_or_default();
     enabled && !server.trim().is_empty()
 }
 
@@ -341,7 +341,6 @@ fn clear_if_ours(key: &RegKey, cur: &str) {
     }
     restore_or_clear(key);
 }
-
 
 pub fn close_to_tray() -> bool {
     state()
@@ -377,7 +376,6 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
     state().mitm.store(on, std::sync::atomic::Ordering::Relaxed);
     save()
 }
-
 
 /// 串发游标表：键位恒为全量族键、顺序恒为表序、空值表示该族未驻留；读兼容数组与对象，写只写对象。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,7 +469,7 @@ struct SettingsFile {
     last_pac: String, // 我们最后一次写进系统的 PAC URL——识别自己的残留
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
-    /// 自定义镜像注册表：settings.json 永久记录；启停只增删 plans.json 链成员。
+    /// 自定义镜像注册表：settings.json 永久记录；启停只增删 routes.json 链成员。
     #[serde(deserialize_with = "lenient")]
     worker_mirrors: Vec<WorkerMirror>,
 }
@@ -577,7 +575,6 @@ pub fn set_last_ips(marks: Vec<(String, String)>) {
     let _ = save();
 }
 
-
 pub fn autostart_enabled() -> bool {
     let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_READ)
     else {
@@ -630,7 +627,7 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 自定义镜像注册表（settings.json 永久记录；启停只增删 plans.json 链成员）。
+/// 自定义镜像注册表（settings.json 永久记录；启停只增删 routes.json 链成员）。
 pub fn worker_mirrors() -> Vec<WorkerMirror> {
     state().worker_mirrors.lock().unwrap().clone()
 }
@@ -655,7 +652,11 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
-        norm.push(WorkerMirror { url: u, on: w.on, trusted: w.trusted });
+        norm.push(WorkerMirror {
+            url: u,
+            on: w.on,
+            trusted: w.trusted,
+        });
     }
     let old = worker_mirrors();
     let removed: Vec<String> = old
@@ -663,7 +664,11 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         .map(|w| w.url.clone())
         .filter(|u| !norm.iter().any(|n| n.url == *u))
         .collect();
-    let enabled: Vec<String> = norm.iter().filter(|w| w.on).map(|w| w.url.clone()).collect();
+    let enabled: Vec<String> = norm
+        .iter()
+        .filter(|w| w.on)
+        .map(|w| w.url.clone())
+        .collect();
     *state().worker_mirrors.lock().unwrap() = norm;
     save()?;
     Ok((enabled, removed))
@@ -680,7 +685,6 @@ pub fn trusted_mirrors() -> std::collections::HashSet<String> {
         .map(|w| w.url.clone())
         .collect()
 }
-
 
 #[cfg(test)]
 #[path = "tests/settings.rs"]

@@ -25,7 +25,6 @@ pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
 
-
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
@@ -65,7 +64,7 @@ pub async fn handle_connect_mitm(
         .selected_alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-// ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
+    // ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
     let alpn_name = match alpn.as_slice() {
         b"h2" => "h2",
         b"http/1.1" => "http/1.1",
@@ -110,7 +109,7 @@ async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
-// h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
+    // h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
     let host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
@@ -184,10 +183,9 @@ async fn mitm_http(
     }
     if let Some(reason) = streaming_reason {
         let body = match overflow_prefix {
-            Some(prefix) => upstream::prepend_body(
-                vec![Bytes::from(prefix)],
-                incoming_to_body(req.into_body()),
-            ),
+            Some(prefix) => {
+                upstream::prepend_body(vec![Bytes::from(prefix)], incoming_to_body(req.into_body()))
+            }
             None => incoming_to_body(req.into_body()),
         };
         return stream_passthrough(&log, &out, &host, &info, body, reason).await;
@@ -206,7 +204,11 @@ async fn mitm_http(
         let new_bytes =
             mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
         // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；全部候选耗尽才 502。
-        match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await {
+        match mirror_or_direct(
+            &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
+        )
+        .await
+        {
             Ok(resp) => return resp,
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
@@ -227,7 +229,10 @@ async fn mitm_http(
                         req.headers().get("range").and_then(|v| v.to_str().ok()),
                     );
                     // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
-                    match mirror_or_direct(&log, &out_body, &host, chain_host, new_bytes, &info, &replay).await
+                    match mirror_or_direct(
+                        &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
+                    )
+                    .await
                     {
                         Ok(resp) => return resp,
                         Err(_) => (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭")),
@@ -248,7 +253,11 @@ async fn mitm_http(
                     }
                 }
             }
-            return mitm_unavailable(&req, &host, "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。");
+            return mitm_unavailable(
+                &req,
+                &host,
+                "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
+            );
         }
     };
     if is_simple
@@ -262,7 +271,11 @@ async fn mitm_http(
                     "[MITM] {host}{} 拦截页化解失败: {e}",
                     path_of(req.uri())
                 ));
-                return mitm_unavailable(&req, &host, "全部边缘均返回风控拦截页, 代理正在按表自动重试。");
+                return mitm_unavailable(
+                    &req,
+                    &host,
+                    "全部边缘均返回风控拦截页, 代理正在按表自动重试。",
+                );
             }
         }
     }
@@ -280,11 +293,7 @@ async fn mitm_http(
     let resp = page_cache::cache_put(&log, &req, &host, resp).await;
     write_upstream(resp, "direct", &info)
 }
-fn stream_decision(
-    method: &Method,
-    path: &str,
-    declared_len: Option<u64>,
-) -> Option<&'static str> {
+fn stream_decision(method: &Method, path: &str, declared_len: Option<u64>) -> Option<&'static str> {
     if *method == Method::GET || *method == Method::HEAD {
         return None;
     }
@@ -310,7 +319,9 @@ fn incoming_to_body(body: Incoming) -> BoxBody {
 fn plain_502() -> axum::response::Response<BoxBody> {
     axum::response::Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(protocol::full_body(Bytes::from_static(b"upstream unavailable")))
+        .body(protocol::full_body(Bytes::from_static(
+            b"upstream unavailable",
+        )))
         .unwrap()
 }
 /// 流式直通：体不进缓冲边收边泵，响应头一到立即交付，泵失败不覆盖已交付的响应。
@@ -657,7 +668,7 @@ pub(super) async fn get_direct(
     if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
         return r;
     }
-// per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
+    // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
     if is_content && pool::CONTENT_BREAKER.open(host) {
@@ -838,14 +849,16 @@ async fn dns_direct_fetch(
     let budget_content = pool::route::is_content(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
-            Ok(c) => c,
-            Err(e) => {
-                (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
-                continue;
-            }
-        };
-        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await {
+        let conn =
+            match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
+                Ok(c) => c,
+                Err(e) => {
+                    (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
+                    continue;
+                }
+            };
+        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
+        {
             Ok(u) => u,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));

@@ -8,6 +8,8 @@
 /dist/ca.key
 /dist/plans.json
 /dist/plans.json.bak*
+/dist/routes.json
+/dist/routes.json.bak*
 /dist/settings.json
 /dist/*.WebView2/
 /dist/*.log

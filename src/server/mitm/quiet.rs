@@ -53,13 +53,15 @@ pub(super) fn note_reuse(log: &LogFn, host: &str, ms: u64) {
     if g.len() >= 128 {
         g.clear();
     }
-    let e = g
-        .entry(host.to_string())
-        .or_insert((0, 0, Instant::now()));
+    let e = g.entry(host.to_string()).or_insert((0, 0, Instant::now()));
     e.0 += 1;
     e.1 += ms;
     if e.2.elapsed() >= Duration::from_secs(60) {
-        (log)(&format!("[上游] {host} 复用连接 {} 次, 均 {}ms", e.0, e.1 / e.0));
+        (log)(&format!(
+            "[上游] {host} 复用连接 {} 次, 均 {}ms",
+            e.0,
+            e.1 / e.0
+        ));
         *e = (0, 0, Instant::now());
     }
 }

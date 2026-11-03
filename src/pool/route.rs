@@ -1,11 +1,17 @@
-//! 路由表：plans.json 的 `routes` 数组，整串正则匹配，从上往下先命中先用。
+//! 路由表：routes.json 的 `routes` 字典，键就是域名，最长匹配优先。
 //!
 //! 这张表是唯一真相：一个 host 用哪组 IP、握手用真名还是伪装、全灭后走镜像还是 DNS。
-//! 代码里不再有"IP 末段是多少"的判断——加 IP 只改 plans.json。
+//! 代码里不再有"IP 末段是多少"的判断——加 IP 只改 routes.json。
+//!
+//! 键的语义只有两种：
+//! - `github.com`   —— 自己 + 任意级子域（`www.github.com` 也命中）
+//! - `*.github.com` —— 只认子域，裸域不命中
+//!
+//! 多条同时命中时取**最长的键**（更具体者胜），所以 `api.github.com` 天然压过
+//! `github.com`，用户不用操心排列顺序。
 
 use super::SerialPlan;
 use crate::util::lock;
-use regex_lite::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,7 +24,7 @@ pub enum Route {
     Tunnel,
 }
 
-/// 一条路由的开关位；全部来自 plans.json，不从 host 形态推断。
+/// 一条路由的开关位；全部来自 routes.json，不从 host 形态推断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Flags {
     /// 本机直连，不进代理。
@@ -38,11 +44,12 @@ pub enum Fallback {
     MirrorDns,
 }
 
-/// plans.json 里一条 routes 的原始形状。
+/// routes.json 里一条路由的值部分；域名键在外层，解析时补进 `key`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteSpec {
-    #[serde(rename = "match")]
-    pub matcher: String,
+    /// 域名键：`github.com` = 自己 + 所有子域；`*.github.com` = 仅子域。
+    #[serde(default)]
+    pub key: String,
     #[serde(default)]
     pub pac: Option<String>,
     /// 目前只有 "direct"。
@@ -65,36 +72,61 @@ pub struct RouteSpec {
 }
 
 pub struct RouteRow {
-    pub pattern: String,
+    pub key: String,
     pub pac: Option<String>,
     pub flags: Flags,
     pub fallback: Fallback,
     pub plans: Vec<SerialPlan>,
     pub real_plans: Vec<SerialPlan>,
-    re: Regex,
+    /// 去掉 `*.` 的裸域名，全小写。
+    bare: String,
+    /// `*.` 前缀：只认子域，裸域不命中。
+    sub_only: bool,
+    /// 具体度 = bare 的字符数；多条同时命中时长的胜。
+    rank: usize,
 }
 
 impl RouteRow {
     pub fn new(spec: RouteSpec) -> Result<Self, String> {
-        let pattern = spec.matcher.trim().to_string();
-        if pattern.is_empty() {
-            return Err("match 为空".to_string());
+        let key = spec.key.trim().trim_end_matches('.').to_string();
+        if key.is_empty() {
+            return Err("key 为空".to_string());
         }
-        // 整串匹配：用户写 github\.com 就只匹配它自己，不用记锚点。
-        let re = Regex::new(&format!("^(?:{pattern})$"))
-            .map_err(|e| format!("match {pattern:?} 正则无效: {e}"))?;
+        let lower = key.to_ascii_lowercase();
+        let (sub_only, bare) = match lower.strip_prefix("*.") {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, lower),
+        };
+        if bare.is_empty() {
+            return Err(format!("key {key:?} 缺域名"));
+        }
+        if bare.contains('*') {
+            return Err(format!("key {key:?} 只允许开头一个 `*.`"));
+        }
+        if !bare
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return Err(format!(
+                "key {key:?} 含非法字符（域名只允许字母数字 . - _）"
+            ));
+        }
+        if !bare.contains('.') || bare.starts_with('.') {
+            return Err(format!("key {key:?} 不像域名（至少一个点）"));
+        }
         let fallback = match spec.fallback.as_deref().unwrap_or("dns") {
             "dns" => Fallback::Dns,
             "mirror" => Fallback::MirrorDns,
-            other => return Err(format!("match {pattern:?} fallback 未知({other})")),
+            other => return Err(format!("key {key:?} fallback 未知({other})")),
         };
         let direct = match spec.action.as_deref().unwrap_or("") {
             "" => false,
             "direct" => true,
-            other => return Err(format!("match {pattern:?} action 未知({other})")),
+            other => return Err(format!("key {key:?} action 未知({other})")),
         };
         Ok(Self {
-            pattern,
+            rank: bare.len(),
+            key,
             pac: spec.pac,
             flags: Flags {
                 direct,
@@ -105,8 +137,22 @@ impl RouteRow {
             fallback,
             plans: spec.plans,
             real_plans: spec.real_plans,
-            re,
+            bare,
+            sub_only,
         })
+    }
+
+    /// 这个 host（已小写）命中本行吗？`foo.github.com` 命中 `github.com`；
+    /// `evilgithub.com` 不命中（要求点分隔）。
+    #[inline]
+    fn hits(&self, host_lower: &str) -> bool {
+        if host_lower.len() > self.bare.len() && host_lower.ends_with(&self.bare) {
+            // 边界必须是点：github.com 命中，xgithub.com 不命中
+            if host_lower.as_bytes()[host_lower.len() - self.bare.len() - 1] == b'.' {
+                return true;
+            }
+        }
+        !self.sub_only && host_lower == self.bare
     }
 
     /// 拨号候选：真名腿（隧道 / real 路由）额外带上 realPlans。
@@ -119,9 +165,9 @@ impl RouteRow {
     }
 }
 
-/// 落盘用的快照（不含正则）。
+/// 落盘用的快照（不含编译后的匹配态）。
 pub struct RowMeta {
-    pub pattern: String,
+    pub key: String,
     pub pac: Option<String>,
     pub flags: Flags,
     pub fallback: Fallback,
@@ -160,11 +206,18 @@ pub fn route_for(host: &str) -> Option<Hit> {
     let idx = match memo.get(host) {
         Some(v) => *v,
         None => {
-            let i = table.iter().position(|r| r.re.is_match(host));
-            if memo.len() < 4096 {
-                memo.insert(host.to_string(), i);
+            // 域名不区分大小写；每个 host 只算一次，结果进 memo。
+            let lower = host.to_ascii_lowercase();
+            let mut best: Option<usize> = None;
+            for (i, r) in table.iter().enumerate() {
+                if r.hits(&lower) && best.is_none_or(|b| r.rank > table[b].rank) {
+                    best = Some(i);
+                }
             }
-            i
+            if memo.len() < 4096 {
+                memo.insert(host.to_string(), best);
+            }
+            best
         }
     }?;
     Some(Hit { table, idx })
@@ -202,8 +255,8 @@ pub fn cursor_keys() -> Vec<String> {
         if r.flags.direct {
             continue;
         }
-        out.push(r.pattern.clone());
-        out.push(format!("{}~2", r.pattern));
+        out.push(r.key.clone());
+        out.push(format!("{}~2", r.key));
     }
     out
 }
@@ -236,7 +289,7 @@ pub fn snapshot() -> Vec<RowMeta> {
     };
     t.iter()
         .map(|r| RowMeta {
-            pattern: r.pattern.clone(),
+            key: r.key.clone(),
             pac: r.pac.clone(),
             flags: r.flags,
             fallback: r.fallback,
@@ -253,11 +306,7 @@ pub fn route_count() -> usize {
 pub fn plan_count() -> usize {
     let g = lock(&TABLE);
     g.as_ref()
-        .map(|t| {
-            t.iter()
-                .map(|r| r.plans.len() + r.real_plans.len())
-                .sum()
-        })
+        .map(|t| t.iter().map(|r| r.plans.len() + r.real_plans.len()).sum())
         .unwrap_or(0)
 }
 

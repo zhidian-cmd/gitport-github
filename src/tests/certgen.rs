@@ -27,6 +27,8 @@ fn tls_acceptor_ok() {
     let _acc = tls_acceptor_of(&a);
 }
 
+// 用例独占路由表与本地监听端口，串行锁必须跨 await 持有；生产路径不这么用。
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mitm_handshake_roundtrip() {
     let _g = crate::pool::TEST_LOCK

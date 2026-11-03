@@ -29,7 +29,6 @@ fn set_running(v: bool) {
     RUNNING.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-
 static PROXY_CTX: std::sync::Mutex<Option<CancellationToken>> = std::sync::Mutex::new(None);
 static PROXY_JOIN: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
@@ -331,7 +330,7 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
     (target.to_lowercase(), def)
 }
 
-/// 上游唯一入口：串发池按 plans.json 串发，其余交系统 DNS 直连；这是真名透传腿。
+/// 上游唯一入口：串发池按 routes.json 串发，其余交系统 DNS 直连；这是真名透传腿。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::route::is_managed(host) {
@@ -382,14 +381,14 @@ where
 /// 轻量随机（stdlib RandomState 技巧，避免引入 rand 依赖）：每次调用值不同。
 fn fresh_rand() -> u64 {
     use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new().build_hasher().finish()
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 fn split_delay() -> std::time::Duration {
     let span = config::HELLO_SPLIT_DELAY_MAX_MS - config::HELLO_SPLIT_DELAY_MIN_MS + 1;
-    std::time::Duration::from_millis(
-        config::HELLO_SPLIT_DELAY_MIN_MS + (fresh_rand() % span),
-    )
+    std::time::Duration::from_millis(config::HELLO_SPLIT_DELAY_MIN_MS + (fresh_rand() % span))
 }
 
 /// TLS 握手首段分片：2~3 段、切点随机；仅总闸开启且首字节为 0x16 才拆。

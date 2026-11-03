@@ -34,7 +34,8 @@ fn search_skeleton_gate_gzip() {
         "gzip 正常页解压后应命中载体标志"
     );
     let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    enc.write_all(b"<html>Your search did not match any</html>").unwrap();
+    enc.write_all(b"<html>Your search did not match any</html>")
+        .unwrap();
     let gz = enc.finish().unwrap();
     assert!(is_search_skeleton(k, &gz, true), "gzip 骨架应拦截");
 }
@@ -107,10 +108,7 @@ fn search_query_normalization() {
     );
     // 非 /search：原样保留（顺序与 p=1 都不动）
     let repo = mk("/octocat/repo/issues", Some("q=1&page=2"));
-    assert!(
-        repo.contains("?q=1&page=2"),
-        "其他路径的查询串不能被归一化"
-    );
+    assert!(repo.contains("?q=1&page=2"), "其他路径的查询串不能被归一化");
 }
 
 /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
@@ -139,7 +137,13 @@ fn search_page_eligible_regardless_of_nav_kind() {
         "其他列表页的软导航维持原状不收"
     );
     assert!(
-        !cache_eligible_rules("github.com", &Method::GET, "/search", Some("no-cache"), false),
+        !cache_eligible_rules(
+            "github.com",
+            &Method::GET,
+            "/search",
+            Some("no-cache"),
+            false
+        ),
         "Ctrl+F5 直通对搜索页同样生效"
     );
 }
@@ -235,11 +239,17 @@ async fn roundtrip_gates_and_self_heal() {
         .body(protocol::full_body(Bytes::from_static(b"{}")))
         .unwrap();
     let _ = collect_and_submit(&log, "GET github.com/api/x", false, false, false, resp).await;
-    assert!(page_cache_get("GET github.com/api/x").is_none(), "非 HTML 不缓存");
+    assert!(
+        page_cache_get("GET github.com/api/x").is_none(),
+        "非 HTML 不缓存"
+    );
 
     // ②c 正文类型闸门（纯函数，落盘有时序所以不断言命中）
     assert!(body_type_allowed(Some("text/html; charset=utf-8"), false));
-    assert!(body_type_allowed(Some("application/json; charset=utf-8"), true));
+    assert!(body_type_allowed(
+        Some("application/json; charset=utf-8"),
+        true
+    ));
     assert!(body_type_allowed(Some("text/plain; charset=utf-8"), true));
     assert!(
         !body_type_allowed(Some("application/json; charset=utf-8"), false),
@@ -265,7 +275,9 @@ async fn roundtrip_gates_and_self_heal() {
     assert_eq!(page_file_name(ck), page_file_name(ck));
     assert_ne!(page_file_name(ck), page_file_name("GET github.com/other"));
     // 碰撞防护：文件里存的 key 与请求 key 不符 → 拒服，不串页
-    let bad_path = dir.join("pages").join(page_file_name("GET github.com/spoof"));
+    let bad_path = dir
+        .join("pages")
+        .join(page_file_name("GET github.com/spoof"));
     let bad_hdr = serde_json::to_vec(&serde_json::json!({
         "key": "GET github.com/someone-else",
         "status": 200,
@@ -293,8 +305,7 @@ async fn roundtrip_gates_and_self_heal() {
         .insert(super::super::PeekRaw(vec![Bytes::from_static(
             b"<html>hello ",
         )]));
-    let out =
-        collect_and_submit(&log, "GET github.com/peek", false, false, false, sniffed).await;
+    let out = collect_and_submit(&log, "GET github.com/peek", false, false, false, sniffed).await;
     let body = http_body_util::BodyExt::collect(out.into_body())
         .await
         .unwrap()
@@ -343,8 +354,8 @@ async fn roundtrip_gates_and_self_heal() {
         .to_bytes();
     assert_eq!(back.as_ref(), gz.as_slice(), "正文应原样是压缩字节");
     // 同一份压缩字节里装的若是闸门页，读侧也要认出来（第二道防线）
-    let mut gate = b"<html><head><title>Verify your two-factor authentication</title></head><body>"
-        .to_vec();
+    let mut gate =
+        b"<html><head><title>Verify your two-factor authentication</title></head><body>".to_vec();
     gate.extend_from_slice(&vec![b'g'; 4000]);
     let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut enc2, &gate).unwrap();
@@ -389,7 +400,10 @@ fn capacity_wipe_on_growth() {
         200,
         &test_hdrs(),
     );
-    assert!(page_cache_get("GET github.com/again").is_some(), "前提：有条目");
+    assert!(
+        page_cache_get("GET github.com/again").is_some(),
+        "前提：有条目"
+    );
     page_cache_clear();
     let (n, _) = pages_stat(&dir);
     assert_eq!(n, 0, "清空后条目应为零");
@@ -408,7 +422,10 @@ async fn keys_invalidation_and_pollution() {
     // ⑧ 会话边界：空闲超阈值（或进程第一页）→ 清盘并从空白重来；紧跟的请求不再清
     set_last_nav(0);
     assert!(note_nav(), "进程启动/空闲后的第一页必须判为新会话");
-    assert!(!note_nav(), "紧跟其后的第二页不该再清盘（swap 只让第一个请求拿到旧时间戳）");
+    assert!(
+        !note_nav(),
+        "紧跟其后的第二页不该再清盘（swap 只让第一个请求拿到旧时间戳）"
+    );
     let _ = persist_page_entry_blocking(
         &dir,
         "GET github.com/old-session",
@@ -416,7 +433,10 @@ async fn keys_invalidation_and_pollution() {
         200,
         &test_hdrs(),
     );
-    assert!(page_cache_get("GET github.com/old-session").is_some(), "前提：有旧条目");
+    assert!(
+        page_cache_get("GET github.com/old-session").is_some(),
+        "前提：有旧条目"
+    );
     assert_eq!(wipe_pages(&dir), 1, "应清掉上一会话的 1 条");
     assert_eq!(wipe_pages(&dir), 0, "空目录再清一次不得报错");
     assert!(
@@ -436,13 +456,7 @@ async fn keys_invalidation_and_pollution() {
     let issue_key = "GET github.com/o/r/issues/5-calice-gz";
     let other_key = "GET github.com/o/r/pulls/9-calice-gz";
     for k in [issue_key, other_key] {
-        let _ = persist_page_entry_blocking(
-            &dir,
-            k,
-            b"<html>i</html>",
-            200,
-            &test_hdrs(),
-        );
+        let _ = persist_page_entry_blocking(&dir, k, b"<html>i</html>", 200, &test_hdrs());
     }
     invalidate_prefix_blocking(&dir, "github.com", "/o/r/issues/5/comment");
     assert!(
@@ -522,7 +536,15 @@ async fn keys_invalidation_and_pollution() {
             b"<html><body class=\"logged-out env-production\">sign in</body></html>",
         )))
         .unwrap();
-    let _ = collect_and_submit(&log, "GET github.com/-cauthed-poison", false, false, true, poisoned).await;
+    let _ = collect_and_submit(
+        &log,
+        "GET github.com/-cauthed-poison",
+        false,
+        false,
+        true,
+        poisoned,
+    )
+    .await;
     assert!(
         page_cache_get_logged_in("GET github.com/-cauthed-poison").is_none(),
         "会话死亡期间的未登录页不得进缓存"
@@ -569,7 +591,8 @@ async fn keys_invalidation_and_pollution() {
         .unwrap();
     let _ = collect_and_submit(
         &log,
-        "GET github.com/-cauthed-gz-poison", false,
+        "GET github.com/-cauthed-gz-poison",
+        false,
         false,
         true,
         poisoned_gz,

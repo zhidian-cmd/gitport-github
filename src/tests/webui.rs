@@ -25,10 +25,7 @@ fn same_site_write_rules() {
     assert!(same_site_write(&h), "带意图头的本机脚本应放行");
     h.remove("x-gitport-request");
     let base = format!("http://127.0.0.1:{}", config::webui_port());
-    h.insert(
-        "origin",
-        HeaderValue::from_str(&base).unwrap(),
-    );
+    h.insert("origin", HeaderValue::from_str(&base).unwrap());
     assert!(same_site_write(&h));
     h.insert("origin", HeaderValue::from_static("http://evil.com"));
     assert!(!same_site_write(&h));

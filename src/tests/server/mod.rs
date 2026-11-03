@@ -9,7 +9,10 @@ fn host_only_strips_port() {
 
 #[test]
 fn split_target_parses_and_defaults() {
-    assert_eq!(split_target("github.com:443", 443), ("github.com".into(), 443));
+    assert_eq!(
+        split_target("github.com:443", 443),
+        ("github.com".into(), 443)
+    );
     assert_eq!(split_target("github.com", 80), ("github.com".into(), 80));
     assert_eq!(split_target("[::1]:8443", 443), ("[::1]".into(), 8443));
     assert_eq!(split_target("[::1]", 443), ("[::1]".into(), 443));
@@ -117,7 +120,9 @@ fn chunked_request_body_is_refused() {
     assert!(headers_have_chunked(
         b"Host: a\r\nTransfer-Encoding: chunked\r\n"
     ));
-    assert!(headers_have_chunked(b"transfer-encoding: gzip, chunked\r\n"));
+    assert!(headers_have_chunked(
+        b"transfer-encoding: gzip, chunked\r\n"
+    ));
     assert!(!headers_have_chunked(
         b"Content-Length: 5\r\nConnection: close\r\n"
     ));
@@ -131,7 +136,10 @@ fn hello_split_ranges_gate() {
         .chain(std::iter::repeat_n(0u8, 300))
         .collect();
     let ranges = hello_split_ranges(&tls_long).expect("TLS 握手应拆");
-    assert!(ranges.len() == 2 || ranges.len() == 3, "段数应在 2~3: {ranges:?}");
+    assert!(
+        ranges.len() == 2 || ranges.len() == 3,
+        "段数应在 2~3: {ranges:?}"
+    );
     assert_eq!(ranges.first().unwrap().start, 0);
     assert!(!ranges.first().unwrap().is_empty());
     assert!(ranges.first().unwrap().len() <= config::HELLO_SPLIT_FIRST_MAX);
@@ -168,10 +176,7 @@ fn hello_split_randomizes_cuts() {
         firsts.len() >= 3,
         "40 次拆分首刀位置应多变(随机化失效?): {firsts:?}"
     );
-    assert!(
-        seg_counts.len() >= 2,
-        "段数应在 2~3 间变化: {seg_counts:?}"
-    );
+    assert!(seg_counts.len() >= 2, "段数应在 2~3 间变化: {seg_counts:?}");
 }
 
 /// 首包分片不丢字节：TLS 握手载荷经分片转发后必须完整到达对端。

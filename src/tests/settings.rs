@@ -145,7 +145,9 @@ fn last_ip_canonicalizes_once_routes_are_loaded() {
         "路由表外的旧键应丢: {marks:?}"
     );
     assert!(
-        marks.iter().all(|(_, ip)| ip != "1.1.1.1" && ip != "9.9.9.9"),
+        marks
+            .iter()
+            .all(|(_, ip)| ip != "1.1.1.1" && ip != "9.9.9.9"),
         "旧键的值不再沿用"
     );
 }

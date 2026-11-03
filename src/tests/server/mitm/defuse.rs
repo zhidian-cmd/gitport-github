@@ -32,7 +32,10 @@ async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
         .unwrap()
         .into_parts();
     let mut resp = hyper::Response::from_parts(parts, body);
-    assert!(is_gh_block_page(&mut resp).await, "gzip 压缩的拦截页应被判定");
+    assert!(
+        is_gh_block_page(&mut resp).await,
+        "gzip 压缩的拦截页应被判定"
+    );
     let raw = resp
         .extensions()
         .get::<PeekRaw>()

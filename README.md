@@ -8,7 +8,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 
 本机跑一个代理（`127.0.0.1:7810`）+ 管理页面（`127.0.0.1:7811`），只接管 GitHub 系域名：
 
-- **不查 DNS**：内置 GitHub 真实 IP 表（`plans.json`），DNS 污染免疫
+- **不查 DNS**：内置 GitHub 真实 IP 表（`routes.json`），DNS 污染免疫
 - **连不上就换**：IP 按表逐个试，坏的垫底，单点故障只慢不掉
 - **TLS 指纹是 Chrome 同款**：BoringSSL + 伪装 SNI，绕过针对明文域名的阻断
 - **隧道握手首包分片**：CONNECT 透传把 ClientHello 拆成 2~3 段（切点/间隔每连接随机）再发，DPI 拼不齐 SNI——真名腿免于 RST 的掩体（byedpi 同款思路，纯用户态，可 A/B 开关）
@@ -19,7 +19,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 ## 快速上手
 
 1. 双击 `gitport-github.exe`（或 `.\gitport-github.exe -tray` 驻留托盘）
-2. 首次启动在 exe 同目录自动生成 `ca.crt`/`ca.key`、`plans.json`、`settings.json` —— 所有开关默认全关
+2. 首次启动在 exe 同目录自动生成 `ca.crt`/`ca.key`、`routes.json`、`settings.json` —— 所有开关默认全关
 3. 打开工作台：先开「GitHub 分流接管」（写系统 PAC）→ 需要内容域直连/流式直通再开「MITM」（一键装证书根）
 
 不开 MITM 也能用（纯透传加速）。系统代理接管在退出时自动还原；强杀残留由下次启动自愈。
@@ -30,7 +30,7 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 |---|---|---|
 | macOS / Linux | 系统代理、托盘、剪贴板全调 Windows API（winreg / WinInet） | macOS 推荐 Watt Toolkit / Clash Verge |
 | 大文件上传快 | push 与单附件都是单流协议，一条 TCP 的吞吐就是天花板（本机实测约 119KB/s）；代码里没有限速，换链路会变 | 多附件并发；优先走 release 附件上传（本机实测直拨约 1.3MB/s） |
-| 一劳永逸 | GitHub 边缘 IP 会迁移 | 种子补缺 + DNS 兜底腿自愈；极端情况手改 `plans.json` |
+| 一劳永逸 | GitHub 边缘 IP 会迁移 | 种子补缺 + DNS 兜底腿自愈；极端情况手改 `routes.json` |
 | 零门槛 | MITM 需装本地根证书 | WebUI 一键安装；不装也能用 |
 | 加速所有网站 | 只路由 GitHub 系域名 | 其他站点用通用代理 |
 | 带凭据查询串的请求不进镜像 | 签名/令牌串等价凭据，交第三方即外泄——剥空镜像仅派直连（同浏览器直答源站，零外泄） | release 附件/私库资产走直连腿正常下载 |
@@ -62,14 +62,17 @@ clone / push / 网页 / Release 下载 / raw / 头像全场景加速，其余网
 - [工作原理](docs/ARCHITECTURE.md) —— 请求全流程、串发拨号、连接复用、镜像链、流式直通
 - [路由表](docs/ROUTING.md) —— 四层决策链全矩阵（2026-10-19 实测）
 - [页面缓存](docs/CACHE.md) —— 缓什么/不缓什么、会话语义、分钥匙、骨架门、头像 302 记忆
-- [高级配置](docs/CONFIG.md) —— plans.json 手改指南、IP 认读、分流域名总表
+- [高级配置](docs/CONFIG.md) —— routes.json 手改指南、IP 认读、分流域名总表
 - [术语速查](docs/GLOSSARY.md) —— 网络与封锁名词大白话
 
 ## 构建
 
+前提：`ninja.exe` 与 `nasm.exe` 在 `PATH` 中。Ninja 在 VS BuildTools 的 `...\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`（默认不在 PATH，需要手动加一次），nasm 在 `...\nasm\nasm-<ver>`。`.cargo/config.toml` 已选用 Ninja 生成器，并让 `boring-sys` 在 dev profile 下走 Release CRT——否则 VS 生成器会撞上 MSBuild 的 `XamlTaskFactory` 权限错误，dev 链接会缺 `__imp__CrtDbgReport`。
+
 ```powershell
 cargo build --release   # 产物 target\release\gitport-github.exe
 cargo test
+cargo clippy --all-targets
 ```
 
 ## Roadmap
@@ -115,7 +118,7 @@ cargo test
 
 ## 镜像站致谢
 
-本项目默认使用的镜像链来自 gh-proxy.org 等公益服务。由于本工具直接调用接口，无法帮镜像站增加广告收益。如果您频繁使用镜像下载大文件，恳请您稍微花几分钟，去原网站关闭 AdBlock 浏览一下页面，或者给站长捐赠一杯咖啡。如果您有条件，请一定优先在 plans.json 中填入您自建的 CF 节点。
+本项目默认使用的镜像链来自 gh-proxy.org 等公益服务。由于本工具直接调用接口，无法帮镜像站增加广告收益。如果您频繁使用镜像下载大文件，恳请您稍微花几分钟，去原网站关闭 AdBlock 浏览一下页面，或者给站长捐赠一杯咖啡。如果您有条件，请一定优先在 routes.json 中填入您自建的 CF 节点。
 
 ## 支持项目
 

@@ -31,7 +31,14 @@ async fn slot_filter_pins_search_to_primary() {
     // 主通道被摘后:Some(1) -> None(交拨号按主键重建),绝不误用第二通道
     drop_h2_id(host, {
         let g = lock(conn_pool());
-        g.get(host).unwrap().conns.iter().find(|c| c.up.slot == 1).unwrap().up.id
+        g.get(host)
+            .unwrap()
+            .conns
+            .iter()
+            .find(|c| c.up.slot == 1)
+            .unwrap()
+            .up
+            .id
     });
     assert!(
         cached_h2_in(host, Some(1)).is_none(),
@@ -46,22 +53,17 @@ async fn slot_filter_pins_search_to_primary() {
 /// 借道用例要装一张路由表（donor 标记现在由数据给，不再看域名后缀）。
 fn install_borrow_routes() {
     let specs = [
-        r#"{"match":".*\\.githubassets\\.com","donor":true}"#,
-        r#"{"match":".*\\.githubusercontent\\.com","content":true,"fallback":"mirror"}"#,
+        r#"{"key":"githubassets.com","donor":true}"#,
+        r#"{"key":"*.githubusercontent.com","content":true,"fallback":"mirror"}"#,
     ];
     let rows = specs
         .iter()
         .map(|s| {
-            crate::pool::route::RouteRow::new(serde_json::from_str(s).expect("spec")).expect("行合法")
+            crate::pool::route::RouteRow::new(serde_json::from_str(s).expect("spec"))
+                .expect("行合法")
         })
         .collect();
     crate::pool::route::install(rows);
-}
-
-/// 借道用例都要扫全局连接池，串行跑，免得互相挑到对方塞进去的 donor。
-fn pool_lock() -> std::sync::MutexGuard<'static, ()> {
-    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    L.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// 造一条真能用的 donor：对端是本地 h2 服务，回 200 并把收到的 `:authority` 回显到响应头，
@@ -105,6 +107,8 @@ async fn live_donor(ip: &str) -> H2Upstream {
 /// 1) 只认 assets 域现成连接，内容域自己的连接和 donor 自身都不算；
 /// 2) 借来的流 `:authority` 仍是目标 host（服务端按它路由，这才是能取到内容域的原因）；
 /// 3) 借失败要进冷却，后续请求直接回落，不再逐条空等。
+// 用例独占全局路由表与连接池，串行锁必须跨 await 持有；生产路径不这么用。
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn borrow_contract_end_to_end() {
     let _g = crate::pool::TEST_LOCK
@@ -156,14 +160,12 @@ async fn borrow_contract_end_to_end() {
         .body(empty_body())
         .unwrap();
     let dead_info = crate::server::mitm::UpstreamInfo::default();
-    let first =
-        crate::server::mitm::try_borrow(&log, &out2, dead_target, &dead_info, &None).await;
+    let first = crate::server::mitm::try_borrow(&log, &out2, dead_target, &dead_info, &None).await;
     assert!(
         matches!(first, Some(Err(_))),
         "借失败要如实报错, 不能假装成功"
     );
-    let second =
-        crate::server::mitm::try_borrow(&log, &out2, dead_target, &dead_info, &None).await;
+    let second = crate::server::mitm::try_borrow(&log, &out2, dead_target, &dead_info, &None).await;
     assert!(second.is_none(), "冷却期内不再空试, 直接交回退路径");
 
     for h in [content_host, dead_host] {
@@ -177,6 +179,7 @@ async fn borrow_contract_end_to_end() {
 
 /// 两条通道要摊开：前一条已经挂着借出的流，下一条请求就该走另一条；
 /// 归还后计数必须回到 0，否则那条连接会一直"在忙"，再也挑不中。
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn borrow_spreads_over_two_channels() {
     let _g = crate::pool::TEST_LOCK
@@ -210,6 +213,7 @@ async fn borrow_spreads_over_two_channels() {
 
 /// 一条通道坏了不该拖死请求：同一次调用里换另一条，响应照拿；
 /// 借出的配额在响应体丢弃时要还回去。
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn borrow_fails_over_to_second_channel() {
     let _g = crate::pool::TEST_LOCK
@@ -234,11 +238,7 @@ async fn borrow_fails_over_to_second_channel() {
         .expect("有 donor 就该尝试借道")
         .expect("一条坏了要自动换另一条，不能让请求陪它一起失败");
     assert_eq!(got.status(), 200);
-    assert_eq!(
-        *info.lock().unwrap(),
-        "9.9.3.2",
-        "响应应来自健康的那条通道"
-    );
+    assert_eq!(*info.lock().unwrap(), "9.9.3.2", "响应应来自健康的那条通道");
 
     drop(got); // 体丢弃 -> 借出配额归还
     let (_, again) = borrow_donor(target).expect("健康通道应已归还配额");

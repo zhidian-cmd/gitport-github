@@ -66,7 +66,7 @@ fn bad_route_row_does_not_wipe_table() {
     let dir = tmpdir();
     crate::settings::save_worker_mirrors(Vec::new());
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "routes": [
     {"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "1.2.3.4", "sni": "baidu.com"}]},
@@ -90,11 +90,87 @@ fn bad_route_row_does_not_wipe_table() {
         "镜像链必须保留"
     );
     assert!(
-        seen.lock().unwrap().iter().any(|l| l.contains("routes[1] 丢弃")),
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("routes[1] 丢弃")),
         "日志应指明坏的是第几行: {:?}",
         seen.lock().unwrap()
     );
-    assert!(dir.join("plans.json.bak").exists(), "有行写坏应备份原文件");
+    assert!(dir.join("routes.json.bak").exists(), "有行写坏应备份原文件");
+}
+
+#[test]
+fn legacy_plans_file_renamed_to_routes() {
+    // 老用户的 plans.json 必须原样搬成 routes.json：表不能被种子顶掉，原表留 .bak。
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmpdir();
+    crate::settings::save_worker_mirrors(Vec::new());
+    std::fs::write(
+        dir.join("plans.json"),
+        r#"{
+  "routes": [
+    {"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "9.9.9.1", "sni": "baidu.com"}]}
+  ],
+  "mirrors": {"raw.githubusercontent.com": ["https://v4.gh-proxy.org"]}
+}"#,
+    )
+    .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    serial_load(&dir, Vec::new(), Some(log));
+
+    assert!(!dir.join("plans.json").exists(), "旧名应被搬走, 不能留两份");
+    assert!(dir.join("routes.json").exists(), "新名必须出现");
+    assert!(dir.join("routes.json.bak").exists(), "搬之前应留 .bak 保险");
+    assert_eq!(
+        route::route_for("github.com").unwrap().plans[0].ip,
+        "9.9.9.1",
+        "老表必须原样生效, 不能被种子顶掉"
+    );
+    assert_eq!(
+        mirror_chain("raw.githubusercontent.com"),
+        vec!["https://v4.gh-proxy.org".to_string()],
+        "镜像链也要跟着搬过来"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("已更名为 routes.json")),
+        "日志应说明改名: {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[test]
+fn existing_routes_file_wins_over_legacy() {
+    // 新表已在时旧名必须被忽略：否则用户改 plans.json 会"改了但不生效"。
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmpdir();
+    crate::settings::save_worker_mirrors(Vec::new());
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{"routes": [{"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "1.1.1.1"}]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("plans.json"),
+        r#"{"routes": [{"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "2.2.2.2"}]}]}"#,
+    )
+    .unwrap();
+    serial_load(&dir, Vec::new(), None);
+
+    assert_eq!(
+        route::route_for("github.com").unwrap().plans[0].ip,
+        "1.1.1.1",
+        "routes.json 是唯一权威, 旧名不得覆盖"
+    );
+    assert!(
+        dir.join("plans.json").exists(),
+        "旧文件不由程序删, 留给用户处理"
+    );
 }
 
 #[test]
@@ -124,7 +200,7 @@ fn legacy_pools_migrate_to_route_rows() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "core": [
     {"ip": "1.2.3.4", "sni": "ech", "成功次数": "9/9", "分数": 99}
@@ -168,7 +244,7 @@ fn legacy_pools_migrate_to_route_rows() {
     let app = route::route_for("api.githubapp.com").expect("auth 行");
     assert!(app.plans.iter().any(|p| p.ip == "140.82.112.29"));
 
-    let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+    let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     assert!(back.get("routes").is_some(), "应写回新格式: {b}");
     assert!(back.get("core").is_none() && back.get("edge").is_none());
@@ -181,7 +257,7 @@ fn seed_topup_appends_missing_and_keeps_order() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "routes": [
     {"match": ".*\\.githubusercontent\\.com", "content": true, "fallback": "mirror",
@@ -195,58 +271,72 @@ fn seed_topup_appends_missing_and_keeps_order() {
     let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
     serial_load(&dir, Vec::new(), Some(log));
     let row = route::route_for("raw.githubusercontent.com").expect("内容域行");
-    assert_eq!(row.plans[0].ip, "9.9.9.9", "用户手排顺序保留, 补缺只追加尾部");
+    assert_eq!(
+        row.plans[0].ip, "9.9.9.9",
+        "用户手排顺序保留, 补缺只追加尾部"
+    );
     assert!(row.plans.len() > 1, "应叠加种子: {:?}", row.plans);
     assert!(
         seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
         "补缺应打一行日志"
     );
-    let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+    let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     assert!(b.contains("185.199.110.133"), "补缺应落盘: {b}");
 }
 
 #[test]
-fn encode_plans_roundtrip() {
+fn encode_routes_roundtrip() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     route::install(vec![
-        route::RouteRow::new(
-            route::RouteSpec {
-                matcher: r"(.*\.)?github\.com".into(),
-                pac: Some("github.com".into()),
-                action: None,
-                real: false,
-                content: false,
-                donor: false,
-                fallback: None,
-                plans: vec![
-                    SerialPlan { ip: "1.2.3.4".into(), sni: "baidu.com".into() },
-                    SerialPlan { ip: "5.6.7.8".into(), sni: "baidu.com".into() },
-                ],
-                real_plans: Vec::new(),
-            },
-        )
+        route::RouteRow::new(route::RouteSpec {
+            key: "github.com".into(),
+            pac: Some("github.com".into()),
+            action: None,
+            real: false,
+            content: false,
+            donor: false,
+            fallback: None,
+            plans: vec![
+                SerialPlan {
+                    ip: "1.2.3.4".into(),
+                    sni: "baidu.com".into(),
+                },
+                SerialPlan {
+                    ip: "5.6.7.8".into(),
+                    sni: "baidu.com".into(),
+                },
+            ],
+            real_plans: Vec::new(),
+        })
         .unwrap(),
-        route::RouteRow::new(
-            route::RouteSpec {
-                matcher: r".*\.githubusercontent\.com".into(),
-                pac: Some("githubusercontent.com".into()),
-                action: None,
-                real: false,
-                content: true,
-                donor: false,
-                fallback: Some("mirror".into()),
-                plans: vec![SerialPlan { ip: "185.199.110.133".into(), sni: String::new() }],
-                real_plans: vec![SerialPlan { ip: "185.199.108.154".into(), sni: String::new() }],
-            },
-        )
+        route::RouteRow::new(route::RouteSpec {
+            key: "*.githubusercontent.com".into(),
+            pac: Some("githubusercontent.com".into()),
+            action: None,
+            real: false,
+            content: true,
+            donor: false,
+            fallback: Some("mirror".into()),
+            plans: vec![SerialPlan {
+                ip: "185.199.110.133".into(),
+                sni: String::new(),
+            }],
+            real_plans: vec![SerialPlan {
+                ip: "185.199.108.154".into(),
+                sni: String::new(),
+            }],
+        })
         .unwrap(),
     ]);
     let mut mirrors = HashMap::new();
     mirrors.insert(
         "raw.githubusercontent.com".to_string(),
-        vec!["https://axisnow.gh-proxy.org".to_string(), "https://v4.gh-proxy.org".to_string()],
+        vec![
+            "https://axisnow.gh-proxy.org".to_string(),
+            "https://v4.gh-proxy.org".to_string(),
+        ],
     );
-    let b = encode_plans(&mirrors);
+    let b = encode_routes(&mirrors);
     // IP 条目必须单行
     for line in b.lines() {
         let t = line.trim();
@@ -256,13 +346,17 @@ fn encode_plans_roundtrip() {
     }
     assert!(b.contains("\"mirrors_small\""), "镜像链板块应落盘: {b}");
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
-    let rows = back["routes"].as_array().expect("routes 应是数组");
+    let rows = back["routes"]
+        .as_object()
+        .expect("routes 应是对象(域名作键)");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["match"], "(.*\\.)?github\\.com");
-    assert_eq!(rows[0]["plans"][1]["ip"], "5.6.7.8");
-    assert_eq!(rows[1]["content"], true);
-    assert_eq!(rows[1]["fallback"], "mirror");
-    assert_eq!(rows[1]["realPlans"][0]["ip"], "185.199.108.154");
+    assert_eq!(rows["github.com"]["plans"][1]["ip"], "5.6.7.8");
+    assert_eq!(rows["*.githubusercontent.com"]["content"], true);
+    assert_eq!(rows["*.githubusercontent.com"]["fallback"], "mirror");
+    assert_eq!(
+        rows["*.githubusercontent.com"]["realPlans"][0]["ip"],
+        "185.199.108.154"
+    );
     assert_eq!(
         back["mirrors_small"]["raw.githubusercontent.com"]
             .as_array()
@@ -277,13 +371,13 @@ fn cursor_park_is_memory_only_and_freezes_order() {
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
     let row = route::route_for("github.com").expect("github.com 应有路由");
-    let pattern = row.pattern.clone();
+    let pattern = row.key.clone();
     let plans = row.plans.clone();
     assert!(plans.len() >= 3, "初始表过小: {}", plans.len());
     let head_before = plans[0].ip.clone();
     let target = plans[2].ip.clone();
     assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
-    let file_before = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+    let file_before = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     cursor_note("github.com", &target, true, 1);
     // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
     assert_eq!(
@@ -292,7 +386,7 @@ fn cursor_park_is_memory_only_and_freezes_order() {
         "表序冻结"
     );
     assert_eq!(
-        std::fs::read_to_string(dir.join("plans.json")).unwrap(),
+        std::fs::read_to_string(dir.join("routes.json")).unwrap(),
         file_before,
         "游标驻留零写盘"
     );
@@ -316,10 +410,15 @@ fn custom_mirrors_align() {
             "https://pub2".into(),
         ],
     );
-    m.insert("raw.githubusercontent.com".into(), vec!["https://pub1".into()]);
+    m.insert(
+        "raw.githubusercontent.com".into(),
+        vec!["https://pub1".into()],
+    );
     let enabled = vec!["https://customB".to_string(), "https://customA".to_string()];
     let disabled = vec!["https://customC".to_string()];
-    assert!(align_custom_mirrors(&mut m, &enabled, &disabled, &enabled, &disabled));
+    assert!(align_custom_mirrors(
+        &mut m, &enabled, &disabled, &enabled, &disabled
+    ));
     // github.com：链里没有的 customB 追加到链尾；已在链中的成员位置不动
     assert_eq!(
         m["github.com"],
@@ -333,14 +432,22 @@ fn custom_mirrors_align() {
     // raw：customB、customA 都追加到链尾，customC 本就不在链中无影响
     assert_eq!(
         m["raw.githubusercontent.com"],
-        vec!["https://pub1".to_string(), "https://customB".to_string(), "https://customA".to_string()]
+        vec![
+            "https://pub1".to_string(),
+            "https://customB".to_string(),
+            "https://customA".to_string()
+        ]
     );
     // 幂等：再跑一次无变更
-    assert!(!align_custom_mirrors(&mut m, &enabled, &disabled, &enabled, &disabled));
+    assert!(!align_custom_mirrors(
+        &mut m, &enabled, &disabled, &enabled, &disabled
+    ));
     // 删除：customB 移出启用清单（进 disabled）→ 从全部链消失；其余不动
     let enabled2 = vec!["https://customA".to_string()];
     let disabled2 = vec!["https://customB".to_string(), "https://customC".to_string()];
-    assert!(align_custom_mirrors(&mut m, &enabled2, &disabled2, &enabled2, &disabled2));
+    assert!(align_custom_mirrors(
+        &mut m, &enabled2, &disabled2, &enabled2, &disabled2
+    ));
     assert!(!m["github.com"].iter().any(|x| x == "https://customB"));
     assert_eq!(
         m["github.com"],
@@ -356,14 +463,20 @@ fn custom_mirrors_align() {
 fn worker_chain_replace_old_url() {
     // 换地址：新地址追加到链尾的同时旧地址必须移除（防新旧并存）
     let mut m: HashMap<String, Vec<String>> = HashMap::new();
-    m.insert("github.com".into(), vec!["https://old.worker".into(), "https://a.example".into()]);
+    m.insert(
+        "github.com".into(),
+        vec!["https://old.worker".into(), "https://a.example".into()],
+    );
     let new = vec!["https://new.worker".to_string()];
     let old = vec!["https://old.worker".to_string()];
     align_custom_mirrors(&mut m, &new, &old, &new, &old);
     let c = &m["github.com"];
     assert_eq!(
         c,
-        &vec!["https://a.example".to_string(), "https://new.worker".to_string()]
+        &vec![
+            "https://a.example".to_string(),
+            "https://new.worker".to_string()
+        ]
     );
     assert!(!c.iter().any(|x| x.contains("old.worker")));
 }
@@ -375,7 +488,7 @@ fn toggle_gates_big_file_chains_only() {
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "core": [],
   "mirrors_big":   {"objects.githubusercontent.com": ["https://on.example", "https://off.example"]},
@@ -398,8 +511,14 @@ fn toggle_gates_big_file_chains_only() {
     serial_load(&dir, Vec::new(), None);
     sync_custom_mirrors(&[]);
     let big = mirror_chain("objects.githubusercontent.com");
-    assert!(big.contains(&"https://on.example".to_string()), "启用镜留在大文件链: {big:?}");
-    assert!(!big.contains(&"https://off.example".to_string()), "关闭镜从大文件链摘除: {big:?}");
+    assert!(
+        big.contains(&"https://on.example".to_string()),
+        "启用镜留在大文件链: {big:?}"
+    );
+    assert!(
+        !big.contains(&"https://off.example".to_string()),
+        "关闭镜从大文件链摘除: {big:?}"
+    );
     let small = mirror_chain("raw.githubusercontent.com");
     assert!(
         small.contains(&"https://on.example".to_string())
@@ -417,7 +536,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "core": [],
   "mirrors_big":   {"codeload.github.com": ["https://big.example"]},
@@ -468,7 +587,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
-    std::fs::write(dir.join("plans.json"), r#"{"core": []}"#).unwrap();
+    std::fs::write(dir.join("routes.json"), r#"{"core": []}"#).unwrap();
     serial_load(&dir, Vec::new(), None);
     assert!(
         mirror_chain("raw.githubusercontent.com").is_empty(),
@@ -499,7 +618,7 @@ fn mirror_chain_load_and_topup() {
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "core": [{"ip": "140.82.112.3", "sni": "baidu.com"}],
   "mirrors": {
@@ -533,9 +652,12 @@ fn mirror_chain_load_and_topup() {
         ],
         "media 无自带链, 应被注册表对齐填成启用镜像全量: {media:?}"
     );
-    let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
+    let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
-    assert!(b.contains("\"mirrors_small\""), "镜像链应落盘(raw 为小文件域): {b}");
+    assert!(
+        b.contains("\"mirrors_small\""),
+        "镜像链应落盘(raw 为小文件域): {b}"
+    );
     let mut new_chain = raw_chain.clone();
     new_chain.reverse();
     assert!(
@@ -558,7 +680,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
     let row = route::route_for("github.com").expect("github.com 应有路由");
-    let pattern = row.pattern.clone();
+    let pattern = row.key.clone();
     let base = row.plans.clone();
     assert!(base.len() >= 6, "初始表过小: {}", base.len());
     let head = base[0].ip.clone();
@@ -606,7 +728,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     dial::set_dial_port(port);
     let dir = tmpdir();
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{"core":[{"ip":"127.0.0.1","sni":"a.example"},{"ip":"127.0.0.2","sni":"a.example"}]}"#,
     )
     .unwrap();
@@ -631,16 +753,11 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
         let g = SERIAL.lock().unwrap();
         let t = g.as_ref().unwrap();
         assert_eq!(
-            t.cursor
-                .get("(.*\\.)?github\\.com")
-                .map(String::as_str),
+            t.cursor.get("github.com").map(String::as_str),
             Some("127.0.0.2"),
             "成功必须驻留记号(下次从它起步)"
         );
-        assert!(
-            t.dead.contains_key("127.0.0.1"),
-            "TCP 层失败应进死亡退避表"
-        );
+        assert!(t.dead.contains_key("127.0.0.1"), "TCP 层失败应进死亡退避表");
     }
 
     // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
@@ -660,4 +777,25 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     drop(conn);
     assert_eq!(ip, "127.0.0.2");
     dial::set_dial_port(0); // 复位，别影响别的测试
+}
+
+/// 种子表本身就是 routes 格式：新装直接可用，不再依赖旧三池迁移。
+#[test]
+fn seeds_are_new_routes_format() {
+    let seeds = seed_db();
+    assert!(
+        seeds.routes.len() >= 10,
+        "种子路由过少: {}",
+        seeds.routes.len()
+    );
+    assert!(
+        seeds
+            .routes
+            .iter()
+            .any(|r| r.key == "github.com" && !r.plans.is_empty()),
+        "主站种子 IP 不能为空"
+    );
+    for spec in seeds.routes {
+        route::RouteRow::new(spec).expect("种子每行都必须能编译");
+    }
 }

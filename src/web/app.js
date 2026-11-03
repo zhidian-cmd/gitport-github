@@ -132,7 +132,7 @@ async function toggleMitm(on) {
 }
 $('mitmBtn').onclick = () => toggleMitm(!S.mitm);
 
-// poolRefresh 已移除: 串发模式按 plans.json 演化, 无换血刷新
+// poolRefresh 已移除: 串发模式按 routes.json 演化, 无换血刷新
 
 /* ---------- 设置页 ---------- */
 function applySettings(s) {
@@ -162,7 +162,7 @@ $('swGh').onchange = e => setSetting('/api/settings/githubPAC', e.target.checked
 
 /* ---------- 自定义镜像注册表 ----------
    settings.json 永久记录全部网址（点垃圾桶才彻底消失）；
-   启动/关闭只增删 plans.json 镜像链成员，注册表不受影响。 */
+   启动/关闭只增删 routes.json 镜像链成员，注册表不受影响。 */
 let MIRRORS = [];
 const TRASH_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6"/></svg>';
 // HTML 属性转义五个字符实体缺一不可——曾把 & < > " 原样返回，镜像 URL 里的 "><script> 逃逸 value="" 执行（注入面）。

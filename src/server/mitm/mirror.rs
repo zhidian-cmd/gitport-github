@@ -273,7 +273,12 @@ fn walk_order(chain_len: usize, start: usize, limit: usize) -> Vec<usize> {
         .collect()
 }
 /// cap 窗口没轮到直连时把它追加为最后一棒；已在列表或失败窗未过的 不追加。
-fn append_direct_if_missed(order: &mut Vec<usize>, direct_idx: usize, fail_until: u64, now_ms: u64) {
+fn append_direct_if_missed(
+    order: &mut Vec<usize>,
+    direct_idx: usize,
+    fail_until: u64,
+    now_ms: u64,
+) {
     if order.contains(&direct_idx) {
         return;
     }
@@ -637,6 +642,8 @@ enum Probe {
     NotSliceable(hyper::Response<BoxBody>),
 }
 
+// 参数都是同一请求链路的借用；拆结构体只是把解构搬到调用点，收益不抵改动面。
+#[allow(clippy::too_many_arguments)]
 async fn probe_total(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -660,6 +667,7 @@ async fn probe_total(
     Err(last)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe_total_one(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -676,7 +684,16 @@ async fn probe_total_one(
         "mirror"
     };
     let mut resp = if mirror.starts_with("direct/") {
-        segment_direct(log, tpl, host, info, replay, Some(http::HeaderValue::from_static("bytes=0-0")), None).await?
+        segment_direct(
+            log,
+            tpl,
+            host,
+            info,
+            replay,
+            Some(http::HeaderValue::from_static("bytes=0-0")),
+            None,
+        )
+        .await?
     } else {
         let mut req = mirror_request(out, mirror, orig_url)?;
         req.headers_mut().insert(
@@ -780,15 +797,17 @@ async fn segment_direct(
             req2.headers_mut().insert(k.clone(), v.clone());
         }
         if let Some(range) = &range {
-            req2.headers_mut().insert(http::header::RANGE, range.clone());
+            req2.headers_mut()
+                .insert(http::header::RANGE, range.clone());
         }
         let fresh = super::UpstreamInfo::default();
         resp = match hop_budget {
-            Some(b) => {
-                tokio::time::timeout(b, super::get_direct(log, &req2, &next_host, &fresh, true, replay))
-                    .await
-                    .map_err(|_| format!("直连跳转首包超时({}ms)", b.as_millis()))??
-            }
+            Some(b) => tokio::time::timeout(
+                b,
+                super::get_direct(log, &req2, &next_host, &fresh, true, replay),
+            )
+            .await
+            .map_err(|_| format!("直连跳转首包超时({}ms)", b.as_millis()))??,
             None => super::get_direct(log, &req2, &next_host, &fresh, true, replay).await?,
         };
         (log)(&format!("[切片] 直连 {next_host} 回 {}", resp.status()));
@@ -1074,16 +1093,7 @@ async fn split_download(
         );
         Box::pin(async move {
             split_fetch(
-                &chain,
-                &orig,
-                &host_s,
-                base,
-                from,
-                to,
-                &log_s,
-                &tpl,
-                &info,
-                &replay,
+                &chain, &orig, &host_s, base, from, to, &log_s, &tpl, &info, &replay,
             )
             .await
         })
@@ -1104,6 +1114,7 @@ async fn split_download(
 
 /// 起一条拉 [from, to) 的新流，偏移相对区间起点、发出去要加 base；候选=镜像+直连（健康时），ECT 挑最小者，两条路都 charge 记账、都采样。
 /// 旧实现补发裸奔：ECT 看不见补发的在途字节会过量堆活，直连被永久排除在补发外。
+#[allow(clippy::too_many_arguments)]
 async fn split_fetch(
     chain: &[String],
     orig_url: &str,
@@ -1183,10 +1194,7 @@ async fn split_fetch(
             .method(http::Method::GET)
             .uri(format!("{m}/{orig_url}"))
             .header(http::header::USER_AGENT, MIRROR_UA)
-            .header(
-                http::header::RANGE,
-                format!("bytes={s}-{}", base + to - 1),
-            )
+            .header(http::header::RANGE, format!("bytes={s}-{}", base + to - 1))
             .body(protocol::empty_body())
             .map_err(|e| e.to_string())?;
         match mirror_do(req, &m, log).await {

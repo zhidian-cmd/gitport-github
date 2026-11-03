@@ -251,10 +251,7 @@ async fn session_resumed_on_second_dial() {
         "首拨没有缓存可注入，必须是完整握手"
     );
     assert!(
-        session_cache()
-            .lock()
-            .unwrap()
-            .contains_key(sni),
+        session_cache().lock().unwrap().contains_key(sni),
         "NewSessionTicket 回调应已把 ticket 写入缓存"
     );
 

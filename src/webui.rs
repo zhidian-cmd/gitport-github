@@ -29,7 +29,6 @@ pub struct App {
     pub version: &'static str,
 }
 
-
 fn local_host(h: &str) -> bool {
     matches!(
         crate::server::host_only(&h.to_lowercase()),
@@ -84,7 +83,6 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
     next.run(req).await
 }
 
-
 pub async fn serve(app: Arc<App>) -> Result<(), String> {
     let router = axum::Router::new()
         .route("/", axum::routing::get(index))
@@ -104,7 +102,10 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/settings/closeToTray",
             axum::routing::post(api_close_to_tray),
         )
-        .route("/api/settings/workerMirrors", axum::routing::post(api_worker_mirrors))
+        .route(
+            "/api/settings/workerMirrors",
+            axum::routing::post(api_worker_mirrors),
+        )
         .route(
             "/api/settings/githubPAC",
             axum::routing::post(api_github_pac),
@@ -176,11 +177,13 @@ async fn app_js() -> Response {
         .into_response()
 }
 
-
 /// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
 async fn img_jpeg(bytes: &'static [u8]) -> Response {
     (
-        [("cache-control", "no-cache"), ("content-type", "image/jpeg")],
+        [
+            ("cache-control", "no-cache"),
+            ("content-type", "image/jpeg"),
+        ],
         bytes,
     )
         .into_response()
@@ -275,8 +278,7 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
         mitm: settings::mitm(),
         domain_count,
         pool_total,
-        split_attempt: pool::dial::SPLIT_ATTEMPT
-            .load(std::sync::atomic::Ordering::Relaxed),
+        split_attempt: pool::dial::SPLIT_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
         split_done: pool::dial::SPLIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
@@ -320,7 +322,7 @@ async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
              关闭窗口进托盘不影响任务。"
             .to_string(),
     )
-    .into_response()
+        .into_response()
 }
 
 #[derive(Deserialize)]

@@ -29,19 +29,18 @@ async fn h2_body_pump_delivers_every_byte() {
     // 假上游：h2 服务端，收满请求体后把字节数写回响应体。
     let srv = tokio::spawn(async move {
         let (sock, _) = ln.accept().await.unwrap();
-        let svc = hyper::service::service_fn(
-            |req: hyper::Request<hyper::body::Incoming>| async move {
+        let svc =
+            hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
                 let n = req
                     .into_body()
                     .collect()
                     .await
                     .map(|c| c.to_bytes().len())
                     .unwrap_or(0);
-                Ok::<_, std::convert::Infallible>(hyper::Response::new(full_body(
-                    Bytes::from(n.to_string()),
-                )))
-            },
-        );
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(full_body(Bytes::from(
+                    n.to_string(),
+                ))))
+            });
         let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(TokioIo::new(sock), svc)
             .await;

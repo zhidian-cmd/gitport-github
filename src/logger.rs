@@ -13,9 +13,8 @@ use time::OffsetDateTime;
 static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
 
 fn now_str(fd: &[time::format_description::FormatItem<'static>]) -> String {
-    let offset = *LOCAL_OFFSET.get_or_init(|| {
-        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
-    });
+    let offset = *LOCAL_OFFSET
+        .get_or_init(|| time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
     OffsetDateTime::now_utc()
         .to_offset(offset)
         .format(fd)
@@ -87,7 +86,6 @@ impl Logger {
         (out, g.seq)
     }
 }
-
 
 /// 崩溃取证落点：未装（headless 以外的早期阶段）时静默丢弃。
 static CRASH: Mutex<Option<PathBuf>> = Mutex::new(None);

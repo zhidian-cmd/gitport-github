@@ -27,7 +27,6 @@ bytes = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-regex-lite = "0.1"
 axum = { version = "0.8", features = ["json"] }
 rcgen = { version = "0.14", features = ["x509-parser"] } # Issuer::from_ca_cert_der 需要（2026-10-18 审计误删后构建报错，已恢复）
 time = { version = "0.3", features = ["macros", "local-offset"] }

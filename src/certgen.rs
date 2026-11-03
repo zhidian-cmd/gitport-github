@@ -95,8 +95,10 @@ fn mitm_host_ctx(leaf: &X509, ca: &X509, key: &PKey<Private>) -> Result<SslConte
     // schannel 会话恢复票据与本服务端互操作报 bad record MAC：禁票据 + 禁缓存。
     b.set_session_cache_mode(SslSessionCacheMode::OFF);
     b.set_options(SslOptions::NO_TICKET);
-    b.set_certificate(leaf).map_err(|e| format!("证书装配失败: {e}"))?;
-    b.set_private_key(key).map_err(|e| format!("私钥装配失败: {e}"))?;
+    b.set_certificate(leaf)
+        .map_err(|e| format!("证书装配失败: {e}"))?;
+    b.set_private_key(key)
+        .map_err(|e| format!("私钥装配失败: {e}"))?;
     b.add_extra_chain_cert(ca.clone())
         .map_err(|e| format!("证书链装配失败: {e}"))?;
     Ok(b.build().into_context())
@@ -105,8 +107,8 @@ fn mitm_host_ctx(leaf: &X509, ca: &X509, key: &PKey<Private>) -> Result<SslConte
 /// 服务端 TLS 接受器：SNI 到来时按主机切换到缓存的上下文；无 SNI/非受管域 → fatal alert。
 pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
     let authority = a.clone();
-    let mut base = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
-        .expect("TLS 基座初始化不会失败");
+    let mut base =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("TLS 基座初始化不会失败");
     base.set_servername_callback(move |ssl, _alert| {
         let Some(host) = ssl.servername(NameType::HOST_NAME) else {
             return Err(SniError::ALERT_FATAL); // 无 SNI：没有可出的证书
@@ -145,7 +147,9 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| format!("ca.key 解析失败: {e}"))?;
     let ca_x509 = X509::from_pem(cert_pem.as_bytes())
         .map_err(|_| "ca.crt 不是可解析的 PEM 证书".to_string())?;
-    let cert_der = ca_x509.to_der().map_err(|e| format!("ca.crt DER 转换失败: {e}"))?;
+    let cert_der = ca_x509
+        .to_der()
+        .map_err(|e| format!("ca.crt DER 转换失败: {e}"))?;
     let _ = issuer_of(&cert_der, &ca_key).map_err(|e| e.to_string())?;
     Ok(Arc::new(Authority {
         cert_pem,
@@ -199,10 +203,9 @@ impl Authority {
 /// 把根证书装入当前用户受信任根存储（免管理员，重启后浏览器/schannel 即信任）；直接走证书存储 API 不起外部进程，失败能拿到错误码。
 pub fn install_ca(dir: &str) -> Result<(), String> {
     use windows::Win32::Security::Cryptography::{
-        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore,
-        CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE, CERT_STORE_ADD_REPLACE_EXISTING,
-        CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING,
-        X509_ASN_ENCODING,
+        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, CERT_OPEN_STORE_FLAGS,
+        CERT_QUERY_ENCODING_TYPE, CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W,
+        CERT_SYSTEM_STORE_CURRENT_USER, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
 
     let cert_path = std::path::Path::new(dir).join("ca.crt");

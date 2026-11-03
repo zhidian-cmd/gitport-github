@@ -11,7 +11,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-
 pub type BoringTls = tokio_boring::SslStream<TcpStream>;
 /// 白名单腿：底层 TCP 套了分片器，ClientHello 分三段发出。
 pub type BoringTlsSplit = tokio_boring::SslStream<SplitHello>;
@@ -92,7 +91,8 @@ impl AsyncWrite for SplitHello {
         } else {
             (buf.len() / segs).max(1).min(buf.len())
         };
-        let written = futures_util::ready!(std::pin::Pin::new(&mut me.inner).poll_write(cx, &buf[..n]))?;
+        let written =
+            futures_util::ready!(std::pin::Pin::new(&mut me.inner).poll_write(cx, &buf[..n]))?;
         if written == 0 {
             return std::task::Poll::Ready(Ok(0));
         }
@@ -224,17 +224,18 @@ fn apply_cached_session(ssl: &mut Ssl, mode: &str) {
 
 fn system_root_certs() -> Option<&'static [X509]> {
     static CERTS: std::sync::OnceLock<Option<Vec<X509>>> = std::sync::OnceLock::new();
-    CERTS.get_or_init(|| {
-        let mut out = Vec::new();
-        let CertificateResult { certs, .. } = rustls_native_certs::load_native_certs();
-        for c in certs {
-            if let Ok(x) = X509::from_der(c.as_ref()) {
-                out.push(x);
+    CERTS
+        .get_or_init(|| {
+            let mut out = Vec::new();
+            let CertificateResult { certs, .. } = rustls_native_certs::load_native_certs();
+            for c in certs {
+                if let Ok(x) = X509::from_der(c.as_ref()) {
+                    out.push(x);
+                }
             }
-        }
-        (!out.is_empty()).then_some(out)
-    })
-    .as_deref()
+            (!out.is_empty()).then_some(out)
+        })
+        .as_deref()
 }
 
 fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::SslContext> {
@@ -290,8 +291,9 @@ fn default_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
 /// 构建三形态 BoringSSL 客户端连接；ca_pem 为测试用内存信任锚。
 fn client_ssl(host: &str, mode: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
     let mut ssl = match ca_pem {
-        None => Ssl::new(default_ssl_context()?)
-            .map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?,
+        None => {
+            Ssl::new(default_ssl_context()?).map_err(|e| io_err(format!("Ssl 初始化失败: {e}")))?
+        }
         Some(pem) => {
             let certs = X509::stack_from_pem(pem.as_bytes())
                 .map_err(|e| io_err(format!("CA PEM 解析失败: {e}")))?;
@@ -326,12 +328,7 @@ async fn tls_handshake(ssl: Ssl, tcp: TcpStream, label: &str) -> std::io::Result
         tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
     )
     .await
-    .map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("{label}TLS 握手超时"),
-        )
-    })?
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label}TLS 握手超时")))?
     .map_err(|e| io_err(format!("{label}TLS 握手失败: {e}")))
 }
 
@@ -457,16 +454,6 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "镜像拨号超时"))??;
     let _ = tcp.set_nodelay(true);
     tls_handshake(ssl, tcp, "镜像 ").await
-}
-
-#[cfg(test)]
-pub fn system_roots() -> Arc<rustls::RootCertStore> {
-    let mut roots = rustls::RootCertStore::empty();
-    let CertificateResult { certs, .. } = rustls_native_certs::load_native_certs();
-    for c in certs {
-        let _ = roots.add(c);
-    }
-    Arc::new(roots)
 }
 
 /// 分片器单测：分片默认关掉线上验证就只剩"看日志猜"，这里直接量时间差。

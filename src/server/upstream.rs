@@ -151,7 +151,11 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     }
     let mut idx = h.next % n;
     h.next = idx + 1;
-    if n > 1 && !EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
+    if n > 1
+        && !EXPLORE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(8)
+    {
         if let Some((i, _)) = h
             .conns
             .iter()
@@ -199,11 +203,7 @@ pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
         }
     }
     let (host, id, _) = pick?;
-    let c = g
-        .get_mut(&host)?
-        .conns
-        .iter_mut()
-        .find(|c| c.up.id == id)?;
+    let c = g.get_mut(&host)?.conns.iter_mut().find(|c| c.up.id == id)?;
     c.borrow_cool = None; // 冷却到期：这次选中即复位
     c.borrowed = c.borrowed.saturating_add(1);
     Some((host, c.up.clone()))
@@ -332,13 +332,18 @@ pub async fn h2_from_dialed(
     let mut cb = h2::client::Builder::new();
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
-    // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
+                                                          // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
     let (send, mut conn) = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
         cb.handshake(conn_io),
     )
     .await
-    .map_err(|_| format!("h2 握手超时({}s): {host}", crate::config::H2_HANDSHAKE_TIMEOUT_SECS))?
+    .map_err(|_| {
+        format!(
+            "h2 握手超时({}s): {host}",
+            crate::config::H2_HANDSHAKE_TIMEOUT_SECS
+        )
+    })?
     .map_err(|e| format!("h2 握手失败: {e}"))?;
     let ping = conn
         .ping_pong()
@@ -347,7 +352,11 @@ pub async fn h2_from_dialed(
         let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
     });
     // 第二通道在行尾标出;主通道与单发保持原样,免日志噪音。
-    let chan = if slot > 1 { format!(", 通道{slot}") } else { String::new() };
+    let chan = if slot > 1 {
+        format!(", 通道{slot}")
+    } else {
+        String::new()
+    };
     (log)(&format!(
         "[上游] {host} <- {ip} (boring {form} SNI, h2 握手{chan})"
     ));

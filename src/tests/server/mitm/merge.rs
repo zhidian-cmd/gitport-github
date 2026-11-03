@@ -86,7 +86,10 @@ fn split_keep_is_rate_proportional() {
     let even = split_keep(8 * MB, 2e6, 2e6, SPLIT_SETUP_SECS);
     assert!(even > 4 * MB && even < 5 * MB, "实际 {even}");
     // 永远不能把一段切没
-    assert_eq!(split_keep(MIN_PIECE, 1e6, 9e6, SPLIT_SETUP_SECS), MIN_PIECE / 2);
+    assert_eq!(
+        split_keep(MIN_PIECE, 1e6, 9e6, SPLIT_SETUP_SECS),
+        MIN_PIECE / 2
+    );
     assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0, SPLIT_SETUP_SECS) <= 3 * MIN_PIECE);
 }
 
@@ -422,7 +425,8 @@ fn recent_rate_prefers_sliding_window() {
         s.recent_rate(now)
     );
     // 滑窗内 1.2s 收 1200B → 1000B/s；全片均速的历史包袱不进判据。
-    s.recent.push_back((now - Duration::from_millis(1200), 1000));
+    s.recent
+        .push_back((now - Duration::from_millis(1200), 1000));
     s.got = 2200; // 生产里 recent 样本就是 (时刻, got) 快照，末样本恒等于 got
     s.recent.push_back((now, s.got));
     let r = s.recent_rate(now);

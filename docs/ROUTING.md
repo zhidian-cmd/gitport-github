@@ -52,7 +52,7 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 
 **主路由白名单（2026-10-27 新增）**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy` 这 10 个域名**不再返回 DIRECT**，而是走通配进代理。原因：它们托管在 Fastly `185.199.10x` / Azure，伪装 SNI 对这批无效（docs 走 core 池 90ms 回 400 Whoa），裸直连又没有分片掩体。进代理后用真名 + 首包分片，族路由见第 3 节 `wl*` 四族。
 
-**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `*.github.com` 通配吞进 core 池，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
+**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `github.com` 那条（含所有子域）吞进 core 池，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
 
 ---
 
@@ -102,7 +102,7 @@ core/api 各一个通配族；edge 八族（四个原有 + 四个白名单）。
 | edge | **io** | `*.github.io` | Fastly `.153` + 伪装 SNI | Dns | ✅ octocat.github.io → 185.199.**108.153**，200 |
 | edge | **auth** | `githubapp.com` 系；兼未列族 host 的兜底族 | 非 Fastly 段 + 伪装 SNI（**排除 4.249.x**，那是 Azure 白名单专段） | Dns | ✅ githubapp.com → **140.82.112.29**（非 Fastly），200 |
 
-**实表快照**（当日 `/api/pools`，plans.json 演化值）：
+**实表快照**（当日 `/api/pools`，routes.json 演化值）：
 
 | 池 | 条目数 | 构成 |
 |---|---|---|
@@ -189,9 +189,9 @@ core/api 各一个通配族；edge 八族（四个原有 + 四个白名单）。
 ## 8. 复查发现的已知边界（非路由错误，登记在案）
 
 1. **交付计数体（2026-10-21 整体删除）**：曾用 `CountingBody` 包镜像大响应，产 `[交付] 推完 / 推了 N/M 后连接终止` 两行日志。为一行诊断在每块数据上过手，且 HEAD 有大文件假阳性（324faa6 补过）。现按审计删除：大文件推流看 `content-length` 与 `[镜像]` 链位/耗时即可。
-2. **裸域 PAC/路由不一致（无实际影响，不动）**：`githubassets.com` 与 `githubusercontent.com` 两个**裸域**（无子域）在 PAC 的 `fpMatch` 里 `h === d` 精确命中 → 送进代理；但代理内 `pool_for` 的通配符卡点号边界不认裸域 → 判 Tunnel（纯隧道直通）。这两个裸域没有业务、浏览器永远不会请求它们；即使被强制请求，纯隧道也能通，只是不走池/MITM。真实业务域的裸域（github.com / api.github.com / githubapp.com / github.io）两边判定一致。
+2. **裸域 PAC/路由不一致（无实际影响，不动）**：`githubassets.com` 与 `githubusercontent.com` 两个**裸域**（无子域）在 PAC 的 `fpMatch` 里 `h === d` 精确命中 → 送进代理；但代理内 `*.` 键的边界判断不认裸域 → 判 Tunnel（纯隧道直通）。这两个裸域没有业务、浏览器永远不会请求它们；即使被强制请求，纯隧道也能通，只是不走池/MITM。真实业务域的裸域（github.com / api.github.com / githubapp.com / github.io）两边判定一致。
 3. **退役 IP 日内波动（2026-10-19 晚）**：185.199.108/109/111.133 当日午后两测 TCP 死、晚测复活且 raw 出 200——属封锁窗口假死而非真死。RETIRED_IPS 退役名单机制已据此整体删除（名单会覆盖文件数据，与数据驱动相悖）：IP 死活全凭串发实测动态裁决，死时自动垫底、活时自动置顶。140.82.115-120 段当日三测仍 TCP 死，不建议手写入表。另：web 族对其余 vhost 一律 301 重定向（接得住不交付），唯一全服务 IP 为 140.82.113.22；`.9` 段 codeload 专用边缘族为本次测绘新发现，详见 CONFIG.md 认 IP 速查。
 
 ---
 
-*实测时间：2026-10-19 10:33-10:41（UTC+8）。代理：dist 新二进制（6151063），plans.json core 25 / api 6 / edge 19，镜像链 9 host × 11 家。*
+*实测时间：2026-10-19 10:33-10:41（UTC+8）。代理：dist 新二进制（6151063），routes.json core 25 / api 6 / edge 19，镜像链 9 host × 11 家。*

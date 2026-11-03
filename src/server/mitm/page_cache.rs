@@ -1,8 +1,8 @@
 //! 列表页缓存：只缓存 github.com 列表页与跟班 XHR，按会话存活；存 pages/<hash>，不做后台 SWR，闸门页/未登录页/跨账号不缓存。
 use super::BoxBody;
-use crate::util::{now_ms, LogFn};
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
+use crate::util::{now_ms, LogFn};
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,9 +19,21 @@ const CACHE_HOST: &str = "github.com";
 
 /// 列表页路径段：末段命中，或后跟一个非数字段；数字结尾当详情页。
 const LIST_SEGMENTS: &[&str] = &[
-    "search", "issues", "pulls", "commits", "releases", "discussions",
-    "notifications", "feed", "trending", "explore", "topics",
-    "stargazers", "watchers", "forks", "activity",
+    "search",
+    "issues",
+    "pulls",
+    "commits",
+    "releases",
+    "discussions",
+    "notifications",
+    "feed",
+    "trending",
+    "explore",
+    "topics",
+    "stargazers",
+    "watchers",
+    "forks",
+    "activity",
 ];
 
 fn is_list_path(path: &str) -> bool {
@@ -134,10 +146,7 @@ enum CacheMsg {
         hdrs: Vec<Vec<String>>,
     },
     /// 写操作成功后的缓存失效（异步，POST 响应路径不等它）。
-    Invalidate {
-        host: String,
-        path: String,
-    },
+    Invalidate { host: String, path: String },
     /// 空闲后重新开始浏览：整盘清空，本次会话从空白积累。
     Purge,
 }
@@ -147,7 +156,11 @@ enum CacheMsg {
 /// 文档导航：不论值不值得缓存，都算"还在浏览"（决定会话是否延续）。
 fn is_doc_nav(req: &hyper::Request<Incoming>) -> bool {
     req.method() == Method::GET
-        && match req.headers().get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        && match req
+            .headers()
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+        {
             Some(d) => d == "document",
             None => true, // curl/git 等本机工具无该头：同一用户，命中无妨
         }
@@ -219,7 +232,13 @@ pub(super) fn cache_take(
     } else {
         ""
     };
-    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req), variant);
+    let key = live_cache_key(
+        req.uri(),
+        host,
+        cookies,
+        upstream::accepts_gzip(req),
+        variant,
+    );
     let (status, hdrs, body) = match load_disk_entry_reason(&key, session_value(cookies).is_some())
     {
         Ok(v) => v,
@@ -285,7 +304,11 @@ pub(super) async fn cache_put(
         return resp;
     }
     // Content-Length 粗筛（压缩后大小）；chunked 无该头靠 collect 后的 2MB 上限兜底。
-    if let Some(cl) = resp.headers().get("content-length").and_then(|v| v.to_str().ok()) {
+    if let Some(cl) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(n) = cl.parse::<u64>() {
             if n > PAGE_CACHE_MAX_BODY_BYTES as u64 {
                 if search_dbg {
@@ -314,7 +337,13 @@ pub(super) async fn cache_put(
     } else {
         ""
     };
-    let key = live_cache_key(req.uri(), host, cookies, upstream::accepts_gzip(req), variant);
+    let key = live_cache_key(
+        req.uri(),
+        host,
+        cookies,
+        upstream::accepts_gzip(req),
+        variant,
+    );
     let has_session = session_value(cookies).is_some();
     collect_and_submit(log, &key, xhr, search_page, has_session, resp).await
 }
@@ -629,10 +658,7 @@ fn load_disk_entry(
 }
 
 /// 带拒绝原因的读取，供命中侧按需落日志。
-fn load_disk_entry_reason(
-    key: &str,
-    logged_in: bool,
-) -> Result<DiskEntry, &'static str> {
+fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'static str> {
     let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
     if key.ends_with("-k") {
@@ -652,8 +678,8 @@ fn load_disk_entry_reason(
     let Some(hlen_bytes) = raw.get(0..4) else {
         return Err("文件过短");
     };
-    let hlen = u32::from_be_bytes([hlen_bytes[0], hlen_bytes[1], hlen_bytes[2], hlen_bytes[3]])
-        as usize;
+    let hlen =
+        u32::from_be_bytes([hlen_bytes[0], hlen_bytes[1], hlen_bytes[2], hlen_bytes[3]]) as usize;
     let end = 4usize.checked_add(hlen).ok_or("头部长度溢出")?;
     if raw.len() < end {
         return Err("条目截断"); // miss 自愈
@@ -712,10 +738,7 @@ fn page_cache_get_logged_in(key: &str) -> Option<axum::response::Response<BoxBod
 }
 
 #[cfg(test)]
-fn read_cached(
-    key: &str,
-    logged_in: bool,
-) -> Option<axum::response::Response<BoxBody>> {
+fn read_cached(key: &str, logged_in: bool) -> Option<axum::response::Response<BoxBody>> {
     let (status, hdrs, body) = load_disk_entry(key, logged_in)?;
     Some(rebuild_cached_response(status, &hdrs, body))
 }
@@ -807,7 +830,8 @@ async fn collect_and_submit(
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut allowed = body_type_allowed(Some(&ct), xhr);
-    if !allowed && search_page
+    if !allowed
+        && search_page
         && (ct.starts_with("text/html") || ct.starts_with("application/json"))
     {
         // 搜索页软导航按 Accept 协商出 JSON 或 HTML，分钥匙后照存。
@@ -842,9 +866,7 @@ async fn collect_and_submit(
         .headers
         .iter()
         .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
-        .map(|(k, v)| {
-            vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()]
-        })
+        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
         .collect();
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
@@ -904,7 +926,9 @@ async fn collect_and_submit(
             // 收集失败：无内容可交付，回 502
             hyper::Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(protocol::full_body(Bytes::from_static(b"page collect failed")))
+                .body(protocol::full_body(Bytes::from_static(
+                    b"page collect failed",
+                )))
                 .unwrap()
         }
     }

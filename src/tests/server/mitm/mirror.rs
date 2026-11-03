@@ -287,7 +287,11 @@ fn ect_window_slots_snapshot_stall_and_idle() {
 
     // 下一窗有债零收：卡死 → prev 清零，派发立即避开。
     ect_sweep();
-    assert_eq!(ld.window_prev.load(Ordering::Relaxed), 0, "有债零收 = 卡死清零");
+    assert_eq!(
+        ld.window_prev.load(Ordering::Relaxed),
+        0,
+        "有债零收 = 卡死清零"
+    );
 
     // 恢复出货：prev 换新值。
     g.on_frame(4 * 1024 * 1024);

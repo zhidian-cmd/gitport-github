@@ -1,15 +1,21 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 真网端到端（默认不跑，要连 GitHub：`cargo test -- --ignored whitelist_e2e`）：白名单域必须走 TlsSplit（真名 + 分片）且分片计数真的涨了；IP 取 docs 实测的 Fastly .154，失效则换 plans.json 里任一 185.199.x.154。
+/// 真网端到端（默认不跑，要连 GitHub：`cargo test -- --ignored whitelist_e2e`）：白名单域必须走 TlsSplit（真名 + 分片）且分片计数真的涨了；IP 取 docs 实测的 Fastly .154，失效则换 routes.json 里任一 185.199.x.154。
 #[tokio::test]
 #[ignore]
 async fn whitelist_e2e_through_pool() {
     use std::sync::atomic::Ordering;
     let before = SPLIT_DONE.load(Ordering::Relaxed);
-    let d = dial_one("docs.github.com", "185.199.108.154", "docs.github.com", true, true)
-        .await
-        .expect("白名单拨号应成功");
+    let d = dial_one(
+        "docs.github.com",
+        "185.199.108.154",
+        "docs.github.com",
+        true,
+        true,
+    )
+    .await
+    .expect("白名单拨号应成功");
     assert!(
         matches!(d, Dialed::TlsSplit(_)),
         "白名单域名应走分片腿，实际不是 TlsSplit"

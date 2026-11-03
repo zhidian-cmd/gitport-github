@@ -75,7 +75,7 @@ flowchart TB
         R2["响应注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
         CA["本地 CA（certgen）→ Windows 证书库"]
         WUI["WebUI 7811<br/>状态 · 日志 · 池序 · 镜像校准 · 开关"]
-        PLAN["plans.json（池序 + 镜像链）<br/>2s 去抖落盘，可手改"]
+        ROUTES["routes.json（路由表 + 镜像链）<br/>2s 去抖落盘，可手改"]
         TRAY["托盘 + WebView2 桌面壳（-tray / -headless）"]
         LOG["日志环形 2000 条 + 崩溃捕获"]
     end
@@ -83,10 +83,10 @@ flowchart TB
     R1 --> R2
     R2 --> B
     MITM -.->|"按需现签叶子证书"| CA
-    WUI --> PLAN
+    WUI --> ROUTES
     WUI --> LOG
     TRAY --> WUI
-    WUI -.->|"校准重排镜像链"| PLAN
+    WUI -.->|"校准重排镜像链"| ROUTES
 ```
 
 ## 两层白名单
@@ -105,7 +105,7 @@ flowchart TB
 `docs` / `support` / `resources` / `desktop` / `pages` / `skills` /
 `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy`。
 
-这批托管在 Fastly `185.199.10x` 或 Azure `4.249.x`，被 `*.github.com` 通配送进 core 池后拿主站 IP + 伪装 SNI，上游直接判非法——docs 实测 90ms 回 400 Whoa。
+这批托管在 Fastly `185.199.10x` 或 Azure `4.249.x`，被 `github.com` 那条（含所有子域）送进 core 池后拿主站 IP + 伪装 SNI，上游直接判非法——docs 实测 90ms 回 400 Whoa。
 
 它们进 **edge 池**，由四个族按段选 IP（`.154` / `.153` / `.133` / Azure），握手用真名、ClientHello 拆 3 段、段间隔 100ms。进池的额外好处是一个 IP 连不上会自动换下一个候选，全灭才退回系统 DNS。
 
@@ -212,7 +212,7 @@ GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能�
 - **codeload 源码包单流**：该域不支持 Range 无法分段——直连优先，失败按校准链序逐家；客户端带 Range 也按 200 整包回（HTTP 允许上游无视 Range）
 - **小文件域单请求单镜像**：avatars / raw / gist / media 串行逐家，单请求限前 5 家
 - **ECT 时间槽派发**：选家 = (在途字节 + 新请求) ÷ 上一窗(500ms)实收，即「还需几个槽跑完」，最小者胜、无容差；并列看在途流数、再并列轮转。零历史按 +∞ 垫底（档内闲者先试）；有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——三个 AtomicU64 + 一次除法，无 EWMA、无时间戳
-- **链序**：种子快照序（随表演化，代码零内置）→ 图片链/codeload 链 UI「校准」重排（TTFB）→ 手改 plans.json（`mirrors_big` / `mirrors_small` 两字典，codeload 已归 small）；大文件域链序只作失败顺延次序，选家由 ECT 动态调度；codeload 直连优先
+- **链序**：种子快照序（随表演化，代码零内置）→ 图片链/codeload 链 UI「校准」重排（TTFB）→ 手改 routes.json（`mirrors_big` / `mirrors_small` 两字典，codeload 已归 small）；大文件域链序只作失败顺延次序，选家由 ECT 动态调度；codeload 直连优先
 - 校准覆盖图片链与 codeload 链：逐镜像响应头测速（TTFB），host 间严格串行防测量污染；后台任务，关窗进托盘继续跑完。objects / release-assets 不校准——吞吐由真实下载流量按时间槽持续学习，比合成测速更真且零额外流量
 - 镜像请求走共享连接池（每镜像 4 条空闲、60s 回收），批量加载/Range 续传不再逐次握手
 - 整链全灭熔断 60s，窗口内同域毫秒级快速失败

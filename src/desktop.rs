@@ -1,9 +1,9 @@
 //! 桌面框架：tao 窗口 + wry(WebView2) + 托盘；✕ 收托盘即释放 WebView2，单实例 mutex。
 
-use crate::util::LogFn;
 use crate::settings;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::util::LogFn;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
@@ -13,9 +13,7 @@ use tao::window::{Window, WindowBuilder};
 #[cfg(target_os = "windows")]
 fn write_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, OpenClipboard, SetClipboardData,
-    };
+    use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard, SetClipboardData};
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
     unsafe {
@@ -75,13 +73,12 @@ fn tray_send(ev: AppEvent) {
     }
 }
 
-
 /// 当前进程完整性级别（4096=Low 8192=Medium 12288=High）；低于 shell 时 Shell_NotifyIcon 会被 UIPI 拒（err=5），必须记。
 unsafe fn current_il() -> u32 {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
-        GetSidSubAuthority, GetTokenInformation, SID_AND_ATTRIBUTES, TOKEN_QUERY,
-        TokenIntegrityLevel,
+        GetSidSubAuthority, GetTokenInformation, TokenIntegrityLevel, SID_AND_ATTRIBUTES,
+        TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
@@ -117,7 +114,7 @@ unsafe fn tray_add(
     hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
 ) -> (bool, u32) {
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW, Shell_NotifyIconW,
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW,
     };
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -138,7 +135,7 @@ unsafe fn tray_add(
 
 /// 问系统要图标矩形：拿到才算真进了通知区。
 fn tray_rect(hwnd: windows::Win32::Foundation::HWND) -> String {
-    use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
+    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
     let id = NOTIFYICONIDENTIFIER {
         cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
         hWnd: hwnd,
@@ -155,8 +152,8 @@ fn tray_rect(hwnd: windows::Win32::Foundation::HWND) -> String {
 unsafe fn tray_popup(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, GetCursorPos, HMENU, MF_STRING, PostMessageW,
-        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+        AppendMenuW, CreatePopupMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
+        TrackPopupMenu, HMENU, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
     };
     unsafe {
         let mut menu = HMENU(TRAY_MENU.load(Ordering::Relaxed) as *mut _);
@@ -208,9 +205,12 @@ unsafe extern "system" fn tray_proc(
         let restart = TASKBAR_CREATED.load(Ordering::Relaxed);
         if restart != 0 && msg == restart {
             // 资源管理器重启：旧图标已被清空，重新挂一次。
-            let (ok, err) = tray_add(hwnd, windows::Win32::UI::WindowsAndMessaging::HICON(
-                TRAY_ICON.load(Ordering::Relaxed) as *mut _,
-            ));
+            let (ok, err) = tray_add(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HICON(
+                    TRAY_ICON.load(Ordering::Relaxed) as *mut _
+                ),
+            );
             tray_log(&format!("[托盘] explorer 重启后重挂: {ok} err={err}"));
         }
         DefWindowProcW(hwnd, msg, wp, lp)
@@ -230,9 +230,9 @@ fn spawn_tray(
             use windows::Win32::Foundation::{HINSTANCE, HWND};
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DispatchMessageW, GetMessageW, HICON, IDI_APPLICATION, IMAGE_ICON,
-                LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MSG, RegisterClassW,
-                RegisterWindowMessageW, TranslateMessage, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+                CreateWindowExW, DispatchMessageW, GetMessageW, LoadImageW, RegisterClassW,
+                RegisterWindowMessageW, TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON,
+                LR_DEFAULTCOLOR, LR_SHARED, MSG, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
             };
             let note = |s: String| {
                 thread_log(&s);
@@ -288,18 +288,19 @@ fn spawn_tray(
                     LR_DEFAULTCOLOR,
                 ) {
                     Ok(h) => HICON(h.0),
-                    Err(_) => LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)
-                        .map(|h| HICON(h.0))
-                        .unwrap_or_default(),
+                    Err(_) => {
+                        LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)
+                            .map(|h| HICON(h.0))
+                            .unwrap_or_default()
+                    }
                 };
                 TRAY_ICON.store(hicon.0 as isize, Ordering::Relaxed);
                 let (mut ok, mut err) = tray_add(hwnd, hicon);
                 if !ok {
                     // 图标句柄有问题时换系统默认图标再试：能分开"图标坏"和"进程被拒"。
-                    let sys_icon =
-                        LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_SHARED)
-                            .map(|h| HICON(h.0))
-                            .unwrap_or_default();
+                    let sys_icon = LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, 32, 32, LR_SHARED)
+                        .map(|h| HICON(h.0))
+                        .unwrap_or_default();
                     let (ok2, err2) = tray_add(hwnd, sys_icon);
                     if ok2 {
                         TRAY_ICON.store(sys_icon.0 as isize, Ordering::Relaxed);
@@ -414,10 +415,11 @@ pub fn signal_show(port: u16) -> bool {
         Ok(a) => a,
         Err(_) => return false,
     };
-    let mut s = match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1200)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let mut s =
+        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(1200)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
     let req = "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1\r\nX-GitPort-Request: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
     if s.write_all(req.as_bytes()).is_err() {
@@ -462,11 +464,7 @@ fn create_window(
         (x, y, WIN_W as i32, WIN_H as i32)
     };
     let (l, t, w, h) = match settings::window_rect() {
-        Some((l, t, w, h))
-            if l < sw && t < sh && l + w > 0 && t + h > 0 =>
-        {
-            (l, t, w, h)
-        }
+        Some((l, t, w, h)) if l < sw && t < sh && l + w > 0 && t + h > 0 => (l, t, w, h),
         _ => default_rect(),
     };
     if settings::window_rect() != Some((l, t, w, h)) {
@@ -493,7 +491,9 @@ fn create_window(
                 ));
             }
         })
-        .with_url(url).build(&window) {
+        .with_url(url)
+        .build(&window)
+    {
         Ok(wv) => {
             g.win = Some(window);
             g.wv = Some(wv);
@@ -616,7 +616,10 @@ pub fn run(args: DesktopArgs) -> ! {
     // 托盘先挂、拿到回执再往下走：WebView2 起来后 Shell_NotifyIcon 会被系统拒（err=5），必须先托盘后窗口且等它真的注册上。
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
     // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。
-    if tray_rx.recv_timeout(std::time::Duration::from_secs(3)).is_err() {
+    if tray_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .is_err()
+    {
         (log)("[启动] 托盘: 回执超时");
     }
     event_loop.run(move |event, elwt, control_flow| {

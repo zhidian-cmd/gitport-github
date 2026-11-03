@@ -434,11 +434,14 @@ impl MergeBody {
             }
         }
         let (start, pos, remaining, _) = victim?;
-        let holder = self.segs.get(&start).map_or(best_rate, |s| s.recent_rate(now));
+        let holder = self
+            .segs
+            .get(&start)
+            .map_or(best_rate, |s| s.recent_rate(now));
         // 切口按两家的速度比例分，让两边差不多同时跑完；刀口上限按帮手实测速率折算——
         // 接手的家是 ECT 挑的没错，可它的"快"是上一轮实测、新流起步速度是 0，刀口越大下一轮越易再被判慢、再切一刀，来回抖。
-        let keep =
-            split_keep(remaining, holder, best_rate, setup).max(remaining.saturating_sub(handoff_cap(best_rate)));
+        let keep = split_keep(remaining, holder, best_rate, setup)
+            .max(remaining.saturating_sub(handoff_cap(best_rate)));
         let out = self.cut(start, pos + keep, now);
         if out.is_some() {
             self.last_cut_any = Some(now);

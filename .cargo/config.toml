@@ -1,0 +1,17 @@
+# Windows-only 项目的构建约定：把 BoringSSL 的两处 MSVC 坑一次固化，免去每次手动 export。
+
+[env]
+# 1) VS 生成器的 nasm.targets 在 MSBuild 18 上会报
+#    "XamlTaskFactory ... 客户端没有所需的特权"，BoringSSL 编译中断。
+#    Ninja 直接调 nasm，不经过 MSBuild。
+#    前提：ninja.exe 与 nasm.exe 在 PATH 中（VS BuildTools 自带，通常在
+#    ...\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja 与 ...\nasm\nasm-<ver>）。
+CMAKE_GENERATOR = "Ninja"
+
+# 2) boring-sys 按 OPT_LEVEL/DEBUG 推 CMAKE_BUILD_TYPE。dev 默认 Debug → /MDd，
+#    而 Rust 固定 /MD，链接报 LNK2019 __imp__CrtDbgReport。
+#    只把 boring-sys 抬到 opt-level=1、关调试信息，让 CMake 走 Release CRT；
+#    主 crate 与其他依赖的 dev 调试信息不受影响。
+[profile.dev.package.boring-sys]
+opt-level = 1
+debug = 0
