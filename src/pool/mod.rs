@@ -761,8 +761,12 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     *lock(&SERIAL) = Some(tab);
-    sync_custom_mirrors(&[]); // 自定义镜像注册表对齐：启用中的自建节点确保在链中（幂等）
-    write_routes_file(&path, &mirror_chains_snapshot());
+    // 注册表对齐只动内存：启动不写盘（routes.json 是手改入口，写盘只发生在运行时改链）。
+    sync_custom_mirrors(&[], false);
+    // 只有文件不存在（全新安装）才生成一次；之后的启动一律不重写，手改原样生效。
+    if raw.is_none() {
+        write_routes_file(&path, &mirror_chains_snapshot());
+    }
 }
 
 /// IpSpec → 运行时节点：末段范围展开 + 边界校验。
@@ -1144,7 +1148,8 @@ fn builtin_mirror_urls() -> std::collections::HashSet<String> {
 }
 
 /// 按注册表对齐全部镜像链（幂等）；开关只管大文件链，小文件链全量保留、仅摘已删除地址。
-pub fn sync_custom_mirrors(removed: &[String]) {
+/// persist=false：只对齐内存，不落盘（启动路径用，避免把手改的 routes.json 规范化重写）。
+pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     let registry = crate::settings::worker_mirrors();
     let enabled: Vec<String> = registry
         .iter()
@@ -1172,7 +1177,7 @@ pub fn sync_custom_mirrors(removed: &[String]) {
     let changed = align_custom_mirrors(&mut tab.mirrors, &enabled, &disabled, &all, removed);
     // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
     drop(g);
-    if changed {
+    if changed && persist {
         write_routes_file(&routes_path(), &mirror_chains_snapshot());
     }
 }

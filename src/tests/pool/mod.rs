@@ -15,7 +15,7 @@ fn tmpdir() -> PathBuf {
 /// 生产路径：settings 只存注册表，存完由调用方用 removed 触发链对齐。
 fn apply_worker_mirrors(list: Vec<crate::settings::WorkerMirror>) -> Result<(), String> {
     let (_, removed) = crate::settings::set_worker_mirrors(list)?;
-    sync_custom_mirrors(&removed);
+    sync_custom_mirrors(&removed, true);
     Ok(())
 }
 
@@ -272,14 +272,12 @@ fn legacy_pools_migrate_to_route_rows() {
         "githubapp 行: {app:?}"
     );
 
+    // 启动只读不写：旧格式文件原样留在盘上，迁移只发生在运行时表里。
     let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
-    let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     assert!(
-        back.get("hosts").is_some() && back.get("ips").is_some(),
-        "应写回二部图: {b}"
+        b.contains("\"core\"") && !b.contains("\"hosts\""),
+        "手改表不应被启动重写: {b}"
     );
-    assert!(back.get("core").is_none() && back.get("edge").is_none());
-    assert!(!b.contains("成功次数") && !b.contains("分数"));
 }
 
 #[test]
@@ -310,10 +308,11 @@ fn seed_topup_appends_missing_and_keeps_order() {
         seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
         "补缺应打一行日志"
     );
+    // 补缺只进内存：手改文件保持原样，启动不做任何规范化重写。
     let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     assert!(
-        b.contains("185.199.108-111.133"),
-        "补缺应落盘(段展开写法): {b}"
+        !b.contains("185.199.108-111.133"),
+        "启动不应改写手改表: {b}"
     );
 }
 
@@ -517,7 +516,7 @@ fn toggle_gates_big_file_chains_only() {
         },
     ]);
     serial_load(&dir, Vec::new(), None);
-    sync_custom_mirrors(&[]);
+    sync_custom_mirrors(&[], true);
     let big = mirror_chain("objects.githubusercontent.com");
     assert!(
         big.contains(&"https://on.example".to_string()),
@@ -662,17 +661,27 @@ fn mirror_chain_load_and_topup() {
         ],
         "media 无自带链, 应被注册表对齐填成启用镜像全量: {media:?}"
     );
+    // 启动不写盘：手改文件原样保留（未知 host 只在运行时表里被丢）。
     let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
-    assert!(!b.contains("not-a-content.host"), "未知 host 应丢弃: {b}");
     assert!(
-        b.contains("\"mirrors_small\""),
-        "镜像链应落盘(raw 为小文件域): {b}"
+        b.contains("not-a-content.host"),
+        "启动不应改写手改表: {b}"
     );
     let mut new_chain = raw_chain.clone();
     new_chain.reverse();
     assert!(
         set_mirror_chain("raw.githubusercontent.com", &new_chain, "测试"),
         "新链应写入"
+    );
+    // 运行时改链才落盘：此刻文件被规范化，未知 host 丢弃、镜像链入库。
+    let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
+    assert!(
+        !b.contains("not-a-content.host"),
+        "改链落盘后未知 host 应丢弃: {b}"
+    );
+    assert!(
+        b.contains("\"mirrors_small\""),
+        "镜像链应落盘(raw 为小文件域): {b}"
     );
     assert!(
         !set_mirror_chain("raw.githubusercontent.com", &new_chain, "测试"),

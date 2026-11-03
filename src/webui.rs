@@ -356,7 +356,7 @@ async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> 
     match settings::set_worker_mirrors(body.mirrors) {
         Ok((_, removed)) => {
             // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
-            pool::sync_custom_mirrors(&removed);
+            pool::sync_custom_mirrors(&removed, true);
             write_json(
                 &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
             )
