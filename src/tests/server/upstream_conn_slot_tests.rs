@@ -285,3 +285,193 @@ async fn probe_content_edges() {
         }
     }
 }
+
+/// 一次性探针（手动跑，走真网络）：为 4 个无边域名实测候选 IP 与证书锚点。
+/// 用法：cargo test probe_new_hosts -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn probe_new_hosts() {
+    use crate::pool::dial::dial_one;
+    use crate::server::protocol::empty_body;
+    use crate::server::upstream::{h2_from_dialed, h2_send};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let hosts = [
+        "api.mcp.github.com",
+        "githubapp.com",
+        "objects-origin.githubusercontent.com",
+        "viewscreen.githubusercontent.com",
+    ];
+    let ips = [
+        "140.82.112.21",
+        "140.82.112.22",
+        "140.82.113.21",
+        "140.82.113.22",
+        "140.82.114.21",
+        "140.82.114.22",
+        "140.82.112.29",
+        "140.82.112.30",
+        "140.82.113.29",
+        "140.82.113.30",
+        "140.82.114.29",
+        "140.82.114.30",
+    ];
+    let log: crate::util::LogFn = Arc::new(|_: &str| {});
+    for host in hosts {
+        // 证书锚点：先按域名本身，其次回落到基础域（GitHub 证书常见多 SAN）。
+        let anchors: Vec<&str> = match host {
+            "api.mcp.github.com" => vec![host, "github.com"],
+            "githubapp.com" => vec!["githubapp.com"],
+            _ => vec![host, "githubusercontent.com"],
+        };
+        for ip in ips {
+            let mut chosen: Option<(String, crate::pool::dial::Dialed)> = None;
+            let mut last_err = String::new();
+            for anchor in &anchors {
+                match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    dial_one(ip, "baidu.com", anchor, true),
+                )
+                .await
+                {
+                    Ok(Ok(d)) => {
+                        chosen = Some(((*anchor).to_string(), d));
+                        break;
+                    }
+                    Ok(Err(e)) => last_err = e.to_string(),
+                    Err(_) => last_err = "TLS 超时".to_string(),
+                }
+            }
+            let Some((anchor, dialed)) = chosen else {
+                println!("HOSTPROBE\t{ip}\t{host}\t-\tERR {last_err}");
+                continue;
+            };
+            let up = match h2_from_dialed(host, dialed, ip, "probe", 1, &log).await {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("HOSTPROBE\t{ip}\t{host}\t{anchor}\th2 ERR {e}");
+                    continue;
+                }
+            };
+            let req = hyper::Request::builder()
+                .method("HEAD")
+                .uri(format!("https://{host}/"))
+                .body(empty_body())
+                .unwrap();
+            let r = tokio::time::timeout(Duration::from_secs(8), h2_send(&up, &req, &None)).await;
+            let s = match r {
+                Ok(Ok(resp)) => {
+                    let srv = resp
+                        .headers()
+                        .get("server")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    format!("{} server={srv}", resp.status().as_u16())
+                }
+                Ok(Err(e)) => format!("ERR {e}"),
+                Err(_) => "TIMEOUT".to_string(),
+            };
+            println!("HOSTPROBE\t{ip}\t{host}\t{anchor}\t{s}");
+        }
+    }
+}
+
+/// 一次性探针：同一连接（SNI=api.mcp）改发其它 :authority，看服务端是否 421。
+/// 决定连接池能否按 IP 复用不同 SNI 的节点。
+/// 用法：cargo test probe_cross_sni_reuse -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn probe_cross_sni_reuse() {
+    use crate::pool::dial::dial_one;
+    use crate::server::protocol::empty_body;
+    use crate::server::upstream::{h2_from_dialed, h2_send};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ip = "140.82.112.21";
+    let log: crate::util::LogFn = Arc::new(|_: &str| {});
+    let dialed = dial_one(ip, "api.mcp.github.com", "api.mcp.github.com", true)
+        .await
+        .expect("api.mcp 握手应成功");
+    let up = h2_from_dialed("api.mcp.github.com", dialed, ip, "probe", 1, &log)
+        .await
+        .expect("h2 握手");
+    for host in [
+        "api.mcp.github.com",
+        "objects-origin.githubusercontent.com",
+        "viewscreen.githubusercontent.com",
+        "githubapp.com",
+        "github.com",
+    ] {
+        let req = hyper::Request::builder()
+            .method("HEAD")
+            .uri(format!("https://{host}/"))
+            .body(empty_body())
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(8), h2_send(&up, &req, &None)).await;
+        let s = match r {
+            Ok(Ok(resp)) => resp.status().as_u16().to_string(),
+            Ok(Err(e)) => format!("ERR {e}"),
+            Err(_) => "TIMEOUT".to_string(),
+        };
+        println!("REUSE\t{ip}\tSNI=api.mcp\t{host}\t{s}");
+    }
+}
+
+/// 一次性探针：验证基线节点（SNI=baidu, verify=actions.githubusercontent.com）是否服务三个域名。
+/// 用法：cargo test probe_baseline_actions -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn probe_baseline_actions() {
+    use crate::pool::dial::dial_one;
+    use crate::server::protocol::empty_body;
+    use crate::server::upstream::{h2_from_dialed, h2_send};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let log: crate::util::LogFn = Arc::new(|_: &str| {});
+    for ip in ["140.82.112.21", "140.82.113.22", "140.82.114.21"] {
+        let dialed = match tokio::time::timeout(
+            Duration::from_secs(8),
+            dial_one(ip, "baidu.com", "actions.githubusercontent.com", true),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                println!("BASE\t{ip}\tTLS ERR {e}");
+                continue;
+            }
+            Err(_) => {
+                println!("BASE\t{ip}\tTLS TIMEOUT");
+                continue;
+            }
+        };
+        let up = match h2_from_dialed("baseline", dialed, ip, "probe", 1, &log).await {
+            Ok(u) => u,
+            Err(e) => {
+                println!("BASE\t{ip}\th2 ERR {e}");
+                continue;
+            }
+        };
+        for host in [
+            "api.mcp.github.com",
+            "objects-origin.githubusercontent.com",
+            "viewscreen.githubusercontent.com",
+        ] {
+            let req = hyper::Request::builder()
+                .method("HEAD")
+                .uri(format!("https://{host}/"))
+                .body(empty_body())
+                .unwrap();
+            let r = tokio::time::timeout(Duration::from_secs(8), h2_send(&up, &req, &None)).await;
+            let s = match r {
+                Ok(Ok(resp)) => resp.status().as_u16().to_string(),
+                Ok(Err(e)) => format!("ERR {e}"),
+                Err(_) => "TIMEOUT".to_string(),
+            };
+            println!("BASE\t{ip}\t{host}\t{s}");
+        }
+    }
+}
