@@ -36,8 +36,6 @@ pub enum Fallback {
 pub struct HostSpec {
     #[serde(default)]
     pub key: String,
-    #[serde(default)]
-    pub pac: Option<String>,
     /// 目前只有 "direct"。
     #[serde(default)]
     pub action: Option<String>,
@@ -90,7 +88,6 @@ pub struct NodeIp {
 /// host 侧路由行；裸键含自身+子域，`*.` 仅子域，最长键胜。
 pub struct RouteRow {
     pub key: String,
-    pub pac: Option<String>,
     pub flags: Flags,
     pub fallback: Fallback,
     /// 去掉 `*.` 的裸域名，全小写。
@@ -142,8 +139,6 @@ impl RouteRow {
         Ok(Self {
             rank: bare.len(),
             key,
-            // pac 不落盘：缺省 = 键去 `*.` 的裸域名（PAC 名单靠它，语义恒定）。
-            pac: spec.pac.or_else(|| Some(bare.clone())),
             flags: Flags {
                 direct,
                 content: spec.content,
@@ -359,13 +354,12 @@ pub fn pac_lists() -> (Vec<String>, Vec<String>) {
     let mut proxy = Vec::new();
     let mut direct = Vec::new();
     for r in t.rows.iter() {
-        let Some(pac) = r.pac.as_ref() else { continue };
         if r.flags.direct {
-            if !direct.contains(pac) {
-                direct.push(pac.clone());
+            if !direct.contains(&r.bare) {
+                direct.push(r.bare.clone());
             }
-        } else if !proxy.contains(pac) {
-            proxy.push(pac.clone());
+        } else if !proxy.contains(&r.bare) {
+            proxy.push(r.bare.clone());
         }
     }
     (proxy, direct)
@@ -374,7 +368,6 @@ pub fn pac_lists() -> (Vec<String>, Vec<String>) {
 /// 落盘用 host 侧快照。
 pub struct HostMeta {
     pub key: String,
-    pub pac: Option<String>,
     pub flags: Flags,
     pub fallback: Fallback,
 }
@@ -388,7 +381,6 @@ pub fn hosts_snapshot() -> Vec<HostMeta> {
         .iter()
         .map(|r| HostMeta {
             key: r.key.clone(),
-            pac: r.pac.clone(),
             flags: r.flags,
             fallback: r.fallback,
         })

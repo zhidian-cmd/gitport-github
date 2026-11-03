@@ -322,7 +322,6 @@ fn v1_route_spec(
     let direct = spec.action.as_deref() == Some("direct");
     let host = route::HostSpec {
         key: key.to_string(),
-        pac: spec.pac.clone(),
         // v2 实测后 direct 4 域进池；迁移时旧 direct 标志一并解除，IP 边由种子补。
         action: None,
         content: spec.content,
@@ -349,7 +348,6 @@ fn v1_route_spec(
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct V1RouteBody {
-    pac: Option<String>,
     action: Option<String>,
     real: bool,
     content: bool,
@@ -437,42 +435,36 @@ fn legacy_pools_to_v2(
     let mut hosts = vec![
         route::HostSpec {
             key: "github.com".into(),
-            pac: Some("github.com".into()),
             action: None,
             content: false,
             fallback: None,
         },
         route::HostSpec {
             key: "api.github.com".into(),
-            pac: Some("api.github.com".into()),
             action: None,
             content: false,
             fallback: None,
         },
         route::HostSpec {
             key: "*.githubusercontent.com".into(),
-            pac: Some("githubusercontent.com".into()),
             action: None,
             content: true,
             fallback: Some("mirror".into()),
         },
         route::HostSpec {
             key: "githubassets.com".into(),
-            pac: Some("githubassets.com".into()),
             action: None,
             content: false,
             fallback: None,
         },
         route::HostSpec {
             key: "github.io".into(),
-            pac: Some("github.io".into()),
             action: None,
             content: false,
             fallback: None,
         },
         route::HostSpec {
             key: "githubapp.com".into(),
-            pac: Some("githubapp.com".into()),
             action: None,
             content: false,
             fallback: None,
@@ -481,7 +473,6 @@ fn legacy_pools_to_v2(
     for h in LEGACY_HOST_ROWS {
         hosts.push(route::HostSpec {
             key: (*h).to_string(),
-            pac: Some((*h).to_string()),
             action: None,
             content: false,
             fallback: None,
@@ -490,7 +481,7 @@ fn legacy_pools_to_v2(
     (hosts, ips)
 }
 
-/// v1 白名单行（real 标志丢弃，只保留 pac 行）。
+/// v1 白名单行（real 标志丢弃）。
 const LEGACY_HOST_ROWS: &[&str] = &[
     "docs.github.com",
     "support.github.com",

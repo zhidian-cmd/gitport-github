@@ -2,7 +2,7 @@
 name = "gitport-github"
 version = "0.5.4"
 edition = "2021"
-description = "GitHub 加速器 —— 串发表驱动的本地加速代理"
+description = "GitHub 加速器 —— 路由二部图驱动的本地加速代理"
 license = "Apache-2.0"
 # 建仓后取消注释并填实际地址:
 # repository = "https://github.com/<account>/gitport-github"

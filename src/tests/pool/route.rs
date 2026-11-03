@@ -96,7 +96,7 @@ fn direct_key_beats_parent_wildcard() {
         ),
         (
             "objects-origin.githubusercontent.com",
-            r#"{"action":"direct","pac":"objects-origin.githubusercontent.com"}"#,
+            r#"{"action":"direct"}"#,
         ),
     ]);
     assert!(!is_managed("objects-origin.githubusercontent.com"), "直连");
@@ -123,7 +123,7 @@ fn flags_come_from_the_row() {
     install_rows(&[
         (
             "direct.example",
-            r#"{"action":"direct","pac":"direct.example"}"#,
+            r#"{"action":"direct"}"#,
         ),
         (
             "*.githubusercontent.com",
@@ -145,10 +145,10 @@ fn pac_lists_split_direct_and_proxy() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     install_rows(&[
-        ("a.example", r#"{"action":"direct","pac":"a.example"}"#),
+        ("a.example", r#"{"action":"direct"}"#),
         (
             "*.githubusercontent.com",
-            r#"{"pac":"githubusercontent.com"}"#,
+            r#"{}"#,
         ),
         ("no-pac.example", "{}"),
     ]);
@@ -171,7 +171,7 @@ fn cursor_keys_follow_routes() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     install_rows(&[
-        ("a.example", r#"{"action":"direct","pac":"a.example"}"#),
+        ("a.example", r#"{"action":"direct"}"#),
         ("b.example", "{}"),
     ]);
     assert_eq!(cursor_keys(), vec!["b.example", "b.example_vice"]);
@@ -186,7 +186,7 @@ fn master_route_direct_tunnel_mirror() {
     install_rows(&[
         (
             "objects-origin.githubusercontent.com",
-            r#"{"action":"direct","pac":"objects-origin.githubusercontent.com"}"#,
+            r#"{"action":"direct"}"#,
         ),
         ("github.com", "{}"),
         ("*.githubusercontent.com", r#"{"content":true}"#),

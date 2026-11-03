@@ -240,7 +240,7 @@ fn legacy_pools_migrate_to_route_rows() {
         "core 摊到 github.com: {github:?}"
     );
     let row = route::route_for("github.com").expect("core 应迁到 github.com 行");
-    assert_eq!(row.pac.as_deref(), Some("github.com"));
+    assert_eq!(row.key, "github.com");
 
     let content = target_ips("avatars.githubusercontent.com");
     assert!(
@@ -365,11 +365,11 @@ fn encode_routes_roundtrip() {
     );
     let (doc, _) = parse_routes_tolerant(&b, None).expect("编码结果应可解析");
     assert_eq!(doc.latency.get("1.2.3.4"), Some(&111), "测速值应可回读");
-    let row = route::RouteRow::new(
+    let _row = route::RouteRow::new(
         serde_json::from_str::<route::HostSpec>(r#"{"key":"github.com"}"#).unwrap(),
     )
     .unwrap();
-    assert_eq!(row.pac.as_deref(), Some("github.com"), "pac 缺省 = 裸键");
+    // “pac 缺省 = 裸键”的派生行为由 pac_lists_split_direct_and_proxy 钉着。
     latency::install(HashMap::new());
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     let hosts = back["hosts"].as_object().expect("hosts 应是对象(域名作键)");
