@@ -25,6 +25,14 @@ pub fn dial_cool_open(host: &str) -> bool {
     SERIAL_COOL.open(host)
 }
 
+/// 游标快照（UI 二部图起点标记用）：路由键 → 驻留 IP（空串 = 未驻留）。
+pub fn cursor_snapshot() -> HashMap<String, String> {
+    lock(&SERIAL)
+        .as_ref()
+        .map(|t| t.cursor.clone())
+        .unwrap_or_default()
+}
+
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[

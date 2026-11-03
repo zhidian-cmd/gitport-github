@@ -64,6 +64,20 @@ pub fn clear(ip: &str, key: &str) {
     }
 }
 
+/// 坏边快照（UI 二部图着色用）：(具体 IP, 路由键)。
+pub fn bad_snapshot() -> Vec<(String, String)> {
+    let now = Instant::now();
+    lock(map())
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, until)| **until > now)
+                .map(|((ip, key), _)| (ip.clone(), key.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 pub(crate) fn clear_all() {
     *lock(map()) = Some(HashMap::new());

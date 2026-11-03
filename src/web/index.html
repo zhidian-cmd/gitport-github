@@ -110,6 +110,15 @@
             <span class="meta">按表逐个重试 · 通者置顶</span>
           </div>
         </div>
+
+        <div class="panel">
+          <h2>路由二部图</h2>
+          <p class="hint" style="margin:0 0 10px">
+            左 = IP 节点（伪装身份），右 = 分流域名，连线 = 该节点服务该域名。
+            <span style="color:var(--green)">绿框</span> = 游标起点（上次驻留），红字 = 被边缘拒绝冷却中，灰 = 无活连接。
+          </p>
+          <div id="topoBox"></div>
+        </div>
       </section>
 
       <!-- 自定义镜像 -->

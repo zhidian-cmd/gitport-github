@@ -245,6 +245,14 @@ fn occupied_ips(ips: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// IP → 活连接数（UI 二部图着色用）。
+pub fn conn_counts() -> std::collections::HashMap<String, usize> {
+    lock(conn_pool())
+        .iter()
+        .map(|(ip, h)| (ip.clone(), h.conns.len()))
+        .collect()
+}
+
 /// 首条建好后后台补第二条：skip 池中活连接占用的 IP，游标用副键。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     let Some(targets) = pool::route::dial_targets(host) else {
