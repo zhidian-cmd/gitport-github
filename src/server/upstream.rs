@@ -427,17 +427,21 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
             None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
         }
     };
-    // 收尾移交后台：晚成者建成入库，失败走补建入口；竞速败者的空试不逐条刷红。
+    // 收尾移交后台：晚成者已在拨号任务里自入库；只有「一成一败」才值得补建第二条。
+    // 全败时补建必再失败（IP 刚判死），只会白刷一条"第二条连接失败"。
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
+        let mut any_ok = false;
+        let mut any_err = false;
         while let Some(r) = rx.recv().await {
             match r {
-                // 晚成者已在它自己的拨号任务里入过库（见上面 store_h2）：
-                // 这里再存一次会变成两条同 id 的槽位，把真正的另一条挤掉。
-                Ok(_) => {}
-                Err(_) => maybe_spawn_second(&host, &log),
+                Ok(_) => any_ok = true,
+                Err(_) => any_err = true,
             }
+        }
+        if any_ok && any_err {
+            maybe_spawn_second(&host, &log);
         }
     });
     Ok(won)

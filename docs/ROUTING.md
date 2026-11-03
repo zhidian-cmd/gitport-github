@@ -1,193 +1,152 @@
-# GitPort GitHub 路由表（实测版）
+# 路由（v2 二部图）
 
-> 2026-10-19 实测，2026-10-27 补白名单腿。
-> **⚠️ v2（2026-11-03）起本文的 Mirror 判定与真名分片腿已成历史**：routes.json 改二部图（见 POOL-V2.md），codeload/archive 迁池、白名单域转伪装锚点、real/donor 标志删除；PAC 与最长匹配判定不变。历史实测数据仍具参考价值。
-> 2026-11-02 派发演化：codeload 并入小文件域（直连优先 + TTFB 校准链序）、大文件域改分段竞速（慢段让位）、ECT 改离散时间槽——**本文的路由判定（PAC / master_route / 族 / 兜底）全部不变**，派发细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。
-> 代码唯一真相（v2 起）：`src/pool/route.rs`（二部图查询管线：route_for / dial_targets / master_route）+ `routes.json`（ips/hosts 数据）+ [POOL-V2.md](POOL-V2.md)（设计动机与实测证据）；`src/config.rs` 只剩端口与超时常量。本文以下内容为 v1 族路由（池/族/对口规则/真名分片腿）的历史实测记录，判定逻辑已被 routes.json 取代。
-> 本文每行「实测」列均为当日对**运行中的代理**（127.0.0.1:7810，新二进制，MITM 开）的真实请求结果，日志佐证取自 `/api/logs`。
+> 判定逻辑唯一真相:`src/pool/route.rs`(route_for / dial_targets / master_route)+ `routes.json`(ips / hosts / mirrors_big / mirrors_small)。设计动机与 openssl 实测证据见 [POOL-V2.md](POOL-V2.md)。
+> v1 时代(池/族/对口规则/真名分片腿)的实测矩阵作为历史存档保留在文末附录——其中 objects-origin、codeload、白名单腿的结论**已被 v2 推翻**,以本文为准;IP 死活与镜像质量的观察仍具参考价值。
 
----
-
-## 0. 总览：一条请求的四层决策
+## 0. 总览
 
 ```mermaid
 flowchart TD
-    B["浏览器"] --> L1["① PAC（webui.rs pac_script）<br/>池内域名 + 主路由白名单 → PROXY 127.0.0.1:7810<br/>直连白名单/其余 → DIRECT"]
+    B["浏览器"] --> L1["① PAC（pac_lists 生成）<br/>routes.json 有 pac 的行 → PROXY<br/>action:direct 行 → DIRECT<br/>其余 → DIRECT"]
     L1 --> P["代理 7810"]
-    P --> L2["② master_route（route.rs）<br/>System / Mirror / Pool{池,族} / Tunnel"]
-    L2 --> L3["③ 池内族路由（route.rs POOL_ROUTES）<br/>按 host 选族，按 IP 末段 + SNI 形态筛条目<br/>主路由白名单落 edge 的 wl* 族：真名 SNI + ClientHello 分 3 片"]
-    L3 --> L4["④ 兜底（Fallback）<br/>族全灭后：content → 镜像链 → 系统 DNS 腿<br/>其余 → 系统 DNS 腿"]
-    L4 --> UP["上游（GitHub 边缘 / 镜像站 / 系统 DNS）"]
+    P --> L2["② master_route<br/>未命中 → Tunnel · direct 行 → System<br/>大文件/附件 GET/HEAD → Mirror · 其余 → Pool"]
+    L2 --> L3["③ dial_targets<br/>路由键 → 邻接 IP 节点展开（末段 a-b）<br/>→ 滤冷却中的黑边 → 去重"]
+    L3 --> L4["④ 串发 NodeIp{ip, sni, verify}<br/>伪装 sni 骗墙 · verify 锚点验真<br/>业务路由全靠 h2 :authority"]
+    L4 --> OUT["成功：edges::clear + 游标驻留<br/>421 → 拉黑 4h · 超时 → 降权 2min<br/>风控页 → 冷却 600s + 换边"]
+    OUT -.->|"候选未走完"| L3
+    OUT -->|"候选走完 / 全黑"| FB["fallback：content 行 → 镜像链<br/>其余 → 系统 DNS 腿"]
+    FB --> UP["上游（GitHub 边缘 / 镜像站 / 系统 DNS）"]
 ```
 
-一句话版：**PAC 决定谁进代理；master_route 决定进代理后直连还是镜像；族路由决定用哪些 IP；兜底决定全灭之后找谁。**
+一句话版:**PAC 决定谁进代理;master_route 决定进代理后直连还是镜像;dial_targets 决定用哪些 IP(边状态机实时剔坏);兜底决定全灭之后找谁。**
 
----
+## 1. ① PAC:routes.json 的 pac 字段
 
-## 1. 第一层：PAC（浏览器 → 代理 or 直连）
+PAC 由 `pool::pac_lists()` 生成:`action:"direct"` 的行进 DIRECT 名单,其余带 `pac` 的行进 PROXY 名单,表外域名 DIRECT。
 
-PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**直连白名单先行**（会被 `*.githubusercontent.com` 通配符误吞，必须最先短路）→ 池内域名（含主路由白名单）→ 其余 DIRECT。
+**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(POOL-V2.md §8)。当前 routes.json **没有 action:direct 行**,GitHub 系 20 个路由键全部进代理。
 
-两种白名单在 PAC 里的位置正好相反：
+匹配语义:裸键含自身+任意级子域,`*.` 只认子域(裸域不命中),最长键胜,点边界(`evilgithub.com` 不命中 `github.com`),大小写无关。
 
-- **直连白名单**（4 个）出现在 PAC 的 `dl` 列表里 → 返回 DIRECT，流量不进代理
-- **主路由白名单**（10 个）**故意不出现在 PAC 里** → 落到 `*.github.com` / `*.githubusercontent.com` 通配 → PROXY，进代理后由族路由接管
+## 2. ② master_route
 
-| 域名形态 | PAC 决策 | 实测（node 跑线上真实 PAC，26 个主机） |
+| 请求 | 路由 | 说明 |
 |---|---|---|
-| `github.com` 及子域（gist / codeload / api 精确匹配优先） | PROXY 127.0.0.1:7810 | ✅ github.com / gist.github.com / codeload.github.com / api.github.com 全 PROXY |
-| `*.githubapp.com`、`*.githubassets.com`、`*.github.io`、`*.githubusercontent.com` | PROXY | ✅ githubapp.com / api.githubapp.com / github.githubassets.com / github.io / octocat.github.io / raw+avatars+camo+objects+release-assets+media+user-images+private-user-images.githubusercontent.com 全 PROXY |
-| `objects-origin.githubusercontent.com`（上传落点） | **DIRECT**（白名单） | ✅ DIRECT——且确实先于通配符短路，没被 `*.githubusercontent.com` 吞掉 |
-| `uploads.github.com` | **DIRECT**（白名单） | ✅ DIRECT |
-| `viewscreen.githubusercontent.com`（mermaid 渲染） | **DIRECT**（白名单） | ✅ DIRECT |
-| `api.mcp.github.com`（Copilot MCP 端点） | **DIRECT**（白名单） | ✅ DIRECT——先于 `github.com` 后缀匹配短路 |
-| 其余一切（example.com、githubstatus.com、fastly.com…） | DIRECT | ✅ |
-| 边界：notgithub.com / xgithub.com / evilgithub.com / github.com.evil.com | DIRECT（不误吞） | ✅ 四个边界主机全 DIRECT |
+| 未命中任何 hosts 行 | **Tunnel** | 系统 DNS 直拨(纯隧道,如 update.googleapis.com 经代理的流量) |
+| `action:"direct"` 行 | **System** | 本机直连,不进代理管线(当前 routes.json 无此行) |
+| GET/HEAD + objects / release-assets 域,或 github.com 的 `/releases/download`、`/releases/latest/download` 路径 | **Mirror** | 分片竞速(派发细节见 [ARCHITECTURE.md](ARCHITECTURE.md) 镜像链节) |
+| 其余(含 codeload——按子域命中 `github.com` 裸键) | **Pool** | 查询管线走二部图 |
 
-> 注：池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连的保险链（2026-10-19 晚复核确认，不应视为路由偏差）。
+codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪装通道,直连优先,失败按校准链序逐家),`/archive` 源码包不再镜像——镜像链归属只剩 objects / release-assets 两族。
 
-**主路由白名单（2026-10-27 新增）**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy` 这 10 个域名**不再返回 DIRECT**，而是走通配进代理。原因：它们托管在 Fastly `185.199.10x` / Azure，伪装 SNI 对这批无效（docs 走主站候选 90ms 回 400 Whoa），裸直连又没有分片掩体。进代理后用真名 + 首包分片，族路由见第 3 节 `wl*` 四族。
+## 3. ③ dial_targets:二部图查询与边状态机
 
-**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `github.com` 那条（含所有子域）吞进主站候选，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
+`dial_targets(host)` 五步:route_for 定行 → 路由键查反向索引 → 节点 IP 展开(`140.82.112-114.3-4` = 6 IP,笛卡尔积上限 64)→ 滤黑边 → 去重,产出 `NodeIp{ip, sni, verify}`。
+
+- **sni**:骗墙的伪装域(当前全线 `baidu.com`),与目标 host 无关——墙只看 ClientHello 明文,业务路由在加密的 h2 `:authority` 里
+- **verify**:证书校验锚点,只求证明"对面是真 GitHub";留空 = 按目标 host 校验(安全默认)
+- **边状态机**:表是预判,边是实测。`(IP, 路由键)` 三档坏态——421/证书不匹配拉黑 **4h**(静态属性不会自愈)、超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗);成功即清黑,坏边自愈的唯一通道。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
+
+## 4. ④ 兜底与熔断
+
+| 机制 | 规则 |
+|---|---|
+| 全黑 / 候选走完(content 行) | → 镜像链(`mirrors_small`)→ 系统 DNS 腿 |
+| 全黑 / 候选走完(其余行) | → 系统 DNS 腿 |
+| 大文件域整链全灭(镜像+直连) | 熔断 60s,窗口内同域毫秒级快速失败,502 页指引补镜像 |
+| 凭据查询串防护 | `token` / `sig` / `x-amz-*` 等参数 → 剥空镜像仅派直连;WebUI「信任」勾选的镜像例外(见 README) |
+
+## 5. v1 → v2 行为变化对照
+
+| 域 / 机制 | v1(池/族/对口规则) | v2(二部图/边) |
+|---|---|---|
+| objects-origin / uploads / viewscreen / api.mcp | PAC DIRECT,绕过代理 | **入池**:专节点 + verify 锚点,伪装握手 |
+| codeload.github.com | Mirror 整包竞速 | **Pool**(github.com 键),直连优先 |
+| `/archive` 源码包 | 归属 codeload 镜像链 | 不再镜像,走池 |
+| docs / support 等 10 子域 | 真名 SNI + ClientHello 分 3 片(wl* 四族) | **伪装通道 + verify 锚点**,真名分片腿与 real/donor 标志退役 |
+| 主站候选里的 Fastly 段 | 对口规则判据筛除 | 节点不声明该键即不服务(数据表达) |
+| "这个 IP 服务这个 host 吗" | 族判据(静态分类) | **边状态机(实测)**:三档冷却,成功洗白 |
+| 池 / 族 / 对口规则 | route.rs POOL_ROUTES | 已删除,全部由 routes.json 数据表达 |
 
 ---
 
-## 2. 第二层：总路由 master_route（进代理之后）
+## 附录:v1 实测矩阵(2026-10-19 / 10-27,历史存档)
 
-判定顺序同样有硬约束：**直连白名单 → 镜像 only（GET/HEAD）→ 池 → 非池（Tunnel）**。
+> 以下为 v1(池/族/对口规则/真名分片腿)时代的实测记录,**判定逻辑已被 v2 取代**,与上文冲突处以上文为准;IP 死活、镜像质量、边界行为的观察仍具参考价值。
 
-这里只认**直连白名单**（4 个，返回 `System`）。主路由白名单不在这短路——它们的 `pool_for` 返回 `edge`，落到下面的 `Pool` 分支。
+### 附-1:v1 第一层 PAC 实测(当日线上 PAC,26 主机)
 
-| host | 方法+路径 | 路由 | 实测结果 |
+| 域名形态 | PAC 决策 | 实测 |
+|---|---|---|
+| `github.com` 及子域(gist / codeload / api 精确优先) | PROXY | ✅ 全 PROXY |
+| `*.githubapp.com`、`*.githubassets.com`、`*.github.io`、`*.githubusercontent.com` | PROXY | ✅ 全 PROXY |
+| objects-origin / uploads / viewscreen / api.mcp | **DIRECT(白名单)** | ✅——v2 已改入池,见 §1 |
+| 边界:notgithub.com / xgithub.com / evilgithub.com / github.com.evil.com | DIRECT(不误吞) | ✅ |
+
+池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连。
+
+### 附-2:v1 第二层 master_route 实测
+
+| host | 方法+路径 | 路由(v1) | 实测 |
 |---|---|---|---|
-| objects-origin / uploads / viewscreen / api.mcp | 任意 | **System**（PAC 已 DIRECT，双保险） | ✅ 强制打代理 = 纯 TCP 隧道走 system-dns：405 / 302 / 404（各自 vhost 的真实响应，`[CONNECT] ... via system-dns`） |
-| `codeload.github.com` | GET/HEAD 任意路径 | **Mirror** | ✅ 200（Range 206，`via cdn.gh-proxy.org`） |
-| `release-assets.githubusercontent.com` | GET/HEAD 任意路径 | **Mirror** | ✅ 路由正确：无效 URL（/x）11 家镜像全试后 502，**不回落直连**（设计如此） |
-| `objects.githubusercontent.com` | GET/HEAD 任意路径 | **Mirror** | ⚠️ 单测覆盖；e2e 同上形态（release-assets 域直连） |
-| `github.com` | GET `/releases/download/<tag>/<asset>` | **Mirror** | ✅ 206 + `content-range: bytes 0-1023/4898992`，日志 `归属链 release-assets…（不用 github.com 自己的链）` |
-| `github.com` | GET `/releases/latest/download/<asset>` | **Mirror** | ✅ 200 + `content-length: 132855191`，同样归属 release-assets 链（2026-10-19 补的漏洞，漏了它会落 core 直连） |
-| `github.com` | GET `/archive/…`（源码包） | **Mirror** | ✅ 200，日志 `归属链 codeload.github.com` |
-| `github.com` | **POST** `/releases/download/…` | **Pool core**（不镜像） | ✅ 422 + `x-gitport-route: direct` via 140.82.121.3——附件路径只对 GET/HEAD 镜像 |
-| `github.com` | GET `/releases`（页面本身） | **Pool core** | ✅ 200 direct——只拦下载，不拦页面 |
-| `github.com` 其余路径 | GET/HEAD | **Pool core** | ✅ 200 direct via 140.82.121.3 |
-| `api.github.com` | 任意 | **Pool api** | ✅ 200 via **140.82.114.6**（API 专用边缘 .5/.6，与 core 的 .3/.4 互斥——两族按 IP 分服务，落错返 404/301） |
-| `*.githubusercontent.com` | GET/HEAD | **Pool edge/content** | ✅ 见第 3 节 |
-| `*.githubassets.com` | 任意 | **Pool edge/assets** | ✅ 见第 3 节 |
-| `*.github.io` | 任意 | **Pool edge/io** | ✅ 见第 3 节 |
-| `githubapp.com` 系 | 任意 | **Pool edge/auth** | ✅ 见第 3 节 |
-| 非池域名 | 任意 | **Tunnel**（PAC 已 DIRECT，永不达代理；此分支是强制代理时的兜底） | 代码级 |
+| objects-origin / uploads / viewscreen / api.mcp | 任意 | System(双保险) | ✅ 405 / 302 / 404(各自 vhost 真实响应) |
+| codeload.github.com | GET/HEAD | **Mirror**(v2 已迁池) | ✅ 200 |
+| release-assets / objects 域 | GET/HEAD | Mirror | ✅ 无效 URL 全链试后 502 不回落(设计如此) |
+| github.com | GET `/releases/download`、`/releases/latest/download` | Mirror | ✅ 206 + 归属 release-assets 链 |
+| github.com | POST `/releases/download` | Pool core | ✅ 422(附件路径只对 GET/HEAD 镜像) |
+| api.github.com | 任意 | Pool api | ✅ API 专用边缘 .5/.6 与 core 的 .3/.4 互斥,落错返 404/301 |
+| 非池域名 | 任意 | Tunnel | ✅ 强制代理 example.com → 200 直通 |
 
----
+### 附-3:v1 池内族路由与实表快照
 
-## 3. 第三层：池内族路由（edge 是重点）
-
-core/api 各一个通配族；edge 八族（四个原有 + 四个白名单）。族 = **host 判据**（这个 host 归哪族）+ **条目判据**（哪些 IP 条目有资格服务它）。不对口不试不垫底——否则每类请求都把另一族 IP 试败沉底。
-
-白名单四族**排在族表最前**：copilot-proxy 的后缀是 `githubusercontent.com`，排在后面会被 content 族先认走，而 content 只认 `.133`，它的 Azure 段对不上。
-
-| 池 | 族 | host 判据 | 条目判据（IP 末段 / SNI 形态） | 全灭兜底 | 实测佐证 |
-|---|---|---|---|---|---|
-| core | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ github.com/ → 140.82.121.3（core 网站边缘） |
-| api | all | 全部 | 非 Fastly 段 + 伪装 SNI | Dns | ✅ api.github.com/ → 140.82.114.6 |
-| edge | **wl154** | `docs.github.com` | Fastly `.154` + **真名 SNI + 首包分片** | Dns | ✅ 2026-10-26 实测：185.199.108.154，h2 握手成功，JS/字体全量拉通 |
-| edge | **wl153** | desktop / pages / skills / archiveprogram / socialimpact | Fastly `.153` + 真名 + 分片 | Dns | ✅ 直连实测 0.8~3.5s 可通 |
-| edge | **wl133** | support / resources / raw.github.com | Fastly `.133` + 真名 + 分片 | Dns | ✅ 直连实测 10.9~16.6s 可通 |
-| edge | **wl_azure** | `copilot-proxy.githubusercontent.com` | `4.249.x` 前缀 + 真名 + 分片 | Dns | ✅ 直连 0.8s 回 404（规范响应） |
-| edge | **content** | `*.githubusercontent.com` | **Fastly `.133` + 伪装 SNI**（2026-10-19 晚切换，默认证书 SAN 覆盖全系） | **MirrorDns**（先镜像链后 DNS 腿） | ✅ avatars → 185.199.110.133；raw 直连被 GFW RST 后走镜像（见第 4 节） |
-| edge | **assets** | `*.githubassets.com` | Fastly `.154` / `.215` + 伪装 SNI | Dns | ✅ githubassets → 185.199.**108.154**（CSS/JS 200，root 404） |
-| edge | **io** | `*.github.io` | Fastly `.153` + 伪装 SNI | Dns | ✅ octocat.github.io → 185.199.**108.153**，200 |
-| edge | **auth** | `githubapp.com` 系；兼未列族 host 的兜底族 | 非 Fastly 段 + 伪装 SNI（**排除 4.249.x**，那是 Azure 白名单专段） | Dns | ✅ githubapp.com → **140.82.112.29**（非 Fastly），200 |
-
-**实表快照**（当日 `/api/pools`，routes.json 演化值）：
-
-| 池 | 条目数 | 构成 |
-|---|---|---|
-| core | 25 | 140.82.11x 网站边缘（.3/.4）+ Azure 20.x / 4.x / 172.x GLB 族 |
-| api | 6 | 140.82.112-114 的 .5/.6（API 专用边缘） |
-| edge | 23 | Fastly 16 条（`.133` / `.153` / `.154` / `.215` 各 4）+ 非 Fastly 6 条（140.82.112-114.29/.30，auth 族）+ Azure 1 条（`4.249.131.160`，wl_azure 族）。白名单四族与原有四族共用这批 IP，各按自己的判据筛 |
-
-> 13 个实测死 IP 已退役不在表内（core 115/117-120 段 .3/.4；edge 108/109/111.133）。110.133 时通时断，留作 content 独苗。
-
----
-
-## 4. 第四层：兜底与熔断
-
-| 机制 | 规则 | 当日实测 |
-|---|---|---|
-| content 族全灭 | → 镜像链（host 有链才走，11 家串行逐家试）→ 系统 DNS 腿 | ✅ **实地触发**：raw.githubusercontent.com 直连 `TLS 握手失败 10054`（GFW 按域 RST）→ 全灭 → `via axisnow.gh-proxy.org 头 742ms` 拿到 README |
-| 内容域直连熔断 | 该 host 直连失败一次，**120s** 内跳过直连直接走镜像 | ✅ **实地触发**：raw 第二次请求无任何直连尝试，83ms 直达镜像（省掉每次 4s 黑洞预算） |
-| assets / io / auth / core / api 全灭 | → 系统 DNS 直连腿（按系统解析拿当下有效边缘，IP 漂移自愈） | ⚠️ 代码级+单测，当日未实地触发（需要整族死亡） |
-| 镜像链全灭熔断 | 一条链整链烧完，**60s** 内同链请求快速失败 | ✅ **意外实地触发**：测试把一个无效 URL 打穿 release-assets 整链后，20s 内同链的真实下载请求 1.5s 快速失败（日志 `镜像链全灭`，无逐家重烧） |
-| 镜像 only 路由全灭 | **502，不回落直连** | ✅ release-assets 无效 URL：11 家全试（404/403/假页拒）后 502 |
-| 凭据查询串防护 | 镜像 URL 带 `token`/`sig`/`x-amz-*` 等参数 → 拒走镜像（防私库 signed URL 外泄） | 代码级（`has_credential_query`） |
-
----
-
-## 5. 镜像链归属表
-
-**链归属与请求 host 解耦**：镜像跟随 302 是镜像在自己直连落点，"用谁的链"在请求发起前就定了。这是 2026-10-19 DevSidecar 下载风暴的根因修复——release 附件必须用 release-assets 专属链（头部实测 3838KB/s 的 gh-proxy 系），不能用 github.com 链（头部 ghproxy.net 慢且中断）。
-
-| 请求 | 归属链 host | 链头（链位 1） | 当日实测 |
+| 池 | 族 | 条目判据 | 全灭兜底 |
 |---|---|---|---|
-| `github.com/…/releases/download/…` 与 `…/releases/latest/download/…` | release-assets.githubusercontent.com | **gh-proxy.org** | ✅ 日志 `归属链 release-assets…` + `via gh-proxy.org`（v3.5.1 zip 206 头 1900ms；DevSidecar latest 200 头 563ms） |
-| `github.com/…/archive/…` | codeload.github.com | **cdn.gh-proxy.org** | ✅ `归属链 codeload.github.com` + `via cdn.gh-proxy.org 头 673ms` |
-| codeload.github.com 域自身 | 自身 | cdn.gh-proxy.org | ✅ `via cdn.gh-proxy.org 头 1172ms` |
-| release-assets.githubusercontent.com 域自身 | 自身 | gh-proxy.org | ✅ 路由正确（无效 URL 全灭见第 4 节） |
-| objects.githubusercontent.com 域自身 | 自身 | v6.gh-proxy.org | 链表在位，未实地请求 |
-| raw.githubusercontent.com | 自身 | **axisnow.gh-proxy.org** | ✅ 实测 `via axisnow 头 742ms`（GFW 窗口期） |
-| avatars / media / user-images / gist / github.com | 自身 | v6 / v4 / gh-proxy.com / ghproxy.net | 链表在位；avatars 走直连快路径未触发链 |
-| camo.githubusercontent.com | **无链**（9 个 host 有链，camo 不在内） | — | ✅ 直连通（403=URL 无效但 .133 边缘响应）；若直连全灭只走 DNS 腿，无镜像可落 |
+| core / api | all | 非 Fastly 段 + 伪装 SNI | Dns |
+| edge | wl154 / wl153 / wl133 / wl_azure | Fastly `.154`/`.153`/`.133` / Azure `4.249.` + **真名 SNI + 分片** | Dns |
+| edge | content | Fastly `.133`(透传腿放行 .154/.215) | MirrorDns |
+| edge | assets / io / auth | `.154/.215` / `.153` / 非 Fastly | Dns |
 
-> 内容域小文件（头像/图片/gist/media）镜像链限长前 5 家串行；大文件域与 github.com 归档/release 用全链 11 家。
+实表快照(2026-10-19):core 25 / api 6 / edge 23;13 个实测死 IP 已退役不在表内。**v2 起池与族消失**,对应关系见 §5 对照表。
 
----
+### 附-4:v1 兜底与熔断实测
 
-## 6. 实测方法与局限
+- content 族全灭 → 镜像链兜底:raw `TLS 握手失败 10054` → `via axisnow.gh-proxy.org 头 742ms` 拿到 README ✅
+- 内容域直连熔断 120s:raw 第二次请求 83ms 直达镜像,无直连尝试 ✅
+- 镜像链全灭熔断 60s:无效 URL 打穿 release-assets 整链后,20s 内同链请求 1.5s 快速失败 ✅
+- 镜像 only 全灭 502 不回落直连 ✅;凭据查询串拒走镜像(代码级)✅
 
-**方法**（全部对运行中的活实例，非单测）：
+### 附-5:v1 镜像链归属(部分已被 v2 改动)
 
-1. **PAC 层**：拉线上实时生成的 `http://127.0.0.1:7811/proxy.pac`，用 node 对其 `FindProxyForURL` 跑 26 个主机（18 池内 + 3 白名单 + 5 边界/非池）。
-2. **路由层**：curl 打 `127.0.0.1:7810`，每个用例记录 `x-gitport-route` / `x-gitport-upstream` 响应头 + HTTP 状态 + 耗时；同时用 `/api/logs?after=<seq>` 抓该用例的日志切片（串发/族/归属链/兜底/熔断佐证）。
-3. **代码级**：`cargo test` 40 个测试（含 master_route 全主机矩阵、族筛选、链归属、退休 IP 快照）。
+| 请求 | v1 归属链 | v2 现状 |
+|---|---|---|
+| github.com `/releases/download`(含 latest) | release-assets 专属链 | 不变 ✅ |
+| github.com `/archive` | codeload 链 | **不再镜像,走池** |
+| codeload.github.com | 自身链 | **迁池**(github.com 键) |
+| raw / gist / avatars / user-images / media | 自身链(mirrors_small) | 不变 ✅ |
+| camo | 无链 | 不变(直连全灭只走 DNS 腿) |
 
-**局限（没测到的，说清楚）**：
+内容域小文件链限长前 5 家;大文件域全候选。**大文件派发已改 ECT 时间槽 + 切片让位,链序只决定失败顺延**——细节见 ARCHITECTURE.md 镜像链节。
 
-- 本机 curl 无 h2 支持，实测连接全是 h1（日志 `alpn=http/1.1` 行可见）；浏览器页面连接走 h2（用户实例日志 `alpn=h2` 佐证），IDM 下载走 h1（上次排查结论）。协议选择本身不影响路由结论。
-- DNS 兜底腿**成功**的路径未实地触发（需要 assets/io/auth 整族死亡）。
-- objects 域自身的镜像 e2e 未做（无法构造有效 signed URL；带凭据的 signed URL 按设计拒绝走镜像）。
-- ~~Tunnel 分支的真实请求未出现~~ **2026-10-19 晚已实地触发**：强制经代理访问 example.com → 200 直通，响应无诊断头（端到端 TLS 隧道无法注入，属预期形态）。
-- core/api 的「网站 IP 落 api 返 301」互斥现象本次只验证了各自命中正确边缘（114.6 vs 121.3），未构造落错场景。
+### 附-6:实测方法与局限
 
----
+方法:对运行中的活实例——线上 PAC 用 node 跑 26 主机;路由层 curl 打 7810 记录 `x-gitport-route` / `x-gitport-upstream` 头 + `/api/logs` 切片佐证;代码级 cargo test。
 
-## 7. 附：本次实测关键日志摘录
+局限:本机 curl 全 h1(浏览器 h2);DNS 兜底腿成功路径未实地触发(需整族死亡);objects 域自身镜像 e2e 未做(signed URL 按设计拒镜像);core/api 落错互斥未构造。
+
+### 附-7:日志摘录(v1 格式,现日志已降噪)
 
 ```
-# content 族全灭 → 镜像兜底（MirrorDns 生效）
-[10:33:45] [串发] raw.githubusercontent.com edge/content 全灭(1/1 候选, 累计 "TLS 握手失败 ... (os error 10054)"), 不冷却(有镜像兜底)
-[10:33:45] [镜像拨号] axisnow.gh-proxy.org TLS 467ms alpn=h2
-[10:33:46] [镜像] raw.githubusercontent.com/torvalds/linux/master/README via https://axisnow.gh-proxy.org (链位 1/11, 头 742ms)
-
-# 内容域直连熔断 120s（第二次请求跳过直连）
-[10:33:53] [镜像] raw.githubusercontent.com/... via https://axisnow.gh-proxy.org (链位 1/11, 头 83ms)   # 无串发行 = 熔断中直连未试
-
-# release 附件链归属（f605eec 修复生效）
-[10:40:46] [镜像] github.com/git-lfs/git-lfs/releases/download/v3.5.1/...zip 归属链 release-assets.githubusercontent.com（不用 github.com 自己的链）
-[10:40:46] [镜像] ... 客户端 Range: bytes=0-1023                                    # 6151063 新增诊断行
-[10:40:48] [镜像] ... via https://gh-proxy.org (链位 1/11, 头 1900ms)
-
-# /releases/latest/download 也是镜像（曾是直连漏洞）
-[10:40:52] [镜像] github.com/docmirror/dev-sidecar/releases/latest/download/DevSidecar-...exe 归属链 release-assets.githubusercontent.com
+[串发] raw.githubusercontent.com edge/content 全灭(1/1 候选, "TLS 握手失败 (os error 10054)"), 不冷却(有镜像兜底)
+[镜像] raw.githubusercontent.com/... via https://axisnow.gh-proxy.org (链位 1/11, 头 742ms)
+[镜像] github.com/git-lfs/git-lfs/releases/download/v3.5.1/...zip 归属链 release-assets.githubusercontent.com（不用 github.com 自己的链）
 ```
 
----
+### 附-8:复查登记的已知边界
 
-## 8. 复查发现的已知边界（非路由错误，登记在案）
-
-1. **交付计数体（2026-10-21 整体删除）**：曾用 `CountingBody` 包镜像大响应，产 `[交付] 推完 / 推了 N/M 后连接终止` 两行日志。为一行诊断在每块数据上过手，且 HEAD 有大文件假阳性（324faa6 补过）。现按审计删除：大文件推流看 `content-length` 与 `[镜像]` 链位/耗时即可。
-2. **裸域 PAC/路由不一致（无实际影响，不动）**：`githubassets.com` 与 `githubusercontent.com` 两个**裸域**（无子域）在 PAC 的 `fpMatch` 里 `h === d` 精确命中 → 送进代理；但代理内 `*.` 键的边界判断不认裸域 → 判 Tunnel（纯隧道直通）。这两个裸域没有业务、浏览器永远不会请求它们；即使被强制请求，纯隧道也能通，只是不走池/MITM。真实业务域的裸域（github.com / api.github.com / githubapp.com / github.io）两边判定一致。
-3. **退役 IP 日内波动（2026-10-19 晚）**：185.199.108/109/111.133 当日午后两测 TCP 死、晚测复活且 raw 出 200——属封锁窗口假死而非真死。RETIRED_IPS 退役名单机制已据此整体删除（名单会覆盖文件数据，与数据驱动相悖）：IP 死活全凭串发实测动态裁决，死时自动垫底、活时自动置顶。140.82.115-120 段当日三测仍 TCP 死，不建议手写入表。另：web 族对其余 vhost 一律 301 重定向（接得住不交付），唯一全服务 IP 为 140.82.113.22；`.9` 段 codeload 专用边缘族为本次测绘新发现，详见 CONFIG.md 认 IP 速查。
+1. 交付计数体已删(2026-10-21):为一行诊断在每块数据上过手,大文件推流看 content-length 与链位耗时即可。
+2. 裸域 PAC/路由不一致(githubassets.com / githubusercontent.com 裸域):PAC 精确命中进代理、代理内 `*.` 键不认裸域 → Tunnel 纯隧道直通。无业务域请求,即使强制请求纯隧道也能通——不动。
+3. 退役 IP 日内波动:108/109/111.133 午后 TCP 死、晚间复活出 200——封锁窗口假死而非真死。RETIRED_IPS 静态退役名单机制已整体删除(IP 死活全凭串发实测动态裁决,与数据驱动相悖)。140.82.115-120 段三测 TCP 死,不建议手写入表;web 族唯一全服务 IP 为 140.82.113.22。
 
 ---
 
-*实测时间：2026-10-19 10:33-10:41（UTC+8）。代理：dist 新二进制（6151063），routes.json core 25 / api 6 / edge 19，镜像链 9 host × 11 家。*
+*历史实测时间:2026-10-19 10:33-10:41(UTC+8),代理 6151063;2026-10-27 补白名单腿。v2 重写:2026-11-04。*
