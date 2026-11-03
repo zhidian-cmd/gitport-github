@@ -181,7 +181,7 @@ fn refresh_wininet() {
     }
 }
 
-/// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉；失败返回 Win32 错误码，调用方原样报出别吞。
+/// 连接级代理配置：必须置 `PROXY_TYPE_AUTO_PROXY_URL` 位，只写 AutoConfigURL 会被系统刷新抹掉；失败返回 Win32 错误码。
 fn apply_conn_options(flags: u32, pac: Option<&str>) -> Result<(), u32> {
     use windows::core::PWSTR;
     use windows::Win32::Networking::WinInet::{
@@ -256,7 +256,7 @@ fn force_pac_flag() -> Result<(), String> {
     Ok(())
 }
 
-/// 按开关接管/还原系统代理（幂等）：只备份用户自己的配置（残留当原配置会让自愈还原死 PAC）；返回供启动/界面日志原样打印的可读结果，失败带 Win32 错误码。
+/// 按开关接管/还原系统代理（幂等）：只备份用户自己的配置，避免把自家残留当原配置还原成死 PAC。
 pub fn ensure_system_proxy() -> Result<String, String> {
     let key = internet_settings_key()?;
     let cur = get_auto_config_url(&key);
@@ -377,15 +377,12 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
     save()
 }
 
-/// 串发游标表：键位恒为全量族键、顺序恒为表序、空值表示该族未驻留；读兼容数组与对象，写只写对象。
+/// 串发游标表：键位与顺序恒为路由表全量，空值=未驻留；读兼容数组/对象，写只写对象。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
-    /// 按规范键序成表：全量键位预写空值再覆盖，表外键直接丢弃。
-    ///
-    /// 路由表还没装载（settings 先于 plans 读）时没有"规范键序"可言，
-    /// 此时原样保留——否则每次启动都会把上次驻留的游标丢光。
+    /// 按规范键序成表；路由表未装载时原样保留，否则会丢光上次游标。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
         let keys = crate::pool::circle_keys();
         if keys.is_empty() {
@@ -638,7 +635,7 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     let _ = save();
 }
 
-/// 整表保存：规范化校验+与旧表差集，删除即彻底消失，前端须先 GET 合并；返回 (启用清单, 被删地址)，链对齐由调用方用 removed 触发，本模块只管存。
+/// 整表保存：规范化校验并与旧表求差集；删除即彻底消失，前端须先 GET 合并，链对齐由调用方用 removed 触发。
 pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<String>), String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {

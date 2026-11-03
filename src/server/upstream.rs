@@ -169,17 +169,8 @@ pub fn cached_h2_in(host: &str, want_slot: Option<u8>) -> Option<H2Upstream> {
     Some(h.conns[idx].up.clone())
 }
 
-/// 借道 donor：assets 域已建好的伪装连接。
-///
-/// 证书只覆盖 `*.githubassets.com`，但 h2 的路由依据是 `:authority` 而不是 SNI——
-/// 同一条连接换 `:authority` 就能取内容域（实测 avatars/raw 都是 200 整包）。
-///
-/// 只返回池里**现成**的连接：新建一条就得选 SNI，真名会暴露目标域，伪装又过不了内容域的证书校验，
-/// 两条都是死路。所以这里没有"借不到就建一条"的分支，借不到就返回 None，让调用方走回退。
-///
-/// 挑法：先看这条连接上还挂着几条借出的流（少的优先），同负载再取 EWMA 快的；
-/// 冷却中的直接跳过。借出的计数要由调用方在响应体走完（或失败）时归还，
-/// 否则一条连接会越借越"忙"，最后谁也选不中它。
+/// 借 assets 域现成的伪装连接：h2 按 `:authority` 路由，换名即可取内容域（证书只覆盖 `*.githubassets.com`）。
+/// 只借不建——新建要么真名暴露目标、要么伪装过不了证书校验；优先少在途、再取快者，借出计数由调用方归还。
 pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
     let mut g = lock(conn_pool());
     let now = Instant::now();

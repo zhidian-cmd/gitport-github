@@ -371,7 +371,7 @@ fn cursor_park_is_memory_only_and_freezes_order() {
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
     let row = route::route_for("github.com").expect("github.com 应有路由");
-    let pattern = row.key.clone();
+    let key = row.key.clone();
     let plans = row.plans.clone();
     assert!(plans.len() >= 3, "初始表过小: {}", plans.len());
     let head_before = plans[0].ip.clone();
@@ -392,7 +392,7 @@ fn cursor_park_is_memory_only_and_freezes_order() {
     );
     let g = SERIAL.lock().unwrap();
     assert_eq!(
-        g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
+        g.as_ref().unwrap().cursor.get(&key).map(String::as_str),
         Some(target.as_str()),
         "游标应驻留 target"
     );
@@ -550,8 +550,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     )
     .unwrap();
     serial_load(&dir, Vec::new(), None);
-    // 断言只锁"优先级"这一点：自建镜像收编(sync_custom_mirrors)会把非内置镜像追加进所有链尾，属既有设计，不在本测试射程。
-    // ① 旧 mirrors 不得覆盖新字典 → codeload 链里绝不允许出现 legacy-wrong；② 新字典成员在前 → 链头必须是 big/small，旧字典独有成员追加在尾。
+    // 断言只锁优先级：旧 mirrors 不得覆盖新字典，新字典成员居首，旧字典独有成员追加在尾（自建镜像收编会追加链尾，不在本测试射程）。
     let big = mirror_chain("codeload.github.com");
     assert_eq!(
         big.first(),
@@ -680,7 +679,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
     let row = route::route_for("github.com").expect("github.com 应有路由");
-    let pattern = row.key.clone();
+    let key = row.key.clone();
     let base = row.plans.clone();
     assert!(base.len() >= 6, "初始表过小: {}", base.len());
     let head = base[0].ip.clone();
@@ -691,7 +690,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
-            g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
+            g.as_ref().unwrap().cursor.get(&key).map(String::as_str),
             Some(next.as_str()),
             "失败后记号应前移到下一候选"
         );
@@ -702,7 +701,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
-            g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
+            g.as_ref().unwrap().cursor.get(&key).map(String::as_str),
             Some(next.as_str())
         );
     }

@@ -1,4 +1,4 @@
-//! 切片合并：一条请求按镜像数切段并发拉，按边界序泵成单条字节河；段是可缩的边界而非一条命的连接——慢段把尾巴让给闲镜像，断了从已收位置续，绝不整段判死。
+//! 切片合并：按镜像数切段并发拉，按边界泵成单条流；段是可缩的边界而非固定连接——慢段让尾、断点续拉，不整段判死。
 //! 交付线只认相对偏移，与边界同域。
 
 use super::protocol::{self, BoxBody};
@@ -21,8 +21,7 @@ const RATE_WARMUP: Duration = Duration::from_millis(400);
 const CUT_COOLDOWN: Duration = Duration::from_millis(1_500);
 /// 两次让位之间的全局间隔：多段同时"偏慢"时轮着切就是抖动。
 const CUT_ANY_COOLDOWN: Duration = Duration::from_millis(2_500);
-/// 刀口上限按帮手实测速率折算：≈ 它 3 秒能啃下的量，钳在 [MIN_PIECE, 64MB]。
-/// 旧常数 4MB 对 2MB/s 源够用，对 10MB/s 快源是把再平衡钉死在 ~1.6MB/s——快源下完份额只能龟速捡慢段尾巴，聚合速率上不去。
+/// 刀口上限 ≈ 帮手 3 秒的吞吐，钳在 [MIN_PIECE, 64MB]；上限定死会让快源被慢段尾巴拖住。
 fn handoff_cap(best_rate: f64) -> u64 {
     ((best_rate * 3.0) as u64).clamp(MIN_PIECE, 64 * 1024 * 1024)
 }
@@ -83,8 +82,7 @@ pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
     t.parse().ok()
 }
 
-/// 让位时持有者该留多少：按两者速率反比切使双方同时完成（DEMS），帮手的建连+爬坡耗时折进分母——`helper × setup` 是它起跑期间白下的字节。
-/// 结果钳在 [MIN_PIECE, remaining − MIN_PIECE]，保证两边都不是碎渣。
+/// 让位时持有者留多少：按双方速率反比切（DEMS），帮手的建连+爬坡折进分母；结果钳在 [MIN_PIECE, remaining−MIN_PIECE]。
 pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64, setup_secs: f64) -> u64 {
     if remaining < 2 * MIN_PIECE {
         return remaining / 2;
@@ -369,8 +367,7 @@ impl MergeBody {
         any
     }
 
-    /// 让位：把预计最晚完成的段切掉尾巴，交给最快的镜像，返回被切出去的区间。
-    /// 判据是「抢过来能提前多少」——剩余÷我的速度 对 剩余÷最快速度+建连；没有空闲连接也可抢：新开一条流的代价就是那次建连，已折进判据里。
+    /// 让位：切掉最晚完成段的尾巴交给最快的镜像；判据是「抢过来能提前多少」，新建连与爬坡都折进成本。
     pub(super) fn plan_cut(&mut self, now: Instant) -> Option<(u64, u64)> {
         if !self.fill.is_empty() {
             return None;
@@ -382,7 +379,7 @@ impl MergeBody {
         {
             return None;
         }
-        // 有闲连接 = 复用，不花建连；没有 = 新开一条。爬坡两者都有：新流（哪怕复用连接）要跨几个 RTT 才到稳态，这段空转折进收益判据。
+        // 有闲连接就复用、不花建连；新流都要爬坡几个 RTT，折进 setup。
         let setup = if self.idle_credit > 0 {
             0.0
         } else {
@@ -424,7 +421,7 @@ impl MergeBody {
                 continue;
             }
             let etc = remaining as f64 / r;
-            // 比最快那家慢就算慢，交给最快的接手；只有"抢过去反而更久"才不动（remaining/best + 建连+爬坡 >= remaining/我），这是算术，不是门槛。
+            // 比最快那家慢就算慢；只有抢过去反而更久才不动——算术，不是门槛。
             let steal = remaining as f64 / best_rate + setup;
             if etc <= steal {
                 continue;
@@ -438,8 +435,7 @@ impl MergeBody {
             .segs
             .get(&start)
             .map_or(best_rate, |s| s.recent_rate(now));
-        // 切口按两家的速度比例分，让两边差不多同时跑完；刀口上限按帮手实测速率折算——
-        // 接手的家是 ECT 挑的没错，可它的"快"是上一轮实测、新流起步速度是 0，刀口越大下一轮越易再被判慢、再切一刀，来回抖。
+        // 切口按两家速度比例分；刀口再按帮手实测速率封顶，防止新流起步慢被反复判慢、来回抖。
         let keep = split_keep(remaining, holder, best_rate, setup)
             .max(remaining.saturating_sub(handoff_cap(best_rate)));
         let out = self.cut(start, pos + keep, now);

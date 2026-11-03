@@ -550,7 +550,7 @@ async fn keys_invalidation_and_pollution() {
         "会话死亡期间的未登录页不得进缓存"
     );
 
-    // ⑪d 匿名页双向判定：未登录浏览存下的页面，匿名请求必须能命中；同一份正文被带会话的请求拿到才算污染。少了前者，未登录用户的缓存全废（线上症状：缓存写进去了却永远不命中）。
+    // 匿名页双向判定：未登录存下的页面匿名请求必须命中；同一正文被带会话请求拿到才算污染。
     let anon = b"<html><body class=\"logged-out env-production\">results</body></html>";
     let _ = persist_page_entry_blocking(
         &dir,

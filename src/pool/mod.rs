@@ -16,8 +16,7 @@ pub struct SerialPlan {
     pub sni: String,
 }
 
-/// 旧版三池名：只用于首启迁移读取。
-/// 旧版白名单：host → 段。迁移时一次性摊进各自的路由行，之后代码不再需要它。
+/// 旧版三池名与白名单：只用于首启迁移，摊进路由行后不再使用。
 const LEGACY_WHITELIST: &[(&str, &str)] = &[
     ("docs.github.com", "154"),
     ("support.github.com", "133"),
@@ -375,8 +374,7 @@ fn routes_path() -> PathBuf {
     dir.join(ROUTES_FILE)
 }
 
-/// 旧名 plans.json → routes.json。只在新名缺席、旧名存在时搬一次：
-/// 改名不是复制，搬完旧名就没了，所以先把原表留成 .bak 再动。
+/// 旧名 plans.json → routes.json：只搬一次，搬前留 .bak，rename 失败退化为复制。
 fn migrate_legacy_name(path: &Path, log: Option<&LogFn>) {
     let Some(dir) = path.parent() else { return };
     let old = dir.join(LEGACY_ROUTES_FILE);

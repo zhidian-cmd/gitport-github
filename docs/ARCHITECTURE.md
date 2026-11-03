@@ -43,7 +43,7 @@ flowchart TB
     Q --> S3
     Q --> S4
     subgraph L5["⑤ 上游拨号（所有直连腿共用）"]
-        D1["串发：三池一个 IP 一个试"]
+        D1["串发：每条路由一个 IP 一个试"]
         T1["boring Chrome TLS 指纹<br/>老族 = 伪装 SNI（.133 于 2026-10-19 切换）<br/>白名单四族 = 真名 SNI + ClientHello 分 3 片"]
         H1["h2 多路复用 + 每 host ≤2 连接<br/>EWMA 择优 + 活跃窗口每 30s PING 保活（静默 5 分钟停）"]
     end
@@ -105,7 +105,7 @@ flowchart TB
 `docs` / `support` / `resources` / `desktop` / `pages` / `skills` /
 `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy`。
 
-这批托管在 Fastly `185.199.10x` 或 Azure `4.249.x`，被 `github.com` 那条（含所有子域）送进 core 池后拿主站 IP + 伪装 SNI，上游直接判非法——docs 实测 90ms 回 400 Whoa。
+这批托管在 Fastly `185.199.10x` 或 Azure `4.249.x`，被 `github.com` 那条（含所有子域）送进主站候选后拿主站 IP + 伪装 SNI，上游直接判非法——docs 实测 90ms 回 400 Whoa。
 
 它们进 **edge 池**，由四个族按段选 IP（`.154` / `.153` / `.133` / Azure），握手用真名、ClientHello 拆 3 段、段间隔 100ms。进池的额外好处是一个 IP 连不上会自动换下一个候选，全灭才退回系统 DNS。
 
@@ -121,7 +121,7 @@ flowchart TB
 | objects-origin | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
 | viewscreen | 无污染（→ GLB 140.82.114.22） | 无阻断 | 直连 ✅ |
 | uploads.github.com | 无污染（→ alambic .161） | 无阻断 | 直连 ✅ |
-| docs.github.com | 无污染（→ 185.199.110.154） | 走 core 池 90ms 回 400 Whoa | 进代理 + 分片 ✅ |
+| docs.github.com | 无污染（→ 185.199.110.154） | 走主站候选 90ms 回 400 Whoa | 进代理 + 分片 ✅ |
 | raw.github.com | 无污染（→ 185.199.108.133） | 直连 16.6s，真名易被 RST | 进代理 + 分片 ✅ |
 
 判定原则：vhost → 边缘的映射只有 GitHub 的 DNS 知道。代理只接管"表能可靠覆盖"的域名（主站 / API / Fastly 三族），其余交给系统 DNS——能开就行，慢一点也好过打不开。

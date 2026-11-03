@@ -1,4 +1,4 @@
-//! MITM 本地证书机构：生成/加载 CA、按域即时签发叶子证书（仅池内域）；TLS 终结走 boring，每主机一个 SslContext 由 SNI 回调切换，与直连腿共用一套 BoringSSL。
+//! MITM 本地 CA：按域即时签发叶子证书，TLS 终结走 boring，每主机一个 SslContext 由 SNI 切换。
 
 use boring::pkey::{PKey, Private};
 use boring::ssl::{

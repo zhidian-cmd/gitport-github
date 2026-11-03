@@ -37,8 +37,8 @@ pub(super) struct MirrorLoad {
     pub(super) in_flight_streams: AtomicU64,
     /// 本时间槽实收字节：on_frame 累加，ect_sweep 每 ECT_WINDOW_MS 快照进 window_prev 后清零。
     window_bytes: AtomicU64,
-    /// 上一时间槽实收字节（派发器的吞吐分母）；0 = 零历史，派发时按 +∞ 垫底。
-    /// 快照规则：有字节 → 换新值；零收且有债 → 卡死清零；零收无债 → 空闲，沿用旧值。
+    /// 上一时间槽实收（派发器的吞吐分母）；0=零历史，按 +∞ 垫底。
+    /// 快照：有字节换新值；零收有债=卡死清零；零收无债=空闲沿用。
     pub(super) window_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
@@ -88,8 +88,7 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
-/// ECT 时间槽结算（后台定时器每 ECT_WINDOW_MS 调一次）：本窗实收快照进 window_prev 后清零。
-/// 零收分两断：有债 = 卡死（清零，派发立即避开）；无债 = 空闲（沿用旧窗值，别把歇着的快家当死腿）。
+/// ECT 时间槽结算：本窗实收快照进 `window_prev` 后清零；零收有债=卡死清零，无债=空闲沿用。
 fn ect_sweep() {
     let g = crate::util::lock(&MIRROR_LOAD);
     for ld in g.values() {
@@ -200,8 +199,8 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 派发：score = (在途 + 新增) ÷ 上一窗实收，即「还需几个时间槽跑完」，最小者胜、无容差；
-/// 零历史（window_prev=0）按 +∞ 垫底，全零并列才看流数、再并列才轮转。失败窗内的跳过，全在窗内则放开。
+/// ECT 派发：score=(在途+新增)÷上一窗实收，即还需几个时间槽，最小者胜、无容差。
+/// 零历史按 +∞ 垫底；失败窗内跳过，全在窗内则放开。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
@@ -303,7 +302,7 @@ pub(super) fn range_bytes(range: Option<&str>) -> u64 {
     }
 }
 
-/// 非 3xx、非 HTML；带 Range 必须 206，304 放行；`allow_full` 仅总长探测——上游无视 Range 回 200 全量时放行，body 由调用方当单流接管。
+/// 非 3xx、非 HTML；带 Range 必须 206，304 放行；`allow_full` 仅总长探测放行 200 全量。
 fn validate_mirror_response(
     had_range: bool,
     status: u16,
@@ -633,12 +632,11 @@ fn total_memo_put(key: &str, total: u64) {
     g.insert(key.to_string(), (total, Instant::now()));
 }
 
-/// 无 Range 时发 1 字节 Range 探测总长，从 Content-Range 取分母。
-/// 旧实现单点押注链头，链头挂了每个下载先白付一轮探测超时；现在头两家各试一次（真实请求、不合成测速），谁先给总长用谁。
+/// 无 Range 时发 1 字节 Range 探测总长；头两家各试一次（真实请求），谁先给总长用谁。
 enum Probe {
     /// 上游回了 206 + Content-Range：拿到了总长，可以切。
     Total(u64),
-    /// 上游忽略 Range 直接回 200 全量：body 就是整份文件，直接当单流交出去，别丢。
+    /// 上游忽略 Range 回 200 全量：body 就是整份文件，当单流交出。
     NotSliceable(hyper::Response<BoxBody>),
 }
 
@@ -739,8 +737,8 @@ fn mark_unsliceable(key: String) {
     g.insert(key, Instant::now());
 }
 
-/// 直连段请求：模板克隆原请求头换本段 Range 走直连腿；release 下载地址 302 到 release-assets，跟一跳把 Range 带过去，跳转目标 IP 与原 host 无关、用独立记账。
-/// 预算按跳记：有镜像兜底时每跳 2s 拿不到响应头即死路（好 IP 建连 0.6s、首包再 1s）；没镜像（用户没配/链全灭）时不设预算。
+/// 直连段请求：克隆模板头、换本段 Range；release 302 到 release-assets 时跟一跳并带 Range。
+/// 预算按跳记：有镜像兜底时每跳 2s 等响应头，无兜底不设预算。
 async fn segment_direct(
     log: &LogFn,
     tpl: &DirectTpl,
@@ -827,8 +825,7 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     }
 }
 
-/// 切片下载：一条请求按镜像数平均切段并发拉，按边界合并回单条字节流；段数=空闲镜像数（候选 − 在途），少于 2 段不切、交回单流。
-/// 探片、开区间 Range、上游不支持 Range 一律退回单流。
+/// 切片下载：按空闲镜像数切段并发拉，按边界合成单条流；不足 2 段、探片或上游不支持 Range 则退回单流。
 async fn split_download(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -875,7 +872,7 @@ async fn split_download(
             // 总长记忆命中：省掉探测往返（探测本身是真实请求，结果只记 10 分钟）。
             Some(t) => (0, t, Some(t)),
             None => {
-                // 探测候选按 ECT 择优、不按链序：大文件域若不支持 Range，整包从探测腿单流出，链头盲选会把大下载砸在慢镜像上；冷启动 ECT 全零时稳定排序退化回链序。
+                // 探测候选按 ECT 择优、不按链序——整包单流时链头盲选会把大下载砸在慢镜像上；冷启动全零则退化回链序。
                 let mut probe_cands: Vec<&str> = healthy.clone();
                 probe_cands.sort_by_key(|m| {
                     let ld = mirror_load(m);
@@ -1112,8 +1109,8 @@ async fn split_download(
     builder.body(body).map(Some).map_err(|e| e.to_string())
 }
 
-/// 起一条拉 [from, to) 的新流，偏移相对区间起点、发出去要加 base；候选=镜像+直连（健康时），ECT 挑最小者，两条路都 charge 记账、都采样。
-/// 旧实现补发裸奔：ECT 看不见补发的在途字节会过量堆活，直连被永久排除在补发外。
+/// 为 [from,to) 起新流（发出时加 base）；候选=镜像+健康直连，ECT 挑最小，两边都记账采样。
+/// 旧实现补发不进 ECT，直连会被永久排除。
 #[allow(clippy::too_many_arguments)]
 async fn split_fetch(
     chain: &[String],
@@ -1278,8 +1275,8 @@ fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
     }
 }
 
-/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连/等首包再久也不挡泵数据与让位。
-/// 补发没有全局次数上限——还在往前走就一直续，卡死才有上限。
+/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连再久也不挡泵数据与让位。
+/// 补发只受卡死上限约束。
 fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Fetched>(8);
     // tx 每个状态机实例克隆一份：unfold 的闭包是 FnMut，不能把 tx 移出去。

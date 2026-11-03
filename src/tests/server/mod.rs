@@ -90,7 +90,7 @@ async fn plain_http_post_body_forwarded_intact() {
     let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .unwrap();
-    // 一次 write：头与体同包到达（正是当年被吞的形态）；明文走代理必须绝对 URI。顺带带 Connection/Keep-Alive 逐跳头：假上游断言它们被剥除（曾原样泄漏，上游收完即关导致代理转发语义被逐跳头带偏）。
+    // 一次 write：头与体同包到达（当年被吞的形态）；明文代理用绝对 URI，并带 Connection/Keep-Alive 供假上游断言逐跳头被剥除。
     let req = format!(
         "POST http://127.0.0.1:{up_port}/x HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
     );

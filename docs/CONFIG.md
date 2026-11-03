@@ -115,7 +115,7 @@
 
 | 流量 | 上游路径 |
 |---|---|
-| github.com 及其余子域 | core 池直连串发 + gh_defuse |
+| github.com 及其余子域 | 主站候选直连串发 + gh_defuse |
 | api.github.com | api 池直连串发（API 专用边缘，与网站 IP 互斥） |
 | uploads.github.com | **直连白名单**（DNS 直达 alambic .161） |
 | viewscreen.githubusercontent.com | **直连白名单**（mermaid 渲染） |

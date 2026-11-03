@@ -73,7 +73,7 @@ fn tray_send(ev: AppEvent) {
     }
 }
 
-/// 当前进程完整性级别（4096=Low 8192=Medium 12288=High）；低于 shell 时 Shell_NotifyIcon 会被 UIPI 拒（err=5），必须记。
+/// 当前进程完整性级别；低于 shell 时 Shell_NotifyIcon 会被 UIPI 拒（err=5）。
 unsafe fn current_il() -> u32 {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
@@ -357,8 +357,9 @@ fn tray_log(line: &str) {
 }
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true；mutex 句柄须活到进程退出，用 static 锚住。
-#[allow(dead_code)]
-struct SingleMutexHandle(windows::Win32::Foundation::HANDLE);
+struct SingleMutexHandle {
+    _handle: windows::Win32::Foundation::HANDLE,
+}
 unsafe impl Send for SingleMutexHandle {}
 unsafe impl Sync for SingleMutexHandle {}
 
@@ -387,7 +388,7 @@ pub fn already_running() -> bool {
                 }
                 true
             } else {
-                *SINGLE_MUTEX.lock().unwrap() = Some(SingleMutexHandle(h));
+                *SINGLE_MUTEX.lock().unwrap() = Some(SingleMutexHandle { _handle: h });
                 false
             }
         }

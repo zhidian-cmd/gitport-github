@@ -1,14 +1,5 @@
-//! 路由表：routes.json 的 `routes` 字典，键就是域名，最长匹配优先。
-//!
-//! 这张表是唯一真相：一个 host 用哪组 IP、握手用真名还是伪装、全灭后走镜像还是 DNS。
-//! 代码里不再有"IP 末段是多少"的判断——加 IP 只改 routes.json。
-//!
-//! 键的语义只有两种：
-//! - `github.com`   —— 自己 + 任意级子域（`www.github.com` 也命中）
-//! - `*.github.com` —— 只认子域，裸域不命中
-//!
-//! 多条同时命中时取**最长的键**（更具体者胜），所以 `api.github.com` 天然压过
-//! `github.com`，用户不用操心排列顺序。
+//! 路由表：`routes.json` 的 `routes` 字典，键即域名；裸键含自身+子域，`*.` 仅子域，最长键胜。
+//! 这张表是唯一真相：host 用哪组 IP、真名还是伪装、全灭后走镜像还是 DNS。
 
 use super::SerialPlan;
 use crate::util::lock;

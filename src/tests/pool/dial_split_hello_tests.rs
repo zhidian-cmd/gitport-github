@@ -1,7 +1,7 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 真网端到端（默认不跑，要连 GitHub：`cargo test -- --ignored whitelist_e2e`）：白名单域必须走 TlsSplit（真名 + 分片）且分片计数真的涨了；IP 取 docs 实测的 Fastly .154，失效则换 routes.json 里任一 185.199.x.154。
+/// 真网端到端（默认不跑：`cargo test -- --ignored whitelist_e2e`）：白名单域必须走 TlsSplit 且分片计数上涨；IP 取 .154，失效则换任一 185.199.x.154。
 #[tokio::test]
 #[ignore]
 async fn whitelist_e2e_through_pool() {

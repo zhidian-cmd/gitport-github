@@ -50,9 +50,9 @@ PAC 由工作台按开关实时生成（`GET /proxy.pac`）。判定顺序：**�
 
 > 注：池内条目实际返回 `PROXY 127.0.0.1:7810; DIRECT`——代理不可达时浏览器自动回落直连的保险链（2026-10-19 晚复核确认，不应视为路由偏差）。
 
-**主路由白名单（2026-10-27 新增）**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy` 这 10 个域名**不再返回 DIRECT**，而是走通配进代理。原因：它们托管在 Fastly `185.199.10x` / Azure，伪装 SNI 对这批无效（docs 走 core 池 90ms 回 400 Whoa），裸直连又没有分片掩体。进代理后用真名 + 首包分片，族路由见第 3 节 `wl*` 四族。
+**主路由白名单（2026-10-27 新增）**：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` / `copilot-proxy` 这 10 个域名**不再返回 DIRECT**，而是走通配进代理。原因：它们托管在 Fastly `185.199.10x` / Azure，伪装 SNI 对这批无效（docs 走主站候选 90ms 回 400 Whoa），裸直连又没有分片掩体。进代理后用真名 + 首包分片，族路由见第 3 节 `wl*` 四族。
 
-**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `github.com` 那条（含所有子域）吞进 core 池，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
+**白名单为什么存在**（2026-10-17 逐 IP 实测的结论）：objects-origin 只由 GLB 族（140.82.11x.21/.22）服务，主站网页边缘对它一律 301 且无 CORS 头——走代理会把网页上传弄死；uploads 是 API 式上传源站；viewscreen 走代理真名 SNI 拨 .133 被 GFW 间歇掐断，浏览器直连反而"一进仓库就出图"；api.mcp.github.com 被 `github.com` 那条（含所有子域）吞进主站候选，但池内 IP 返回的证书 SAN 不覆盖它（27 连败全 Hostname mismatch），走池必然全灭（2026-10-21 实测，75 分钟日志里 93% 的失败是它）。
 
 ---
 

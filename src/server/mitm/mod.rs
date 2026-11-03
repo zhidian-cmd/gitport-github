@@ -483,13 +483,8 @@ fn borrow_guard_body(host: String, id: u64, body: BoxBody) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(guarded))
 }
 
-/// 内容域候选全灭时的最后一条路：借 assets 已建好的伪装连接发同一个请求。
-///
-/// 全程零握手——`out` 里的 URI 就是目标 host，h2 直接用它生成 `:authority`，
-/// Fastly 按它路由。所以这条路上既没有真名 ClientHello，也不会连累 donor 的通道。
-///
-/// 一条 donor 失败就换另一条再试（最多 [`MAX_BORROW_TRIES`] 条）：坏的那条只冷藏自己，
-/// 不连坐同 host 的另一条，也不会让这个请求白白落到镜像链。
+/// 内容域全灭时的最后一条路：借 assets 的伪装连接发同一请求，全程零握手。
+/// h2 用 `out` 的 URI 生成 `:authority`，Fastly 按它路由，不暴露真名；一条 donor 失败换下一条（最多 `MAX_BORROW_TRIES`）。
 pub(super) async fn try_borrow(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
