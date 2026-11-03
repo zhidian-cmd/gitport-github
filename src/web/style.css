@@ -128,7 +128,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .hero-addr .hint{margin-top:auto;padding-top:10px}
 
 /* 校准报告：与卡片同规范的框，不再是裸文字 */
-#calResult{margin-top:10px;white-space:pre-wrap;display:none;max-height:280px;overflow:auto;
+#calResult,#ipTestResult{margin-top:10px;white-space:pre-wrap;display:none;max-height:280px;overflow:auto;
   background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:12px 14px;
   font:12px var(--mono);color:var(--mid);line-height:1.7}
 

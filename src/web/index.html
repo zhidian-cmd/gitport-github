@@ -111,6 +111,16 @@
           </div>
         </div>
 
+        <div class="panel">
+          <h2>IP 建连测速</h2>
+          <p class="hint" style="margin:0 0 4px">
+            串行实测表内每个 IP 的 TCP+TLS 建连用时（约 1~2 分钟），结果写入 routes.json 的 latency 键；
+            某域上次的 IP 失败后，候选按实测延迟从小到大逐个试。
+          </p>
+          <div class="row"><button class="btn primary" id="ipTestBtn">开始测速</button></div>
+          <pre id="ipTestResult"></pre>
+        </div>
+
       </section>
 
       <!-- 自定义镜像 -->

@@ -837,3 +837,23 @@ fn seeds_are_new_routes_format() {
         route::RouteRow::new(spec.clone()).expect("种子每行都必须能编译");
     }
 }
+
+/// 拨号顺序：游标 IP 优先；其余按实测延迟升序；未测的垫底并保持表序。
+#[test]
+fn dial_order_cursor_first_then_latency_asc() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mk = |ip: &str| route::NodeIp {
+        ip: ip.into(),
+        sni: String::new(),
+        verify: String::new(),
+    };
+    let circle = vec![mk("1.1.1.1"), mk("2.2.2.2"), mk("3.3.3.3"), mk("4.4.4.4")];
+    latency::install(HashMap::new());
+    latency::seed("2.2.2.2", 300);
+    latency::seed("3.3.3.3", 200);
+    latency::seed("4.4.4.4", 100);
+    assert_eq!(dial_order(&circle, Some("1.1.1.1")), vec![0, 3, 2, 1]);
+    assert_eq!(dial_order(&circle, None), vec![3, 2, 1, 0]);
+    assert_eq!(dial_order(&circle, Some("3.3.3.3")), vec![2, 3, 1, 0]);
+    latency::install(HashMap::new());
+}

@@ -292,6 +292,33 @@ async function runCal(btn) {
 }
 $('calImgBtn').onclick = () => runCal($('calImgBtn'));
 
+/* ---------- IP 建连测速 ---------- */
+// 串行实测 TCP+TLS：后台任务 + 轮询状态；完成后结果写进 routes.json 的 latency 键。
+async function runIpTest(btn) {
+  const box = $('ipTestResult');
+  btn.disabled = true;
+  box.style.display = 'block';
+  try {
+    const r = await fetch('/api/ip-test', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-GitPort-Request': '1'}, body: '{}'});
+    box.textContent = await r.text();
+    toast('IP 建连测速已开始');
+    const timer = setInterval(async () => {
+      try {
+        const st = await (await fetch('/api/ip-test')).json();
+        if (st.running) { box.textContent = '测速中…（串行，约 1~2 分钟）'; return; }
+        clearInterval(timer);
+        box.textContent = st.report || '测速完成（无结果）';
+        toast('IP 建连测速完成');
+        refreshLogs();
+      } catch (e) { /* 网络抖动继续轮询 */ }
+    }, 1500);
+  } catch (e) {
+    box.textContent = '测速启动失败: ' + e;
+  }
+  btn.disabled = false;
+}
+$('ipTestBtn').onclick = () => runIpTest($('ipTestBtn'));
+
 /* ---------- 启动 ---------- */
 route(); refreshStatus(); refreshLogs(); refreshSettings();
 // 页面在后台(挂托盘/切走)时完全停轮询 —— 后台零请求

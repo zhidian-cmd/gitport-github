@@ -1,6 +1,7 @@
 //! 串发拨号：二部图（`ips` 节点 × `hosts` 行）唯一权威。成功驻留游标、失败前移；SNI 骗墙、证书按锚点校验。
 pub mod dial;
 pub mod edges;
+pub mod latency;
 pub mod route;
 
 use crate::util::{lock, LogFn};
@@ -65,12 +66,13 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 路由表文档：v2 给 ips+hosts，旧 routes 字典与旧三池在迁移期兼容。
+/// 路由表文档：v2 给 ips+hosts，旧 routes 字典与旧三池在迁移期兼容；latency = 测速键值。
 #[derive(Default)]
 struct TopoDoc {
     hosts: Vec<route::HostSpec>,
     ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
+    latency: HashMap<String, u64>,
 }
 
 /// 合并为运行时单表；旧键不覆盖新键已声明的 host。
@@ -248,6 +250,12 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     doc.chains = merged_chains(&big, &small, &legacy);
+    // 测速键：{ip: ms}；写坏就当没测过，不触发 .bak（它不影响路由表本身）。
+    if let Some(v) = obj.get("latency") {
+        if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
+            doc.latency = m;
+        }
+    }
     Some((doc, salvaged))
 }
 
@@ -575,6 +583,17 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             small_rows.join(",\n")
         ));
     }
+    // 测速键：有数据才写，键按字典序稳定输出。
+    let lat = latency::snapshot_all();
+    if !lat.is_empty() {
+        let mut keys: Vec<&String> = lat.keys().collect();
+        keys.sort();
+        let rows: Vec<String> = keys
+            .iter()
+            .map(|k| format!("    {}: {}", json_of(*k), lat[*k]))
+            .collect();
+        parts.push(format!("  \"latency\": {{\n{}\n  }}", rows.join(",\n")));
+    }
     format!("{{\n{}\n}}\n", parts.join(",\n"))
 }
 
@@ -597,6 +616,11 @@ fn routes_path() -> PathBuf {
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     dir.join(ROUTES_FILE)
+}
+
+/// 立即把内存表（含 latency 键）落盘：测速完成后由 webui 调用。
+pub fn save_routes_now() {
+    write_routes_file(&routes_path(), &mirror_chains_snapshot());
 }
 
 /// 旧名 plans.json → routes.json：只搬一次，搬前留 .bak，rename 失败退化为复制。
@@ -664,7 +688,9 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         hosts: seeds.hosts.clone(),
         ips: seeds.ips.clone(),
         chains: seeds.chains.clone(),
+        latency: HashMap::new(),
     });
+    latency::install(std::mem::take(&mut doc.latency));
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
 
     let mut dropped = 0usize;
@@ -894,6 +920,21 @@ fn cursor_key(key: &str, slot: u8) -> String {
     }
 }
 
+/// 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底并保持表序。
+fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..circle.len()).collect();
+    order.sort_by_key(|&i| (latency::get(&circle[i].ip).unwrap_or(u64::MAX), i));
+    if let Some(ip) = start_ip {
+        if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
+            if let Some(at) = order.iter().position(|&j| j == pos) {
+                order.remove(at);
+                order.insert(0, pos);
+            }
+        }
+    }
+    order
+}
+
 /// 冷启动竞速的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
 pub struct DialCrew {
     claimed: Mutex<HashSet<String>>,
@@ -959,16 +1000,12 @@ pub async fn serial_dial_skip(
     }
     let cursor_key = cursor_key(&key, slot);
 
-    // 起点 = 记号(上次驻留/尝试的 IP);找不到则从 0 号位起步。
-    let start = {
+    // 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底保持表序。
+    let start_ip = {
         let g = lock(&SERIAL);
-        g.as_ref()
-            .unwrap()
-            .cursor
-            .get(&cursor_key)
-            .and_then(|m| circle.iter().position(|p| &p.ip == m))
-            .unwrap_or(0)
+        g.as_ref().unwrap().cursor.get(&cursor_key).cloned()
     };
+    let order = dial_order(&circle, start_ip.as_deref());
 
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
@@ -978,8 +1015,8 @@ pub async fn serial_dial_skip(
     let mut budget_used = Duration::ZERO;
     let mut budget_hit = false;
     let mut slow_n = 0usize;
-    for i in 0..circle.len() {
-        let p = &circle[(start + i) % circle.len()];
+    for (oi, &ci) in order.iter().enumerate() {
+        let p = &circle[ci];
         {
             let g = lock(&SERIAL);
             if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
@@ -1019,8 +1056,8 @@ pub async fn serial_dial_skip(
                 // 前移到下一候选；物理顺序不动，零写盘。
                 {
                     let mut g = lock(&SERIAL);
-                    let n = circle.len();
-                    let next = &circle[(start + i + 1) % n];
+                    let n = order.len();
+                    let next = &circle[order[(oi + 1) % n]];
                     if let Some(t) = g.as_mut() {
                         t.cursor.insert(cursor_key.clone(), next.ip.clone());
                     }
