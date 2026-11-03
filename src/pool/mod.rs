@@ -250,10 +250,15 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     doc.chains = merged_chains(&big, &small, &legacy);
-    // 测速键：{ip: ms}；写坏就当没测过，不触发 .bak（它不影响路由表本身）。
+    // 测速键：顶层旧布局（{ip: ms}）先读，节点条目内的同键覆盖（新布局）。
     if let Some(v) = obj.get("latency") {
         if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
             doc.latency = m;
+        }
+    }
+    for spec in &doc.ips {
+        for (ip, ms) in &spec.latency {
+            doc.latency.insert(ip.clone(), *ms);
         }
     }
     Some((doc, salvaged))
@@ -334,6 +339,7 @@ fn v1_route_spec(
             },
             verify: verify_for(&p.ip),
             hosts: vec![key.to_string()],
+            latency: HashMap::new(),
         });
     }
     let _ = direct;
@@ -388,6 +394,7 @@ fn legacy_pools_to_v2(
                 },
                 verify: verify_for(&p.ip),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                latency: HashMap::new(),
             });
         }
     };
@@ -519,9 +526,6 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
         .iter()
         .map(|r| {
             let mut fields: Vec<String> = Vec::new();
-            if let Some(pac) = &r.pac {
-                fields.push(format!("\"pac\": {}", json_of(pac)));
-            }
             if r.flags.direct {
                 fields.push("\"action\": \"direct\"".to_string());
             }
@@ -544,17 +548,27 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
         .collect();
     parts.push(format!("  \"hosts\": {{\n{}\n  }}", rows.join(",\n")));
 
+    // 测速值跟着节点走：只写该节点展开出的 IP，range 节点各 IP 各记各的。
+    let lat = latency::snapshot_all();
     let nodes: Vec<String> = route::nodes_snapshot()
         .iter()
         .map(|n| {
             let hosts: Vec<String> = n.hosts.iter().map(json_of).collect();
-            format!(
-                "    {{\n      \"ip\": {},\n      \"sni\": {},\n      \"verify\": {},\n      \"hosts\": [{}]\n    }}",
-                json_of(&n.raw),
-                json_of(&n.sni),
-                json_of(&n.verify),
-                hosts.join(", ")
-            )
+            let mut fields: Vec<String> = vec![
+                format!("\"ip\": {}", json_of(&n.raw)),
+                format!("\"sni\": {}", json_of(&n.sni)),
+                format!("\"verify\": {}", json_of(&n.verify)),
+                format!("\"hosts\": [{}]", hosts.join(", ")),
+            ];
+            let lat_rows: Vec<String> = n
+                .ips
+                .iter()
+                .filter_map(|ip| lat.get(ip).map(|ms| format!("{}: {}", json_of(ip), ms)))
+                .collect();
+            if !lat_rows.is_empty() {
+                fields.push(format!("\"latency\": {{{}}}", lat_rows.join(", ")));
+            }
+            format!("    {{\n      {}\n    }}", fields.join(",\n      "))
         })
         .collect();
     parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
@@ -582,17 +596,6 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             "  \"mirrors_small\": {{\n{}\n  }}",
             small_rows.join(",\n")
         ));
-    }
-    // 测速键：有数据才写，键按字典序稳定输出。
-    let lat = latency::snapshot_all();
-    if !lat.is_empty() {
-        let mut keys: Vec<&String> = lat.keys().collect();
-        keys.sort();
-        let rows: Vec<String> = keys
-            .iter()
-            .map(|k| format!("    {}: {}", json_of(*k), lat[*k]))
-            .collect();
-        parts.push(format!("  \"latency\": {{\n{}\n  }}", rows.join(",\n")));
     }
     format!("{{\n{}\n}}\n", parts.join(",\n"))
 }

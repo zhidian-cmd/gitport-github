@@ -347,6 +347,8 @@ fn encode_routes_roundtrip() {
             "https://v4.gh-proxy.org".to_string(),
         ],
     );
+    latency::install(HashMap::new());
+    latency::seed("1.2.3.4", 111);
     let b = encode_routes(&mirrors);
     // 节点条目必须单行
     for line in b.lines() {
@@ -356,6 +358,19 @@ fn encode_routes_roundtrip() {
         }
     }
     assert!(b.contains("\"mirrors_small\""), "镜像链板块应落盘: {b}");
+    assert!(!b.contains("\"pac\""), "pac 不再落盘: {b}");
+    assert!(
+        b.contains("\"latency\": {\"1.2.3.4\": 111}"),
+        "测速值应挂在节点条目里: {b}"
+    );
+    let (doc, _) = parse_routes_tolerant(&b, None).expect("编码结果应可解析");
+    assert_eq!(doc.latency.get("1.2.3.4"), Some(&111), "测速值应可回读");
+    let row = route::RouteRow::new(
+        serde_json::from_str::<route::HostSpec>(r#"{"key":"github.com"}"#).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(row.pac.as_deref(), Some("github.com"), "pac 缺省 = 裸键");
+    latency::install(HashMap::new());
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     let hosts = back["hosts"].as_object().expect("hosts 应是对象(域名作键)");
     assert_eq!(hosts.len(), 2);

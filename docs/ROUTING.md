@@ -3,26 +3,21 @@
 > 2026-10-19 实测，2026-10-27 补白名单腿。
 > **⚠️ v2（2026-11-03）起本文的 Mirror 判定与真名分片腿已成历史**：routes.json 改二部图（见 POOL-V2.md），codeload/archive 迁池、白名单域转伪装锚点、real/donor 标志删除；PAC 与最长匹配判定不变。历史实测数据仍具参考价值。
 > 2026-11-02 派发演化：codeload 并入小文件域（直连优先 + TTFB 校准链序）、大文件域改分段竞速（慢段让位）、ECT 改离散时间槽——**本文的路由判定（PAC / master_route / 族 / 兜底）全部不变**，派发细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。
-> 代码唯一真相：`src/pool/route.rs`（总路由 + 池内族表）、`src/config.rs`（GROUPS / DIRECT_HOSTS / WHITELIST_HOSTS）、`src/webui.rs`（PAC 生成）。
+> 代码唯一真相（v2 起）：`src/pool/route.rs`（二部图查询管线：route_for / dial_targets / master_route）+ `routes.json`（ips/hosts 数据）+ [POOL-V2.md](POOL-V2.md)（设计动机与实测证据）；`src/config.rs` 只剩端口与超时常量。本文以下内容为 v1 族路由（池/族/对口规则/真名分片腿）的历史实测记录，判定逻辑已被 routes.json 取代。
 > 本文每行「实测」列均为当日对**运行中的代理**（127.0.0.1:7810，新二进制，MITM 开）的真实请求结果，日志佐证取自 `/api/logs`。
 
 ---
 
 ## 0. 总览：一条请求的四层决策
 
-```
-浏览器
-  │  ① PAC（webui.rs pac_script）——池内域名 + 主路由白名单 → PROXY 127.0.0.1:7810；直连白名单/其余 → DIRECT
-  ▼
-代理 7810
-  │  ② master_route（route.rs）——System / Mirror / Pool{池,族} / Tunnel
-  ▼
-  │  ③ 池内族路由（route.rs POOL_ROUTES）——按 host 选族，按 IP 末段 + SNI 形态筛条目；
-  │     主路由白名单落 edge 的 wl* 族，改用真名 SNI + ClientHello 分 3 片
-  ▼
-  │  ④ 兜底（Fallback）——族全灭后：content → 镜像链 → 系统 DNS 腿；其余 → 系统 DNS 腿
-  ▼
-上游（GitHub 边缘 / 镜像站 / 系统 DNS）
+```mermaid
+flowchart TD
+    B["浏览器"] --> L1["① PAC（webui.rs pac_script）<br/>池内域名 + 主路由白名单 → PROXY 127.0.0.1:7810<br/>直连白名单/其余 → DIRECT"]
+    L1 --> P["代理 7810"]
+    P --> L2["② master_route（route.rs）<br/>System / Mirror / Pool{池,族} / Tunnel"]
+    L2 --> L3["③ 池内族路由（route.rs POOL_ROUTES）<br/>按 host 选族，按 IP 末段 + SNI 形态筛条目<br/>主路由白名单落 edge 的 wl* 族：真名 SNI + ClientHello 分 3 片"]
+    L3 --> L4["④ 兜底（Fallback）<br/>族全灭后：content → 镜像链 → 系统 DNS 腿<br/>其余 → 系统 DNS 腿"]
+    L4 --> UP["上游（GitHub 边缘 / 镜像站 / 系统 DNS）"]
 ```
 
 一句话版：**PAC 决定谁进代理；master_route 决定进代理后直连还是镜像；族路由决定用哪些 IP；兜底决定全灭之后找谁。**

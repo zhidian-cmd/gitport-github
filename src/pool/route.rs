@@ -62,6 +62,9 @@ pub struct IpSpec {
     /// 本节点服务的路由键列表。
     #[serde(default)]
     pub hosts: Vec<String>,
+    /// 测速值（`{具体 IP: 毫秒}`）：跟着节点条目走，range 节点每个展开 IP 各记各的。
+    #[serde(default)]
+    pub latency: HashMap<String, u64>,
 }
 
 /// 展开后的运行时节点：具体 IP 组 + 伪装身份。
@@ -139,7 +142,8 @@ impl RouteRow {
         Ok(Self {
             rank: bare.len(),
             key,
-            pac: spec.pac,
+            // pac 不落盘：缺省 = 键去 `*.` 的裸域名（PAC 名单靠它，语义恒定）。
+            pac: spec.pac.or_else(|| Some(bare.clone())),
             flags: Flags {
                 direct,
                 content: spec.content,

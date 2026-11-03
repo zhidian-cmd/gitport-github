@@ -138,7 +138,7 @@ fn flags_come_from_the_row() {
     assert_eq!(fallback_for("other.example"), Fallback::Dns, "表外默认 DNS");
 }
 
-/// PAC 名单从路由行取：直连行进 direct，其余带 pac 的进代理名单。
+/// PAC 名单从路由行取：直连行进 direct，其余行进代理名单（pac 不落盘，缺省 = 裸键）。
 #[test]
 fn pac_lists_split_direct_and_proxy() {
     let _g = crate::pool::TEST_LOCK
@@ -154,7 +154,14 @@ fn pac_lists_split_direct_and_proxy() {
     ]);
     let (proxy, direct) = pac_lists();
     assert_eq!(direct, vec!["a.example".to_string()]);
-    assert_eq!(proxy, vec!["githubusercontent.com".to_string()]);
+    assert_eq!(
+        proxy,
+        vec![
+            "githubusercontent.com".to_string(),
+            "no-pac.example".to_string()
+        ],
+        "缺省 pac = 裸键，不再有'不写 pac 就不进名单'的行"
+    );
 }
 
 /// 游标键跟路由行一一对应（主键 + `_vice` 副键），直连行不占键。
