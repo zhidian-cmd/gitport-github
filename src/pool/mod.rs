@@ -573,11 +573,7 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             if fields.is_empty() {
                 format!("    {}: {{}}", json_of(&r.key))
             } else {
-                format!(
-                    "    {}: {{\n      {}\n    }}",
-                    json_of(&r.key),
-                    fields.join(",\n      ")
-                )
+                format!("    {}: {{{}}}", json_of(&r.key), fields.join(", "))
             }
         })
         .collect();
