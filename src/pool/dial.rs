@@ -419,6 +419,7 @@ pub async fn dial_one(
     host: &str,
     ip: &str,
     mode: &str,
+    real: bool,
     tls_handshake: bool,
 ) -> std::io::Result<Dialed> {
     let _permit = gate_acquire().await;
@@ -435,8 +436,8 @@ pub async fn dial_one(
         return Ok(Dialed::Plain(tcp));
     }
 
-    // 白名单域名一律真名 + 分片，条目自带的 sni 不生效（伪装会被上游判非法）。
-    if crate::config::is_whitelist(host) {
+    // real 路由一律真名 + 分片，条目自带的 sni 不生效（伪装会被上游判非法）。
+    if real {
         let tls = tls_connect_split(host, tcp).await?;
         return Ok(Dialed::TlsSplit(tls));
     }

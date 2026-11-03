@@ -89,7 +89,6 @@ pub(super) async fn gh_defuse(
     out: &hyper::Request<BoxBody>,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = crate::config::pool_for(host);
     let is_simple = true;
     let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
     let mut tried = 0; // 已垫底重试候选数(仅日志)
@@ -100,8 +99,8 @@ pub(super) async fn gh_defuse(
             return Ok(resp);
         }
         let ip = info.lock().unwrap().clone();
-        if name.is_empty() {
-            return Ok(resp); // 非池域名: 无表可换, 诚实透传
+        if !pool::route::is_managed(host) {
+            return Ok(resp); // 非受管域名: 无表可换, 诚实透传
         }
         if ip.is_empty() {
             empty_ip_retries += 1;
@@ -114,7 +113,7 @@ pub(super) async fn gh_defuse(
             };
             continue;
         }
-        pool::cursor_note(name, host, &ip, false, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
+        pool::cursor_note(host, &ip, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
                                                // 风控页说明该 IP 的连接不可信，必须同步清复用槽，否则下个请求又拿到坏连接，垫底/重拨乒乓死循环。
         upstream::drop_h2(host, &ip);
         // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。

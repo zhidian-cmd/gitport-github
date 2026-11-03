@@ -50,91 +50,9 @@ pub const HELLO_SPLIT_DELAY_MAX_MS: u64 = 70;
 /// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;
-/// 域名分组：命中即按该池 plans.json 串发表拨号；IP 名单只住 plans.json。
-pub struct Group {
-    pub name: &'static str,
-    pub patterns: &'static [&'static str],
-}
-
-pub const GROUPS: &[Group] = &[
-    Group {
-        name: "core",
-        patterns: &["github.com", "*.github.com"],
-    },
-    Group {
-        // api 走专用边缘（.5/.6）：与网站 IP 分服务互斥，落错返 404/301，必须精确优先拆池。
-        name: "api",
-        patterns: &["api.github.com"],
-    },
-    Group {
-        name: "edge",
-        patterns: &[
-            "githubapp.com",
-            "*.githubapp.com",
-            "*.githubassets.com",
-            "github.io",
-            "*.github.io",
-            "*.githubusercontent.com",
-        ],
-    },
-];
-
-/// `*.x` 匹配子域，否则全等。
-pub fn pattern_match(host: &str, pat: &str) -> bool {
-    match pat.strip_prefix("*.") {
-        Some(suffix) => host
-            .strip_suffix(suffix)
-            .is_some_and(|h| h.ends_with('.')),
-        None => host == pat,
-    }
-}
-
-/// 直连白名单：不走池、不经代理——池的 IP 与伪装 SNI 对这些域会被上游判非法，系统 DNS 直连反而可用。
-pub const DIRECT_HOSTS: &[&str] = &[
-    "objects-origin.githubusercontent.com",
-    "uploads.github.com",
-    "viewscreen.githubusercontent.com",
-    "api.mcp.github.com",
-];
-
-/// 主路由白名单：进 edge 池但按 seg 选段、握手用真名 + 分片；这些域不在老族的段上，落老族会被判 400。
-pub struct WhitelistHost {
-    pub host: &'static str,
-    pub seg: &'static str,
-}
-
-pub const WHITELIST_HOSTS: &[WhitelistHost] = &[
-    WhitelistHost { host: "docs.github.com", seg: "154" },
-    WhitelistHost { host: "support.github.com", seg: "133" },
-    WhitelistHost { host: "resources.github.com", seg: "133" },
-    WhitelistHost { host: "desktop.github.com", seg: "153" },
-    WhitelistHost { host: "pages.github.com", seg: "153" },
-    WhitelistHost { host: "skills.github.com", seg: "153" },
-    WhitelistHost { host: "archiveprogram.github.com", seg: "153" },
-    WhitelistHost { host: "socialimpact.github.com", seg: "153" },
-    WhitelistHost { host: "raw.github.com", seg: "133" },
-    WhitelistHost {
-        host: "copilot-proxy.githubusercontent.com",
-        seg: "4.249",
-    },
-];
-
 /// 白名单腿分片参数：固定 3 段、间隔 100ms——真名 SNI 一旦被拼齐就明文暴露，宁可多等。
 pub const WHITELIST_SPLIT_SEGS: usize = 3;
 pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;
-
-pub fn is_whitelist(host: &str) -> bool {
-    whitelist_seg(host).is_some()
-}
-
-/// 白名单域名该落哪段 IP（Fastly 末段 / Azure 前缀）；不在白名单返回 None。
-pub fn whitelist_seg(host: &str) -> Option<&'static str> {
-    WHITELIST_HOSTS.iter().find(|w| w.host == host).map(|w| w.seg)
-}
-
-pub fn is_direct(host: &str) -> bool {
-    DIRECT_HOSTS.contains(&host)
-}
 
 /// 直连优先域：先试直连，失败按链序逐家；codeload 已并入小文件派发并享受 TTFB 校准。
 pub const DIRECT_FIRST_HOSTS: &[&str] = &["codeload.github.com"];
@@ -142,41 +60,3 @@ pub const DIRECT_FIRST_HOSTS: &[&str] = &["codeload.github.com"];
 pub fn is_direct_first(host: &str) -> bool {
     DIRECT_FIRST_HOSTS.contains(&host)
 }
-
-/// 域名 → 池名（"" = 非池）。精确 pattern 优先于通配符；总路由见 route::master_route。
-pub fn pool_for(host: &str) -> &'static str {
-    // 白名单必须先于 GROUPS 遍历：objects-origin 会被 edge 通配符吞掉（Fastly 500）。
-    if is_direct(host) {
-        return "";
-    }
-    // 白名单进 edge 池：池里靠白名单族按 seg 选 IP，握手由 dial_one 切成真名 + 分片。
-    if is_whitelist(host) {
-        return "edge";
-    }
-    for g in GROUPS {
-        for pat in g.patterns {
-            if *pat == host {
-                return g.name;
-            }
-        }
-    }
-    for g in GROUPS {
-        for pat in g.patterns {
-            if pattern_match(host, pat) {
-                return g.name;
-            }
-        }
-    }
-    ""
-}
-
-/// 全部受管域名的裸形（`*.x` 剥成 `x`），去重由调用方做一次（PAC 本身就是低频请求）。
-pub fn pooled_domains() -> impl Iterator<Item = &'static str> {
-    GROUPS
-        .iter()
-        .flat_map(|g| g.patterns.iter().map(|p| p.strip_prefix("*.").unwrap_or(p)))
-}
-
-#[cfg(test)]
-#[path = "tests/config.rs"]
-mod tests;

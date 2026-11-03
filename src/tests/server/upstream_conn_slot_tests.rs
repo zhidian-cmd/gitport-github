@@ -43,6 +43,21 @@ async fn slot_filter_pins_search_to_primary() {
     let _ = lock(conn_pool()).remove(host);
 }
 
+/// 借道用例要装一张路由表（donor 标记现在由数据给，不再看域名后缀）。
+fn install_borrow_routes() {
+    let specs = [
+        r#"{"match":".*\\.githubassets\\.com","donor":true}"#,
+        r#"{"match":".*\\.githubusercontent\\.com","content":true,"fallback":"mirror"}"#,
+    ];
+    let rows = specs
+        .iter()
+        .map(|s| {
+            crate::pool::route::RouteRow::new(serde_json::from_str(s).expect("spec")).expect("行合法")
+        })
+        .collect();
+    crate::pool::route::install(rows);
+}
+
 /// 借道用例都要扫全局连接池，串行跑，免得互相挑到对方塞进去的 donor。
 fn pool_lock() -> std::sync::MutexGuard<'static, ()> {
     static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -92,7 +107,10 @@ async fn live_donor(ip: &str) -> H2Upstream {
 /// 3) 借失败要进冷却，后续请求直接回落，不再逐条空等。
 #[tokio::test]
 async fn borrow_contract_end_to_end() {
-    let _g = pool_lock();
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_borrow_routes();
     let target = "avatars.test-borrow.githubusercontent.com";
     let donor_host = "github.test-borrow.githubassets.com";
     let content_host = "raw.test-borrow.githubusercontent.com";
@@ -161,7 +179,10 @@ async fn borrow_contract_end_to_end() {
 /// 归还后计数必须回到 0，否则那条连接会一直"在忙"，再也挑不中。
 #[tokio::test]
 async fn borrow_spreads_over_two_channels() {
-    let _g = pool_lock();
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_borrow_routes();
     let target = "avatars.test-spread.githubusercontent.com";
     let donor_host = "github.test-spread.githubassets.com";
     let a = live_donor("9.9.4.1").await;
@@ -191,7 +212,10 @@ async fn borrow_spreads_over_two_channels() {
 /// 借出的配额在响应体丢弃时要还回去。
 #[tokio::test]
 async fn borrow_fails_over_to_second_channel() {
-    let _g = pool_lock();
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_borrow_routes();
     let target = "avatars.test-failover.githubusercontent.com";
     let donor_host = "github.test-failover.githubassets.com";
     // 先入池的先被选中：坏的那条排前面，才能真的走到"换一条再试"。

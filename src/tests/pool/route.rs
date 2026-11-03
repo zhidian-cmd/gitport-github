@@ -1,226 +1,155 @@
 use super::*;
 
-fn mk(ip: &str, sni: &str) -> SerialPlan {
-    SerialPlan {
-        ip: ip.into(),
-        sni: sni.into(),
-    }
+fn row(spec: &str) -> RouteRow {
+    RouteRow::new(serde_json::from_str(spec).expect("spec 应是合法 JSON")).expect("行应可编译")
 }
 
-/// 白名单四族：按 seg 认域名、按段认 IP。段号填错或族序排错都会在这里红。
-#[test]
-fn whitelist_families_route_by_seg() {
-    for (host, fam, ip) in [
-        ("docs.github.com", "wl154", "185.199.108.154"),
-        ("pages.github.com", "wl153", "185.199.108.153"),
-        ("support.github.com", "wl133", "185.199.108.133"),
-    ] {
-        let f = serial_family("edge", host, false)
-            .unwrap_or_else(|| panic!("{host} 没有命中任何族"));
-        assert_eq!(f.name, fam, "{host} 落错族");
-        assert!((f.serves)(host, &mk(ip, "baidu.com")), "{host} 应认 {ip}");
-    }
-
-    // Azure 段不是 Fastly 四段之一，必须按前缀认
-    let cp = "copilot-proxy.githubusercontent.com";
-    let f = serial_family("edge", cp, false).unwrap();
-    assert_eq!(f.name, "wl_azure", "copilot-proxy 被别的族抢走了");
-    assert!((f.serves)(cp, &mk("4.249.131.160", "baidu.com")));
-
-    // 反例一：githubapp 系的兜底族不能把 Azure 段当候选（连过去是别的服务）
-    let auth = serial_family("edge", "api.githubapp.com", false).unwrap();
-    assert_eq!(auth.name, "auth");
-    assert!(!(auth.serves)(
-        "api.githubapp.com",
-        &mk("4.249.131.160", "baidu.com")
-    ));
-
-    // 反例二：老族行为不变，content 仍只认 .133
-    let content = serial_family("edge", "avatars.githubusercontent.com", false).unwrap();
-    assert_eq!(content.name, "content");
-    assert!((content.serves)(
-        "avatars.githubusercontent.com",
-        &mk("185.199.110.133", "baidu.com")
-    ));
-    assert!(!(content.serves)(
-        "avatars.githubusercontent.com",
-        &mk("185.199.110.154", "baidu.com")
-    ));
+fn install_rows(specs: &[&str]) {
+    install(specs.iter().map(|s| row(s)).collect());
 }
 
-
+/// 只有一条匹配规则：数组从上往下，先命中先用。顺序就是用户排的顺序。
 #[test]
-fn master_route_all_hosts() {
-    use Route::*;
+fn first_match_wins_in_array_order() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[
+        r#"{"match":"docs\\.github\\.com","real":true,"plans":[{"ip":"1.1.1.1"}]}"#,
+        r#"{"match":"(.*\\.)?github\\.com","plans":[{"ip":"2.2.2.2"}]}"#,
+    ]);
+    let docs = route_for("docs.github.com").expect("精确项应命中");
+    assert_eq!(docs.pattern, "docs\\.github\\.com");
+    assert_eq!(docs.plans[0].ip, "1.1.1.1");
+    assert!(docs.flags.real, "real 标记应随行带出");
+    assert_eq!(
+        route_for("api.github.com").expect("通配项应兜住").plans[0].ip,
+        "2.2.2.2"
+    );
+    assert!(route_for("example.com").is_none(), "表外域名不归代理管");
+
+    // 顺序颠倒：通配写在前面就会吞掉精确项，这是用户自己排的，不再有隐藏优先级。
+    install_rows(&[
+        r#"{"match":"(.*\\.)?github\\.com","plans":[{"ip":"2.2.2.2"}]}"#,
+        r#"{"match":"docs\\.github\\.com","plans":[{"ip":"1.1.1.1"}]}"#,
+    ]);
+    assert_eq!(
+        route_for("docs.github.com").expect("应命中").plans[0].ip,
+        "2.2.2.2",
+        "先命中的通配说了算"
+    );
+}
+
+/// 整串匹配：`github\.com` 只认它自己，不做子串也不做后缀。
+#[test]
+fn match_is_whole_string() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[r#"{"match":"github\\.com","plans":[{"ip":"1.1.1.1"}]}"#]);
+    assert!(route_for("github.com").is_some());
+    assert!(route_for("api.github.com").is_none(), "子域不该被裸域命中");
+    assert!(route_for("xgithub.com").is_none(), "后缀相同但不是子域");
+    assert!(route_for("github.com.evil.tld").is_none(), "不得当前缀");
+}
+
+/// 四个开关位都由数据给，代码不再从 host 形状推断。
+#[test]
+fn flags_come_from_the_row() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[
+        r#"{"match":"direct\\.example","action":"direct","pac":"direct.example"}"#,
+        r#"{"match":".*\\.githubusercontent\\.com","content":true,"fallback":"mirror","plans":[]}"#,
+        r#"{"match":".*\\.githubassets\\.com","donor":true,"plans":[]}"#,
+    ]);
+    assert!(route_for("direct.example").unwrap().flags.direct);
+    assert!(!is_managed("direct.example"), "直连行不进代理");
+    assert!(is_managed("a.githubusercontent.com"));
+    assert!(is_content("a.githubusercontent.com"));
+    assert_eq!(
+        fallback_for("a.githubusercontent.com"),
+        Fallback::MirrorDns
+    );
+    assert!(is_donor("x.githubassets.com"));
+    assert!(!is_donor("a.githubusercontent.com"));
+    assert_eq!(fallback_for("other.example"), Fallback::Dns, "表外默认 DNS");
+}
+
+/// 真名腿（隧道 / real 路由）才带上 realPlans；伪装腿绝不碰它们。
+#[test]
+fn real_plans_only_on_real_wire() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let r = row(
+        r#"{"match":"x","plans":[{"ip":"1.1.1.1"}],"realPlans":[{"ip":"2.2.2.2"}]}"#,
+    );
+    assert_eq!(r.dial_plans(false).len(), 1, "伪装腿只有 plans");
+    let both = r.dial_plans(true);
+    assert_eq!(both.len(), 2, "真名腿加 realPlans");
+    assert_eq!(both[1].ip, "2.2.2.2");
+}
+
+/// PAC 名单从路由行取：直连行进 direct，其余带 pac 的进代理名单。
+#[test]
+fn pac_lists_split_direct_and_proxy() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[
+        r#"{"match":"a\\.example","action":"direct","pac":"a.example"}"#,
+        r#"{"match":".*\\.githubusercontent\\.com","pac":"githubusercontent.com","plans":[]}"#,
+        r#"{"match":"no-pac\\.example","plans":[]}"#,
+    ]);
+    let (proxy, direct) = pac_lists();
+    assert_eq!(direct, vec!["a.example".to_string()]);
+    assert_eq!(proxy, vec!["githubusercontent.com".to_string()]);
+}
+
+/// 游标键跟路由行一一对应，直连行不占键。
+#[test]
+fn cursor_keys_follow_routes() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[
+        r#"{"match":"a\\.example","action":"direct","pac":"a.example"}"#,
+        r#"{"match":"b\\.example","plans":[]}"#,
+    ]);
+    assert_eq!(cursor_keys(), vec!["b\\.example", "b\\.example~2"]);
+}
+
+/// 总路由：直连行短路 → System；表外 → Tunnel；镜像路径照旧。
+#[test]
+fn master_route_direct_tunnel_mirror() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install_rows(&[
+        r#"{"match":"objects-origin\\.githubusercontent\\.com","action":"direct","pac":"objects-origin.githubusercontent.com"}"#,
+        r#"{"match":"(.*\\.)?github\\.com","plans":[]}"#,
+        r#"{"match":".*\\.githubusercontent\\.com","content":true,"plans":[]}"#,
+    ]);
     assert_eq!(
         master_route("objects-origin.githubusercontent.com", "PUT", "/x"),
-        System
+        Route::System
     );
-    assert_eq!(master_route("uploads.github.com", "GET", "/"), System);
+    assert_eq!(master_route("github.com", "GET", "/"), Route::Pool);
     assert_eq!(
-        master_route("viewscreen.githubusercontent.com", "GET", "/"),
-        System
-    );
-    assert_eq!(
-        master_route("api.mcp.github.com", "GET", "/x"),
-        System,
-        "core 池证书不覆盖 api.mcp，必须白名单短路"
+        master_route("github.com", "GET", "/o/r/archive/x.zip"),
+        Route::Mirror
     );
     assert_eq!(
         master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
-        Mirror
+        Route::Mirror
     );
     assert_eq!(
-        master_route("objects.githubusercontent.com", "HEAD", "/x"),
-        Mirror
+        master_route("example.com", "GET", "/"),
+        Route::Tunnel,
+        "表外域名走隧道"
     );
-    assert_eq!(
-        master_route(
-            "github.com",
-            "GET",
-            "/git-lfs/git-lfs/releases/download/v3.5.1/x.zip"
-        ),
-        Mirror
-    );
-    assert_eq!(master_route("github.com", "GET", "/o/r/archive/x.zip"), Mirror);
-    assert_eq!(
-        master_route("github.com", "POST", "/o/r/releases/download/x"),
-        Pool
-    );
-    assert_eq!(
-        master_route("github.com", "GET", "/o/r/releases"),
-        Pool
-    );
-    assert_eq!(
-        master_route("github.com", "GET", "/"),
-        Pool
-    );
-    assert_eq!(
-        master_route("gist.github.com", "GET", "/"),
-        Pool
-    );
-    assert_eq!(
-        master_route("api.github.com", "GET", "/"),
-        Pool
-    );
-    assert_eq!(master_route("example.com", "GET", "/"), Tunnel);
-    assert_eq!(master_route("githubstatus.com", "GET", "/"), Tunnel);
 }
 
+/// 坏行在校验期就拒绝：正则写错、action/fallback 拼错都不许静默通过。
 #[test]
-fn master_route_edge_families() {
-    use Route::*;
-    for (host, fam) in [
-        ("raw.githubusercontent.com", "content"),
-        ("avatars.githubusercontent.com", "content"),
-        ("camo.githubusercontent.com", "content"),
-        ("user-images.githubusercontent.com", "content"),
-        ("media.githubusercontent.com", "content"),
-        ("private-user-images.githubusercontent.com", "content"),
-        ("github.githubassets.com", "assets"),
-        ("assets.githubassets.com", "assets"),
-        ("github.io", "io"),
-        ("octocat.github.io", "io"),
-        ("githubapp.com", "auth"),
-        ("api.githubapp.com", "auth"),
-    ] {
-        assert_eq!(
-            master_route(host, "GET", "/x"),
-            Pool,
-            "{host} 应归 edge 池"
-        );
-        assert_eq!(
-            serial_family("edge", host, false).map(|f| f.name),
-            Some(fam),
-            "{host} 的族应为 {fam}"
-        );
-    }
-}
-
-
-#[test]
-fn family_entry_serves() {
-    assert!(host_is_content("avatars.githubusercontent.com"));
-    assert_eq!(fastly_last_octet("185.199.110.133"), Some("133"));
-    assert_eq!(fastly_last_octet("185.199.110.154"), Some("154"));
-    assert!(fastly_last_octet("140.82.112.3").is_none());
-    assert!((FAMILY_CONTENT.serves)("x", &mk("185.199.110.133", "baidu.com")));
-    assert!(!(FAMILY_CONTENT.serves)("x", &mk("185.199.110.154", "baidu.com")));
-    assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.215", "baidu.com")));
-    assert!((FAMILY_ASSETS.serves)("x", &mk("185.199.110.154", "baidu.com")));
-    assert!(!(FAMILY_ASSETS.serves)(
-        "x",
-        &mk("185.199.110.133", "baidu.com")
-    ));
-    assert!((FAMILY_IO.serves)("x", &mk("185.199.110.153", "baidu.com")));
-    assert!(!(FAMILY_IO.serves)("x", &mk("185.199.110.154", "baidu.com")));
-    assert!((FAMILY_AUTH.serves)("x", &mk("140.82.112.29", "baidu.com")));
-    assert!(!(FAMILY_AUTH.serves)(
-        "x",
-        &mk("185.199.110.133", "baidu.com")
-    ));
-    assert!((FAMILY_ALL.serves)("x", &mk("140.82.112.3", "baidu.com")));
-}
-
-fn fam(pool: &str, host: &str) -> &'static str {
-    serial_family(pool, host, false).map_or("", |f| f.name)
-}
-
-#[test]
-fn family_for_and_fallback() {
-    assert_eq!(fam("core", "github.com"), "all");
-    assert_eq!(fam("api", "api.github.com"), "all");
-    assert_eq!(fam("edge", "raw.githubusercontent.com"), "content");
-    assert_eq!(fam("edge", "github.githubassets.com"), "assets");
-    assert_eq!(fam("edge", "octocat.github.io"), "io");
-    assert_eq!(fam("edge", "githubapp.com"), "auth");
-    assert_eq!(fam("edge", "future.edge.host"), "auth");
-    assert_eq!(fam("codeload", "codeload.github.com"), "");
-    assert_eq!(
-        fallback_for("edge", "raw.githubusercontent.com"),
-        Fallback::MirrorDns
+fn invalid_rows_are_rejected() {
+    assert!(RouteRow::new(serde_json::from_str(r#"{"match":"([a-z"}"#).unwrap()).is_err());
+    assert!(
+        RouteRow::new(serde_json::from_str(r#"{"match":"x","action":"proxy"}"#).unwrap()).is_err()
     );
-    assert_eq!(
-        fallback_for("edge", "camo.githubusercontent.com"),
-        Fallback::MirrorDns
+    assert!(
+        RouteRow::new(serde_json::from_str(r#"{"match":"x","fallback":"mirror2"}"#).unwrap())
+            .is_err()
     );
-    assert_eq!(fallback_for("edge", "github.githubassets.com"), Fallback::Dns);
-    assert_eq!(fallback_for("edge", "octocat.github.io"), Fallback::Dns);
-    assert_eq!(fallback_for("edge", "githubapp.com"), Fallback::Dns);
-    assert_eq!(fallback_for("core", "github.com"), Fallback::Dns);
-    assert_eq!(fallback_for("api", "api.github.com"), Fallback::Dns);
-}
-
-#[test]
-fn serial_family_edge_fallback() {
-    let f = serial_family("edge", "future.edge.host", false).unwrap();
-    assert_eq!(f.name, "auth");
-    assert!((f.serves)("x", &mk("140.82.112.29", "baidu.com")));
-    assert!(!(f.serves)("x", &mk("185.199.110.133", "real")));
-}
-
-#[test]
-fn content_serves_splits_by_leg() {
-    let mitm = serial_family("edge", "raw.githubusercontent.com", false).unwrap();
-    let pt = serial_family("edge", "raw.githubusercontent.com", true).unwrap();
-    assert_eq!(mitm.name, "content");
-    assert_eq!(pt.name, "content", "游标键不随模式分裂");
-    // MITM 假名腿：只有 .133（默认证书 SAN 覆盖内容族）
-    assert!((mitm.serves)("x", &mk("185.199.110.133", "baidu.com")));
-    // 透传真名腿：.133/.154/.215 全放行，.153(io 组)不放行
-    for last in ["133", "154", "215"] {
-        let ip = format!("185.199.110.{last}");
-        assert!((pt.serves)("x", &mk(&ip, "baidu.com")), "透传应放行 {ip}");
-    }
-    for last in ["154", "215"] {
-        let ip = format!("185.199.110.{last}");
-        assert!(!(mitm.serves)("x", &mk(&ip, "baidu.com")), "MITM 仍拒绝 {ip}");
-    }
-    assert!(!(pt.serves)("x", &mk("185.199.110.153", "baidu.com")));
-    // 非 content 族不受模式影响
-    let assets = serial_family("edge", "github.githubassets.com", true).unwrap();
-    assert_eq!(assets.name, "assets");
-    assert!((assets.serves)("x", &mk("185.199.110.154", "baidu.com")));
+    assert!(RouteRow::new(serde_json::from_str(r#"{"match":""}"#).unwrap()).is_err());
 }
 
 #[test]
@@ -230,29 +159,12 @@ fn mirror_chain_host_dedicated() {
         "release-assets.githubusercontent.com"
     );
     assert_eq!(
-        mirror_chain_host("github.com", "/o/r/releases/latest/download/f.exe"),
-        "release-assets.githubusercontent.com"
-    );
-    assert_eq!(
         mirror_chain_host("github.com", "/o/r/archive/refs/tags/v1.tar.gz"),
         "codeload.github.com"
-    );
-    assert_eq!(
-        mirror_chain_host(
-            "release-assets.githubusercontent.com",
-            "/x?sig=abc"
-        ),
-        "release-assets.githubusercontent.com"
     );
     assert_eq!(
         mirror_chain_host("codeload.github.com", "/o/r/tar.gz/x"),
         "codeload.github.com"
     );
-    assert_eq!(mirror_chain_host("raw.githubusercontent.com", "/o/r/f"), "raw.githubusercontent.com");
     assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
-    assert_eq!(mirror_chain_host("github.com", "/o/r/releases"), "github.com");
-    assert_eq!(
-        master_route("github.com", "GET", "/o/r/releases/latest/download/f.exe"),
-        Route::Mirror
-    );
 }

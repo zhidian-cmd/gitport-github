@@ -181,7 +181,7 @@ pub fn borrow_donor(exclude_host: &str) -> Option<(String, H2Upstream)> {
     let now = Instant::now();
     let mut pick: Option<(String, u64, (u32, f64))> = None;
     for (h, hc) in g.iter() {
-        if h.as_str() == exclude_host || !h.ends_with("githubassets.com") {
+        if h.as_str() == exclude_host || !crate::pool::route::is_donor(h) {
             continue;
         }
         for c in &hc.conns {
@@ -309,8 +309,7 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
-        let name = crate::config::pool_for(&host);
-        match h2_dial_slot(name, &host, &log, &skip, 2, None).await {
+        match h2_dial_slot(&host, &log, &skip, 2, None).await {
             Ok(up) => store_h2(&host, up),
             Err(e) => {
                 (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
@@ -370,7 +369,6 @@ fn occupied_ips(host: &str) -> Vec<String> {
 
 /// 单通道拨号：串发选 IP → boring 握手 → h2；白名单域名的 sni 由 dial_one 强制真名分片。
 async fn h2_dial_slot(
-    pool_name: &str,
     host: &str,
     log: &LogFn,
     skip_ips: &[String],
@@ -379,11 +377,10 @@ async fn h2_dial_slot(
 ) -> Result<H2Upstream, String> {
     let (conn_io, ip, shape) = pool::serial_dial_skip(
         pool::DialSkip {
-            pool_name,
             host,
             tls_handshake: true,
             skip_ips,
-            passthrough: false,
+            tunnel: false,
             slot,
             crew,
         },
@@ -391,7 +388,7 @@ async fn h2_dial_slot(
     )
     .await
     .map_err(|e| e.to_string())?;
-    let form = if crate::config::is_whitelist(host) {
+    let form = if crate::pool::route::is_real(host) {
         "真名(分片)"
     } else if shape.is_empty() {
         "无"
@@ -404,18 +401,17 @@ async fn h2_dial_slot(
 }
 
 /// 双通道冷启动并行竞速：各领各的游标、跳过对方正在试的 IP，先成者服务、晚成者入库。
-async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
     (log)(&format!("[建连] {host} 冷启动竞速发射"));
     for slot in [1u8, 2] {
         let tx = tx.clone();
-        let name = pool_name.to_string();
         let host = host.to_string();
         let log = log.clone();
         let crew = crew.clone();
         tokio::spawn(async move {
-            match h2_dial_slot(&name, &host, &log, &[], slot, Some(&crew)).await {
+            match h2_dial_slot(&host, &log, &[], slot, Some(&crew)).await {
                 Ok(up) => {
                     store_h2(&host, up.clone());
                     let _ = tx.send(Ok(up)).await;
@@ -453,17 +449,13 @@ async fn dial_h2_race(pool_name: &str, host: &str, log: &LogFn) -> Result<H2Upst
 }
 
 /// 建连统一入口：双通道高频站池空走竞速，其余单发（单发也跳过池中占用的 IP）。
-pub async fn dial_upstream(
-    pool_name: &str,
-    host: &str,
-    log: &LogFn,
-) -> Result<(H2Upstream, bool), String> {
+pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
     if DUAL_CONN_HOSTS.contains(&host) && occupied_ips(host).is_empty() {
-        let up = dial_h2_race(pool_name, host, log).await?;
+        let up = dial_h2_race(host, log).await?;
         return Ok((up, false)); // 竞速任务内部已入库
     }
     let skip = occupied_ips(host);
-    let up = h2_dial_slot(pool_name, host, log, &skip, 1, None).await?;
+    let up = h2_dial_slot(host, log, &skip, 1, None).await?;
     Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。

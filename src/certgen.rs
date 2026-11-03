@@ -51,7 +51,7 @@ impl Authority {
             }
         }
         // MITM 只校验 CONNECT 目标域，SNI 是客户端自己给的，不锁就能借根证书签走别的域。
-        if crate::config::pool_for(host).is_empty() {
+        if !crate::pool::route::is_managed(host) {
             return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
         }
         let leaf_key = KeyPair::generate().map_err(|e| e.to_string())?;

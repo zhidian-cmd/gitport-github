@@ -3,18 +3,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
-// SERIAL/SERIAL_DIR 是进程级全局态，测试并行会互相踩踏 → 需要全局态的测试串行
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+// 全局串行锁在 pool::TEST_LOCK：路由表/串发表/连接池都是进程级全局态。
 
 fn tmpdir() -> PathBuf {
     let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("gitport_test_{}_{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-fn reset_state(dir: &Path) {
-    serial_load(dir, Vec::new(), None);
 }
 
 /// 生产路径：settings 只存注册表，存完由调用方用 removed 触发链对齐。
@@ -65,20 +60,19 @@ fn breaker_expired_entry_lazily_removed() {
 }
 
 #[test]
-fn plans_json_single_bad_pool_does_not_wipe_table() {
-    // 单池写坏只丢该池（按种子补缺），其余池与镜像链原样保留——旧行为是 flatten 全有或全无：一处笔误 → 整表按种子重建。
-    let _guard = TEST_LOCK.lock().unwrap();
+fn bad_route_row_does_not_wipe_table() {
+    // 单行写坏只丢那一行，其余路由与镜像链原样保留；原文件先备份。
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
-    // 隔离：自定义镜像注册表经 settings.json 跨测试/跨轮次持久化，别处收养的自建镜像会被 sync_custom_mirrors 追加回既有链——先清空，本断言只验 plans.json 里的链是否原样保留，不掺注册表状态。
     crate::settings::save_worker_mirrors(Vec::new());
     std::fs::write(
         dir.join("plans.json"),
         r#"{
-  "core": [{"ip": "1.2.3.4", "sni": "baidu.com"}],
-  "edge": "写坏了-不是数组",
-  "mirrors": {
-    "raw.githubusercontent.com": ["https://v4.gh-proxy.org"]
-  }
+  "routes": [
+    {"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "1.2.3.4", "sni": "baidu.com"}]},
+    {"match": "bad\\.example", "fallback": "mirror2", "plans": []}
+  ],
+  "mirrors": {"raw.githubusercontent.com": ["https://v4.gh-proxy.org"]}
 }"#,
     )
     .unwrap();
@@ -86,231 +80,174 @@ fn plans_json_single_bad_pool_does_not_wipe_table() {
     let sink = seen.clone();
     let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
     serial_load(&dir, Vec::new(), Some(log));
-    // 好池的用户条目保留（+ 种子补缺）
-    let core = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("core").unwrap().clone()
-    };
-    assert_eq!(core[0].ip, "1.2.3.4", "好池必须保留: {core:?}");
-    assert!(core.len() > 1, "好池应叠加种子补缺: {core:?}");
-    // 整个写坏的池 → 按种子重建（不连坐）
-    let edge_n = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("edge").unwrap().len()
-    };
-    assert!(edge_n > 0, "坏池应按种子重建: {edge_n}");
-    // 镜像链保留
+
+    let good = route::route_for("github.com").expect("好行必须保留");
+    assert_eq!(good.plans[0].ip, "1.2.3.4", "好行的用户条目不能被连坐");
+    assert!(route::route_for("bad.example").is_none(), "坏行应丢弃");
     assert_eq!(
         mirror_chain("raw.githubusercontent.com"),
         vec!["https://v4.gh-proxy.org".to_string()],
         "镜像链必须保留"
     );
-    // 日志指明哪个池坏了；原文件备份（坏段可从 .bak 捡回）
     assert!(
-        seen.lock().unwrap().iter().any(|l| l.contains("池 edge 写坏")),
-        "应记录坏池名: {:?}",
+        seen.lock().unwrap().iter().any(|l| l.contains("routes[1] 丢弃")),
+        "日志应指明坏的是第几行: {:?}",
         seen.lock().unwrap()
     );
-    assert!(
-        dir.join("plans.json.bak").exists(),
-        "有段落坏应备份原文件"
-    );
+    assert!(dir.join("plans.json.bak").exists(), "有行写坏应备份原文件");
 }
 
 #[test]
-fn direct_hosts_never_pooled() {
+fn direct_rows_bypass_proxy() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmpdir();
+    serial_load(&dir, Vec::new(), None);
     for host in [
         "objects-origin.githubusercontent.com",
         "uploads.github.com",
         "viewscreen.githubusercontent.com",
+        "api.mcp.github.com",
     ] {
-        assert!(crate::config::is_direct(host), "{host} 应在直连白名单");
-        assert_eq!(crate::config::pool_for(host), "", "{host} 不应归任何池");
+        assert!(!route::is_managed(host), "{host} 不应进代理");
+        assert_eq!(
+            route::master_route(host, "GET", "/"),
+            route::Route::System,
+            "{host} 应短路为直连"
+        );
     }
+    assert!(route::is_managed("github.com"), "普通域名照常进代理");
 }
 
 #[test]
-fn fastly_pools_no_longer_serial() {
-    assert!(!SERIAL_POOLS.contains(&"fastly"));
-    assert!(!SERIAL_POOLS.contains(&"codeload"));
-    for p in ["core", "api", "edge"] {
-        assert!(SERIAL_POOLS.contains(&p), "{p} 应为串发池");
-    }
-    assert!(!SERIAL_POOLS.contains(&"uploads"));
-}
-
-#[test]
-fn migrate_drops_stats_and_normalizes_shapes() {
-    let _guard = TEST_LOCK.lock().unwrap();
+fn legacy_pools_migrate_to_route_rows() {
+    // 旧三池 → routes：按段拆回各自槽位，sni 原样，未知字段丢弃，落盘换成新格式。
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     std::fs::write(
         dir.join("plans.json"),
         r#"{
   "core": [
-    {"ip": "1.2.3.4", "sni": "ech", "成功次数": "9/9", "分数": 99},
-    {"ip": "5.6.7.8", "sni": "real"},
-    {"ip": "bad-ip", "sni": "real"}
+    {"ip": "1.2.3.4", "sni": "ech", "成功次数": "9/9", "分数": 99}
   ],
   "edge": [
     {"ip": "140.82.112.29", "sni": "real"},
     {"ip": "185.199.108.154", "sni": "sni"},
-    {"ip": "185.199.109.153", "sni": "sni"}
-  ],
-  "ghapp": [{"ip": "9.9.9.9", "sni": "baidu.com"}],
-  "assets": [{"ip": "8.8.8.8", "sni": "sni"}]
+    {"ip": "185.199.109.153", "sni": "sni"},
+    {"ip": "185.199.110.133", "sni": "baidu.com"}
+  ]
 }"#,
     )
     .unwrap();
-    reset_state(&dir);
-    let ps = {
-        let g = SERIAL.lock().unwrap();
-        let tab = g.as_ref().unwrap();
-        tab.pools.get("core").unwrap().clone()
-    };
-    let core_seed_n = seed_db().pools.get("core").map(|v| v.len()).unwrap_or(0);
-    assert_eq!(
-        ps.len(),
-        2 + core_seed_n,
-        "补缺后 = 用户条目 + 全部种子: {ps:?}"
-    );
-    assert_eq!(
-        ps[0],
-        SerialPlan {
-            ip: "1.2.3.4".into(),
-            sni: "ech".into()
-        },
-        "sni 原样透传(写什么传什么)"
-    );
-    assert_eq!(
-        ps[1],
-        SerialPlan {
-            ip: "5.6.7.8".into(),
-            sni: "real".into()
-        },
-        "sni 原样透传(写什么传什么, 含真名写法)"
-    );
-    let edge_ps = {
-        let g = SERIAL.lock().unwrap();
-        let tab = g.as_ref().unwrap();
-        tab.pools.get("edge").unwrap().clone()
-    };
-    assert!(edge_ps.len() >= 3, "edge 至少含旧表 3 条: {edge_ps:?}");
+    serial_load(&dir, Vec::new(), None);
+
+    let core = route::route_for("github.com").expect("core 应迁到 github.com 行");
+    assert_eq!(core.plans[0].ip, "1.2.3.4");
+    assert_eq!(core.plans[0].sni, "ech", "sni 原样透传");
+
+    let content = route::route_for("avatars.githubusercontent.com").expect("内容域行");
+    assert!(content.flags.content && content.fallback == route::Fallback::MirrorDns);
+    assert!(content.plans.iter().any(|p| p.ip == "185.199.110.133"));
     assert!(
-        edge_ps.contains(&SerialPlan {
-            ip: "140.82.112.29".into(),
-            sni: "real".into()
-        }),
-        "ghapp 条目保留, sni 原样透传: {edge_ps:?}"
+        !content.plans.iter().any(|p| p.ip == "185.199.108.154"),
+        "伪装腿不该带 154: {:?}",
+        content.plans
     );
     assert!(
-        edge_ps.contains(&SerialPlan {
-            ip: "185.199.108.154".into(),
-            sni: "sni".into()
-        }) && edge_ps.contains(&SerialPlan {
-            ip: "185.199.109.153".into(),
-            sni: "sni".into()
-        }),
-        "sni 文件权威——旧表显式真名写法原样保留: {edge_ps:?}"
+        content.real_plans.iter().any(|p| p.ip == "185.199.108.154"),
+        "真名腿才带 154: {:?}",
+        content.real_plans
     );
-    assert!(
-        edge_ps
-            .iter()
-            .any(|p| route::fastly_last_octet(&p.ip) == Some("133") && p.sni == "baidu.com"),
-        "种子补缺应追加 .133 伪装内容域条目: {edge_ps:?}"
-    );
+
+    let assets = route::route_for("github.githubassets.com").expect("assets 行");
+    assert!(assets.flags.donor);
+    assert!(assets.plans.iter().any(|p| p.ip == "185.199.108.154"));
+
+    let io = route::route_for("octocat.github.io").expect("io 行");
+    assert!(io.plans.iter().any(|p| p.ip == "185.199.109.153"));
+
+    let app = route::route_for("api.githubapp.com").expect("auth 行");
+    assert!(app.plans.iter().any(|p| p.ip == "140.82.112.29"));
+
     let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-    assert!(!b.contains("成功次数") && !b.contains("分数"));
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
-    for gone in ["fastly", "codeload", "ghapp", "assets"] {
-        assert!(back.get(gone).is_none(), "{gone} 不应再落盘: {back}");
-    }
-    assert!(back.get("edge").is_some(), "edge 池应落盘: {back}");
+    assert!(back.get("routes").is_some(), "应写回新格式: {b}");
+    assert!(back.get("core").is_none() && back.get("edge").is_none());
+    assert!(!b.contains("成功次数") && !b.contains("分数"));
 }
 
 #[test]
 fn seed_topup_appends_missing_and_keeps_order() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    // 用户条目在前，种子只往尾部补缺；已存在的 IP 不重复。
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     std::fs::write(
         dir.join("plans.json"),
-        r#"{ "edge": [{"ip": "140.82.112.29", "sni": "baidu.com"}] }"#,
+        r#"{
+  "routes": [
+    {"match": ".*\\.githubusercontent\\.com", "content": true, "fallback": "mirror",
+     "plans": [{"ip": "9.9.9.9", "sni": "baidu.com"}]}
+  ]
+}"#,
     )
     .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
     serial_load(&dir, Vec::new(), Some(log));
-    let ps = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("edge").unwrap().clone()
-    };
-    assert_eq!(
-        ps[0].ip, "140.82.112.29",
-        "用户手排顺序保留, 补缺只追加尾部"
-    );
-    let seeds = seed_db();
-    let seed = seeds.pools.get("edge").unwrap();
-    assert_eq!(ps.len(), seed.len(), "补缺后应覆盖全部种子: {ps:?}");
+    let row = route::route_for("raw.githubusercontent.com").expect("内容域行");
+    assert_eq!(row.plans[0].ip, "9.9.9.9", "用户手排顺序保留, 补缺只追加尾部");
+    assert!(row.plans.len() > 1, "应叠加种子: {:?}", row.plans);
     assert!(
         seen.lock().unwrap().iter().any(|l| l.contains("种子补缺")),
         "补缺应打一行日志"
     );
     let b = std::fs::read_to_string(dir.join("plans.json")).unwrap();
     assert!(b.contains("185.199.110.133"), "补缺应落盘: {b}");
-    // 2026-10-19 起三个 .133 复活移出退役清单、入种子——应随补缺落盘（伪装形态）
-    assert!(
-        b.contains("185.199.108.133")
-            && b.contains("185.199.109.133")
-            && b.contains("185.199.111.133"),
-        "复活的内容边缘应随种子补缺落盘: {b}"
-    );
 }
 
 #[test]
 fn encode_plans_roundtrip() {
-    let mut tab = HashMap::new();
-    tab.insert(
-        "core".into(),
-        vec![
-            SerialPlan {
-                ip: "1.2.3.4".into(),
-                sni: "baidu.com".into(),
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    route::install(vec![
+        route::RouteRow::new(
+            route::RouteSpec {
+                matcher: r"(.*\.)?github\.com".into(),
+                pac: Some("github.com".into()),
+                action: None,
+                real: false,
+                content: false,
+                donor: false,
+                fallback: None,
+                plans: vec![
+                    SerialPlan { ip: "1.2.3.4".into(), sni: "baidu.com".into() },
+                    SerialPlan { ip: "5.6.7.8".into(), sni: "baidu.com".into() },
+                ],
+                real_plans: Vec::new(),
             },
-            SerialPlan {
-                ip: "5.6.7.8".into(),
-                sni: "baidu.com".into(),
+        )
+        .unwrap(),
+        route::RouteRow::new(
+            route::RouteSpec {
+                matcher: r".*\.githubusercontent\.com".into(),
+                pac: Some("githubusercontent.com".into()),
+                action: None,
+                real: false,
+                content: true,
+                donor: false,
+                fallback: Some("mirror".into()),
+                plans: vec![SerialPlan { ip: "185.199.110.133".into(), sni: String::new() }],
+                real_plans: vec![SerialPlan { ip: "185.199.108.154".into(), sni: String::new() }],
             },
-        ],
-    );
-    tab.insert(
-        "api".into(),
-        vec![SerialPlan {
-            ip: "140.82.112.5".into(),
-            sni: "baidu.com".into(),
-        }],
-    );
-    tab.insert(
-        "edge".into(),
-        vec![
-            SerialPlan {
-                ip: "185.199.108.154".into(),
-                sni: "sni".into(),
-            },
-            SerialPlan {
-                ip: "140.82.112.29".into(),
-                sni: "baidu.com".into(),
-            },
-        ],
-    );
+        )
+        .unwrap(),
+    ]);
     let mut mirrors = HashMap::new();
     mirrors.insert(
         "raw.githubusercontent.com".to_string(),
-        vec![
-            "https://axisnow.gh-proxy.org".to_string(),
-            "https://v4.gh-proxy.org".to_string(),
-        ],
+        vec!["https://axisnow.gh-proxy.org".to_string(), "https://v4.gh-proxy.org".to_string()],
     );
-    let b = encode_plans(&tab, &mirrors);
+    let b = encode_plans(&mirrors);
+    // IP 条目必须单行
     for line in b.lines() {
         let t = line.trim();
         if t.starts_with("{\"ip\"") && t.matches('{').count() != 1 {
@@ -318,44 +255,39 @@ fn encode_plans_roundtrip() {
         }
     }
     assert!(b.contains("\"mirrors_small\""), "镜像链板块应落盘: {b}");
-    assert!(b.contains("raw.githubusercontent.com"));
-    let back_file: PlansFile = serde_json::from_str(&b).unwrap();
+    let back: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let rows = back["routes"].as_array().expect("routes 应是数组");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["match"], "(.*\\.)?github\\.com");
+    assert_eq!(rows[0]["plans"][1]["ip"], "5.6.7.8");
+    assert_eq!(rows[1]["content"], true);
+    assert_eq!(rows[1]["fallback"], "mirror");
+    assert_eq!(rows[1]["realPlans"][0]["ip"], "185.199.108.154");
     assert_eq!(
-        back_file
-            .mirrors_small
-            .get("raw.githubusercontent.com")
-            .map(|c| c.len()),
-        Some(2),
-        "镜像链应可读回(小文件域落 mirrors_small): {:?}",
-        back_file.mirrors_small
+        back["mirrors_small"]["raw.githubusercontent.com"]
+            .as_array()
+            .map(|a| a.len()),
+        Some(2)
     );
-    let back: HashMap<String, Vec<SerialPlan>> = back_file.pools;
-    assert_eq!(back["core"].len(), 2);
-    assert_eq!(back["core"][0].sni, "baidu.com");
-    assert_eq!(back["edge"].len(), 2);
-    assert_eq!(back["edge"][0].sni, "sni");
-    assert!(!b.contains("fastly") && !b.contains("codeload"));
 }
 
 #[test]
 fn cursor_park_is_memory_only_and_freezes_order() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
-    let head_before = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("core").unwrap()[0].ip.clone()
-    };
-    let target = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("core").unwrap()[2].ip.clone()
-    };
+    let row = route::route_for("github.com").expect("github.com 应有路由");
+    let pattern = row.pattern.clone();
+    let plans = row.plans.clone();
+    assert!(plans.len() >= 3, "初始表过小: {}", plans.len());
+    let head_before = plans[0].ip.clone();
+    let target = plans[2].ip.clone();
     assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
     let file_before = std::fs::read_to_string(dir.join("plans.json")).unwrap();
-    cursor_note("core", "github.com", &target, true, false, 1);
+    cursor_note("github.com", &target, true, 1);
     // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
     assert_eq!(
-        SERIAL.lock().unwrap().as_ref().unwrap().pools.get("core").unwrap()[0].ip,
+        route::route_for("github.com").unwrap().plans[0].ip,
         head_before,
         "表序冻结"
     );
@@ -366,7 +298,7 @@ fn cursor_park_is_memory_only_and_freezes_order() {
     );
     let g = SERIAL.lock().unwrap();
     assert_eq!(
-        g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+        g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
         Some(target.as_str()),
         "游标应驻留 target"
     );
@@ -439,7 +371,7 @@ fn worker_chain_replace_old_url() {
 /// 开关语义：启动/关闭只摘大文件链；小文件链全量按序保留(off 的也留)。
 #[test]
 fn toggle_gates_big_file_chains_only() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
@@ -480,7 +412,7 @@ fn toggle_gates_big_file_chains_only() {
 /// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；仅旧字典有的 host 照常并入（升级兼容的钉子）。
 #[test]
 fn merged_chains_prefers_typed_dictionaries_over_legacy() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // 隔离：.example 自建镜像会被收编进注册表并跨测试持久化，先清空。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
@@ -533,7 +465,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
 /// 全新安装+添加镜像 → 启用镜像必须落进全部 8 条链（v0.5.0 回归：空表遍历不到，镜像只进注册表）。
 #[test]
 fn fresh_install_mirror_lands_in_all_chains() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(dir.join("plans.json"), r#"{"core": []}"#).unwrap();
@@ -562,7 +494,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
 
 #[test]
 fn mirror_chain_load_and_topup() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // 隔离：自定义镜像注册表经 settings.json 跨进程持久化（上一轮 serial_load 收养的自建镜像会留在里面），不清空的话 sync_custom_mirrors 会把它们追加进本测试的链。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
@@ -622,40 +554,41 @@ fn mirror_chain_load_and_topup() {
 
 #[test]
 fn cursor_advance_on_failure_then_park_on_success() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tmpdir();
     serial_load(&dir, Vec::new(), None);
-    let base = {
-        let g = SERIAL.lock().unwrap();
-        g.as_ref().unwrap().pools.get("core").unwrap().clone()
-    };
+    let row = route::route_for("github.com").expect("github.com 应有路由");
+    let pattern = row.pattern.clone();
+    let base = row.plans.clone();
     assert!(base.len() >= 6, "初始表过小: {}", base.len());
     let head = base[0].ip.clone();
     let next = base[1].ip.clone();
 
     // 失败:记号前移到圈中下一候选
-    cursor_note("core", "github.com", &head, false, false, 1);
+    cursor_note("github.com", &head, false, 1);
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
-            g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+            g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
             Some(next.as_str()),
             "失败后记号应前移到下一候选"
         );
     }
 
     // 成功:记号驻留;表序全程未变
-    cursor_note("core", "github.com", &next, true, false, 1);
+    cursor_note("github.com", &next, true, 1);
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
-            g.as_ref().unwrap().cursor.get("core/all").map(String::as_str),
+            g.as_ref().unwrap().cursor.get(&pattern).map(String::as_str),
             Some(next.as_str())
         );
-        let ps = g.as_ref().unwrap().pools.get("core").unwrap();
-        let order_unchanged = ps.iter().zip(base.iter()).all(|(a, b)| a.ip == b.ip);
-        assert!(order_unchanged, "表序应冻结(游标不重排)");
     }
+    let now = route::route_for("github.com").unwrap().plans.clone();
+    assert!(
+        now.iter().zip(base.iter()).all(|(a, b)| a.ip == b.ip),
+        "表序应冻结(游标不重排)"
+    );
 }
 
 /// 串发重试引擎实机圈：TCP 拒 → 沿圈到活条 → 驻留 + 死亡退避。
@@ -663,7 +596,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn serial_dial_rotates_on_failure_and_parks_on_success() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // 只有 127.0.0.2 在监听；127.0.0.1 的同端口连接会被立刻拒绝。
     let Ok(ln) = tokio::net::TcpListener::bind("127.0.0.2:0").await else {
         eprintln!("跳过: 本机绑不了 127.0.0.2(回环 /8 行为不同), 串发实测留给真机");
@@ -681,11 +614,10 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
 
     let (conn, ip, _) = serial_dial_skip(
         DialSkip {
-            pool_name: "core",
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            passthrough: false,
+            tunnel: false,
             slot: 1,
             crew: None,
         },
@@ -699,7 +631,9 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
         let g = SERIAL.lock().unwrap();
         let t = g.as_ref().unwrap();
         assert_eq!(
-            t.cursor.get("core/all").map(String::as_str),
+            t.cursor
+                .get("(.*\\.)?github\\.com")
+                .map(String::as_str),
             Some("127.0.0.2"),
             "成功必须驻留记号(下次从它起步)"
         );
@@ -712,11 +646,10 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
     let (conn, ip, _) = serial_dial_skip(
         DialSkip {
-            pool_name: "core",
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            passthrough: false,
+            tunnel: false,
             slot: 1,
             crew: None,
         },

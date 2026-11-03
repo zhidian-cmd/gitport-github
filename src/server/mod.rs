@@ -156,12 +156,11 @@ impl ProxyServer {
         .await;
         (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
 
-        let name = config::pool_for(&host);
-        if !name.is_empty() && ip != "system-dns" {
+        if pool::route::is_managed(&host) && ip != "system-dns" {
             match (sent, recv) {
-                (s, r) if s > 0 && r > 0 => pool::cursor_note(name, &host, &ip, true, true, 1),
+                (s, r) if s > 0 && r > 0 => pool::cursor_note(&host, &ip, true, 1),
                 (s, r) if s > 0 && r == 0 => {
-                    pool::cursor_note(name, &host, &ip, false, true, 1);
+                    pool::cursor_note(&host, &ip, false, 1);
                     (self.log)(&format!("[串发] {host} 客户端已握手但零回包, 垫底换下一个"));
                 }
                 _ => {}
@@ -239,9 +238,8 @@ impl ProxyServer {
         } else {
             0
         };
-        let name = config::pool_for(&host);
-        if !name.is_empty() && ip != "system-dns" {
-            pool::cursor_note(name, &host, &ip, recv > 0, true, 1);
+        if pool::route::is_managed(&host) && ip != "system-dns" {
+            pool::cursor_note(&host, &ip, recv > 0, 1);
         }
     }
 }
@@ -335,16 +333,14 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 
 /// 上游唯一入口：串发池按 plans.json 串发，其余交系统 DNS 直连；这是真名透传腿。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
-    let name = config::pool_for(host);
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
-    if port == 443 && pool::SERIAL_POOLS.contains(&name) {
+    if port == 443 && pool::route::is_managed(host) {
         let (conn, ip, _shape) = pool::serial_dial_skip(
             pool::DialSkip {
-                pool_name: name,
                 host,
                 tls_handshake: false,
                 skip_ips: &[],
-                passthrough: true,
+                tunnel: true,
                 slot: 1,
                 crew: None,
             },

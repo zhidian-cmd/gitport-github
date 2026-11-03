@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn whitelist_e2e_through_pool() {
     use std::sync::atomic::Ordering;
     let before = SPLIT_DONE.load(Ordering::Relaxed);
-    let d = dial_one("docs.github.com", "185.199.108.154", "docs.github.com", true)
+    let d = dial_one("docs.github.com", "185.199.108.154", "docs.github.com", true, true)
         .await
         .expect("白名单拨号应成功");
     assert!(

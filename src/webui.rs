@@ -1,6 +1,6 @@
 //! 管理界面：axum + 内嵌前端，REST API 驱动；本地管理面防护见 localGuard。
 use crate::certgen::Authority;
-use crate::config::{self, pooled_domains};
+use crate::config;
 use crate::logger::Logger;
 use crate::{pool, settings};
 use axum::extract::{Path, Query, State};
@@ -198,23 +198,21 @@ async fn guide_img(Path(file): Path<String>) -> Response {
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
-/// 分流 PAC：白名单 DIRECT 短路必须在通配符匹配之前（否则被 *.githubusercontent.com 吞掉）。
+/// 分流 PAC：host 名单全部来自路由表（`pac` 字段），不再另存一份。
 fn pac_script() -> String {
-    let mut domains: Vec<&str> = Vec::new();
-    if settings::github_pac() {
-        for d in pooled_domains() {
-            if !domains.contains(&d) {
-                domains.push(d);
-            }
-        }
-    }
+    let (proxy_hosts, direct_hosts) = crate::pool::route::pac_lists();
+    let domains = if settings::github_pac() {
+        proxy_hosts
+    } else {
+        Vec::new()
+    };
     let proxy = format!("PROXY 127.0.0.1:{}", config::proxy_port());
     let list = domains
         .iter()
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let direct_list = config::DIRECT_HOSTS
+    let direct_list = direct_hosts
         .iter()
         .map(|d| format!("'{d}'"))
         .collect::<Vec<_>>()
@@ -268,8 +266,8 @@ struct StatusResp {
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
-    let domain_count = config::GROUPS.iter().map(|g| g.patterns.len()).sum();
-    let pool_total: usize = pool::plans_snapshot().values().map(|v| v.len()).sum();
+    let domain_count = pool::route::route_count();
+    let pool_total: usize = pool::route::plan_count();
     write_json(&StatusResp {
         version: st.version.to_string(),
         running: crate::server::running(),

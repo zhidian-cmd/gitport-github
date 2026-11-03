@@ -2,6 +2,10 @@ use super::*;
 
 #[test]
 fn ca_generate_and_leaf_ctx() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
     let dir = std::env::temp_dir().join(format!("gitport_cert_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let a = load_or_generate(&dir, None).unwrap();
@@ -25,6 +29,10 @@ fn tls_acceptor_ok() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mitm_handshake_roundtrip() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
     // rustls 客户端 ↔ boring 服务端：独立实现互验，本地终结栈换血后的互操作钉子。
     let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

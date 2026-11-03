@@ -32,7 +32,7 @@ pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
     }
-    !config::pool_for(host).is_empty()
+    crate::pool::route::is_managed(host)
 }
 pub async fn handle_connect_mitm(
     srv: &crate::server::ProxyServer,
@@ -217,11 +217,10 @@ async fn mitm_http(
             "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
         );
     }
-    let name = config::pool_for(&host);
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
         Err(e) => {
-            match pool::route::fallback_for(name, &host) {
+            match pool::route::fallback_for(&host) {
                 pool::route::Fallback::MirrorDns if is_simple => {
                     let chain_host = pool::route::mirror_chain_host(&host, &path);
                     let new_bytes = mirror::range_bytes(
@@ -323,7 +322,6 @@ async fn stream_passthrough(
     body: BoxBody,
     reason: &str,
 ) -> axum::response::Response<BoxBody> {
-    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
@@ -337,7 +335,7 @@ async fn stream_passthrough(
                 }
             }
         }
-        match upstream::dial_upstream(name, host, log).await {
+        match upstream::dial_upstream(host, log).await {
             Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
@@ -361,10 +359,8 @@ async fn stream_passthrough(
     match timed {
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
-            if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
-                upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
-            }
+            pool::cursor_note(host, &up.ip, true, up.slot);
+            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
@@ -610,18 +606,15 @@ async fn try_cached(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    // name/path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
-    let name = config::pool_for(host);
+    // path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
+    let is_content = pool::route::is_content(host);
     let up = upstream::cached_h2_in(host, want_slot)?;
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
-            if !name.is_empty() {
-                pool::cursor_note(name, host, &up.ip, true, false, up.slot);
-            }
+            pool::cursor_note(host, &up.ip, true, up.slot);
             upstream::note_latency(host, up.id, ms);
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
@@ -650,12 +643,11 @@ pub(super) async fn get_direct(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let name = config::pool_for(host);
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
-    let is_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
-    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+    let is_content = pool::route::is_content(host);
+    if is_content && pool::CONTENT_BREAKER.open(host) {
         // 熔断期间不干等：内容域候选全灭时借 assets 的现成通道，借不到才回镜像链。
         if let Some(r) = try_borrow(log, out, host, info, body).await {
             return r;
@@ -668,7 +660,7 @@ pub(super) async fn get_direct(
 // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
-    if name == "edge" && is_content && pool::CONTENT_BREAKER.open(host) {
+    if is_content && pool::CONTENT_BREAKER.open(host) {
         // 等锁期间别人可能刚把熔断补上：同样先试借道，借不到才回镜像链。
         if let Some(r) = try_borrow(log, out, host, info, body).await {
             return r;
@@ -688,7 +680,7 @@ pub(super) async fn get_direct(
         // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
         let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
             Some(up) => (up, false),
-            None => match upstream::dial_upstream(name, host, log).await {
+            None => match upstream::dial_upstream(host, log).await {
                 Ok((up, fresh)) => (up, fresh),
                 Err(e) => {
                     (log)(&format!(
@@ -717,9 +709,7 @@ pub(super) async fn get_direct(
                 let up_slot = up.slot;
                 let up_ip = up.ip.clone();
                 *info.lock().unwrap() = up_ip.clone();
-                if !name.is_empty() {
-                    pool::cursor_note(name, host, &up_ip, true, false, up_slot); // 数据到手 = 真成功, 置顶
-                }
+                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶
                 if fresh {
                     upstream::store_h2(host, up);
                     upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
@@ -736,8 +726,8 @@ pub(super) async fn get_direct(
             Err(e) => e,
         };
         // 数据层失败才垫底 IP，且只认幂等、无镜像兜底的失败；POST/内容域失败不代表 IP 死。
-        if !name.is_empty() && is_simple && !is_content {
-            pool::cursor_note(name, host, &up.ip, false, false, up.slot);
+        if is_simple && !is_content {
+            pool::cursor_note(host, &up.ip, false, up.slot);
         }
         upstream::drop_h2_id(host, up.id);
         (log)(&format!(
@@ -845,10 +835,10 @@ async fn dns_direct_fetch(
         addrs.len()
     ));
     // 与 get_direct 口径一致：白名单域名不算内容域；预算与候选地址无关，循环外算一次。
-    let budget_content = pool::route::host_is_content(host) && !config::is_whitelist(host);
+    let budget_content = pool::route::is_content(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(host, &ip, host, true).await {
+        let conn = match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
             Ok(c) => c,
             Err(e) => {
                 (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));

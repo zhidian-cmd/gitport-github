@@ -385,9 +385,16 @@ struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
     /// 按规范键序成表：全量键位预写空值再覆盖，表外键直接丢弃。
+    ///
+    /// 路由表还没装载（settings 先于 plans 读）时没有"规范键序"可言，
+    /// 此时原样保留——否则每次启动都会把上次驻留的游标丢光。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
+        let keys = crate::pool::circle_keys();
+        if keys.is_empty() {
+            return LastIpTable(marks.into_iter().collect());
+        }
         let mut pending: HashMap<String, String> = marks.into_iter().collect();
-        let rows = crate::pool::circle_keys()
+        let rows = keys
             .into_iter()
             .map(|key| {
                 let ip = pending.remove(&key).unwrap_or_default();
