@@ -978,14 +978,12 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
-    let budget_deadline =
-        Instant::now() + Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
+    // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
+    let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
+    let mut budget_used = Duration::ZERO;
     let mut budget_hit = false;
+    let mut slow_n = 0usize;
     for i in 0..circle.len() {
-        if Instant::now() >= budget_deadline {
-            budget_hit = true;
-            break;
-        }
         let p = &circle[(start + i) % circle.len()];
         {
             let g = lock(&SERIAL);
@@ -1003,7 +1001,9 @@ pub async fn serial_dial_skip(
             }
         }
         tried += 1;
+        let t0 = Instant::now();
         let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
+        let dt = t0.elapsed();
         match result {
             Ok(conn) => {
                 // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
@@ -1056,24 +1056,36 @@ pub async fn serial_dial_skip(
                         }
                     }
                 }
+                // 慢失败烧预算；快速失败不烧——连续拒连也拦不住把圈走完。
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || msg.contains("超时")
+                    || msg.to_lowercase().contains("timed out")
+                {
+                    budget_used += dt;
+                    slow_n += 1;
+                    if budget_used >= budget_cap {
+                        budget_hit = true;
+                        break;
+                    }
+                }
                 continue;
             }
         }
     }
 
     if budget_hit {
-        // 预算烧满 = 同等退避，防重试每次再烧一遍；有镜像兜底的 host 豁免。
+        // 慢失败预算烧满 = 同等退避，防重试每次再烧一遍；有镜像兜底的 host 豁免。
         if mirror_chain(host).is_empty() {
             SERIAL_COOL.set(host);
         }
         if let Some(log) = log {
             log(&format!(
-                "[串发] {host} [{key}] 耗时预算({}s)到期(试 {tried} 个), 冷却退避, 剩余候选稍后复测",
+                "[串发] {host} [{key}] 慢失败预算({}s)耗尽(试 {tried} 个, 其中慢 {slow_n} 个), 冷却退避, 剩余候选稍后复测",
                 crate::config::SERIAL_DIAL_BUDGET_SECS
             ));
         }
         return Err(format!(
-            "串发耗时预算到期({}s)",
+            "串发慢失败预算耗尽({}s)",
             crate::config::SERIAL_DIAL_BUDGET_SECS
         ));
     }
