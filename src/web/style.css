@@ -193,14 +193,17 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .switch input:focus-visible + .track{outline:2px solid var(--green-line);outline-offset:2px}
 
 /* ---------- 日志 ---------- */
-#logsBox{background:#0a0d13;border:1px solid #171d27;color:#7d92a8;border-radius:9px;
-         padding:13px 15px;font:12px var(--mono);overflow-y:auto;overflow-x:hidden;
-         min-height:140px;line-height:1.75;white-space:normal}
-/* 每行独立块：长 URL 强制断行——此前整段 pre-wrap 遇长串不折行，尾部被裁掉（2026-10-18 修） */
-#logsBox .lg{white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere}
-#logsBox .lg.err{color:#c9837c}   /* 柔化红：低饱和，长行不刺眼 */
-#logsBox .lg.warn{color:#c2a35e}  /* 柔化黄：降级/冷却类 */
-#logsBox .lg.ok{color:#7fbf98}    /* 柔化绿：成功路径 */
+#logsBox{background:#0a0d13;border:1px solid #171d27;color:#8fa3b8;border-radius:9px;
+         padding:10px 12px;font:12px var(--mono);overflow-y:auto;overflow-x:hidden;
+         min-height:140px;line-height:1.9;white-space:normal}
+/* 每行单行省略：断行会把一条日志撑成三行、整页没法看；全文在悬停 title 与「复制全部」里 */
+#logsBox .lg{display:flex;gap:10px;white-space:nowrap;padding:0 4px 0 9px;
+             border-left:2px solid transparent}
+#logsBox .lg .lt{flex:none;width:72px;color:#4a5768;font-variant-numeric:tabular-nums}
+#logsBox .lg .lm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#logsBox .lg.err{color:#c9837c;border-left-color:#7d3f3a}   /* 柔化红：低饱和，长行不刺眼 */
+#logsBox .lg.warn{color:#c2a35e;border-left-color:#7d6b3a}  /* 柔化黄：降级/冷却类 */
+#logsBox .lg.ok{color:#7fbf98;border-left-color:#3e6a52}    /* 柔化绿：成功路径 */
 #view-logs #logsBox{flex:1;min-height:0}
 .check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);cursor:pointer}
 .check input{accent-color:var(--green)}

@@ -111,7 +111,7 @@ fn mirror_auto_config_url(value: Option<&str>) {
             let _ = key.set_value("AutoConfigURL", &v);
         }
         None => {
-            mirror_auto_config_url(None);
+            let _ = key.delete_value("AutoConfigURL");
         }
     }
 }

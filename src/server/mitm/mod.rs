@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 mod defuse;
 mod merge;
 mod page_cache;
-mod quiet;
+pub(crate) mod quiet;
 mod redirect_memo;
 
 pub(crate) mod mirror;
@@ -643,7 +643,10 @@ pub(super) async fn get_direct(
                 let up_ip = up.ip.clone();
                 // 服务端回 421 = 这个 IP 服务不了这个 host：边级长冷却，换下一条。
                 if resp.status() == StatusCode::MISDIRECTED_REQUEST {
-                    pool::edges::mark_reject(&up_ip, host);
+                    // 边状态按路由键记账（子域请求的 host ≠ 路由键，按 host 记会永远对不上）。
+                    if let Some(row) = pool::route::route_for(host) {
+                        pool::edges::mark_reject(&up_ip, &row.key);
+                    }
                     upstream::drop_h2_id(&up_ip, id);
                     (log)(&format!(
                         "[MITM] {host} <- {up_ip} 421 边缘拒绝, 该边长冷却, 换候选"

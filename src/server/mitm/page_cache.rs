@@ -226,7 +226,8 @@ pub(super) fn cache_take(
     if !cache_eligible(req, host) {
         return None;
     }
-    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let cookies = all_cookies(req.headers());
+    let cookies = cookies.as_deref();
     let variant = if search_page {
         search_variant(req.headers().get("accept").and_then(|v| v.to_str().ok()))
     } else {
@@ -267,7 +268,10 @@ pub(super) fn cache_take(
     } else {
         format!("{}KB", body.len() / 1024)
     };
-    (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
+    // 命中是常态：每路径只留首条，否则浏览高峰整页都是「缓存命中」。
+    if super::quiet::first_time("cachehit", &path) {
+        (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
+    }
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
@@ -319,7 +323,8 @@ pub(super) async fn cache_put(
         }
     }
     let xhr = is_xhr_path(req.uri().path());
-    let cookies = req.headers().get("cookie").and_then(|v| v.to_str().ok());
+    let cookies = all_cookies(req.headers());
+    let cookies = cookies.as_deref();
     let search_page = is_search_page(req.uri().path());
     // 分钥匙以实际 Content-Type 为准：同 URL 可能回 JSON 也可能回 HTML。
     let ct_lower = resp
@@ -478,6 +483,20 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
+/// 全部 Cookie 头按出现序拼接：浏览器的大 Cookie 会被 h2 拆成多行，
+/// 只读第一行会漏掉排在后面的 user_session —— 登录流量就会被记成 -cloggedout。
+fn all_cookies(hdrs: &hyper::HeaderMap) -> Option<String> {
+    let mut joined = String::new();
+    for v in hdrs.get_all("cookie") {
+        let Ok(s) = v.to_str() else { continue };
+        if !joined.is_empty() {
+            joined.push_str("; ");
+        }
+        joined.push_str(s);
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// 登录态 cookie 的值（GitHub 的两种 user_session 写法）。有值 = 已登录。
 fn session_value(cookies: Option<&str>) -> Option<&str> {
     cookies?.split(';').map(str::trim).find_map(|kv| {
@@ -611,6 +630,21 @@ fn is_logged_out_body(plain: &str) -> bool {
     plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
 }
 
+/// HTML 是否完整（末 2KB 内有 </html>）：GitHub 的 h2 响应没有 content-length，
+/// 上游流中途断掉时 collect 仍返回 Ok —— 截断页落进 keep/ 会被 7 天寿命内
+/// 的每次后退命中，等于必现白屏。读写两侧都用它把关。
+fn html_complete(bytes: &[u8], gzip: bool) -> bool {
+    let full = if gzip {
+        super::defuse::gunzip_partial(bytes, 32 << 20)
+    } else {
+        bytes.to_vec()
+    };
+    full.len() >= 7
+        && full[full.len().saturating_sub(2048)..]
+            .windows(7)
+            .any(|w| w == b"</html>")
+}
+
 /// 闸门页标记：GitHub 拿这些页顶替你请求的 URL 回 200，存下会一直显示。
 const GATE_MARKERS: &[&str] = &[
     "verify your two-factor authentication",
@@ -722,6 +756,19 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
     let plain = plain_prefix(body, gzip);
     if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
         return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
+    }
+    // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
+    if key.ends_with("-k")
+        && hdrs.iter().any(|(k, v)| {
+            k.as_str() == "content-type"
+                && v.to_str()
+                    .map(|v| v.starts_with("text/html"))
+                    .unwrap_or(false)
+        })
+        && !html_complete(body, gzip)
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err("骨架条目截断(无</html>)");
     }
     Ok((status, hdrs, Bytes::copy_from_slice(body)))
 }
@@ -879,7 +926,9 @@ async fn collect_and_submit(
             }
             // 不缓存"顶替真实内容"的页：未登录页（会话已死）与各类闸门页。
             let plain = plain_prefix(&bytes, gzip);
+            // 首页骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
+                && (!key.ends_with("-k") || html_complete(&bytes, gzip))
                 && !(has_session && is_logged_out_body(&plain))
                 && !is_gate_page(&plain)
                 && !is_search_skeleton(key, &bytes, gzip);

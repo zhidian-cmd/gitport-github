@@ -108,7 +108,15 @@ async function refreshLogs() {
     for (const l of lines) {
       const row = document.createElement('div');
       row.className = 'lg ' + logTone(l);
-      row.textContent = l;
+      row.title = l; // 单行省略后，悬停看全文；「复制全部」也保留完整文本
+      const m = l.match(/^\[(\d\d:\d\d:\d\d)\] ([\s\S]*)$/);
+      const ts = document.createElement('span');
+      ts.className = 'lt';
+      ts.textContent = m ? '[' + m[1] + ']' : '';
+      const msg = document.createElement('span');
+      msg.className = 'lm';
+      msg.textContent = m ? m[2] : l;
+      row.append(ts, msg);
       frag.appendChild(row);
     }
     box.appendChild(frag);
@@ -253,90 +261,6 @@ $('mirrorRows').addEventListener('input', e => {
   }
 });
 
-/* ---------- 路由二部图 ----------
-   左列 = IP 节点（伪装身份），右列 = 分流域名（有边的），连线 = 服务关系。
-   绿框 = 游标起点，红边 = (ip,host) 边缘拒绝冷却中，节点右上角 = 池内活连接数。 */
-let topoSeq = 0;
-
-function renderTopology(d) {
-  const box = $('topoBox');
-  if (!box) return;
-  const NODE_W = 250, NODE_H = 40, NODE_GAP = 10;
-  const HOST_W = 210, HOST_H = 26, HOST_GAP = 8;
-  const LEFT_X = 8, RIGHT_X = 470, W = 690;
-  const nodes = d.nodes || [];
-  const hosts = (d.hosts || []).filter(h => !h.direct);
-  const hostByKey = {};
-  hosts.forEach(h => hostByKey[h.key] = h);
-  // 只画有节点服务的 host（无边行不在池路径上）
-  const used = new Set();
-  nodes.forEach(n => (n.hosts || []).forEach(k => used.add(k)));
-  const hostRows = hosts.filter(h => used.has(h.key));
-  const leftH = nodes.length * (NODE_H + NODE_GAP);
-  const rightH = Math.max(1, hostRows.length) * (HOST_H + HOST_GAP);
-  const H = Math.max(leftH, rightH) + 10;
-
-  const nodeY = i => 6 + i * (NODE_H + NODE_GAP);
-  const hostY = i => 6 + i * (HOST_H + HOST_GAP);
-  const center = y => y + 16;
-
-  let edgesSvg = '';
-  // 节点多 host 的连线从节点右侧散开到各 host 左侧；同节点多条边纵向微散
-  nodes.forEach((n, i) => {
-    const y = nodeY(i);
-    (n.hosts || []).forEach(k => {
-      const hi = hostRows.findIndex(h => h.key === k);
-      if (hi < 0) return;
-      const hy = center(hostY(hi));
-      const ny = center(y) + ((n.hosts.length > 1 ? (n.hosts.indexOf(k) - (n.hosts.length - 1) / 2) * 6 : 0));
-      const bad = (n.bad || 0) > 0 && (n.bad || 0) >= (n.count || 1);
-      const partial = (n.bad || 0) > 0 && !bad;
-      const live = (n.conns || 0) > 0;
-      const stroke = bad ? '#e5534b' : (partial ? '#d29922' : (live ? '#57ab5a' : '#51607a'));
-      const dash = bad || partial ? 'stroke-dasharray="5 3"' : '';
-      edgesSvg += `<line x1="${LEFT_X + NODE_W}" y1="${ny}" x2="${RIGHT_X}" y2="${hy}" stroke="${stroke}" stroke-width="${live ? 1.6 : 1}" ${dash} opacity="${live ? 0.9 : 0.45}"><title>${escAttr(n.ip)} → ${escAttr(k)}${bad ? '（全节点冷却中）' : partial ? '（部分 IP 冷却中）' : ''}</title></line>`;
-    });
-  });
-
-  const nodesSvg = nodes.map((n, i) => {
-    const y = nodeY(i);
-    const bad = (n.bad || 0) > 0 && (n.bad || 0) >= (n.count || 1);
-    const partial = (n.bad || 0) > 0 && !bad;
-    const live = (n.conns || 0) > 0;
-    const border = n.cursor ? '#57ab5a' : bad ? '#e5534b' : live ? '#6cb6ff' : '#3a4450';
-    const fill = bad ? 'rgba(229,83,75,.08)' : n.cursor ? 'rgba(87,171,90,.10)' : 'rgba(110,118,129,.08)';
-    const tip = `${n.ip}（展开 ${n.count} IP）\nSNI: ${n.sni || '（无）'}\n锚点: ${n.verify || '按目标 host'}\n活连接: ${n.conns || 0}\n服务: ${(n.hosts || []).join(', ')}`;
-    return `<g>
-      <rect x="${LEFT_X}" y="${y}" width="${NODE_W}" height="${NODE_H}" rx="7" fill="${fill}" stroke="${border}" stroke-width="${n.cursor ? 1.8 : 1}"><title>${escAttr(tip)}</title></rect>
-      <text x="${LEFT_X + 10}" y="${y + 17}" font-size="12" fill="${bad ? '#e5534b' : '#d0d7de'}" font-family="Consolas,monospace">${escAttr(n.ip)}${n.count > 1 ? ` ×${n.count}` : ''}</text>
-      <text x="${LEFT_X + 10}" y="${y + 32}" font-size="10" fill="#768390">SNI ${escAttr(n.sni || '-')} · 锚点 ${escAttr(n.verify || 'host')}${n.bad ? ` · 坏 ${n.bad}/${n.count}` : ''}</text>
-      ${n.conns ? `<text x="${LEFT_X + NODE_W - 8}" y="${y + 17}" font-size="11" fill="#57ab5a" text-anchor="end" font-weight="bold">${n.conns}</text>` : ''}
-      ${n.cursor ? `<text x="${LEFT_X + NODE_W - 8}" y="${y + 32}" font-size="9" fill="#57ab5a" text-anchor="end">起点</text>` : ''}
-    </g>`;
-  }).join('');
-
-  const hostsSvg = hostRows.map((h, i) => {
-    const y = hostY(i);
-    const marks = [h.content ? '内容' : '', h.fallback === 'mirror' ? '镜像兜底' : ''].filter(Boolean).join(' · ');
-    return `<g>
-      <rect x="${RIGHT_X}" y="${y}" width="${HOST_W}" height="${HOST_H}" rx="6" fill="rgba(110,118,129,.10)" stroke="#3a4450"><title>${escAttr(h.key)}${marks ? '\n' + marks : ''}</title></rect>
-      <text x="${RIGHT_X + 10}" y="${y + 17}" font-size="11" fill="#c9d1d9" font-family="Consolas,monospace">${escAttr(h.key)}</text>
-      ${marks ? `<text x="${RIGHT_X + HOST_W - 8}" y="${y + 17}" font-size="9" fill="#768390" text-anchor="end">${escAttr(marks)}</text>` : ''}
-    </g>`;
-  }).join('');
-
-  const seq = ++topoSeq;
-  if (seq !== topoSeq) return; // 防陈旧渲染覆盖
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block" font-family="system-ui,sans-serif">
-    ${edgesSvg}${nodesSvg}${hostsSvg}</svg>`;
-}
-
-async function refreshTopology() {
-  let d;
-  try { d = await (await fetch('/api/topology')).json(); } catch (e) { return; }
-  renderTopology(d);
-}
-
 /* ---------- 图片链校准 ---------- */
 // 半自动校准：点击 → 后端按内置模板对图片(小文件)链逐镜像串行实测 TTFB → 按成绩重排链序写盘 → 返回人读报告（约 30~90s，期间按钮禁用）。
 // 大文件链不校准：速度学习由代理的实时流量调度(ECT)自动完成，无需手动。
@@ -369,8 +293,7 @@ async function runCal(btn) {
 $('calImgBtn').onclick = () => runCal($('calImgBtn'));
 
 /* ---------- 启动 ---------- */
-route(); refreshStatus(); refreshLogs(); refreshSettings(); refreshTopology();
+route(); refreshStatus(); refreshLogs(); refreshSettings();
 // 页面在后台(挂托盘/切走)时完全停轮询 —— 后台零请求
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 2000);
 setInterval(() => { if (!document.hidden) refreshLogs(); }, 2000);
-setInterval(() => { if (!document.hidden) refreshTopology(); }, 10000);

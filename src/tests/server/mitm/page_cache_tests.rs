@@ -712,3 +712,54 @@ fn list_path_gate() {
     assert!(!is_home_path("/feed"));
     assert!(!is_home_path("/o/r"));
 }
+
+/// 截断的 keep 骨架（无 </html>）必须读失败并删文件自愈：
+/// GitHub h2 响应无 content-length，上游中途断流时 collect 照样成功，
+/// 截断页落盘后 7 天寿命内每次后退都命中它 = 必现白屏。
+#[test]
+fn truncated_keep_entry_self_destructs() {
+    let (dir, _g) = own_dir("trunc");
+    let ck = "GET github.com/-cloggedout-gz-k";
+    let _ = persist_page_entry_blocking(
+        &dir,
+        ck,
+        b"<html><head>truncated page without closing tag",
+        200,
+        &test_hdrs(),
+    );
+    let keep = dir.join("keep");
+    assert_eq!(std::fs::read_dir(&keep).unwrap().count(), 1);
+    assert!(
+        load_disk_entry_reason(ck, true).is_err(),
+        "截断骨架必须当 miss"
+    );
+    assert_eq!(
+        std::fs::read_dir(&keep).unwrap().count(),
+        0,
+        "截断条目必须当场删除(自愈)"
+    );
+    // 完整骨架照常命中
+    let _ = persist_page_entry_blocking(&dir, ck, b"<html>ok</html>", 200, &test_hdrs());
+    assert!(load_disk_entry_reason(ck, true).is_ok(), "完整骨架必须命中");
+}
+
+/// 大 Cookie 会被浏览器按 h2 拆成多行：user_session 落在第二行也必须认出登录态，
+/// 否则登录流量被记成 -cloggedout，与爬虫/无 cookie 流量混池互相污染。
+#[test]
+fn split_cookie_headers_still_fingerprint_account() {
+    let req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("https://github.com/")
+        .header("cookie", "_gh_sess=abc; _device_id=xyz")
+        .header("cookie", "user_session=tok123; dotcom_user=zhidian-cmd")
+        .body(())
+        .unwrap();
+    let joined = all_cookies(req.headers()).expect("应有 cookie");
+    assert!(
+        joined.contains("_gh_sess=abc") && joined.contains("user_session=tok123"),
+        "两行 cookie 都要在: {joined}"
+    );
+    assert_eq!(session_value(Some(&joined)), Some("tok123"));
+    assert_eq!(account_name(Some(&joined)), Some("zhidian-cmd"));
+    assert_eq!(session_fingerprint(Some(&joined)), "-czhidian-cmd");
+}

@@ -114,7 +114,10 @@ pub(super) async fn gh_defuse(
             continue;
         }
         pool::cursor_note(host, &ip, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
-                                                // 风控页说明该 IP 的连接不可信，必须同步清复用槽，否则下个请求又拿到坏连接，垫底/重拨乒乓死循环。
+                                                // 风控页也是"这条边暂时别碰"：记 10 分钟边冷却，同一波并发别再连续撞同一家。
+        if let Some(row) = pool::route::route_for(host) {
+            pool::edges::mark_risk(&ip, &row.key);
+        }
         upstream::drop_h2(&ip);
         // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。
         tried += 1;

@@ -185,3 +185,18 @@ async fn pool_no_samples_takes_first_candidate() {
     let _ = lock(conn_pool()).remove(slow_ip);
     let _ = lock(conn_pool()).remove(fast_ip);
 }
+
+/// 全局"正在拨"登记：认领期间别的 host 能看到，候选组有交集即命中；释放后立刻可拨。
+#[test]
+fn inflight_registry_claim_blocks_and_release_frees() {
+    let ips = vec!["198.51.100.7".to_string()];
+    assert!(!inflight_busy(&ips));
+    let guard = DialingGuard::claim(&ips);
+    assert!(inflight_busy(&ips), "认领后应显示在拨");
+    assert!(
+        inflight_busy(&["203.0.113.9".to_string(), "198.51.100.7".to_string()]),
+        "候选组有交集即算命中"
+    );
+    drop(guard);
+    assert!(!inflight_busy(&ips), "释放后应立刻可拨");
+}

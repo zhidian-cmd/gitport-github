@@ -91,7 +91,6 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/guide/{file}", axum::routing::get(guide_img))
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
-        .route("/api/topology", axum::routing::get(api_topology))
         .route("/api/logs", axum::routing::get(api_logs))
         .route("/api/mitm", axum::routing::post(api_mitm))
         .route("/api/settings", axum::routing::get(api_settings))
@@ -286,88 +285,6 @@ impl Drop for CalibDone {
     fn drop(&mut self) {
         crate::server::mitm::CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-/// 二部图拓扑：节点（IP 表达式 + 伪装身份 + 活连接数 + 起点/坏边标记）× hosts 行。
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TopoNode {
-    ip: String,
-    count: usize,
-    sni: String,
-    verify: String,
-    hosts: Vec<String>,
-    conns: usize,
-    cursor: bool,
-    bad: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TopoHost {
-    key: String,
-    direct: bool,
-    content: bool,
-    fallback: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TopoResp {
-    nodes: Vec<TopoNode>,
-    hosts: Vec<TopoHost>,
-}
-
-async fn api_topology() -> Response {
-    let conns = crate::server::upstream::conn_counts();
-    let cursors = pool::cursor_snapshot();
-    let bad: std::collections::HashSet<(String, String)> =
-        pool::edges::bad_snapshot().into_iter().collect();
-    let nodes: Vec<TopoNode> = pool::route::nodes_snapshot()
-        .iter()
-        .map(|n| {
-            let mut bad_count = 0usize;
-            let mut cursor = false;
-            for ip in &n.ips {
-                if n.hosts
-                    .iter()
-                    .any(|k| bad.contains(&(ip.clone(), k.clone())))
-                {
-                    bad_count += 1;
-                }
-                if cursors.values().any(|v| v == ip) {
-                    cursor = true;
-                }
-            }
-            TopoNode {
-                ip: n.raw.clone(),
-                count: n.ips.len(),
-                sni: n.sni.clone(),
-                verify: n.verify.clone(),
-                hosts: n.hosts.clone(),
-                conns: n
-                    .ips
-                    .iter()
-                    .map(|ip| conns.get(ip).copied().unwrap_or(0))
-                    .sum(),
-                cursor,
-                bad: bad_count,
-            }
-        })
-        .collect();
-    let hosts: Vec<TopoHost> = pool::route::hosts_snapshot()
-        .iter()
-        .map(|r| TopoHost {
-            key: r.key.clone(),
-            direct: r.flags.direct,
-            content: r.flags.content,
-            fallback: match r.fallback {
-                pool::route::Fallback::MirrorDns => "mirror",
-                pool::route::Fallback::Dns => "dns",
-            },
-        })
-        .collect();
-    write_json(&TopoResp { nodes, hosts })
 }
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {

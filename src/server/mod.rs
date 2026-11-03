@@ -142,7 +142,9 @@ impl ProxyServer {
         {
             return;
         }
-        (self.log)(&format!("[CONNECT] {host} via {ip} -> 200已发, 开始转发"));
+        if mitm::quiet::first_time("connect", &host) {
+            (self.log)(&format!("[CONNECT] {host} via {ip} -> 200已发, 开始转发"));
+        }
 
         let (sent, recv) = bidir_copy(
             &mut client,
@@ -153,7 +155,10 @@ impl ProxyServer {
             true,
         )
         .await;
-        (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
+        // 字节数每 host 只留首条：每连接两行会刷满日志环，异常(零回包)另有专门记录。
+        if mitm::quiet::first_time("tunnel-bytes", &host) {
+            (self.log)(&format!("[隧道] {host} via {ip}: ↑{sent} ↓{recv}B"));
+        }
 
         if pool::route::is_managed(&host) && ip != "system-dns" {
             match (sent, recv) {

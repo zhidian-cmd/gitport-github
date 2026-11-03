@@ -24,7 +24,7 @@ fn reuse() -> &'static Mutex<HashMap<String, ReuseStat>> {
 }
 
 /// 该 host 的这类样板首次出现？表满整盘清空——纯日志用途，丢历史无副作用。
-pub(super) fn first_time(tag: &str, host: &str) -> bool {
+pub(crate) fn first_time(tag: &str, host: &str) -> bool {
     let mut g = seen().lock().unwrap();
     if g.len() >= 512 {
         g.clear();

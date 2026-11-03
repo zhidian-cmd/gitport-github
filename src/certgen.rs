@@ -20,6 +20,8 @@ use crate::util::LogFn;
 
 /// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
+/// 叶子上下文缓存上限：受管行含通配（githubusercontent.com/github.io），只进不出会随浏览慢慢涨。
+const LEAVES_CAP: usize = 512;
 
 pub struct Authority {
     cert_pem: String, // CA 证书 PEM（save 落盘用）
@@ -76,10 +78,18 @@ impl Authority {
         let key = PKey::private_key_from_der(&leaf_key.serialize_der())
             .map_err(|e| format!("叶子私钥解析失败: {e}"))?;
         let ctx = Arc::new(mitm_host_ctx(&leaf_x509, &self.ca_x509, &key)?);
-        self.leaves
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(host.to_string(), (SystemTime::now(), ctx.clone()));
+        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+        if leaves.len() >= LEAVES_CAP && !leaves.contains_key(host) {
+            // 超限清签发时刻最旧的一张：被逐出的域名下次访问照常重签，只是慢一次。
+            if let Some(oldest) = leaves
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                leaves.remove(&oldest);
+            }
+        }
+        leaves.insert(host.to_string(), (SystemTime::now(), ctx.clone()));
         Ok(ctx)
     }
 }

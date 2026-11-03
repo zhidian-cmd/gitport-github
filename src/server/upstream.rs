@@ -47,6 +47,12 @@ static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// 每 IP 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
 const MAX_CONNS_PER_IP: usize = 2;
 
+/// 带会话（cookie/auth）的域：只留单通道单 IP。同一会话并发出现在两个 IP 上，
+/// 正是 GitHub 风控最容易抓的特征；内容域（图片/静态资源）才吃双通道加速。
+fn session_host(host: &str) -> bool {
+    matches!(host, "github.com" | "api.github.com")
+}
+
 static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, IpConns>>> = std::sync::OnceLock::new();
 fn conn_pool() -> &'static Mutex<HashMap<String, IpConns>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
@@ -245,19 +251,18 @@ fn occupied_ips(ips: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// IP → 活连接数（UI 二部图着色用）。
-pub fn conn_counts() -> std::collections::HashMap<String, usize> {
-    lock(conn_pool())
-        .iter()
-        .map(|(ip, h)| (ip.clone(), h.conns.len()))
-        .collect()
-}
-
 /// 首条建好后后台补第二条：skip 池中活连接占用的 IP，游标用副键。
+/// 后台执行时点边状态可能已翻转：全黑（targets 空）直接放弃，绝不能索引越界。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
+    if session_host(host) {
+        return; // 会话域单通道：补第二条 = 把同一会话拆到第二个 IP 上
+    }
     let Some(targets) = pool::route::dial_targets(host) else {
         return;
     };
+    if targets.is_empty() {
+        return; // 全黑：补连无从谈起
+    }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     {
         let mut g = lock(conn_pool());
@@ -393,7 +398,9 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
     (log)(&format!("[建连] {host} 冷启动竞速发射"));
-    for slot in [1u8, 2] {
+    // 会话域只发一条（同会话不跨 IP）；内容域保持双通道竞速。
+    let slots: &[u8] = if session_host(host) { &[1] } else { &[1, 2] };
+    for &slot in slots {
         let tx = tx.clone();
         let host = host.to_string();
         let log = log.clone();
@@ -436,6 +443,68 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     Ok(won)
 }
 
+/// 全局"正在拨"登记：IP → 认领时刻。多个 host 的候选组重叠时，后到的等先到的出结果再复用，
+/// 而不是各自拨一条——同一会话被拆到多个 IP，是风控最容易抓的破绽。
+static INFLIGHT: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+static INFLIGHT_DONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// 等别人拨号的上限：对端拨得慢也不能把请求挂住，超时自己拨。
+const INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn inflight_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn inflight_busy(ips: &[String]) -> bool {
+    let g = lock(inflight_map());
+    ips.iter().any(|ip| g.contains_key(ip))
+}
+
+/// 认领这批 IP 的拨号权；Drop 时注销并叫醒等待者（成功入池、失败退出都走）。
+struct DialingGuard {
+    ips: Vec<String>,
+}
+
+impl DialingGuard {
+    fn claim(ips: &[String]) -> Self {
+        let now = std::time::Instant::now();
+        let mut g = lock(inflight_map());
+        for ip in ips {
+            g.insert(ip.clone(), now);
+        }
+        Self { ips: ips.to_vec() }
+    }
+}
+
+impl Drop for DialingGuard {
+    fn drop(&mut self) {
+        {
+            let mut g = lock(inflight_map());
+            for ip in &self.ips {
+                g.remove(ip);
+            }
+        }
+        INFLIGHT_DONE.notify_waiters();
+    }
+}
+
+/// 等这批 IP 上的在拨拨号结束；true = 等过（调用方应回头查池再决定）。
+async fn wait_inflight(ips: &[String]) -> bool {
+    let deadline = std::time::Instant::now() + INFLIGHT_WAIT;
+    let mut waited = false;
+    while inflight_busy(ips) {
+        waited = true;
+        if std::time::Instant::now() >= deadline {
+            return waited;
+        }
+        tokio::select! {
+            _ = INFLIGHT_DONE.notified() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+    waited
+}
+
 /// 建连统一入口：候选全空走竞速（两个两个建），其余单发（单发也跳过池中占用的 IP）。
 /// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
@@ -448,11 +517,19 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    // 支路：别的 host 正在拨同组 IP，先等它出结果——成了直接复用，不重复拨。
+    if wait_inflight(&ips).await {
+        if let Some(up) = cached_h2_in(&ips, None) {
+            return Ok((up, false)); // 池中已有（对方入的库），无需再存
+        }
+    }
     if occupied_ips(&ips).is_empty() {
+        let _claim = DialingGuard::claim(&ips);
         let up = dial_h2_race(host, log).await?;
         return Ok((up, false)); // 竞速任务内部已入库
     }
     let skip = occupied_ips(&ips);
+    let _claim = DialingGuard::claim(&ips);
     let up = h2_dial_slot(host, log, &skip, 1, None).await?;
     Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
 }

@@ -25,14 +25,6 @@ pub fn dial_cool_open(host: &str) -> bool {
     SERIAL_COOL.open(host)
 }
 
-/// 游标快照（UI 二部图起点标记用）：路由键 → 驻留 IP（空串 = 未驻留）。
-pub fn cursor_snapshot() -> HashMap<String, String> {
-    lock(&SERIAL)
-        .as_ref()
-        .map(|t| t.cursor.clone())
-        .unwrap_or_default()
-}
-
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[
@@ -592,7 +584,12 @@ fn json_of<T: Serialize>(v: &T) -> String {
 
 fn write_routes_file(path: &Path, mirrors: &HashMap<String, Vec<String>>) {
     let data = encode_routes(mirrors);
-    let _ = crate::fsx::write_atomic(path, data.as_bytes());
+    if let Err(e) = crate::fsx::write_atomic(path, data.as_bytes()) {
+        // 写盘失败无声 = 镜像链/表变更重启即丢且查无痕迹，必须留一行。
+        if let Some(l) = lock(&SERIAL_LOG).as_ref() {
+            l(&format!("[串发] routes.json 写盘失败: {e}"));
+        }
+    }
 }
 
 fn routes_path() -> PathBuf {
@@ -668,31 +665,16 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         ips: seeds.ips.clone(),
         chains: seeds.chains.clone(),
     });
-    let migrated = {
-        // 迁移会原地改写文件：先留一份旧格式，用户手排的 IP 随时能翻回去对。
-        let bak = path.with_extension("json.bak");
-        if !bak.exists() {
-            let _ = std::fs::copy(&path, &bak);
-        }
-        true
-    };
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
-    if migrated {
-        if let Some(l) = log.as_ref() {
-            l(&format!(
-                "[串发] routes.json 迁移为二部图表({} hosts 行 / {} 节点)",
-                doc.hosts.len(),
-                doc.ips.len()
-            ));
-        }
-    }
 
+    let mut dropped = 0usize;
     let mut rows = Vec::with_capacity(doc.hosts.len());
     for spec in doc.hosts.into_iter() {
         let key = spec.key.clone();
         match route::RouteRow::new(spec) {
             Ok(row) => rows.push(row),
             Err(e) => {
+                dropped += 1;
                 if let Some(l) = log.as_ref() {
                     l(&format!("[串发] hosts[{key}] 丢弃: {e}"));
                 }
@@ -705,14 +687,15 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         match build_node(spec) {
             Ok(n) => nodes.push(n),
             Err(e) => {
+                dropped += 1;
                 if let Some(l) = log.as_ref() {
                     l(&format!("[串发] ips[{ip}] 丢弃: {e}"));
                 }
             }
         }
     }
-    // 有行被丢弃：同样先备份，用户写的标记还能从 .bak 捡回。
-    if !path.with_extension("json.bak").exists() {
+    // 只有真有行被丢弃才留底（用户手写的标记还能从 .bak 捡回）；健康表启动不留任何备份。
+    if dropped > 0 && !path.with_extension("json.bak").exists() {
         let _ = std::fs::copy(&path, path.with_extension("json.bak"));
     }
     route::install(rows, nodes);

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 const REJECT_SECS: u64 = 4 * 3600;
 /// 请求超时 / 断连：网络波动，短冷却。
 const STALL_SECS: u64 = 120;
+/// 风控拦截页：IP 对该域暂时不干净，冷却到窗口过期（GitHub 的限流窗通常几分钟）。
+const RISK_SECS: u64 = 600;
 /// 容量硬顶：超限惰性清过期，再超就整表清（极端场景宁可重新试探）。
 const CAP: usize = 8192;
 
@@ -43,6 +45,11 @@ pub fn mark_stall(ip: &str, key: &str) {
     set(ip, key, STALL_SECS);
 }
 
+/// 边返回风控拦截页：中等冷却，让同一波并发别再撞同一家（风控窗口就它自己过期）。
+pub fn mark_risk(ip: &str, key: &str) {
+    set(ip, key, RISK_SECS);
+}
+
 /// 边在冷却期？查询管线第③步据此滤黑。
 pub fn is_bad(ip: &str, key: &str) -> bool {
     let mut g = lock(map());
@@ -62,20 +69,6 @@ pub fn clear(ip: &str, key: &str) {
     if let Some(m) = lock(map()).as_mut() {
         m.remove(&(ip.to_string(), key.to_string()));
     }
-}
-
-/// 坏边快照（UI 二部图着色用）：(具体 IP, 路由键)。
-pub fn bad_snapshot() -> Vec<(String, String)> {
-    let now = Instant::now();
-    lock(map())
-        .as_ref()
-        .map(|m| {
-            m.iter()
-                .filter(|(_, until)| **until > now)
-                .map(|((ip, key), _)| (ip.clone(), key.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
