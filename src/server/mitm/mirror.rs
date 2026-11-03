@@ -3,7 +3,6 @@
 use super::merge::{self, MergeBody};
 use super::path_of;
 use super::quiet;
-use crate::config;
 use crate::pool;
 use crate::server::protocol::{self, BoxBody};
 use crate::server::upstream;
@@ -448,11 +447,6 @@ pub(super) async fn chain_fetch(
     let direct_key = format!("direct/{chain_host}");
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
-    // 直连优先域（codeload）：direct 提到队首，失败再按校准链序逐家。
-    if config::is_direct_first(chain_host) {
-        let n = candidates.len();
-        candidates.rotate_left(n - 1);
-    }
     // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
     if !chain.is_empty() && pool::MIRROR_BREAKER.open(chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));

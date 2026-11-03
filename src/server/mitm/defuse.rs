@@ -115,7 +115,7 @@ pub(super) async fn gh_defuse(
         }
         pool::cursor_note(host, &ip, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
                                                 // 风控页说明该 IP 的连接不可信，必须同步清复用槽，否则下个请求又拿到坏连接，垫底/重拨乒乓死循环。
-        upstream::drop_h2(host, &ip);
+        upstream::drop_h2(&ip);
         // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。
         tried += 1;
         // 同 IP 再现 = 全员拦截页，再转只会重复；垫底与拔连接必须在终止判定之前，否则坏连接还挂在缓存里。

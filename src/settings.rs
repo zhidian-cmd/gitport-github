@@ -383,12 +383,22 @@ struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
     /// 按规范键序成表；路由表未装载时原样保留，否则会丢光上次游标。
+    /// 旧键 `~2` 迁移为 `_vice`（v2 改名），其余键位原样。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
         let keys = crate::pool::circle_keys();
         if keys.is_empty() {
             return LastIpTable(marks.into_iter().collect());
         }
-        let mut pending: HashMap<String, String> = marks.into_iter().collect();
+        let mut pending: HashMap<String, String> = marks
+            .into_iter()
+            .map(|(k, v)| {
+                if let Some(base) = k.strip_suffix("~2") {
+                    (format!("{base}_vice"), v)
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
         let rows = keys
             .into_iter()
             .map(|key| {

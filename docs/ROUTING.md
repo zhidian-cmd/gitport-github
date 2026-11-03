@@ -1,6 +1,7 @@
 # GitPort GitHub 路由表（实测版）
 
 > 2026-10-19 实测，2026-10-27 补白名单腿。
+> **⚠️ v2（2026-11-03）起本文的 Mirror 判定与真名分片腿已成历史**：routes.json 改二部图（见 POOL-V2.md），codeload/archive 迁池、白名单域转伪装锚点、real/donor 标志删除；PAC 与最长匹配判定不变。历史实测数据仍具参考价值。
 > 2026-11-02 派发演化：codeload 并入小文件域（直连优先 + TTFB 校准链序）、大文件域改分段竞速（慢段让位）、ECT 改离散时间槽——**本文的路由判定（PAC / master_route / 族 / 兜底）全部不变**，派发细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 > 代码唯一真相：`src/pool/route.rs`（总路由 + 池内族表）、`src/config.rs`（GROUPS / DIRECT_HOSTS / WHITELIST_HOSTS）、`src/webui.rs`（PAC 生成）。
 > 本文每行「实测」列均为当日对**运行中的代理**（127.0.0.1:7810，新二进制，MITM 开）的真实请求结果，日志佐证取自 `/api/logs`。

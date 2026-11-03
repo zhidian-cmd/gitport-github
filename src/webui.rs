@@ -261,16 +261,13 @@ struct StatusResp {
     port: u16,
     mitm: bool,
     domain_count: usize,
-    /// 串发候选总数（原 IP 池页删除后并入状态，概览只显示一个数）。
+    /// 路由种子展开后的具体 IP 总数（原 IP 池页删除后并入状态，概览只显示一个数）。
     pool_total: usize,
-    /// 白名单腿握手次数 / 其中真的分成了多段（<2 段 = 首包太短，掩体没上成）。
-    split_attempt: u64,
-    split_done: u64,
 }
 
 async fn api_status(State(st): State<Arc<App>>) -> Response {
     let domain_count = pool::route::route_count();
-    let pool_total: usize = pool::route::plan_count();
+    let pool_total: usize = pool::route::ip_count();
     write_json(&StatusResp {
         version: st.version.to_string(),
         running: crate::server::running(),
@@ -278,8 +275,6 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
         mitm: settings::mitm(),
         domain_count,
         pool_total,
-        split_attempt: pool::dial::SPLIT_ATTEMPT.load(std::sync::atomic::Ordering::Relaxed),
-        split_done: pool::dial::SPLIT_DONE.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 

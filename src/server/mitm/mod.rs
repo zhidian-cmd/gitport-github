@@ -336,12 +336,17 @@ async fn stream_passthrough(
     let path = path_of(out.uri());
     let t0 = Instant::now();
     let mut body = Some(body);
+    let ips = pool::route::dial_targets(host)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.ip)
+        .collect::<Vec<_>>();
     let (fut, send, up) = 'conn: {
-        if let Some(up) = upstream::cached_h2(host) {
+        if let Some(up) = upstream::cached_h2_in(&ips, None) {
             match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
-                    upstream::drop_h2_id(host, up.id);
+                    upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 缓存连接失效({e}), 新拨重试"));
                 }
             }
@@ -350,7 +355,7 @@ async fn stream_passthrough(
             Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send)) => break 'conn (fut, send, up),
                 Err(e) => {
-                    upstream::drop_h2_id(host, up.id);
+                    upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 新拨连接握手即死({e})"));
                 }
             },
@@ -371,7 +376,7 @@ async fn stream_passthrough(
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(host, up.id, t0.elapsed().as_millis() as u64);
+            upstream::note_latency(&up.ip, up.id, t0.elapsed().as_millis() as u64);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
@@ -452,91 +457,6 @@ async fn send_once(
     }
 }
 
-/// 借道被服务端拒绝（421）后的冷却：这不是某条连接坏了，而是跨 `:authority` 不被收，
-/// 换一条也一样，所以停的是整条借道路径。
-static BORROW_BREAKER: pool::Breaker = pool::Breaker::new(30);
-
-/// 一次请求最多换几条 donor 重试（assets 通常一条 host 两条连接）。
-const MAX_BORROW_TRIES: usize = 2;
-
-/// 借来的响应体带着"借出中"计数：流走完或中途被丢弃都要归还，
-/// 否则那条 donor 会一直显示在忙，下一轮再也挑不中它。
-struct BorrowGuard(Option<(String, u64)>);
-
-impl Drop for BorrowGuard {
-    fn drop(&mut self) {
-        if let Some((host, id)) = self.0.take() {
-            upstream::borrow_done(&host, id);
-        }
-    }
-}
-
-fn borrow_guard_body(host: String, id: u64, body: BoxBody) -> BoxBody {
-    let stream = http_body_util::BodyExt::into_data_stream(body);
-    let guarded = futures_util::stream::unfold(
-        (stream, BorrowGuard(Some((host, id)))),
-        |(mut s, g)| async move {
-            let item = futures_util::StreamExt::next(&mut s).await?;
-            Some((item.map(hyper::body::Frame::data), (s, g)))
-        },
-    );
-    BoxBody::new(http_body_util::StreamBody::new(guarded))
-}
-
-/// 内容域全灭时的最后一条路：借 assets 的伪装连接发同一请求，全程零握手。
-/// h2 用 `out` 的 URI 生成 `:authority`，Fastly 按它路由，不暴露真名；一条 donor 失败换下一条（最多 `MAX_BORROW_TRIES`）。
-pub(super) async fn try_borrow(
-    log: &LogFn,
-    out: &hyper::Request<BoxBody>,
-    host: &str,
-    info: &UpstreamInfo,
-    body: &Option<Bytes>,
-) -> Option<Result<hyper::Response<BoxBody>, String>> {
-    if BORROW_BREAKER.open(host) {
-        return None;
-    }
-    let mut last = String::new();
-    for _ in 0..MAX_BORROW_TRIES {
-        let Some((donor_host, donor)) = upstream::borrow_donor(host) else {
-            break; // 没有现成通道，或都在冷却：交回原回退路径
-        };
-        match send_once(&donor, out, body, request_budget(true)).await {
-            Ok((resp, _)) if resp.status() == StatusCode::MISDIRECTED_REQUEST => {
-                // 连接本身没坏，只是服务端不收跨 :authority：归还配额，整条路先歇一会。
-                upstream::borrow_done(&donor_host, donor.id);
-                BORROW_BREAKER.set(host);
-                return Some(Err("借道被 421 拒绝(服务端不收跨 :authority)".to_string()));
-            }
-            Ok((resp, ms)) => {
-                // 借用请求的耗时也记在这条连接上：下次挑 donor 时快的那条更受青睐。
-                upstream::note_latency(&donor_host, donor.id, ms);
-                // 只记实际出口，不回写内容域候选游标：把 .154 记进 content 键，
-                // 下一轮就会拿它配伪装 SNI 去拨 avatars，证书必挂。
-                *info.lock().unwrap() = donor.ip.clone();
-                if quiet::first_time("borrow", host) {
-                    (log)(&format!(
-                        "[借道] {host} 借 {donor_host}({}) 的现成通道, {ms}ms",
-                        donor.ip
-                    ));
-                }
-                let (parts, body) = resp.into_parts();
-                let body = borrow_guard_body(donor_host, donor.id, body);
-                return Some(Ok(hyper::Response::from_parts(parts, body)));
-            }
-            Err(e) => {
-                // 这条坏了就冷藏它，换同 host 的另一条继续——两条通道的意义就在这。
-                upstream::borrow_poison(&donor_host, donor.id);
-                last = format!("{donor_host}({}) {e}", donor.ip);
-            }
-        }
-    }
-    if last.is_empty() {
-        None
-    } else {
-        Some(Err(format!("借道失败: {last}")))
-    }
-}
-
 /// 直连腿组装（两条路径共用）：charge 在 future 首行，镜像胜出丢弃 future 时零残留。
 #[allow(clippy::too_many_arguments)] // 直连腿组装的字面清单, 强行并参只会丢语义
 fn direct_leg<'a>(
@@ -608,6 +528,7 @@ async fn try_cached(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
+    ips: &[String],
     info: &UpstreamInfo,
     is_simple: bool,
     body: &Option<Bytes>,
@@ -616,12 +537,12 @@ async fn try_cached(
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     let is_content = pool::route::is_content(host);
-    let up = upstream::cached_h2_in(host, want_slot)?;
+    let up = upstream::cached_h2_in(ips, want_slot)?;
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(host, up.id, ms);
+            upstream::note_latency(&up.ip, up.id, ms);
             if is_content {
                 pool::CONTENT_BREAKER.clear(host);
             }
@@ -631,7 +552,7 @@ async fn try_cached(
             Some(Ok(resp))
         }
         Err(why) => {
-            upstream::drop_h2_id(host, up.id);
+            upstream::drop_h2_id(&up.ip, up.id);
             (log)(&format!(
                 "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
                 up.ip
@@ -653,38 +574,44 @@ pub(super) async fn get_direct(
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
     let is_content = pool::route::is_content(host);
+    // 查询管线②③：host → 邻接 IP（滤黑边后）。None=不在表；空=全黑走 fallback。
+    let targets = match pool::route::dial_targets(host) {
+        Some(t) => t,
+        None => return Err(format!("域名不在路由表({host})")),
+    };
+    if targets.is_empty() {
+        return Err(format!("{host} 候选 IP 全部在边冷却中"));
+    }
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     if is_content && pool::CONTENT_BREAKER.open(host) {
-        // 熔断期间不干等：内容域候选全灭时借 assets 的现成通道，借不到才回镜像链。
-        if let Some(r) = try_borrow(log, out, host, info, body).await {
-            return r;
-        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
-    if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
+    if let Some(r) = try_cached(log, out, host, &ips, info, is_simple, body).await {
         return r;
     }
     // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
     if is_content && pool::CONTENT_BREAKER.open(host) {
-        // 等锁期间别人可能刚把熔断补上：同样先试借道，借不到才回镜像链。
-        if let Some(r) = try_borrow(log, out, host, info, body).await {
-            return r;
-        }
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
-    if upstream::cached_h2_in(host, want_slot).is_some() {
+    if upstream::cached_h2_in(&ips, want_slot).is_some() {
         guard.take();
-        if let Some(r) = try_cached(log, out, host, info, is_simple, body).await {
+        if let Some(r) = try_cached(log, out, host, &ips, info, is_simple, body).await {
             return r;
         }
         guard = Some(dial_lock.lock().await);
     }
     let _dial_guard = guard;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
+        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。
+        let ips: Vec<String> = match pool::route::dial_targets(host) {
+            Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
+            _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
+        };
         // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
-        let (up, fresh) = match upstream::cached_h2_in(host, want_slot) {
+        let (up, fresh) = match upstream::cached_h2_in(&ips, want_slot) {
             Some(up) => (up, false),
             None => match upstream::dial_upstream(host, log).await {
                 Ok((up, fresh)) => (up, fresh),
@@ -697,12 +624,8 @@ pub(super) async fn get_direct(
                         return Err(format!("POST 等非简单方法不重发({e})"));
                     }
                     if is_content {
-                        // 候选确实全灭：先把熔断记上，后续请求直接抄借道这条近路，
-                        // 不再挨个等拨号超时。
+                        // 候选确实全灭：记熔断，后续请求直接走镜像链。
                         pool::CONTENT_BREAKER.set(host);
-                        if let Some(r) = try_borrow(log, out, host, info, body).await {
-                            return r;
-                        }
                         return Err(format!("内容域直连全灭({e})"));
                     }
                     continue;
@@ -714,13 +637,25 @@ pub(super) async fn get_direct(
                 let id = up.id;
                 let up_slot = up.slot;
                 let up_ip = up.ip.clone();
+                // 服务端回 421 = 这个 IP 服务不了这个 host：边级长冷却，换下一条。
+                if resp.status() == StatusCode::MISDIRECTED_REQUEST {
+                    pool::edges::mark_reject(&up_ip, host);
+                    upstream::drop_h2_id(&up_ip, id);
+                    (log)(&format!(
+                        "[MITM] {host} <- {up_ip} 421 边缘拒绝, 该边长冷却, 换候选"
+                    ));
+                    if !is_simple {
+                        return Err("421 边缘拒绝(非简单方法不重发)".to_string());
+                    }
+                    continue;
+                }
                 *info.lock().unwrap() = up_ip.clone();
-                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶
+                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶（内含成功清黑）
                 if fresh {
-                    upstream::store_h2(host, up);
-                    upstream::maybe_spawn_second(host, log); // 高频 host 后台补第二条
+                    upstream::store_h2(&up_ip, up);
+                    upstream::maybe_spawn_second(host, log); // 后台补第二条
                 } // 竞速路径不补:race 的另一任务就是第二条,补建会与它抢跑
-                upstream::note_latency(host, id, ms); // 新连接也要记账，否则择优池没有它的样本
+                upstream::note_latency(&up_ip, id, ms); // 新连接也要记账，否则择优池没有它的样本
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
                 }
@@ -735,7 +670,9 @@ pub(super) async fn get_direct(
         if is_simple && !is_content {
             pool::cursor_note(host, &up.ip, false, up.slot);
         }
-        upstream::drop_h2_id(host, up.id);
+        // 边级记账：超时/断连短冷却，这个 IP 对这个 host 稍后再说。
+        pool::edges::mark_stall(&up.ip, host);
+        upstream::drop_h2_id(&up.ip, up.id);
         (log)(&format!(
             "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
             attempt + 1
@@ -744,11 +681,8 @@ pub(super) async fn get_direct(
             return Err(format!("POST 等非简单方法不重发({e})"));
         }
         if is_content {
-            // 同上：先熔断再借道，让下一条请求少走一轮必败的拨号。
+            // 同上：先熔断再走镜像链，让下一条请求少走一轮必败的拨号。
             pool::CONTENT_BREAKER.set(host);
-            if let Some(r) = try_borrow(log, out, host, info, body).await {
-                return r;
-            }
             return Err(format!("内容域直连全灭({e})"));
         }
         continue; // GET/HEAD: 换下一个候选重发完整请求
@@ -844,14 +778,13 @@ async fn dns_direct_fetch(
     let budget_content = pool::route::is_content(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn =
-            match pool::dial::dial_one(host, &ip, host, pool::route::is_real(host), true).await {
-                Ok(c) => c,
-                Err(e) => {
-                    (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
-                    continue;
-                }
-            };
+        let conn = match pool::dial::dial_one(&ip, host, host, true).await {
+            Ok(c) => c,
+            Err(e) => {
+                (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
+                continue;
+            }
+        };
         let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
         {
             Ok(u) => u,
@@ -864,8 +797,8 @@ async fn dns_direct_fetch(
             Ok((resp, ms)) => {
                 let id = up.id;
                 *info.lock().unwrap() = ip.clone();
-                upstream::store_h2(host, up); // 入缓存: 后续请求走复用快路径
-                upstream::note_latency(host, id, ms);
+                upstream::store_h2(&ip, up); // 入缓存: 后续请求走复用快路径
+                upstream::note_latency(&ip, id, ms);
                 (log)(&format!(
                     "[DNS直连] {host}{} 新连接 {ip}, 成功({ms}ms)",
                     path_of(out.uri())
@@ -873,7 +806,7 @@ async fn dns_direct_fetch(
                 return Ok(resp);
             }
             Err(e) => {
-                upstream::drop_h2(host, &ip);
+                upstream::drop_h2(&ip);
                 (log)(&format!(
                     "[DNS直连] {host} <- {ip} 请求失败({e}), 换下个解析 IP"
                 ));

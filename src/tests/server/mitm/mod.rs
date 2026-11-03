@@ -43,12 +43,16 @@ use super::*;
 fn release_asset_path_gate() {
     use pool::route::{master_route, Route};
     let mirror = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Mirror);
+    let pool = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Pool);
     let not_mirror =
         |host: &str, path: &str| !matches!(master_route(host, "GET", path), Route::Mirror);
-    assert!(mirror(
-        "github.com",
-        "/torvalds/linux/archive/refs/tags/v6.6.tar.gz"
-    ));
+    assert!(
+        pool(
+            "github.com",
+            "/torvalds/linux/archive/refs/tags/v6.6.tar.gz"
+        ),
+        "archive 已迁池，不再走镜像"
+    );
     assert!(mirror(
         "github.com",
         "/cli/cli/releases/download/v2.0.0/gh_2.0.0_windows_amd64.zip"
@@ -68,7 +72,10 @@ fn release_asset_path_gate() {
     ));
     assert!(not_mirror("github.com", "/torvalds/linux/git-upload-pack"));
     assert!(not_mirror("api.github.com", "/repos/x/y/releases/assets/1"));
-    assert!(mirror("codeload.github.com", "/x/y/legacy.tar.gz"));
+    assert!(
+        pool("codeload.github.com", "/x/y/legacy.tar.gz"),
+        "codeload 命中 github.com 裸键走池"
+    );
 }
 
 #[test]

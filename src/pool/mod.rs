@@ -1,5 +1,6 @@
-//! 串发拨号：路由表（routes.json `routes`）唯一权威。成功驻留游标、失败前移；SNI 与校验名解耦。
+//! 串发拨号：二部图（`ips` 节点 × `hosts` 行）唯一权威。成功驻留游标、失败前移；SNI 骗墙、证书按锚点校验。
 pub mod dial;
+pub mod edges;
 pub mod route;
 
 use crate::util::{lock, LogFn};
@@ -9,41 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SerialPlan {
-    pub ip: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub sni: String,
-}
-
-/// 旧版三池名与白名单：只用于首启迁移，摊进路由行后不再使用。
-const LEGACY_WHITELIST: &[(&str, &str)] = &[
-    ("docs.github.com", "154"),
-    ("support.github.com", "133"),
-    ("resources.github.com", "133"),
-    ("desktop.github.com", "153"),
-    ("pages.github.com", "153"),
-    ("skills.github.com", "153"),
-    ("archiveprogram.github.com", "153"),
-    ("socialimpact.github.com", "153"),
-    ("raw.github.com", "133"),
-    ("copilot-proxy.githubusercontent.com", "4.249"),
-];
-
-/// 旧版直连白名单（迁移成 action: direct 的路由行）。
-const LEGACY_DIRECT: &[&str] = &[
-    "objects-origin.githubusercontent.com",
-    "uploads.github.com",
-    "viewscreen.githubusercontent.com",
-    "api.mcp.github.com",
-];
-
-/// 路由表文件名：`routes` 字典 + 镜像链两字典，手改入口。
+/// 路由表文件名：`ips` 节点 + `hosts` 行 + 镜像链，手改入口。
 const ROUTES_FILE: &str = "routes.json";
 /// 0.5.3 及以前的文件名，首启一次性迁走（迁完原表留 .bak）。
 const LEGACY_ROUTES_FILE: &str = "plans.json";
 
-/// 游标键：每条路由两把（主键 / `~2` 副键），双通道各记各的。
+/// 游标键：每条路由两把（主键 / `_vice` 副键），双通道各记各的。
 pub fn circle_keys() -> Vec<String> {
     route::cursor_keys()
 }
@@ -55,40 +27,26 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "gist.githubusercontent.com",
     "avatars.githubusercontent.com",
     "user-images.githubusercontent.com",
-    "codeload.github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "media.githubusercontent.com",
 ];
 
-/// 种子只剩两个用途：全新安装引导、给已有路由补 IP（不新建路由）。
-/// 与 routes.json 同构：新格式直接读 routes 字典，旧三池文件仍兼容。
-fn seed_db() -> SeedDoc {
+/// 种子只剩两个用途：全新安装引导、给已有表补节点/边（不新建 hosts 行）。
+fn seed_db() -> TopoDoc {
     let Some((doc, _)) = parse_routes_tolerant(SEEDS_JSON, None) else {
-        return SeedDoc::default();
+        return TopoDoc::default();
     };
-    SeedDoc {
-        routes: match doc.routes {
-            Some(rows) => rows,
-            None => legacy_routes(&doc.pools),
-        },
-        chains: doc.chains,
-    }
+    doc
 }
 
-#[derive(Default)]
-struct SeedDoc {
-    routes: Vec<route::RouteSpec>,
-    chains: HashMap<String, Vec<String>>,
-}
-
-const SERIAL_MAX_PLANS: usize = 512;
+const SERIAL_MAX_IPS: usize = 512;
 
 struct SerialTab {
     /// TCP 层死亡退避 60s→5min→30min，成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
     mirrors: HashMap<String, Vec<String>>,
-    /// 每路由（`key[~slot]`）一个游标记号；表序冻结，不随游标重排。
+    /// 每路由（`key` / `key_vice`）一个游标记号；表序冻结，不随游标重排。
     cursor: HashMap<String, String>,
 }
 
@@ -102,11 +60,11 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// routes.json 的解析结果：新格式给 routes，旧格式给 pools；镜像链两边通用。
+/// 路由表文档：v2 给 ips+hosts，旧 routes 字典与旧三池在迁移期兼容。
 #[derive(Default)]
-struct RoutesDoc {
-    routes: Option<Vec<route::RouteSpec>>,
-    pools: HashMap<String, Vec<SerialPlan>>,
+struct TopoDoc {
+    hosts: Vec<route::HostSpec>,
+    ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
 }
 
@@ -127,75 +85,125 @@ fn merged_chains(
 }
 
 /// 容错解析：坏段只丢那一段；salvaged = 有段被丢弃，调用方备份原文件。
-fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(RoutesDoc, bool)> {
+fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, bool)> {
     let root: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = root.as_object()?;
-    let mut doc = RoutesDoc::default();
+    let mut doc = TopoDoc::default();
     let mut big = HashMap::new();
     let mut small = HashMap::new();
     let mut legacy = HashMap::new();
     let mut salvaged = false;
 
-    if let Some(routes) = obj.get("routes") {
-        let mut rows = Vec::new();
-        match routes {
-            // 新格式：键就是域名，值只放开关位和候选表。
-            serde_json::Value::Object(map) => {
-                for (key, body) in map {
-                    match spec_with_key(key, body) {
-                        Ok(spec) => rows.push(spec),
-                        Err(e) => {
-                            salvaged = true;
-                            if let Some(l) = log {
-                                l(&format!(
-                                    "[串发] routes.json routes[{key}] 写坏({e}), 该行丢弃"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            // 旧格式：数组 + `match` 正则，读进来一次性转成域名键。
-            serde_json::Value::Array(list) => {
-                for (i, v) in list.iter().enumerate() {
-                    match legacy_spec_from_row(v) {
-                        Ok(spec) => rows.push(spec),
-                        Err(e) => {
-                            salvaged = true;
-                            if let Some(l) = log {
-                                l(&format!(
-                                    "[串发] routes.json routes[{i}] 写坏({e}), 该行丢弃"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
+    // v2 格式：ips + hosts。
+    if let Some(ips) = obj.get("ips") {
+        match serde_json::from_value::<Vec<route::IpSpec>>(ips.clone()) {
+            Ok(v) => doc.ips = v,
+            Err(e) => {
+                salvaged = true;
                 if let Some(l) = log {
-                    l("[串发] routes.json routes 既不是对象也不是数组, 本次按种子重建");
+                    l(&format!("[串发] routes.json ips 段写坏({e}), 该段丢弃"));
                 }
-                return None;
             }
         }
-        doc.routes = Some(rows);
-    } else {
-        for (k, v) in obj {
-            if k.starts_with("mirrors") {
-                continue;
-            }
-            match serde_json::from_value::<Vec<SerialPlan>>(v.clone()) {
-                Ok(p) => {
-                    doc.pools.insert(k.clone(), p);
+    }
+    if let Some(serde_json::Value::Object(map)) = obj.get("hosts") {
+        for (key, body) in map {
+            let mut v = body.clone();
+            match v.as_object_mut() {
+                Some(o) => {
+                    o.insert(
+                        "key".to_string(),
+                        serde_json::Value::String(key.to_string()),
+                    );
                 }
+                None => {
+                    salvaged = true;
+                    if let Some(l) = log {
+                        l(&format!("[串发] routes.json hosts[{key}] 写坏, 该行丢弃"));
+                    }
+                    continue;
+                }
+            }
+            match serde_json::from_value::<route::HostSpec>(v) {
+                Ok(s) => doc.hosts.push(s),
                 Err(e) => {
                     salvaged = true;
                     if let Some(l) = log {
                         l(&format!(
-                            "[串发] routes.json 池 {k} 写坏({e}), 该池按种子重建(其余表保留)"
+                            "[串发] routes.json hosts[{key}] 写坏({e}), 该行丢弃"
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    // 兼容层：v1 的 routes 字典（含 plans）与 0.5.3 的正则数组折算成 v2；旧三池同理。
+    let has_v2 = doc.ips.len() + doc.hosts.len() > 0;
+    if !has_v2 {
+        if let Some(routes) = obj.get("routes") {
+            match routes {
+                serde_json::Value::Object(map) => {
+                    for (key, body) in map {
+                        match v1_route_spec(key, body) {
+                            Ok(Some(spec)) => {
+                                doc.hosts.push(spec.0);
+                                doc.ips.extend(spec.1);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                salvaged = true;
+                                if let Some(l) = log {
+                                    l(&format!(
+                                        "[串发] routes.json routes[{key}] 写坏({e}), 该行丢弃"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                // 0.5.3 及以前：数组 + `match` 正则，读进来一次性转成域名键。
+                serde_json::Value::Array(list) => {
+                    for (i, v) in list.iter().enumerate() {
+                        match legacy_spec_from_row(v) {
+                            Ok(Some(spec)) => {
+                                doc.hosts.push(spec.0);
+                                doc.ips.extend(spec.1);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                salvaged = true;
+                                if let Some(l) = log {
+                                    l(&format!(
+                                        "[串发] routes.json routes[{i}] 写坏({e}), 该行丢弃"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(l) = log {
+                        l("[串发] routes.json routes 既不是对象也不是数组, 本次按种子重建");
+                    }
+                    return None;
+                }
+            }
+        } else {
+            // 最老的旧三池。
+            let mut pools: HashMap<String, Vec<V1Plan>> = HashMap::new();
+            for (k, v) in obj {
+                if k.starts_with("mirrors") {
+                    continue;
+                }
+                if let Ok(p) = serde_json::from_value::<Vec<V1Plan>>(v.clone()) {
+                    pools.insert(k.clone(), p);
+                }
+            }
+            if !pools.is_empty() {
+                let (hs, is) = legacy_pools_to_v2(&pools);
+                doc.hosts = hs;
+                doc.ips = is;
             }
         }
     }
@@ -238,21 +246,18 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(RoutesDoc, b
     Some((doc, salvaged))
 }
 
-/// 新格式一条：值是开关位，域名键在外层，这里把它补进 spec。
-fn spec_with_key(key: &str, body: &serde_json::Value) -> Result<route::RouteSpec, String> {
-    let mut v = body.clone();
-    let Some(obj) = v.as_object_mut() else {
-        return Err("值不是对象".to_string());
-    };
-    obj.insert(
-        "key".to_string(),
-        serde_json::Value::String(key.to_string()),
-    );
-    serde_json::from_value(v).map_err(|e| e.to_string())
+/// v1 plan 形态（仅迁移解析用）。
+#[derive(Clone, Debug, Deserialize)]
+struct V1Plan {
+    ip: String,
+    #[serde(default)]
+    sni: String,
 }
 
-/// 旧格式一条（0.5.3 及以前）：`match` 是整串正则，转成等价的域名键。
-fn legacy_spec_from_row(v: &serde_json::Value) -> Result<route::RouteSpec, String> {
+/// 旧格式一条（0.5.3 及以前）：`match` 是整串正则，转成等价的域名键再折算。
+fn legacy_spec_from_row(
+    v: &serde_json::Value,
+) -> Result<Option<(route::HostSpec, Vec<route::IpSpec>)>, String> {
     let mut v = v.clone();
     let Some(obj) = v.as_object_mut() else {
         return Err("值不是对象".to_string());
@@ -261,11 +266,9 @@ fn legacy_spec_from_row(v: &serde_json::Value) -> Result<route::RouteSpec, Strin
         .remove("match")
         .and_then(|m| m.as_str().map(str::to_string))
         .ok_or_else(|| "缺 match".to_string())?;
-    obj.insert(
-        "key".to_string(),
-        serde_json::Value::String(legacy_match_to_key(&pat)),
-    );
-    serde_json::from_value(v).map_err(|e| e.to_string())
+    let key = legacy_match_to_key(&pat);
+    obj.insert("key".to_string(), serde_json::Value::String(key.clone()));
+    v1_route_spec(&key, &v)
 }
 
 /// 把老表的正则收敛成域名键。只认当年真用过的三种形态，其余按字面去转义：
@@ -283,54 +286,266 @@ fn legacy_match_to_key(pat: &str) -> String {
     p.replace("\\.", ".")
 }
 
-/// 落盘：routes 逐行、IP 一条一行；镜像链按 CONTENT_HOSTS 序。
+/// 旧 routes 字典一条 → (hosts 行, 折算出的单 IP 节点)。direct/real/donor 标志按 v2 语义处置：
+/// direct 行保留直连（用户显式配置不进代理）；real/donor 标志丢弃（v2 无此概念）。
+fn v1_route_spec(
+    key: &str,
+    body: &serde_json::Value,
+) -> Result<Option<(route::HostSpec, Vec<route::IpSpec>)>, String> {
+    let mut v = body.clone();
+    let Some(obj) = v.as_object_mut() else {
+        return Err("值不是对象".to_string());
+    };
+    obj.insert(
+        "key".to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+    let spec: V1RouteBody = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    let direct = spec.action.as_deref() == Some("direct");
+    let host = route::HostSpec {
+        key: key.to_string(),
+        pac: spec.pac.clone(),
+        // v2 实测后 direct 4 域进池；迁移时旧 direct 标志一并解除，IP 边由种子补。
+        action: None,
+        content: spec.content,
+        fallback: spec.fallback.clone(),
+    };
+    let mut ips = Vec::new();
+    for p in spec.plans.iter().chain(spec.real_plans.iter()) {
+        ips.push(route::IpSpec {
+            ip: p.ip.clone(),
+            sni: if p.sni.is_empty() {
+                key.to_string()
+            } else {
+                p.sni.clone()
+            },
+            verify: verify_for(&p.ip),
+            hosts: vec![key.to_string()],
+        });
+    }
+    let _ = direct;
+    Ok(Some((host, ips)))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct V1RouteBody {
+    pac: Option<String>,
+    action: Option<String>,
+    real: bool,
+    content: bool,
+    donor: bool,
+    fallback: Option<String>,
+    plans: Vec<V1Plan>,
+    #[serde(rename = "realPlans")]
+    real_plans: Vec<V1Plan>,
+}
+
+/// Fastly 四段的末段；迁移时用来把旧 edge 池拆回各族。
+fn fastly_seg(ip: &str) -> Option<&str> {
+    let mut o = ip.split('.');
+    match (o.next(), o.next(), o.next(), o.next()) {
+        (Some("185"), Some("199"), Some("108" | "109" | "110" | "111"), Some(last)) => Some(last),
+        _ => None,
+    }
+}
+
+/// 旧三池 → v2：完整行集（v1 legacy_routes 同款）+ IP 摊成节点；direct 4 域按实测进池。
+fn legacy_pools_to_v2(
+    pools: &HashMap<String, Vec<V1Plan>>,
+) -> (Vec<route::HostSpec>, Vec<route::IpSpec>) {
+    let empty: Vec<V1Plan> = Vec::new();
+    let core = pools.get("core").unwrap_or(&empty);
+    let api = pools.get("api").unwrap_or(&empty);
+    let edge = pools.get("edge").unwrap_or(&empty);
+    let seg = |want: &str| -> Vec<&V1Plan> {
+        edge.iter()
+            .filter(|p| fastly_seg(&p.ip) == Some(want))
+            .collect()
+    };
+    let mut ips: Vec<route::IpSpec> = Vec::new();
+    let mut push_all = |list: Vec<&V1Plan>, hosts: &[&str]| {
+        for p in list {
+            ips.push(route::IpSpec {
+                ip: p.ip.clone(),
+                sni: if p.sni.is_empty() {
+                    "baidu.com".to_string()
+                } else {
+                    p.sni.clone()
+                },
+                verify: verify_for(&p.ip),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            });
+        }
+    };
+    let i133 = seg("133");
+    let i153 = seg("153");
+    let i154 = seg("154");
+    let i215 = seg("215");
+    push_all(core.iter().collect(), &["github.com"]);
+    push_all(api.iter().collect(), &["api.github.com"]);
+    push_all(
+        i133,
+        &[
+            "*.githubusercontent.com",
+            "raw.github.com",
+            "support.github.com",
+            "resources.github.com",
+        ],
+    );
+    push_all(
+        i153,
+        &[
+            "github.io",
+            "desktop.github.com",
+            "pages.github.com",
+            "skills.github.com",
+            "archiveprogram.github.com",
+            "socialimpact.github.com",
+        ],
+    );
+    push_all(i154, &["githubassets.com", "docs.github.com"]);
+    push_all(i215, &["githubassets.com"]);
+    let azure: Vec<&V1Plan> = edge.iter().filter(|p| p.ip.starts_with("4.249.")).collect();
+    push_all(azure, &["copilot-proxy.githubusercontent.com"]);
+    let other: Vec<&V1Plan> = edge
+        .iter()
+        .filter(|p| fastly_seg(&p.ip).is_none() && !p.ip.starts_with("4.249."))
+        .collect();
+    push_all(other, &["githubapp.com"]);
+
+    let mut hosts = vec![
+        route::HostSpec {
+            key: "github.com".into(),
+            pac: Some("github.com".into()),
+            action: None,
+            content: false,
+            fallback: None,
+        },
+        route::HostSpec {
+            key: "api.github.com".into(),
+            pac: Some("api.github.com".into()),
+            action: None,
+            content: false,
+            fallback: None,
+        },
+        route::HostSpec {
+            key: "*.githubusercontent.com".into(),
+            pac: Some("githubusercontent.com".into()),
+            action: None,
+            content: true,
+            fallback: Some("mirror".into()),
+        },
+        route::HostSpec {
+            key: "githubassets.com".into(),
+            pac: Some("githubassets.com".into()),
+            action: None,
+            content: false,
+            fallback: None,
+        },
+        route::HostSpec {
+            key: "github.io".into(),
+            pac: Some("github.io".into()),
+            action: None,
+            content: false,
+            fallback: None,
+        },
+        route::HostSpec {
+            key: "githubapp.com".into(),
+            pac: Some("githubapp.com".into()),
+            action: None,
+            content: false,
+            fallback: None,
+        },
+    ];
+    for h in LEGACY_HOST_ROWS {
+        hosts.push(route::HostSpec {
+            key: (*h).to_string(),
+            pac: Some((*h).to_string()),
+            action: None,
+            content: false,
+            fallback: None,
+        });
+    }
+    (hosts, ips)
+}
+
+/// v1 白名单行（real 标志丢弃，只保留 pac 行）。
+const LEGACY_HOST_ROWS: &[&str] = &[
+    "docs.github.com",
+    "support.github.com",
+    "resources.github.com",
+    "desktop.github.com",
+    "pages.github.com",
+    "skills.github.com",
+    "archiveprogram.github.com",
+    "socialimpact.github.com",
+    "raw.github.com",
+    "copilot-proxy.githubusercontent.com",
+];
+
+/// 迁移期锚点推断：Fastly 段与 Azure 段按实测证书形态给 verify；未知段留空 = 按目标 host 校验。
+fn verify_for(ip: &str) -> String {
+    let segs: Vec<&str> = ip.split('.').collect();
+    if segs.len() != 4 {
+        return String::new();
+    }
+    match (segs[0], segs[1], segs[3]) {
+        ("185", "199", "153" | "133") => "github.com".to_string(),
+        ("185", "199", "154" | "215") => "githubassets.com".to_string(),
+        ("4", "249", _) => "actions.githubusercontent.com".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 落盘：hosts 逐行、ips 逐节点、镜像链按 CONTENT_HOSTS 序。
 fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
-    let rows: Vec<String> = route::snapshot()
+    let mut parts: Vec<String> = Vec::new();
+
+    let rows: Vec<String> = route::hosts_snapshot()
         .iter()
         .map(|r| {
-            let mut parts: Vec<String> = Vec::new();
+            let mut fields: Vec<String> = Vec::new();
             if let Some(pac) = &r.pac {
-                parts.push(format!("\"pac\": {}", json_of(pac)));
+                fields.push(format!("\"pac\": {}", json_of(pac)));
             }
             if r.flags.direct {
-                parts.push("\"action\": \"direct\"".to_string());
-            }
-            if r.flags.real {
-                parts.push("\"real\": true".to_string());
+                fields.push("\"action\": \"direct\"".to_string());
             }
             if r.flags.content {
-                parts.push("\"content\": true".to_string());
-            }
-            if r.flags.donor {
-                parts.push("\"donor\": true".to_string());
+                fields.push("\"content\": true".to_string());
             }
             if r.fallback == route::Fallback::MirrorDns {
-                parts.push("\"fallback\": \"mirror\"".to_string());
+                fields.push("\"fallback\": \"mirror\"".to_string());
             }
-            for (key, list) in [("plans", &r.plans), ("realPlans", &r.real_plans)] {
-                if list.is_empty() {
-                    continue;
-                }
-                let items: Vec<String> = list.iter().map(json_of).collect();
-                parts.push(format!(
-                    "\"{key}\": [\n        {}\n      ]",
-                    items.join(",\n        ")
-                ));
-            }
-            if parts.is_empty() {
+            if fields.is_empty() {
                 format!("    {}: {{}}", json_of(&r.key))
             } else {
                 format!(
                     "    {}: {{\n      {}\n    }}",
                     json_of(&r.key),
-                    parts.join(",\n      ")
+                    fields.join(",\n      ")
                 )
             }
         })
         .collect();
-    let mut blocks = vec![format!("  \"routes\": {{\n{}\n  }}", rows.join(",\n"))];
+    parts.push(format!("  \"hosts\": {{\n{}\n  }}", rows.join(",\n")));
 
-    // 镜像链双字典：按 host 归类。
+    let nodes: Vec<String> = route::nodes_snapshot()
+        .iter()
+        .map(|n| {
+            let hosts: Vec<String> = n.hosts.iter().map(json_of).collect();
+            format!(
+                "    {{\n      \"ip\": {},\n      \"sni\": {},\n      \"verify\": {},\n      \"hosts\": [{}]\n    }}",
+                json_of(&n.raw),
+                json_of(&n.sni),
+                json_of(&n.verify),
+                hosts.join(", ")
+            )
+        })
+        .collect();
+    parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
+
     let mut big_rows: Vec<String> = Vec::new();
     let mut small_rows: Vec<String> = Vec::new();
     for h in CONTENT_HOSTS {
@@ -344,18 +559,18 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
         }
     }
     if !big_rows.is_empty() {
-        blocks.push(format!(
+        parts.push(format!(
             "  \"mirrors_big\": {{\n{}\n  }}",
             big_rows.join(",\n")
         ));
     }
     if !small_rows.is_empty() {
-        blocks.push(format!(
+        parts.push(format!(
             "  \"mirrors_small\": {{\n{}\n  }}",
             small_rows.join(",\n")
         ));
     }
-    format!("{{\n{}\n}}\n", blocks.join(",\n"))
+    format!("{{\n{}\n}}\n", parts.join(",\n"))
 }
 
 fn json_of<T: Serialize>(v: &T) -> String {
@@ -435,50 +650,59 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     }
 
     let seeds = seed_db();
-    let seed_rows = seeds.routes;
-    let doc = parsed.map(|(d, _)| d).unwrap_or_else(|| RoutesDoc {
-        routes: Some(seed_rows.clone()),
-        pools: HashMap::new(),
-        chains: seeds.chains,
+    let mut doc = parsed.map(|(d, _)| d).unwrap_or_else(|| TopoDoc {
+        hosts: seeds.hosts.clone(),
+        ips: seeds.ips.clone(),
+        chains: seeds.chains.clone(),
     });
-    // 新格式直接用；旧三池走一次性迁移；迁移结果之后写回文件，下次就是新格式。
-    let migrated = doc.routes.is_none();
-    let mut specs = match doc.routes {
-        Some(rows) => rows,
-        None => legacy_routes(&doc.pools),
-    };
-    topup_from_seeds(&mut specs, &seed_rows, log.as_ref());
-    if migrated {
+    let migrated = {
         // 迁移会原地改写文件：先留一份旧格式，用户手排的 IP 随时能翻回去对。
         let bak = path.with_extension("json.bak");
         if !bak.exists() {
             let _ = std::fs::copy(&path, &bak);
         }
+        true
+    };
+    topup_from_seeds(&mut doc, &seeds, log.as_ref());
+    if migrated {
         if let Some(l) = log.as_ref() {
             l(&format!(
-                "[串发] routes.json 迁移为 routes 表({} 条路由), 旧三池格式不再使用",
-                specs.len()
+                "[串发] routes.json 迁移为二部图表({} hosts 行 / {} 节点)",
+                doc.hosts.len(),
+                doc.ips.len()
             ));
         }
     }
 
-    let total = specs.len();
-    let mut rows = Vec::with_capacity(total);
-    for (i, spec) in specs.into_iter().enumerate() {
+    let mut rows = Vec::with_capacity(doc.hosts.len());
+    for spec in doc.hosts.into_iter() {
+        let key = spec.key.clone();
         match route::RouteRow::new(spec) {
             Ok(row) => rows.push(row),
             Err(e) => {
                 if let Some(l) = log.as_ref() {
-                    l(&format!("[串发] routes[{i}] 丢弃: {e}"));
+                    l(&format!("[串发] hosts[{key}] 丢弃: {e}"));
                 }
             }
         }
     }
-    // 有行被丢弃：同样先备份，用户写的正则/标记还能从 .bak 捡回。
-    if rows.len() < total && !path.with_extension("json.bak").exists() {
+    let mut nodes = Vec::with_capacity(doc.ips.len());
+    for spec in doc.ips.into_iter() {
+        let ip = spec.ip.clone();
+        match build_node(spec) {
+            Ok(n) => nodes.push(n),
+            Err(e) => {
+                if let Some(l) = log.as_ref() {
+                    l(&format!("[串发] ips[{ip}] 丢弃: {e}"));
+                }
+            }
+        }
+    }
+    // 有行被丢弃：同样先备份，用户写的标记还能从 .bak 捡回。
+    if !path.with_extension("json.bak").exists() {
         let _ = std::fs::copy(&path, path.with_extension("json.bak"));
     }
-    route::install(rows);
+    route::install(rows, nodes);
 
     let mut tab = SerialTab {
         dead: HashMap::new(),
@@ -545,167 +769,90 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     write_routes_file(&path, &mirror_chains_snapshot());
 }
 
-/// 旧三池 → routes 表。只用于旧文件与旧种子的兼容迁移；新格式直接读 routes 字典。
-fn legacy_routes(pools: &HashMap<String, Vec<SerialPlan>>) -> Vec<route::RouteSpec> {
-    let empty: Vec<SerialPlan> = Vec::new();
-    let core = pools.get("core").unwrap_or(&empty);
-    let api = pools.get("api").unwrap_or(&empty);
-    let edge = pools.get("edge").unwrap_or(&empty);
-    let seg = |want: &str| -> Vec<SerialPlan> {
-        edge.iter()
-            .filter(|p| fastly_seg(&p.ip) == Some(want))
-            .cloned()
-            .collect()
-    };
-    let i133 = seg("133");
-    let i153 = seg("153");
-    let i154 = seg("154");
-    let i215 = seg("215");
-    let mut assets = i154.clone();
-    assets.extend(i215.iter().cloned());
-    let azure: Vec<SerialPlan> = edge
-        .iter()
-        .filter(|p| p.ip.starts_with("4.249."))
-        .cloned()
-        .collect();
-    let other: Vec<SerialPlan> = edge
-        .iter()
-        .filter(|p| fastly_seg(&p.ip).is_none() && !p.ip.starts_with("4.249."))
-        .cloned()
-        .collect();
-
-    let mut rows = Vec::new();
-    // 直连键单独成行：它们比父域更具体，最长键匹配会把它们挑出来。
-    for h in LEGACY_DIRECT {
-        rows.push(route::RouteSpec {
-            key: (*h).to_string(),
-            pac: Some((*h).to_string()),
-            action: Some("direct".to_string()),
-            real: false,
-            content: false,
-            donor: false,
-            fallback: None,
-            plans: Vec::new(),
-            real_plans: Vec::new(),
-        });
+/// IpSpec → 运行时节点：末段范围展开 + 边界校验。
+fn build_node(spec: route::IpSpec) -> Result<route::IpNode, String> {
+    let ips = route::expand_ip(&spec.ip)?;
+    if ips.is_empty() {
+        return Err("ip 展开为空".to_string());
     }
-    // 更具体的键自然优先：api 与白名单的键比父域长，不需要靠排序压。
-    rows.push(plain("api.github.com", "api.github.com", api.to_vec()));
-    for (h, s) in LEGACY_WHITELIST {
-        let plans = match *s {
-            "154" => i154.clone(),
-            "153" => i153.clone(),
-            "133" => i133.clone(),
-            _ => azure.clone(),
-        };
-        rows.push(route::RouteSpec {
-            key: (*h).to_string(),
-            pac: Some((*h).to_string()),
-            action: None,
-            real: true,
-            content: false,
-            donor: false,
-            fallback: None,
-            plans,
-            real_plans: Vec::new(),
-        });
+    let mut hosts = spec.hosts;
+    hosts.retain(|k| !k.trim().is_empty());
+    hosts
+        .iter_mut()
+        .for_each(|k| *k = k.trim().trim_end_matches('.').to_ascii_lowercase());
+    hosts.dedup();
+    if hosts.is_empty() {
+        return Err("hosts 为空(节点不服务任何路由键)".to_string());
     }
-    rows.push(plain("github.com", "github.com", core.to_vec()));
-    // 内容域：伪装腿只认默认证书覆盖的那段；真名腿（隧道）额外可用 assets 段。
-    rows.push(route::RouteSpec {
-        key: "*.githubusercontent.com".to_string(),
-        pac: Some("githubusercontent.com".to_string()),
-        action: None,
-        real: false,
-        content: true,
-        donor: false,
-        fallback: Some("mirror".to_string()),
-        plans: i133,
-        real_plans: assets.clone(),
-    });
-    rows.push(route::RouteSpec {
-        key: "githubassets.com".to_string(),
-        pac: Some("githubassets.com".to_string()),
-        action: None,
-        real: false,
-        content: false,
-        donor: true,
-        fallback: None,
-        plans: assets,
-        real_plans: Vec::new(),
-    });
-    rows.push(plain("github.io", "github.io", i153));
-    rows.push(plain("githubapp.com", "githubapp.com", other));
-    rows
-}
-
-fn plain(key: &str, pac: &str, plans: Vec<SerialPlan>) -> route::RouteSpec {
-    route::RouteSpec {
-        key: key.to_string(),
-        pac: Some(pac.to_string()),
-        action: None,
-        real: false,
-        content: false,
-        donor: false,
-        fallback: None,
-        plans,
-        real_plans: Vec::new(),
-    }
+    Ok(route::IpNode {
+        raw: spec.ip,
+        ips,
+        sni: spec.sni.trim().to_string(),
+        verify: spec.verify.trim().to_string(),
+        hosts,
+    })
 }
 
 /// 测试专用：装一份种子路由表，供 certgen/settings 这类不经过 routes.json 的用例。
 #[cfg(test)]
 pub(crate) fn install_seed_routes() {
-    let rows: Vec<route::RouteRow> = seed_db()
-        .routes
-        .into_iter()
-        .filter_map(|s| route::RouteRow::new(s).ok())
+    let seeds = seed_db();
+    let rows: Vec<route::RouteRow> = seeds
+        .hosts
+        .iter()
+        .filter_map(|s| route::RouteRow::new(s.clone()).ok())
         .collect();
-    route::install(rows);
+    let nodes: Vec<route::IpNode> = seeds
+        .ips
+        .iter()
+        .filter_map(|s| build_node(s.clone()).ok())
+        .collect();
+    route::install(rows, nodes);
 }
 
-/// 种子只补已有路由的 IP，不新建路由：用户删掉的行不该被程序加回来。
-fn topup_from_seeds(
-    specs: &mut [route::RouteSpec],
-    seeds: &[route::RouteSpec],
-    log: Option<&LogFn>,
-) {
+/// 种子只补已有表的节点/边，不新建 hosts 行：用户删掉的行不该被程序加回来。
+fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
     let mut added = 0usize;
-    for row in specs.iter_mut() {
-        let Some(seed) = seeds.iter().find(|s| s.key == row.key) else {
-            continue;
+    for seed_node in &seeds.ips {
+        if doc.ips.len() >= SERIAL_MAX_IPS {
+            break;
+        }
+        let seed_ips = match route::expand_ip(&seed_node.ip) {
+            Ok(v) => v,
+            Err(_) => continue,
         };
-        added += topup_list(&mut row.plans, &seed.plans);
-        added += topup_list(&mut row.real_plans, &seed.real_plans);
+        // 按"展开 IP 集合有交集"找现有节点；找不到且 hosts 行存在 → 新建节点。
+        let hit = doc.ips.iter_mut().find(|n| {
+            route::expand_ip(&n.ip)
+                .map(|v| v.iter().any(|ip| seed_ips.contains(ip)))
+                .unwrap_or(false)
+        });
+        match hit {
+            Some(n) => {
+                // 同节点：补缺 IP 与缺边。
+                for k in &seed_node.hosts {
+                    if !n.hosts.iter().any(|x| x == k) {
+                        n.hosts.push(k.clone());
+                        added += 1;
+                    }
+                }
+            }
+            None => {
+                if seed_node
+                    .hosts
+                    .iter()
+                    .any(|k| doc.hosts.iter().any(|h| &h.key == k))
+                {
+                    doc.ips.push(seed_node.clone());
+                    added += 1;
+                }
+            }
+        }
     }
     if added > 0 {
         if let Some(l) = log {
-            l(&format!("[串发] 路由种子补缺 {added} 条(新边缘 IP 上线)"));
+            l(&format!("[串发] 路由种子补缺 {added} 处(新边缘 IP 上线)"));
         }
-    }
-}
-
-fn topup_list(dst: &mut Vec<SerialPlan>, src: &[SerialPlan]) -> usize {
-    let mut added = 0;
-    for p in src {
-        if dst.len() >= SERIAL_MAX_PLANS {
-            break;
-        }
-        if dst.iter().any(|x| x.ip == p.ip) {
-            continue;
-        }
-        dst.push(p.clone());
-        added += 1;
-    }
-    added
-}
-
-/// Fastly 四段的末段；迁移时用来把旧 edge 池拆回各族。
-fn fastly_seg(ip: &str) -> Option<&str> {
-    let mut o = ip.split('.');
-    match (o.next(), o.next(), o.next(), o.next()) {
-        (Some("185"), Some("199"), Some("108" | "109" | "110" | "111"), Some(last)) => Some(last),
-        _ => None,
     }
 }
 
@@ -718,8 +865,10 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool, slot: u8) {
         return;
     }
     let key = cursor_key(&row.key, slot);
-    let plans = &row.plans;
-    if plans.is_empty() {
+    let Some(circle) = route::dial_targets(host) else {
+        return;
+    };
+    if circle.is_empty() {
         return;
     }
     let mut g = lock(&SERIAL);
@@ -727,18 +876,19 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool, slot: u8) {
     if ok {
         t.dead.remove(ip);
         t.cursor.insert(key, ip.to_string());
+        edges::clear(ip, &row.key); // 成功即清黑：坏边自愈的唯一通道
         return;
     }
     // 失败：前移到下一候选(整圈后自然复测)。
-    if let Some(pos) = plans.iter().position(|p| p.ip == ip) {
-        let next = &plans[(pos + 1) % plans.len()];
+    if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
+        let next = &circle[(pos + 1) % circle.len()];
         t.cursor.insert(key, next.ip.clone());
     }
 }
 
 fn cursor_key(key: &str, slot: u8) -> String {
     if slot > 1 {
-        format!("{key}~{slot}")
+        format!("{key}_vice")
     } else {
         key.to_string()
     }
@@ -762,13 +912,11 @@ impl DialCrew {
     }
 }
 
-/// 串发请求描述：拨哪个池的哪个 host、怎么拨。
+/// 串发请求描述：拨哪个 host、怎么拨。
 pub struct DialSkip<'a> {
     pub host: &'a str,
     pub tls_handshake: bool,
     pub skip_ips: &'a [String],
-    /// 隧道腿：客户端自己带真名，候选可加 realPlans。
-    pub tunnel: bool,
     pub slot: u8,
     pub crew: Option<&'a DialCrew>,
 }
@@ -782,7 +930,6 @@ pub async fn serial_dial_skip(
         host,
         tls_handshake,
         skip_ips,
-        tunnel,
         slot,
         crew,
     } = req;
@@ -796,10 +943,9 @@ pub async fn serial_dial_skip(
         return Err(format!("直连域不进拨号({host})"));
     }
     let key = row.key.clone();
-    // 真名腿（隧道 / real 路由）额外带上 realPlans。
-    let mut circle = row.dial_plans(row.flags.real || tunnel);
+    let mut circle = route::dial_targets(host).unwrap_or_default();
     if !skip_ips.is_empty() {
-        let filtered: Vec<SerialPlan> = circle
+        let filtered: Vec<route::NodeIp> = circle
             .iter()
             .filter(|p| !skip_ips.iter().any(|s| s == &p.ip))
             .cloned()
@@ -809,7 +955,7 @@ pub async fn serial_dial_skip(
         }
     }
     if circle.is_empty() {
-        return Err(format!("路由 [{key}] 没有候选 IP({host})"));
+        return Err(format!("路由 [{key}] 没有可用候选 IP({host})"));
     }
     let cursor_key = cursor_key(&key, slot);
 
@@ -852,8 +998,7 @@ pub async fn serial_dial_skip(
             }
         }
         tried += 1;
-        let mode = p.sni.trim();
-        let result = dial::dial_one(host, &p.ip, mode, row.flags.real, tls_handshake).await;
+        let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
         match result {
             Ok(conn) => {
                 // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。

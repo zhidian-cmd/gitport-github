@@ -50,13 +50,3 @@ pub const HELLO_SPLIT_DELAY_MAX_MS: u64 = 70;
 /// 真实流量拨号总并发闸（无它，开页面 30 并发会打爆自己）。
 pub const DIAL_GATE_SIZE: usize = 48;
 pub const LOG_BUFFER_SIZE: usize = 2000;
-/// 白名单腿分片参数：固定 3 段、间隔 100ms——真名 SNI 一旦被拼齐就明文暴露，宁可多等。
-pub const WHITELIST_SPLIT_SEGS: usize = 3;
-pub const WHITELIST_SPLIT_GAP_MS: u64 = 100;
-
-/// 直连优先域：先试直连，失败按链序逐家；codeload 已并入小文件派发并享受 TTFB 校准。
-pub const DIRECT_FIRST_HOSTS: &[&str] = &["codeload.github.com"];
-
-pub fn is_direct_first(host: &str) -> bool {
-    DIRECT_FIRST_HOSTS.contains(&host)
-}

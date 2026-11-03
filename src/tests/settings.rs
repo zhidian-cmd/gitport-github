@@ -101,7 +101,7 @@ fn last_ip_preserved_before_routes_load() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     // 明确装一张空表 = "路由还没装载"，免得别的用例先装好了。
-    crate::pool::route::install(Vec::new());
+    crate::pool::route::install(Vec::new(), Vec::new());
     let v = parse(
         r#"{"closeToTray":true,"mitm":true,"winRect":[0,0,800,600],"githubPAC":true,
                 "lastIp":{"edge/content":"185.199.110.133","core/all":"20.27.177.114"}}"#,
@@ -196,7 +196,7 @@ fn single_bad_field_does_not_wipe_file() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    crate::pool::route::install(Vec::new());
+    crate::pool::route::install(Vec::new(), Vec::new());
     // winRect 写坏：只回退该字段，开关与游标照读。
     let v = parse(
         r#"{"closeToTray":true,"mitm":true,"winRect":"oops","lastIp":{"edge/io":"1.1.1.1"}}"#,

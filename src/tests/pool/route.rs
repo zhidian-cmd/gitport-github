@@ -11,9 +11,20 @@ fn row(key: &str, body: &str) -> RouteRow {
     RouteRow::new(serde_json::from_value(v).expect("spec 应可解析")).expect("行应可编译")
 }
 
+fn install_table(rows: &[(&str, &str)], nodes: &[&str]) {
+    let rows: Vec<RouteRow> = rows.iter().map(|(k, b)| row(k, b)).collect();
+    let nodes: Vec<IpNode> = nodes
+        .iter()
+        .map(|j| {
+            let spec: IpSpec = serde_json::from_str(j).expect("节点应可解析");
+            super::super::build_node(spec).expect("节点应可编译")
+        })
+        .collect();
+    install(rows, nodes);
+}
+
 fn install_rows(specs: &[(&str, &str)]) {
-    let rows: Vec<RouteRow> = specs.iter().map(|(k, b)| row(k, b)).collect();
-    install(rows);
+    install_table(specs, &[]);
 }
 
 /// 多条同时命中时取最长的键：更具体的域名天然压过父域，与书写顺序无关。
@@ -23,25 +34,28 @@ fn longest_key_wins() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     for order in [0, 1] {
-        let mut spec = vec![
-            ("github.com", r#"{"plans":[{"ip":"2.2.2.2"}]}"#),
-            ("api.github.com", r#"{"plans":[{"ip":"1.1.1.1"}]}"#),
-        ];
+        let mut spec = vec![("github.com", "{}"), ("api.github.com", "{}")];
         if order == 1 {
             spec.reverse();
         }
-        install_rows(&spec);
+        install_table(
+            &spec,
+            &[
+                r#"{"ip":"2.2.2.2","hosts":["github.com"]}"#,
+                r#"{"ip":"1.1.1.1","hosts":["api.github.com"]}"#,
+            ],
+        );
         assert_eq!(
-            route_for("api.github.com").expect("精确键应命中").plans[0].ip,
+            dial_targets("api.github.com").expect("精确键应命中")[0].ip,
             "1.1.1.1",
             "长键必须压过父域，顺序不影响"
         );
         assert_eq!(
-            route_for("www.github.com").expect("父域兜底").plans[0].ip,
+            dial_targets("www.github.com").expect("父域兜底")[0].ip,
             "2.2.2.2"
         );
         assert_eq!(
-            route_for("github.com").expect("裸域命中").plans[0].ip,
+            dial_targets("github.com").expect("裸域命中")[0].ip,
             "2.2.2.2"
         );
     }
@@ -53,10 +67,7 @@ fn key_covers_self_and_subdomains() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    install_rows(&[
-        ("github.com", r#"{"plans":[]}"#),
-        ("*.githubusercontent.com", r#"{"plans":[]}"#),
-    ]);
+    install_rows(&[("github.com", "{}"), ("*.githubusercontent.com", "{}")]);
     assert!(route_for("github.com").is_some(), "裸域");
     assert!(route_for("www.github.com").is_some(), "一级子域");
     assert!(route_for("a.b.github.com").is_some(), "多级子域");
@@ -81,7 +92,7 @@ fn direct_key_beats_parent_wildcard() {
     install_rows(&[
         (
             "*.githubusercontent.com",
-            r#"{"content":true,"fallback":"mirror","plans":[]}"#,
+            r#"{"content":true,"fallback":"mirror"}"#,
         ),
         (
             "objects-origin.githubusercontent.com",
@@ -98,12 +109,12 @@ fn host_and_key_case_insensitive() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    install_rows(&[("GitHub.com", r#"{"plans":[]}"#)]);
+    install_rows(&[("GitHub.com", "{}")]);
     assert!(route_for("api.GITHUB.com").is_some());
     assert!(route_for("GitHub.COM").is_some());
 }
 
-/// 四个开关位都由数据给，代码不再从 host 形状推断。
+/// 开关位都由数据给，代码不再从 host 形状推断。
 #[test]
 fn flags_come_from_the_row() {
     let _g = crate::pool::TEST_LOCK
@@ -116,34 +127,15 @@ fn flags_come_from_the_row() {
         ),
         (
             "*.githubusercontent.com",
-            r#"{"content":true,"fallback":"mirror","plans":[]}"#,
+            r#"{"content":true,"fallback":"mirror"}"#,
         ),
-        ("githubassets.com", r#"{"donor":true,"plans":[]}"#),
     ]);
     assert!(route_for("direct.example").unwrap().flags.direct);
     assert!(!is_managed("direct.example"), "直连行不进代理");
     assert!(is_managed("a.githubusercontent.com"));
     assert!(is_content("a.githubusercontent.com"));
     assert_eq!(fallback_for("a.githubusercontent.com"), Fallback::MirrorDns);
-    assert!(is_donor("x.githubassets.com"));
-    assert!(!is_donor("a.githubusercontent.com"));
     assert_eq!(fallback_for("other.example"), Fallback::Dns, "表外默认 DNS");
-}
-
-/// 真名腿（隧道 / real 路由）才带上 realPlans；伪装腿绝不碰它们。
-#[test]
-fn real_plans_only_on_real_wire() {
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let r = row(
-        "x.example",
-        r#"{"plans":[{"ip":"1.1.1.1"}],"realPlans":[{"ip":"2.2.2.2"}]}"#,
-    );
-    assert_eq!(r.dial_plans(false).len(), 1, "伪装腿只有 plans");
-    let both = r.dial_plans(true);
-    assert_eq!(both.len(), 2, "真名腿加 realPlans");
-    assert_eq!(both[1].ip, "2.2.2.2");
 }
 
 /// PAC 名单从路由行取：直连行进 direct，其余带 pac 的进代理名单。
@@ -156,16 +148,16 @@ fn pac_lists_split_direct_and_proxy() {
         ("a.example", r#"{"action":"direct","pac":"a.example"}"#),
         (
             "*.githubusercontent.com",
-            r#"{"pac":"githubusercontent.com","plans":[]}"#,
+            r#"{"pac":"githubusercontent.com"}"#,
         ),
-        ("no-pac.example", r#"{"plans":[]}"#),
+        ("no-pac.example", "{}"),
     ]);
     let (proxy, direct) = pac_lists();
     assert_eq!(direct, vec!["a.example".to_string()]);
     assert_eq!(proxy, vec!["githubusercontent.com".to_string()]);
 }
 
-/// 游标键跟路由行一一对应（就是域名键），直连行不占键。
+/// 游标键跟路由行一一对应（主键 + `_vice` 副键），直连行不占键。
 #[test]
 fn cursor_keys_follow_routes() {
     let _g = crate::pool::TEST_LOCK
@@ -173,12 +165,12 @@ fn cursor_keys_follow_routes() {
         .unwrap_or_else(|p| p.into_inner());
     install_rows(&[
         ("a.example", r#"{"action":"direct","pac":"a.example"}"#),
-        ("b.example", r#"{"plans":[]}"#),
+        ("b.example", "{}"),
     ]);
-    assert_eq!(cursor_keys(), vec!["b.example", "b.example~2"]);
+    assert_eq!(cursor_keys(), vec!["b.example", "b.example_vice"]);
 }
 
-/// 总路由：直连行短路 → System；表外 → Tunnel；镜像路径照旧。
+/// 总路由：直连行短路 → System；表外 → Tunnel；大文件域/附件下载 → Mirror；archive 走池。
 #[test]
 fn master_route_direct_tunnel_mirror() {
     let _g = crate::pool::TEST_LOCK
@@ -189,8 +181,8 @@ fn master_route_direct_tunnel_mirror() {
             "objects-origin.githubusercontent.com",
             r#"{"action":"direct","pac":"objects-origin.githubusercontent.com"}"#,
         ),
-        ("github.com", r#"{"plans":[]}"#),
-        ("*.githubusercontent.com", r#"{"content":true,"plans":[]}"#),
+        ("github.com", "{}"),
+        ("*.githubusercontent.com", r#"{"content":true}"#),
     ]);
     assert_eq!(
         master_route("objects-origin.githubusercontent.com", "PUT", "/x"),
@@ -198,12 +190,18 @@ fn master_route_direct_tunnel_mirror() {
     );
     assert_eq!(master_route("github.com", "GET", "/"), Route::Pool);
     assert_eq!(
-        master_route("github.com", "GET", "/o/r/archive/x.zip"),
+        master_route("github.com", "GET", "/o/r/releases/download/v1/f.zip"),
         Route::Mirror
     );
     assert_eq!(
+        master_route("github.com", "GET", "/o/r/archive/x.zip"),
+        Route::Pool,
+        "archive 迁池，不再走镜像"
+    );
+    assert_eq!(
         master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
-        Route::Mirror
+        Route::Pool,
+        "codeload 命中 github.com 裸键走池"
     );
     assert_eq!(
         master_route("example.com", "GET", "/"),
@@ -218,7 +216,7 @@ fn invalid_rows_are_rejected() {
     let bad = |key: &str, body: &str| {
         let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
         v["key"] = serde_json::Value::String(key.to_string());
-        match serde_json::from_value::<RouteSpec>(v) {
+        match serde_json::from_value::<HostSpec>(v) {
             Ok(spec) => RouteRow::new(spec).is_err(),
             Err(_) => true,
         }
@@ -243,11 +241,76 @@ fn mirror_chain_host_dedicated() {
     );
     assert_eq!(
         mirror_chain_host("github.com", "/o/r/archive/refs/tags/v1.tar.gz"),
-        "codeload.github.com"
+        "github.com",
+        "archive 迁池"
     );
     assert_eq!(
-        mirror_chain_host("codeload.github.com", "/o/r/tar.gz/x"),
-        "codeload.github.com"
+        mirror_chain_host("objects.githubusercontent.com", "/x"),
+        "objects.githubusercontent.com"
     );
     assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
+}
+
+/// 末段范围展开：单段范围、多段笛卡尔积、越界拒绝。
+#[test]
+fn expand_ip_ranges() {
+    assert_eq!(
+        expand_ip("140.82.112-114.5-6").expect("应展开"),
+        vec![
+            "140.82.112.5",
+            "140.82.112.6",
+            "140.82.113.5",
+            "140.82.113.6",
+            "140.82.114.5",
+            "140.82.114.6"
+        ]
+    );
+    assert_eq!(expand_ip("1.2.3.4").expect("单 IP 原样"), vec!["1.2.3.4"]);
+    assert!(expand_ip("1.2.3.9-7").is_err(), "起点大于终点");
+    assert!(expand_ip("1.2.3.0-999").is_err(), "超 255");
+    assert!(expand_ip("1.2.3-9.0-255.0-255").is_err(), "展开超 64");
+}
+
+/// dial_targets：按路由键汇边、去重、滤黑边。
+#[test]
+fn dial_targets_dedup_and_filter() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_table(
+        &[("github.com", "{}")],
+        &[
+            r#"{"ip":"1.1.1.1","sni":"baidu.com","verify":"github.com","hosts":["github.com"]}"#,
+            r#"{"ip":"1.1.1.1","hosts":["github.com"]}"#,
+            r#"{"ip":"2.2.2.2","hosts":["github.com"]}"#,
+        ],
+    );
+    let t = dial_targets("github.com").expect("应命中");
+    assert_eq!(t.len(), 2, "同 IP 去重");
+    assert_eq!(t[0].sni, "baidu.com");
+    crate::pool::edges::mark_reject("1.1.1.1", "github.com");
+    let t2 = dial_targets("github.com").expect("应命中");
+    assert_eq!(t2.len(), 1, "黑边被滤");
+    assert_eq!(t2[0].ip, "2.2.2.2");
+    crate::pool::edges::clear_all();
+    let t3 = dial_targets("github.com").expect("应命中");
+    assert_eq!(t3.len(), 2, "清黑后恢复");
+    crate::pool::edges::clear_all();
+}
+
+/// 全黑 → Some(空)，调用方走 fallback；表外 → None。
+#[test]
+fn dial_targets_empty_vs_none() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_table(
+        &[("github.com", "{}")],
+        &[r#"{"ip":"1.1.1.1","hosts":["github.com"]}"#],
+    );
+    crate::pool::edges::mark_reject("1.1.1.1", "github.com");
+    let t = dial_targets("github.com").expect("在表内");
+    assert!(t.is_empty(), "全黑 = 空组走 fallback");
+    assert!(dial_targets("other.example").is_none(), "表外 = None");
+    crate::pool::edges::clear_all();
 }
