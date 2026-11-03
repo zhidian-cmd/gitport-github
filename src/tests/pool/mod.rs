@@ -248,8 +248,8 @@ fn legacy_pools_migrate_to_route_rows() {
         "133 段服务内容域: {content:?}"
     );
     assert!(
-        !content.contains(&"185.199.108.154".to_string()),
-        "154 段不再混进内容域(verify 锚点不同): {content:?}"
+        content.contains(&"185.199.108.154".to_string()),
+        "同一张证书的整段边缘都应服务内容域(154 上的活通道可被内容域复用): {content:?}"
     );
     assert!(route::is_content("avatars.githubusercontent.com"));
     assert_eq!(

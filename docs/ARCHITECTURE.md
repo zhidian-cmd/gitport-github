@@ -10,7 +10,7 @@ flowchart TB
         B["浏览器"]
         G["git / curl / CLI"]
     end
-    subgraph L2["② 系统代理接管（PAC，由 routes.json 各行的 pac 字段生成）"]
+    subgraph L2["② 系统代理接管（PAC，由路由键派生的裸域名名单生成）"]
         P1{"hosts 行判定"}
         DL["action=direct 的行 → DIRECT"]
         PX["PROXY 127.0.0.1:7810"]
@@ -50,6 +50,8 @@ flowchart TB
     S3 --> R1
     R1 --> R2
     R2 --> D1
+    L6B["候选序按 routes.json 的 latency 键升序<br/>（WebUI 建连测速写入；无值排最后）"]
+    L6B -.-> D1
     subgraph L6["⑥ 结果回写（边状态机）与兜底"]
         OK["成功：edges::clear 洗白 + 游标驻留"]
         REJ["421 / 证书不匹配 → mark_reject（4h）<br/>静态属性不会自愈"]
@@ -76,7 +78,7 @@ flowchart TB
         R2b["响应注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
         CA["本地 CA（certgen）→ Windows 证书库<br/>只签受管域名，拒绝为表外域名签发"]
         WUI["WebUI 7811<br/>概览二部图 · 状态 · 日志 · 镜像信任 · 开关"]
-        ROUTES["routes.json（二部图 + 镜像链）<br/>2s 去抖落盘，可手改"]
+        ROUTES["routes.json（二部图 + 镜像链）<br/>缺失时生成；测速后落 latency 键"]
         TRAY["托盘 + WebView2 桌面壳（-tray / -headless）"]
         LOG["日志环形 2000 条 + 崩溃捕获"]
     end

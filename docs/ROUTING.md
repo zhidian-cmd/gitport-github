@@ -7,7 +7,7 @@
 
 ```mermaid
 flowchart TD
-    B["浏览器"] --> L1["① PAC（pac_lists 生成）<br/>routes.json 有 pac 的行 → PROXY<br/>action:direct 行 → DIRECT<br/>其余 → DIRECT"]
+    B["浏览器"] --> L1["① PAC（pac_lists 派生）<br/>hosts 行（非 direct）→ PROXY，名单 = 路由键去 `*.` 的裸域名<br/>action:direct 行 → DIRECT<br/>其余 → DIRECT"]
     L1 --> P["代理 7810"]
     P --> L2["② master_route<br/>未命中 → Tunnel · direct 行 → System<br/>大文件/附件 GET/HEAD → Mirror · 其余 → Pool"]
     L2 --> L3["③ dial_targets<br/>路由键 → 邻接 IP 节点展开（末段 a-b）<br/>→ 滤冷却中的黑边 → 去重"]
@@ -20,11 +20,11 @@ flowchart TD
 
 一句话版:**PAC 决定谁进代理;master_route 决定进代理后直连还是镜像;dial_targets 决定用哪些 IP(边状态机实时剔坏);兜底决定全灭之后找谁。**
 
-## 1. ① PAC:routes.json 的 pac 字段
+## 1. ① PAC:路由键派生的裸域名名单
 
-PAC 由 `pool::pac_lists()` 生成:`action:"direct"` 的行进 DIRECT 名单,其余带 `pac` 的行进 PROXY 名单,表外域名 DIRECT。
+PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direct"` 行进 DIRECT 名单,表外域名 DIRECT。**名单值 = 路由键去 `*.` 的裸域名,运行时派生、不在 routes.json 落盘**(c3ece1d 起移除 pac 字段;写 `pac` 也兼容读取,但语义恒等于裸域名,没必要写)。
 
-**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(POOL-V2.md §8)。当前 routes.json **没有 action:direct 行**,GitHub 系 20 个路由键全部进代理。
+**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(POOL-V2.md §8)。当前 GitHub 系 20 个路由键全部进代理。
 
 匹配语义:裸键含自身+任意级子域,`*.` 只认子域(裸域不命中),最长键胜,点边界(`evilgithub.com` 不命中 `github.com`),大小写无关。
 
