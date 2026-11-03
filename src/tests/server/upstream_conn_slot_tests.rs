@@ -200,3 +200,88 @@ fn inflight_registry_claim_blocks_and_release_frees() {
     drop(guard);
     assert!(!inflight_busy(&ips), "释放后应立刻可拨");
 }
+
+/// 一次性探针（手动跑，走真网络）：实测 185.199 段每个边缘 IP 对每个内容域名的服务支持。
+/// 每条边 = 用该节点自己的 verify 锚点建一条 h2 连接，再对它发 HEAD 看状态码。
+/// 用法：cargo test probe_content_edges -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn probe_content_edges() {
+    use crate::pool::dial::dial_one;
+    use crate::server::protocol::empty_body;
+    use crate::server::upstream::{h2_from_dialed, h2_send};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // 真实资源路径：只有能取到内容才算"支持"，根路径的 404/302 说明不了问题。
+    let domains = [
+        ("avatars.githubusercontent.com", "/u/1?v=4"),
+        ("raw.githubusercontent.com", "/git/git/master/README.md"),
+        ("docs.github.com", "/en/get-started"),
+        ("octocat.github.io", "/"),
+        ("github.com", "/"),
+    ];
+    let log: crate::util::LogFn = Arc::new(|_: &str| {});
+    for last in ["133", "153", "154", "215"] {
+        for third in 108..=111 {
+            let ip = format!("185.199.{third}.{last}");
+            let verify = if last == "133" || last == "153" {
+                "github.com"
+            } else {
+                "githubassets.com"
+            };
+            let dialed = match tokio::time::timeout(
+                Duration::from_secs(12),
+                dial_one(&ip, "baidu.com", verify, true),
+            )
+            .await
+            {
+                Ok(Ok(d)) => d,
+                Ok(Err(e)) => {
+                    println!("PROBE\t{ip}\t{verify}\tTLS\tERR {e}");
+                    continue;
+                }
+                Err(_) => {
+                    println!("PROBE\t{ip}\t{verify}\tTLS\tTIMEOUT");
+                    continue;
+                }
+            };
+            let up = match h2_from_dialed("probe", dialed, &ip, "probe", 1, &log).await {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("PROBE\t{ip}\t{verify}\th2\tERR {e}");
+                    continue;
+                }
+            };
+            for (d, path) in domains {
+                let req = hyper::Request::builder()
+                    .method("HEAD")
+                    .uri(format!("https://{d}{path}"))
+                    .body(empty_body())
+                    .unwrap();
+                let r =
+                    tokio::time::timeout(Duration::from_secs(10), h2_send(&up, &req, &None)).await;
+                let s = match r {
+                    Ok(Ok(resp)) => {
+                        let code = resp.status().as_u16();
+                        let loc = resp
+                            .headers()
+                            .get("location")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|l| format!(" -> {}", &l[..l.len().min(70)]))
+                            .unwrap_or_default();
+                        let ty = resp
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        format!("{code} {ty}{loc}")
+                    }
+                    Ok(Err(e)) => format!("ERR {e}"),
+                    Err(_) => "TIMEOUT".to_string(),
+                };
+                println!("PROBE\t{ip}\t{verify}\t{d}{path}\t{s}");
+            }
+        }
+    }
+}
