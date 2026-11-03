@@ -373,9 +373,17 @@ fn encode_routes_roundtrip() {
     latency::install(HashMap::new());
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     let hosts = back["hosts"].as_object().expect("hosts 应是对象(域名作键)");
-    assert_eq!(hosts.len(), 2);
+    assert_eq!(
+        hosts.len(),
+        1,
+        "全默认且有节点服务的域名不落盘（由节点 hosts 声明）: {b}"
+    );
     assert_eq!(hosts["*.githubusercontent.com"]["content"], true);
     assert_eq!(hosts["*.githubusercontent.com"]["fallback"], "mirror");
+    assert!(
+        b.contains("\"hosts\": [\"github.com\"]"),
+        "节点 hosts 数组必须单行: {b}"
+    );
     let ips = back["ips"].as_array().expect("ips 应是数组");
     assert_eq!(ips.len(), 3);
     assert_eq!(ips[1]["ip"], "5.6.7.8");
@@ -385,6 +393,31 @@ fn encode_routes_roundtrip() {
             .as_array()
             .map(|a| a.len()),
         Some(2)
+    );
+}
+
+/// 落盘省略的默认域名，读回时从节点 hosts 补齐（否则 PAC/路由会丢域名）。
+#[test]
+fn hosts_filled_from_nodes() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut doc = TopoDoc {
+        hosts: vec![route::HostSpec {
+            key: "b.example".to_string(),
+            ..Default::default()
+        }],
+        ips: vec![route::IpSpec {
+            ip: "1.2.3.4".to_string(),
+            hosts: vec!["a.example".to_string(), "b.example".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    fill_hosts_from_nodes(&mut doc);
+    let keys: Vec<&str> = doc.hosts.iter().map(|h| h.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["b.example", "a.example"],
+        "缺的域名按节点补，已有的不重复"
     );
 }
 

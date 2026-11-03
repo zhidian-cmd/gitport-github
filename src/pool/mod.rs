@@ -518,12 +518,47 @@ fn verify_for(ip: &str) -> String {
     }
 }
 
-/// 落盘：hosts 逐行、ips 逐节点、镜像链按 CONTENT_HOSTS 序。
+/// 落盘：ips 在前、hosts 只写特殊行，镜像链按 CONTENT_HOSTS 序。
 fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
     let mut parts: Vec<String> = Vec::new();
 
+    // 测速值跟着节点走：只写该节点展开出的 IP，range 节点各 IP 各记各的。
+    let lat = latency::snapshot_all();
+    let snapshot = route::nodes_snapshot();
+    let nodes: Vec<String> = snapshot
+        .iter()
+        .map(|n| {
+            let hosts: Vec<String> = n.hosts.iter().map(json_of).collect();
+            let mut fields: Vec<String> = vec![
+                format!("\"ip\": {}", json_of(&n.raw)),
+                format!("\"sni\": {}", json_of(&n.sni)),
+                format!("\"verify\": {}", json_of(&n.verify)),
+                format!("\"hosts\": [{}]", hosts.join(", ")),
+            ];
+            let lat_rows: Vec<String> = n
+                .ips
+                .iter()
+                .filter_map(|ip| lat.get(ip).map(|ms| format!("{}: {}", json_of(ip), ms)))
+                .collect();
+            if !lat_rows.is_empty() {
+                fields.push(format!("\"latency\": {{{}}}", lat_rows.join(", ")));
+            }
+            format!("    {{\n      {}\n    }}", fields.join(",\n      "))
+        })
+        .collect();
+    parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
+
+    // hosts：有节点服务且全默认的键不落盘（域名由节点一行声明），只留特殊属性/无节点的。
+    let served: std::collections::HashSet<&str> = snapshot
+        .iter()
+        .flat_map(|n| n.hosts.iter().map(|s| s.as_str()))
+        .collect();
     let rows: Vec<String> = route::hosts_snapshot()
         .iter()
+        .filter(|r| {
+            let plain = !r.flags.direct && !r.flags.content && r.fallback == route::Fallback::Dns;
+            !(plain && served.contains(r.key.as_str()))
+        })
         .map(|r| {
             let mut fields: Vec<String> = Vec::new();
             if r.flags.direct {
@@ -547,31 +582,6 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
         })
         .collect();
     parts.push(format!("  \"hosts\": {{\n{}\n  }}", rows.join(",\n")));
-
-    // 测速值跟着节点走：只写该节点展开出的 IP，range 节点各 IP 各记各的。
-    let lat = latency::snapshot_all();
-    let nodes: Vec<String> = route::nodes_snapshot()
-        .iter()
-        .map(|n| {
-            let hosts: Vec<String> = n.hosts.iter().map(json_of).collect();
-            let mut fields: Vec<String> = vec![
-                format!("\"ip\": {}", json_of(&n.raw)),
-                format!("\"sni\": {}", json_of(&n.sni)),
-                format!("\"verify\": {}", json_of(&n.verify)),
-                format!("\"hosts\": [{}]", hosts.join(", ")),
-            ];
-            let lat_rows: Vec<String> = n
-                .ips
-                .iter()
-                .filter_map(|ip| lat.get(ip).map(|ms| format!("{}: {}", json_of(ip), ms)))
-                .collect();
-            if !lat_rows.is_empty() {
-                fields.push(format!("\"latency\": {{{}}}", lat_rows.join(", ")));
-            }
-            format!("    {{\n      {}\n    }}", fields.join(",\n      "))
-        })
-        .collect();
-    parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
 
     let mut big_rows: Vec<String> = Vec::new();
     let mut small_rows: Vec<String> = Vec::new();
@@ -695,6 +705,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     });
     latency::install(std::mem::take(&mut doc.latency));
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
+    fill_hosts_from_nodes(&mut doc);
 
     let mut dropped = 0usize;
     let mut rows = Vec::with_capacity(doc.hosts.len());
@@ -840,6 +851,23 @@ pub(crate) fn install_seed_routes() {
 }
 
 /// 种子只补已有表的节点/边，不新建 hosts 行：用户删掉的行不该被程序加回来。
+/// 域名清单可由 ips 节点推出：节点 hosts 里出现、hosts 块没写的键，按默认配置补一行。
+/// 落盘时这些行会被省略（见 encode_routes），文件里只剩有特殊属性的域名。
+fn fill_hosts_from_nodes(doc: &mut TopoDoc) {
+    for spec in &doc.ips {
+        for h in &spec.hosts {
+            let key = h.trim();
+            if key.is_empty() || doc.hosts.iter().any(|x| x.key == key) {
+                continue;
+            }
+            doc.hosts.push(route::HostSpec {
+                key: key.to_string(),
+                ..Default::default()
+            });
+        }
+    }
+}
+
 fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
     let mut added = 0usize;
     for seed_node in &seeds.ips {
