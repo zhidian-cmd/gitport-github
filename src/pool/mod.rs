@@ -20,6 +20,11 @@ pub fn circle_keys() -> Vec<String> {
     route::cursor_keys()
 }
 
+/// 串发全灭冷却是否生效中（30s 快速失败窗）。调用方应直接走兜底，不再空转重试。
+pub fn dial_cool_open(host: &str) -> bool {
+    SERIAL_COOL.open(host)
+}
+
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[

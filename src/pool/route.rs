@@ -286,11 +286,13 @@ pub fn route_for(host: &str) -> Option<Hit> {
 }
 
 /// 查询管线②③：host → 邻接节点展开成具体 IP → 滤黑边 → 去重。
+/// 节点 verify 留空 = 按目标 host 校验（迁移期安全默认，等价 v1 行为）。
 /// 返回 None = host 不在表（走 Tunnel）；Some(空) = 全黑（走 fallback）。
 pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
     let topo = lock(&TABLE).as_ref()?.clone();
     let row_idx = route_for(host)?.row_idx();
     let key = &topo.rows[row_idx].key;
+    let host_lower = host.to_ascii_lowercase();
     let mut out: Vec<NodeIp> = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     for &ni in topo.host_index.get(key).into_iter().flatten() {
@@ -303,7 +305,11 @@ pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
             out.push(NodeIp {
                 ip: ip.clone(),
                 sni: node.sni.clone(),
-                verify: node.verify.clone(),
+                verify: if node.verify.is_empty() {
+                    host_lower.clone()
+                } else {
+                    node.verify.clone()
+                },
             });
         }
     }

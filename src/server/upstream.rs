@@ -429,7 +429,11 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
 }
 
 /// 建连统一入口：候选全空走竞速（两个两个建），其余单发（单发也跳过池中占用的 IP）。
+/// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
+    if pool::dial_cool_open(host) {
+        return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
+    }
     let targets =
         pool::route::dial_targets(host).ok_or_else(|| format!("域名不在路由表({host})"))?;
     if targets.is_empty() {

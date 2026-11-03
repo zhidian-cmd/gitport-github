@@ -298,6 +298,21 @@ fn dial_targets_dedup_and_filter() {
     crate::pool::edges::clear_all();
 }
 
+/// 节点 verify 留空 = 回退按目标 host 校验（迁移期安全默认；空串会让 BoringSSL 校验必败）。
+#[test]
+fn empty_verify_falls_back_to_host() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_table(
+        &[("github.com", "{}")],
+        &[r#"{"ip":"1.1.1.1","sni":"baidu.com","hosts":["github.com"]}"#],
+    );
+    let t = dial_targets("GitHub.com").expect("应命中");
+    assert_eq!(t[0].verify, "github.com", "空锚点回退为小写目标 host");
+    crate::pool::edges::clear_all();
+}
+
 /// 全黑 → Some(空)，调用方走 fallback；表外 → None。
 #[test]
 fn dial_targets_empty_vs_none() {
