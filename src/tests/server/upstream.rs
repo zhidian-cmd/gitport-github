@@ -121,17 +121,21 @@ fn forced_gzip_gated_on_client_accept() {
 /// 单通道日志必须说清是「会话域规则」还是「候选真的不够」，别再混成一行。
 #[test]
 fn single_channel_reason_separates_rule_from_shortage() {
-    let rule = single_channel_reason(true, 26);
+    let rule = single_channel_reason(HostClass::Session, 26, 0);
     assert!(rule.contains("会话域"), "会话域优先，候选再多也按规则解释");
     assert!(rule.contains("26"), "把候选数带上，省得看着像漏算");
 
-    let short = single_channel_reason(false, 1);
+    let other = single_channel_reason(HostClass::Other, 5, 4);
+    assert!(other.contains("大文件"), "大文件/文档站单通道要单独说");
+
+    let short = single_channel_reason(HostClass::Content, 3, 1);
     assert!(short.contains("候选"), "候选不足单独说");
-    assert!(!short.contains("会话域"), "非会话域不许冒充规则");
+    assert!(!short.contains("会话域"), "候选不足不许冒充会话域规则");
 
     // 会话域即使只剩 1 家，也仍按规则归因。
-    assert!(single_channel_reason(true, 1).contains("会话域"));
+    assert!(single_channel_reason(HostClass::Session, 1, 0).contains("会话域"));
     assert_ne!(rule, short, "两种原因不能印成同一句话");
+    assert_ne!(other, rule);
 }
 
 /// 主副分工：主通道只开新坑，副通道先看有没有现成的可捡。
@@ -191,4 +195,68 @@ fn leg_plan_primary_opens_new_vice_reuses_existing() {
             vice_reuse: false,
         }
     );
+}
+
+/// host 三分类：内容域双通道；会话域单通道自建优先；大文件/docs 单通道复用优先。
+#[test]
+fn host_classes_split_content_session_and_other() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_host_class_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+
+    assert_eq!(host_class("github.com"), HostClass::Session);
+    assert_eq!(
+        host_class("api.github.com"),
+        HostClass::Session,
+        "api 也是会话域"
+    );
+    assert_eq!(host_class("githubapp.com"), HostClass::Session);
+
+    assert_eq!(host_class("raw.githubusercontent.com"), HostClass::Content);
+    assert_eq!(
+        host_class("avatars.githubusercontent.com"),
+        HostClass::Content
+    );
+
+    // 大文件域从内容域里摘出来：单通道、复用优先，不再给直连两片。
+    assert_eq!(
+        host_class("objects.githubusercontent.com"),
+        HostClass::Other
+    );
+    assert_eq!(
+        host_class("release-assets.githubusercontent.com"),
+        HostClass::Other
+    );
+    // 只去 Fastly 边缘、不走主站的子域：一个都不能漏（清单见 docs/CONFIG.md）。
+    for h in [
+        "docs.github.com",
+        "support.github.com",
+        "resources.github.com",
+        "desktop.github.com",
+        "pages.github.com",
+        "skills.github.com",
+        "archiveprogram.github.com",
+        "socialimpact.github.com",
+        "raw.github.com",
+        "agent.github.com",
+        "uploads.github.com",
+        "api.mcp.github.com",
+    ] {
+        assert_eq!(host_class(h), HostClass::Other, "{h} 应归「其他」");
+        assert!(!prefer_own_channel(h), "{h} 复用优先");
+    }
+
+    assert!(prefer_own_channel("github.com"), "会话域自建优先");
+    assert!(prefer_own_channel("api.github.com"), "api 也是会话域");
+    assert!(
+        !prefer_own_channel("objects.githubusercontent.com"),
+        "大文件：复用优先"
+    );
+    // raw.github.com 在「其他」，raw.githubusercontent.com 在内容域，别混。
+    assert_eq!(host_class("raw.githubusercontent.com"), HostClass::Content);
+    assert!(!prefer_own_channel("raw.githubusercontent.com"));
 }

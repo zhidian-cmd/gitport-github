@@ -30,10 +30,21 @@ fn main() {
 fn run() {
     let t0 = std::time::Instant::now();
     if desktop::already_running() {
-        if !desktop::signal_show(config::webui_port()) {
-            desktop::notify_already_running();
+        if desktop::signal_show(config::webui_port()) {
+            return;
         }
-        return;
+        // ok:false = 旧实例界面已死（已开始自退）或连不上。等它让出单实例锁后接管；
+        // 一直不放锁才认"已在运行"。already_running() 在锁空闲时会顺手占住它。
+        for _ in 0..20 {
+            if !desktop::already_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if desktop::already_running() {
+            desktop::notify_already_running();
+            return;
+        }
     }
     // 工作目录切到 exe 目录：自启/快捷方式的 cwd 不可靠，数据文件按相对路径读写。
     let exe_dir = std::env::current_exe()

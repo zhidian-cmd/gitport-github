@@ -233,3 +233,30 @@ fn worker_mirrors_roundtrip() {
     assert!(v3.worker_mirrors.is_empty());
     assert!(v3.mitm);
 }
+
+/// 手写注册表的常见写法都要认：只写 URL、snake_case 键名、省略 on、忘了数组括号。
+#[test]
+fn worker_mirrors_accepts_handwritten_forms() {
+    let v = parse(r#"{"workerMirrors":["https://only-url.example"]}"#);
+    assert_eq!(v.worker_mirrors.len(), 1);
+    assert_eq!(v.worker_mirrors[0].url, "https://only-url.example");
+    assert!(v.worker_mirrors[0].on, "只写 URL 应默认启用");
+    assert!(!v.worker_mirrors[0].trusted);
+
+    let v = parse(r#"{"worker_mirrors":["https://snake.example"]}"#);
+    assert_eq!(
+        v.worker_mirrors.first().map(|m| m.url.as_str()),
+        Some("https://snake.example"),
+        "snake_case 键名也要认"
+    );
+
+    let v = parse(r#"{"workerMirrors":[{"url":"https://no-on.example"}]}"#);
+    assert!(v.worker_mirrors[0].on, "手写省略 on 应默认启用");
+
+    let v = parse(r#"{"workerMirrors":"https://one.example"}"#);
+    assert_eq!(v.worker_mirrors.len(), 1, "单条忘了数组括号也收");
+
+    let v = parse(r#"{"workerMirrors":123,"mitm":true}"#);
+    assert!(v.worker_mirrors.is_empty(), "类型不对只丢这一段");
+    assert!(v.mitm);
+}

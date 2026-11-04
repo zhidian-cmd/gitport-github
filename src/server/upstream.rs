@@ -11,6 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tower_service::Service;
@@ -22,6 +23,13 @@ pub struct H2Upstream {
     pub id: u64,
     /// 游标槽位：1 主通道、2 副通道，记账跟着连接走，各记各的钥匙。
     pub slot: u8,
+    /// 建这条连接时用的 host。会话域靠它认出"自己的通道"：优先复用它，
+    /// 而不是额度还没建就连别人的公共通道。
+    pub owner: Option<String>,
+    /// 服务端在 SETTINGS 里下发的并发上限（`MAX_CONCURRENT_STREAMS`）。
+    pub max_streams: u32,
+    /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 延迟"挑最闲且最快的。
+    pub inflight: Arc<AtomicU32>,
     send: SendRequest<Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
 }
@@ -42,7 +50,6 @@ struct IpConns {
     filling: bool,
 }
 
-static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 同一个 IP 永远只允许一条 h2 连接。要开第二条通道只能落在另一个 IP 上。
 /// 这是硬约束：无论多少个 host 同时拨到同一个 IP，入库时只留第一条，其余当场丢弃。
@@ -50,10 +57,66 @@ const MAX_CONNS_PER_IP: usize = 1;
 /// 通道总数上限（跨不同 IP）：冷启动竞速两条，实测能把 p50 腰斩。
 const MAX_CHANNELS: usize = 2;
 
-/// 带会话（cookie/auth）的域：只留单通道单 IP。同一会话并发出现在两个 IP 上，
-/// 正是 GitHub 风控最容易抓的特征；内容域（图片/静态资源）才吃双通道加速。
-fn session_host(host: &str) -> bool {
-    matches!(host, "github.com" | "api.github.com")
+/// 这个错误重试没有意义：候选都被已有通道占着（或只剩 filling 标记），
+/// 换候选、再来一轮都是同一句话。上层看到它直接交兜底，别原地刷屏。
+pub const ERR_NO_FREE_IP: &str = "候选均已有通道";
+
+/// host 三类：
+/// - 内容域：双通道，池里按"空闲且快"选。
+/// - 会话域：单通道单 IP，建连优先自己拨一条，不蹭公共通道（带会话，跨 IP 是风控特征）。
+/// - 其他（大文件、docs/agent）：单通道，复用现成的优先，自建只是兜底——
+///   它们不维护长期会话，没必要占一条专属通道。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HostClass {
+    Content,
+    Session,
+    Other,
+}
+
+/// 归「其他」的 github.com 子域：单通道、复用优先，不值得养一条专属通道。
+/// 前十个只去 Fastly 边缘、不走主站（docs/CONFIG.md 实测表，2026-11-03 全量测绘），
+/// 拿主站 IP 去拨是白试；后两个是超低频入口（上传附件、MCP 调用），
+/// 长期吃灰的通道不如直接蹭一条热的。
+const REUSE_FIRST_HOSTS: &[&str] = &[
+    "docs.github.com",
+    "support.github.com",
+    "resources.github.com",
+    "desktop.github.com",
+    "pages.github.com",
+    "skills.github.com",
+    "archiveprogram.github.com",
+    "socialimpact.github.com",
+    "raw.github.com",
+    "agent.github.com",
+    "uploads.github.com",
+    "api.mcp.github.com",
+];
+
+fn is_other_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    REUSE_FIRST_HOSTS.contains(&h.as_str())
+}
+
+pub(crate) fn host_class(host: &str) -> HostClass {
+    // 大文件域虽然挂着 content 标记（走镜像链），但不再开第二条腿：
+    // 一条长流就能把槽位占满，两条反而互相抢带宽。
+    if pool::route::is_big_file_host(host) || is_other_host(host) {
+        HostClass::Other
+    } else if pool::route::is_content(host) {
+        HostClass::Content
+    } else {
+        HostClass::Session
+    }
+}
+
+/// 是否开双通道。
+fn dual_channel(host: &str) -> bool {
+    host_class(host) == HostClass::Content
+}
+
+/// 会话域：建连时自建优先，连上了再复用自己那条。
+pub(crate) fn prefer_own_channel(host: &str) -> bool {
+    host_class(host) == HostClass::Session
 }
 
 static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, IpConns>>> = std::sync::OnceLock::new();
@@ -116,18 +179,26 @@ async fn keepalive_pass() {
     }
 }
 
-/// 测试专用：把探索计数器对齐到非探索相位（接下来 7 次取用都走 EWMA 择优，概率不进断言）。
-#[cfg(test)]
-pub(crate) fn align_explore_to_sampled_phase() {
-    let c = EXPLORE.load(std::sync::atomic::Ordering::Relaxed);
-    EXPLORE.store(c + (8 - c % 8) + 1, std::sync::atomic::Ordering::Relaxed);
+/// 在给定 IP 集合里取活连接：按「占用率 × 延迟」挑最闲且最快的那条。
+pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
+    cached_h2_in_owner(ips, want_slot, None)
 }
 
-/// 在给定 IP 集合里取活连接：跨 IP 按 EWMA 择优（样本不足取首条），每 8 次放一次轮转做探索。
-pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
+/// 会话域取用：**只认这个 host 自己建的通道**。没有就返回 None，让调用方去自建。
+/// 自建不出来时的兜底复用放在拨号链路末尾（`cached_h2_in`），不在入口抢跑——
+/// 自己拨一条并不慢，但一上来就蹭公共通道会跟一堆 host 抢同一条 h2 的流窗口。
+pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
+    cached_h2_in_owner(ips, want_slot, Some(host))
+}
+
+fn cached_h2_in_owner(
+    ips: &[String],
+    want_slot: Option<u8>,
+    only_owner: Option<&str>,
+) -> Option<H2Upstream> {
     let mut g = lock(conn_pool());
-    // 收集候选集合内全部连接（want_slot 过滤后）。
-    let mut cands: Vec<(f64, H2Upstream)> = Vec::new();
+    // (分数, 是否顶到并发上限, 连接)
+    let mut cands: Vec<(f64, bool, H2Upstream)> = Vec::new();
     for ip in ips {
         let Some(h) = g.get_mut(ip) else { continue };
         for c in &h.conns {
@@ -136,65 +207,35 @@ pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream>
                     continue;
                 }
             }
-            cands.push((c.ewma, c.up.clone()));
+            if let Some(owner) = only_owner {
+                if c.up.owner.as_deref() != Some(owner) {
+                    continue;
+                }
+            }
+            let inflight = c
+                .up
+                .inflight
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let cap = c.up.max_streams.max(1);
+            // 占用率 × 延迟：闲着又快的分最小；都忙时也自然挑"最快腾出槽位"的那条。
+            // 还没发过请求的连接 ewma=0，用 1ms 兜底，免得白捡成永远第一。
+            let ewma = if c.ewma > 0.0 { c.ewma } else { 1.0 };
+            let score = (inflight as f64 + 1.0) / cap as f64 * ewma;
+            cands.push((score, inflight >= cap, c.up.clone()));
         }
     }
     if cands.is_empty() {
         return None;
     }
-    let pick = if want_slot.is_none() {
-        // 分摊策略：两条质量接近（EWMA 差不到 1.5 倍）就轮转，各吃一半；
-        // 只有差距明显时才全押快的。原来固定 1/8 探索，两条一样快时第二条也只吃 12.5%，
-        // 等于白建一条通道。
-        let (lo, hi) = cands.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), c| {
-            if c.0 > 0.0 {
-                (lo.min(c.0), hi.max(c.0))
-            } else {
-                (lo, hi)
-            }
-        });
-        let close = lo.is_finite() && hi / lo < 1.5;
-        let n = EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if cands.len() > 1 && (close || n.is_multiple_of(8)) {
-            // 轮转：按全局计数器在候选里摊开，别全堆一条。
-            let i = n as usize % cands.len();
-            cands.swap(0, i);
-            0
-        } else {
-            // 择优：样本 >=3 的里挑 EWMA 最小；全都没样本取首条。
-            let sampled: Vec<usize> = cands
-                .iter()
-                .enumerate()
-                .filter(|(_, (ewma, _))| *ewma > 0.0)
-                .map(|(i, _)| i)
-                .collect();
-            if sampled.is_empty() {
-                0
-            } else {
-                sampled
-                    .into_iter()
-                    .min_by(|a, b| cands[*a].0.total_cmp(&cands[*b].0))
-                    .unwrap()
-            }
-        }
-    } else {
-        // 槽位过滤：EWMA 最快者胜（样本不足取首条）。
-        let sampled: Vec<usize> = cands
-            .iter()
-            .enumerate()
-            .filter(|(_, (ewma, _))| *ewma > 0.0)
-            .map(|(i, _)| i)
-            .collect();
-        if sampled.is_empty() {
-            0
-        } else {
-            sampled
-                .into_iter()
-                .min_by(|a, b| cands[*a].0.total_cmp(&cands[*b].0))
-                .unwrap()
-        }
-    };
-    Some(cands.remove(pick).1)
+    // 优先没顶到上限的；全满时才按分数排在队首那条（h2 自己会在服务端配额上排队）。
+    let any_free = cands.iter().any(|c| !c.1);
+    let pick = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !any_free || !c.1)
+        .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
+        .map_or(0, |(i, _)| i);
+    Some(cands.remove(pick).2)
 }
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
@@ -262,14 +303,13 @@ pub fn drop_h2(ip: &str) {
     }
 }
 
-/// 池中该组 IP 已占用的地址(供拨号 skip:两条通道不落同一地址)。
+/// 池中该组 IP 里**已经有活连接**的地址(供拨号 skip:同一个 IP 不再拨第二次)。
+/// `filling` 只是"正在补第二条"的防重入标记，不代表通道可用，绝不能算进来——
+/// 把它算成占用会让候选被误判为"全都有通道"，请求原地重试到死。
 fn occupied_ips(ips: &[String]) -> Vec<String> {
     let g = lock(conn_pool());
     ips.iter()
-        .filter(|ip| {
-            g.get(ip.as_str())
-                .is_some_and(|h| !h.conns.is_empty() || h.filling)
-        })
+        .filter(|ip| g.get(ip.as_str()).is_some_and(|h| !h.conns.is_empty()))
         .cloned()
         .collect()
 }
@@ -277,8 +317,8 @@ fn occupied_ips(ips: &[String]) -> Vec<String> {
 /// 首条建好后后台补第二条：skip 池中活连接占用的 IP，游标用副键。
 /// 后台执行时点边状态可能已翻转：全黑（targets 空）直接放弃，绝不能索引越界。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
-    if session_host(host) {
-        return; // 会话域单通道：补第二条 = 把同一会话拆到第二个 IP 上
+    if !dual_channel(host) {
+        return; // 只有内容域才补第二条；会话域和"其他"都是单通道
     }
     let Some(targets) = pool::route::dial_targets(host) else {
         return;
@@ -385,6 +425,8 @@ pub async fn h2_from_dialed(
     let ping = conn
         .ping_pong()
         .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
+    // 服务端在 SETTINGS 里说了它一条连接能接多少流，照着用，不替它猜数字。
+    let max_streams = conn.max_concurrent_send_streams().max(1) as u32;
     tokio::spawn(async move {
         let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
     });
@@ -401,6 +443,9 @@ pub async fn h2_from_dialed(
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         slot,
+        owner: Some(host.to_string()),
+        max_streams,
+        inflight: Arc::new(AtomicU32::new(0)),
         send,
         ping,
     })
@@ -440,13 +485,15 @@ async fn h2_dial_slot(
     Ok(up)
 }
 
-/// 单通道的原因：会话域是规则（候选再多也不开第二条），候选不足是没得选。
+/// 单通道的原因：会话域/大文件是规则（候选再多也不开第二条），候选不足是没得选。
 /// 分开写是为了不出现「26 家候选却单通道」这种看不懂的日志。
-fn single_channel_reason(session: bool, distinct: usize) -> String {
-    if session {
-        format!("会话域: 同会话固定一个 IP, 候选 {distinct} 家也不开第二条")
-    } else {
-        format!("可用候选仅 {distinct} 家, 不够开第二条")
+fn single_channel_reason(class: HostClass, distinct: usize, free: usize) -> String {
+    match class {
+        HostClass::Session => {
+            format!("会话域: 同会话固定一个 IP, 候选 {distinct} 家也不开第二条")
+        }
+        HostClass::Other => "大文件/文档站: 不维护第二条腿, 复用优先".to_string(),
+        HostClass::Content => format!("可用候选仅 {free} 家, 不够开第二条"),
     }
 }
 
@@ -480,6 +527,7 @@ async fn dial_h2_race(
     host: &str,
     log: &LogFn,
     occupied: &[String],
+    allow_reuse: bool,
 ) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
@@ -488,12 +536,17 @@ async fn dial_h2_race(
     let distinct = ips.len();
     // 已有通道占掉的 IP 不再拨：主副两条腿都跳过，这是「更严格的主副通道」的底线。
     let free = distinct.saturating_sub(occupied.len());
-    // 会话域优先：即使只剩一家，原因仍按规则算，不误报成「候选不足」。
-    let session = session_host(host);
+    // 单通道判定：内容域之外都是。即使只剩一家，原因也按规则算，不误报成「候选不足」。
+    let single = !dual_channel(host);
     // 副通道的「先查表」：只在这个 host 自己的候选里找现成通道；
     // 别的 host 能用、但不在本 host 候选里的，不算数。
-    let reusable = if session { None } else { cached_h2_in(&ips, None) };
-    let legs = plan_legs(session, free, reusable.is_some());
+    // 流式请求（allow_reuse=false）不许捡：body 发出去就收不回，只能走确定属于它的新连接。
+    let reusable = if single || !allow_reuse {
+        None
+    } else {
+        cached_h2_in(&ips, None)
+    };
+    let legs = plan_legs(single, free, reusable.is_some());
 
     let mut launched = 0usize;
     if legs.vice_reuse {
@@ -549,8 +602,15 @@ async fn dial_h2_race(
         launched += 1;
     }
     if launched == 0 {
-        // 候选全被已有通道占住、又没捡到现成的：只有池子刚被摘空的瞬间会这样。
-        return Err(format!("{host} 候选均已有通道, 请重查连接池"));
+        // 一条腿都发不出去：可能空 IP 用完了，也可能会话域本来就不设副通道。
+        // 这时池里若已有本 host 候选的连接就直接用——把"已有通道"判成失败，
+        // 上层只会拿同一句话重试到死（实测 api.github.com 连刷 24 行）。
+        if allow_reuse {
+            if let Some(up) = cached_h2_in(&ips, None) {
+                return Ok(up);
+            }
+        }
+        return Err(format!("{host} {ERR_NO_FREE_IP}, 请重查连接池"));
     }
     drop(tx);
     // 两条腿都拨才叫竞速；只发主通道时说清为什么单通道（会话域 / 空 IP 不够）。
@@ -559,7 +619,7 @@ async fn dial_h2_race(
     } else if legs.primary && !legs.vice_reuse {
         (log)(&format!(
             "[建连] {host} 单通道({})",
-            single_channel_reason(session, if session { distinct } else { free })
+            single_channel_reason(host_class(host), distinct, free)
         ));
     }
     // 等第一个成功;两个全败则整组失败
@@ -568,7 +628,16 @@ async fn dial_h2_race(
         match rx.recv().await {
             Some(Ok(up)) => break up,
             Some(Err(e)) => last = Some(e),
-            None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
+            None => {
+                // 候选全试完才看现成的：会话域宁可自己拨，也不要一上来就蹭公共通道；
+                // 但真拨不出来时，有一条能用的总比整组失败好。
+                if allow_reuse {
+                    if let Some(up) = cached_h2_in(&ips, None) {
+                        return Ok(up);
+                    }
+                }
+                return Err(last.unwrap_or_else(|| "并行建连全败".into()));
+            }
         }
     };
     // 收尾移交后台：晚成者已在拨号任务里自入库；只有「一成一败」才值得补建第二条。
@@ -594,7 +663,11 @@ async fn dial_h2_race(
 /// 建连统一入口：主通道串发开新 IP，副通道先查交集、能复用就复用。
 /// 两条腿都跳过本 host 候选里已有通道的 IP，所以永远落在不同 IP 上。
 /// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
-pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
+pub async fn dial_upstream(
+    host: &str,
+    log: &LogFn,
+    allow_reuse: bool,
+) -> Result<(H2Upstream, bool), String> {
     if pool::dial_cool_open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
@@ -607,7 +680,7 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
     // 本 host 候选里已经被通道占掉的 IP：主副两条腿都跳过，绝不为这个 host 再拨一条。
     // 拨号权仍按 IP 粒度逐家抢（pool::inflight），别的 host 正在拨的那家自动绕开。
     let occupied = occupied_ips(&ips);
-    let up = dial_h2_race(host, log, &occupied).await?;
+    let up = dial_h2_race(host, log, &occupied, allow_reuse).await?;
     // 两腿都在这一轮处理完了（副腿可能直接复用了现成通道），调用方不必再补第二条。
     Ok((up, false))
 }
@@ -635,13 +708,37 @@ fn h2_request_head(out: &hyper::Request<BoxBody>) -> Result<hyper::Request<()>, 
     }
     builder.body(()).map_err(|e| e.to_string())
 }
+/// 一条 h2 流的在途计数凭据：建流时 +1，响应体读完或客户端丢弃 body 时 -1。
+/// 跟着 body 的生命周期走，异常、取消、提前断开都不会漏归还槽位。
+pub struct StreamGuard {
+    inflight: Arc<AtomicU32>,
+}
+
+impl StreamGuard {
+    fn new(inflight: Arc<AtomicU32>) -> Self {
+        inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { inflight }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// h2 响应头 future → Response；体逐块即时放窗（不 release 会死锁）。
 pub async fn h2_recv_response(
     resp_fut: h2::client::ResponseFuture,
+    guard: StreamGuard,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let resp = resp_fut.await.map_err(|e| format!("h2 响应: {e}"))?;
     let (parts, mut recv) = resp.into_parts();
-    let body_stream = futures_util::stream::poll_fn(move |cx| match recv.poll_data(cx) {
+    let body_stream = futures_util::stream::poll_fn(move |cx| {
+        // guard 跟着这条 body 一起活；body 被读完或丢弃时才归还并发槽位。
+        let _keep = &guard;
+        match recv.poll_data(cx) {
         std::task::Poll::Ready(Some(Ok(chunk))) => {
             let _ = recv.flow_control().release_capacity(chunk.len());
             std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
@@ -651,6 +748,7 @@ pub async fn h2_recv_response(
         }
         std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
         std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     });
     Ok(hyper::Response::from_parts(
         parts,
@@ -662,11 +760,21 @@ pub async fn h2_open_stream(
     up: &H2Upstream,
     out: &hyper::Request<BoxBody>,
     eos: bool,
-) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), String> {
+) -> Result<
+    (
+        h2::client::ResponseFuture,
+        h2::SendStream<Bytes>,
+        StreamGuard,
+    ),
+    String,
+> {
     let mut send = up.send.clone();
     send = send.ready().await.map_err(|e| format!("h2 流配额: {e}"))?;
-    send.send_request(h2_request_head(out)?, eos)
-        .map_err(|e| format!("h2 发送: {e}"))
+    let (fut, stream) = send
+        .send_request(h2_request_head(out)?, eos)
+        .map_err(|e| format!("h2 发送: {e}"))?;
+    // 流真正建出来才计入在途；ready() 之前卡住的配额等待不该占槽位。
+    Ok((fut, stream, StreamGuard::new(up.inflight.clone())))
 }
 
 pub async fn h2_send(
@@ -675,13 +783,13 @@ pub async fn h2_send(
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let has_body = body.as_ref().is_some_and(|b| !b.is_empty());
-    let (resp_fut, mut send_stream) = h2_open_stream(up, out, !has_body).await?;
+    let (resp_fut, mut send_stream, guard) = h2_open_stream(up, out, !has_body).await?;
     if has_body {
         send_stream
             .send_data(body.as_ref().unwrap().clone(), true)
             .map_err(|e| format!("h2 请求体: {e}"))?;
     }
-    h2_recv_response(resp_fut).await
+    h2_recv_response(resp_fut, guard).await
 }
 /// 请求体泵：按对端窗口分片发送，客户端断开时弃流不补 EOS；句柄供失败路径 abort。
 pub fn h2_spawn_pump(

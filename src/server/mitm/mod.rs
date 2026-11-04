@@ -386,19 +386,25 @@ async fn stream_passthrough(
         .into_iter()
         .map(|t| t.ip)
         .collect::<Vec<_>>();
-    let (fut, send, up) = 'conn: {
-        if let Some(up) = upstream::cached_h2_in(&ips, None) {
+    let (fut, send, guard, up) = 'conn: {
+        let cached = if upstream::prefer_own_channel(host) {
+            upstream::cached_h2_own(host, &ips, None)
+        } else {
+            upstream::cached_h2_in(&ips, None)
+        };
+        if let Some(up) = cached {
             match upstream::h2_open_stream(&up, out, false).await {
-                Ok((fut, send)) => break 'conn (fut, send, up),
+                Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
                     upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 缓存连接失效({e}), 新拨重试"));
                 }
             }
         }
-        match upstream::dial_upstream(host, log).await {
+        // 流式请求不许捡现成连接：body 没有副本，发出去就收不回。
+        match upstream::dial_upstream(host, log, false).await {
             Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
-                Ok((fut, send)) => break 'conn (fut, send, up),
+                Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
                     upstream::drop_h2_id(&up.ip, up.id);
                     (log)(&format!("[流式] {host}{path} 新拨连接握手即死({e})"));
@@ -414,7 +420,7 @@ async fn stream_passthrough(
         .map(|b| upstream::h2_spawn_pump(send, b, log.clone()));
     let timed = tokio::time::timeout(
         std::time::Duration::from_secs(upstream::STREAM_HEAD_BUDGET_SECS),
-        upstream::h2_recv_response(fut),
+        upstream::h2_recv_response(fut, guard),
     )
     .await;
     match timed {
@@ -593,7 +599,12 @@ async fn try_cached(
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     let is_content = pool::route::is_content(host);
-    let up = upstream::cached_h2_in(ips, want_slot)?;
+    // 会话域（含 api）优先用自己建的通道；内容域双通道，池里谁快用谁。
+    let up = if upstream::prefer_own_channel(host) {
+        upstream::cached_h2_own(host, ips, want_slot)?
+    } else {
+        upstream::cached_h2_in(ips, want_slot)?
+    };
     match send_once(&up, out, body, request_budget(is_content)).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
@@ -655,7 +666,11 @@ pub(super) async fn get_direct(
     }
     // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
     let reusable_in_pool = !(!is_simple && body.is_none())
-        && upstream::cached_h2_in(&ips, want_slot).is_some();
+        && if upstream::prefer_own_channel(host) {
+            upstream::cached_h2_own(host, &ips, want_slot).is_some()
+        } else {
+            upstream::cached_h2_in(&ips, want_slot).is_some()
+        };
     if reusable_in_pool {
         guard.take();
         if let Some(r) = try_cached(log, out, host, &ips, info, is_simple, body).await {
@@ -674,14 +689,27 @@ pub(super) async fn get_direct(
         // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
         let cached = if !is_simple && body.is_none() {
             None
+        } else if upstream::prefer_own_channel(host) {
+            upstream::cached_h2_own(host, &ips, want_slot)
         } else {
             upstream::cached_h2_in(&ips, want_slot)
         };
         let (up, fresh) = match cached {
             Some(up) => (up, false),
-            None => match upstream::dial_upstream(host, log).await {
+            None => match upstream::dial_upstream(
+                host,
+                log,
+                !(!is_simple && body.is_none()),
+            )
+            .await
+            {
                 Ok((up, fresh)) => (up, fresh),
                 Err(e) => {
+                    // 候选被已有通道占满：换候选、再来一轮都是同一句话，直接交兜底。
+                    // 这里放过会变成 24 行完全相同的失败日志（实测发生过）。
+                    if e.contains(upstream::ERR_NO_FREE_IP) {
+                        return Err(e);
+                    }
                     // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
                     if pool::dial_cool_open(host) {
                         return Err(e);

@@ -36,8 +36,14 @@ struct SettingsState {
 #[serde(default)]
 pub struct WorkerMirror {
     pub url: String,
+    /// 手写一条镜像时的默认意图就是"用它"：不写 on 视为启用，别让人写半天结果是关的。
+    #[serde(default = "on_by_default")]
     pub on: bool,
     pub trusted: bool,
+}
+
+fn on_by_default() -> bool {
+    true
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
@@ -458,6 +464,52 @@ where
     Ok(T::deserialize(raw).unwrap_or_default())
 }
 
+/// 镜像注册表容错：`["https://x"]`、`[{"url":"https://x"}]`、单个对象都认，
+/// 只写 URL 的默认启用。整段写坏只丢这一段，不连坐其他开关。
+fn lenient_mirrors<'de, D>(d: D) -> Result<Vec<WorkerMirror>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        Url(String),
+        Full(WorkerMirror),
+    }
+    let raw = serde_json::Value::deserialize(d)?;
+    let list: Vec<One> = if raw.is_array() {
+        serde_json::from_value(raw).unwrap_or_default()
+    } else if raw.is_string() || raw.is_object() {
+        // 手写时常见"只写一条、忘了数组括号"，一并收下。
+        serde_json::from_value(raw).map_or_else(|_| Vec::new(), |one| vec![one])
+    } else {
+        Vec::new()
+    };
+    Ok(list
+        .into_iter()
+        .filter_map(|one| {
+            let m = match one {
+                One::Url(url) => WorkerMirror {
+                    url,
+                    on: true,
+                    trusted: false,
+                },
+                One::Full(m) => m,
+            };
+            // 和界面保存同一条校验线：只收 https、无空格；顺手去掉尾斜杠。
+            let url = m.url.trim().trim_end_matches('/');
+            if !url.starts_with("https://") || url.contains(' ') {
+                return None;
+            }
+            Some(WorkerMirror {
+                url: url.to_string(),
+                on: m.on,
+                trusted: m.trusted,
+            })
+        })
+        .collect())
+}
+
 #[derive(Serialize, Deserialize, Default)]
 // 字段名(camelCase)即落盘格式，不能改；容器 default 管漏键，字段 lenient 管坏值。
 #[serde(rename_all = "camelCase", default)]
@@ -477,7 +529,11 @@ struct SettingsFile {
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
     /// 自定义镜像注册表：settings.json 永久记录；启停只增删 routes.json 链成员。
-    #[serde(deserialize_with = "lenient")]
+    /// 同时认 camelCase 与 snake_case；元素可以只写 URL 字符串。
+    #[serde(
+        alias = "worker_mirrors",
+        deserialize_with = "lenient_mirrors"
+    )]
     worker_mirrors: Vec<WorkerMirror>,
 }
 

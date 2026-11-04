@@ -164,7 +164,7 @@ fn pac_lists_split_direct_and_proxy() {
     );
 }
 
-/// 游标键跟路由行一一对应（主键 + `_vice` 副键），直连行不占键。
+/// 游标键跟路由行一一对应：会话域只有主键，内容域才有 `_vice`；直连行不占键。
 #[test]
 fn cursor_keys_follow_routes() {
     let _g = crate::pool::TEST_LOCK
@@ -173,8 +173,13 @@ fn cursor_keys_follow_routes() {
     install_rows(&[
         ("a.example", r#"{"action":"direct"}"#),
         ("b.example", "{}"),
+        ("c.example", r#"{"content":true}"#),
     ]);
-    assert_eq!(cursor_keys(), vec!["b.example", "b.example_vice"]);
+    assert_eq!(
+        cursor_keys(),
+        vec!["b.example", "c.example", "c.example_vice"],
+        "会话域固定单通道，不该再记一个永远为空的副键"
+    );
 }
 
 /// 总路由：直连行短路 → System；表外 → Tunnel；大文件域/附件下载 → Mirror；archive 走池。

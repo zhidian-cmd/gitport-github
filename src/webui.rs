@@ -516,7 +516,12 @@ async fn api_calib_status() -> Response {
 }
 
 async fn api_show() -> Response {
-    if crate::desktop::show_via_proxy() {
+    // 界面已死的旧实例必须让位：它占着单实例锁会让所有新启动静默消失（实测踩到）。
+    // 回 ok:false 后自退，新实例等锁释放即接管。
+    if crate::desktop::ui_dead() {
+        crate::desktop::quit_via_proxy();
+        write_json(&serde_json::json!({"ok": false, "error": "界面不可用, 旧实例退出中"}))
+    } else if crate::desktop::show_via_proxy() {
         write_json(&serde_json::json!({"ok": true}))
     } else {
         write_json(&serde_json::json!({"ok": false, "error": "无窗口(headless 或事件循环未就绪)"}))

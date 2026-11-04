@@ -1012,8 +1012,9 @@ async fn split_download(
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数 + 直连两条通道；实际只能占空着的那几个。
-            let plan = plan_range_segments(&slice_key, len, mirrors + 2, idle.len());
+            // 段位总数 = 镜像数 + 直连一条通道：大文件域归"其他"，单通道、不再给直连两片；
+            // 实际只能占空着的那几个。
+            let plan = plan_range_segments(&slice_key, len, mirrors + 1, idle.len());
             (plan.want, Some(plan))
         }
         None => (

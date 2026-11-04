@@ -14,6 +14,9 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         slot,
+        owner: None,
+        max_streams: 100,
+        inflight: Arc::new(AtomicU32::new(0)),
         send,
         ping: None,
     }
@@ -50,6 +53,9 @@ async fn live_conn(ip: &str) -> H2Upstream {
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         slot: 1,
+        owner: None,
+        max_streams: 100,
+        inflight: Arc::new(AtomicU32::new(0)),
         send,
         ping: None,
     }
@@ -95,6 +101,119 @@ async fn one_ip_one_channel_and_slot_filter() {
     );
     assert!(!pool::inflight::live(ip), "最后一条摘除后应允许重拨");
     let _ = lock(conn_pool()).remove(ip);
+}
+
+/// 只有 filling 标记（没连接）的 IP 不算"已有通道"。把它算进去会让候选被误判为
+/// 全被占住、请求原地重试到死（实测 api.github.com 连刷 24 行同样的失败）。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn filling_mark_is_not_an_occupied_channel() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let ip = "9.9.9.4";
+    {
+        let mut g = lock(conn_pool());
+        g.entry(ip.to_string()).or_default().filling = true;
+    }
+    assert!(
+        occupied_ips(&[ip.to_string()]).is_empty(),
+        "filling 只是补第二条的防重入标记，不是可用通道"
+    );
+    store_h2(ip, mk_up(ip, 1).await);
+    assert_eq!(
+        occupied_ips(&[ip.to_string()]),
+        vec![ip.to_string()],
+        "真正有连接才算占用"
+    );
+    let _ = lock(conn_pool()).remove(ip);
+    pool::inflight::clear();
+}
+
+/// 会话域优先用自己建的通道：池里另有公共连接时也不去蹭，没有自己的才退回任意。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn session_host_prefers_own_channel_over_public() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let own_ip = "9.9.7.1";
+    let public_ip = "9.9.7.2";
+    let mut own = mk_up(own_ip, 1).await;
+    own.owner = Some("api.github.com".into());
+    let own_id = own.id;
+    store_h2(own_ip, own);
+    let mut public = mk_up(public_ip, 1).await;
+    public.owner = Some("raw.githubusercontent.com".into());
+    store_h2(public_ip, public);
+
+    let ips = vec![own_ip.to_string(), public_ip.to_string()];
+    let up = cached_h2_own("api.github.com", &ips, None).expect("应有连接");
+    assert_eq!(up.id, own_id, "会话域先认自己建的通道");
+
+    // 自己没建过：入口不抢公共，返回 None，让调用方去自建。
+    let ips_public_first = vec![public_ip.to_string(), own_ip.to_string()];
+    assert!(
+        cached_h2_own("gist.github.com", &ips_public_first, None).is_none(),
+        "入口只认自己的通道；公共连接留给拨号失败后的兜底"
+    );
+
+    let _ = lock(conn_pool()).remove(own_ip);
+    let _ = lock(conn_pool()).remove(public_ip);
+    pool::inflight::clear();
+}
+
+/// 选路看空闲：一条顶到并发上限，请求该落到另一条闲着的，哪怕它慢一点。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn pool_prefers_idle_channel_over_full_one() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let full_ip = "9.9.4.1";
+    let idle_ip = "9.9.4.2";
+    let mut full = mk_up(full_ip, 1).await;
+    full.max_streams = 4;
+    full.inflight
+        .store(4, std::sync::atomic::Ordering::Relaxed);
+    let full_id = full.id;
+    store_h2(full_ip, full);
+    let mut idle = mk_up(idle_ip, 1).await;
+    idle.max_streams = 4;
+    let idle_id = idle.id;
+    store_h2(idle_ip, idle);
+    // 把"满的那条"灌成明显更快：只看 EWMA 会选它，看空闲就该让给另一条。
+    for _ in 0..4 {
+        note_latency(full_ip, full_id, 10);
+        note_latency(idle_ip, idle_id, 300);
+    }
+    let ips = vec![full_ip.to_string(), idle_ip.to_string()];
+    let up = cached_h2_in(&ips, None).expect("应有一条可用");
+    assert_eq!(up.id, idle_id, "满了的通道不该再接新流");
+    let _ = lock(conn_pool()).remove(full_ip);
+    let _ = lock(conn_pool()).remove(idle_ip);
+    pool::inflight::clear();
+}
+
+/// 在途计数跟着响应体走：body 没消费完算占用，丢弃后必须归还，不能留幽灵占位。
+#[tokio::test]
+async fn inflight_count_follows_response_body_lifecycle() {
+    let ip = "9.9.4.3";
+    let up = live_conn(ip).await;
+    let order = std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(up.inflight.load(order), 0);
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("https://probe.example/")
+        .body(empty_body())
+        .unwrap();
+    let resp = h2_send(&up, &req, &None).await.expect("请求应成功");
+    assert_eq!(up.inflight.load(order), 1, "响应体还在，槽位算占用");
+    drop(resp);
+    assert_eq!(up.inflight.load(order), 0, "body 丢弃后必须归还槽位");
 }
 
 /// 两个 host 同时把新连接交上来，池里也只能留下一条；两条通道只能分落在两个不同 IP。
@@ -204,7 +323,6 @@ async fn pool_no_samples_takes_first_candidate() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    align_explore_to_sampled_phase();
     let slow_ip = "9.9.5.1";
     let fast_ip = "9.9.5.2";
     let slow = mk_up(slow_ip, 1).await;
@@ -223,7 +341,6 @@ async fn pool_no_samples_takes_first_candidate() {
         note_latency(slow_ip, sid, 300);
         note_latency(fast_ip, fid, 50);
     }
-    align_explore_to_sampled_phase();
     for _ in 0..3 {
         let up = cached_h2_in(&ips, None).expect("应有连接");
         assert_eq!(up.ip, fast_ip, "有样本后 EWMA 快者恒胜");
