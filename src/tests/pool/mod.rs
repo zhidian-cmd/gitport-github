@@ -905,3 +905,46 @@ fn dial_order_cursor_first_then_latency_asc() {
     assert_eq!(dial_order(&circle, Some("3.3.3.3")), vec![2, 3, 1, 0]);
     latency::install(HashMap::new());
 }
+
+/// 种子/运行表一 IP 一节点；codeload 单独成行，只挂实测能出 zip 的 IP。
+#[test]
+fn codeload_route_isolated_to_verified_ips() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let seeds = seed_db();
+    assert!(
+        seeds.ips.iter().all(|n| !n.ip.contains('-')),
+        "种子表不许再用范围 IP，一个字典只放一个 IP"
+    );
+    let verified = ["20.27.177.114", "20.205.243.165"];
+    let declared: Vec<&str> = seeds
+        .ips
+        .iter()
+        .filter(|n| n.hosts.iter().any(|h| h == "codeload.github.com"))
+        .map(|n| n.ip.as_str())
+        .collect();
+    assert_eq!(declared.len(), 2, "codeload 只该挂两个实测可用的 IP");
+    assert!(verified.iter().all(|ip| declared.contains(ip)));
+
+    // 生产加载路径要自己补出 codeload 行，别退回 github.com 那一整组 IP。
+    // 空目录 = 全新安装（吃种子）；写了 dist 内容的目录 = 现有用户表。
+    let mut dirs = vec![tmpdir()];
+    if let Ok(raw) = std::fs::read_to_string("dist/routes.json") {
+        let d = tmpdir();
+        std::fs::write(d.join("routes.json"), raw).unwrap();
+        dirs.push(d);
+    }
+    for dir in &dirs {
+        serial_load(dir, Vec::new(), None);
+        let hit = route::route_for("codeload.github.com").expect("codeload 应在表内");
+        assert_eq!(
+            hit.key, "codeload.github.com",
+            "必须命中自己的行，不能蹭 github.com 裸键"
+        );
+        let targets = route::dial_targets("codeload.github.com").expect("应有候选");
+        assert!(
+            targets.iter().all(|t| verified.contains(&t.ip.as_str())),
+            "codeload 候选混进了不对口 IP: {:?}",
+            targets.iter().map(|t| &t.ip).collect::<Vec<_>>()
+        );
+    }
+}

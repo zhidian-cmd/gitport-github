@@ -169,3 +169,55 @@ fn client_gone_log_is_first_per_host() {
     // 隧道解密用的是另一个 tag，不共用名额。
     assert!(quiet::first_time("tunnel", "gone-a.test"));
 }
+
+/// 被 301 踢回主站的死路径要认得出，正常的 archive 下载和别的主站路径不许误伤。
+#[test]
+fn codeload_alias_path_only_matches_kicked_back_zip() {
+    assert!(is_codeload_alias_path(
+        "/zhidian-cmd/gitport-github/zip/refs/heads/main"
+    ));
+    assert!(is_codeload_alias_path("/o/r/tar.gz/refs/tags/v1"));
+    assert!(!is_codeload_alias_path(
+        "/zhidian-cmd/gitport-github/archive/refs/heads/main.zip"
+    ));
+    assert!(!is_codeload_alias_path("/o/r/zipball/main"));
+    assert!(!is_codeload_alias_path("/o/r/zip"));
+    assert!(!is_codeload_alias_path("/"));
+}
+
+/// 死路径只在 github.com 上认；改 host 后路径一字不改发往 codeload，且不再回 3xx。
+#[test]
+fn codeload_alias_rewrites_host_keeps_path() {
+    assert_eq!(
+        codeload_alias_host("github.com", "/zhidian-cmd/gitport-github/zip/refs/heads/main"),
+        Some("codeload.github.com")
+    );
+    assert_eq!(
+        codeload_alias_host("github.com", "/o/r/tar.gz/refs/tags/v1"),
+        Some("codeload.github.com")
+    );
+    // 已经在 codeload 域、正常 archive、别的内容域，都不触发，免得反复改或误伤。
+    assert_eq!(
+        codeload_alias_host("codeload.github.com", "/o/r/zip/refs/heads/main"),
+        None
+    );
+    assert_eq!(
+        codeload_alias_host("github.com", "/o/r/archive/refs/heads/main.zip"),
+        None
+    );
+    assert_eq!(
+        codeload_alias_host("raw.githubusercontent.com", "/o/r/zip/refs/heads/main"),
+        None
+    );
+
+    let req = hyper::Request::builder()
+        .uri("https://github.com/zhidian-cmd/gitport-github/zip/refs/heads/main")
+        .body(protocol::empty_body())
+        .unwrap();
+    let alias = codeload_alias_host("github.com", req.uri().path()).unwrap();
+    let out = upstream::upstream_request(&req, alias).unwrap();
+    assert_eq!(
+        out.uri().to_string(),
+        "https://codeload.github.com/zhidian-cmd/gitport-github/zip/refs/heads/main"
+    );
+}

@@ -125,7 +125,7 @@ async fn mitm_http(
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
     // h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
-    let host = {
+    let mut host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
         if from_uri.is_empty() {
             req.headers()
@@ -137,6 +137,16 @@ async fn mitm_http(
             from_uri
         }
     };
+    // 主站上 /owner/repo/zip/refs/... 是 codeload 被不对口 IP 用 301 踢回来的死路径，
+    // GitHub 主站本身没有这个路由。那条 301 没带缓存头，浏览器会永久记住；此后即使把
+    // codeload 的路由修对，浏览器也直接跳到这条 404 路径、根本不再问代理。这里内部按
+    // codeload 转发（路径一字不改，codeload 用的就是同一串），不再回任何 3xx，旧缓存失效。
+    if let Some(alias) = codeload_alias_host(&host, req.uri().path()) {
+        host = alias.to_string();
+        if let Some(v) = req.headers_mut().get_mut(http::header::HOST) {
+            *v = HeaderValue::from_static("codeload.github.com");
+        }
+    }
     // GitHub 前端遥测只占带宽不影响功能（实测 436 个请求里 325 个是它），读掉请求体再回 204。
     if is_telemetry(&host, &path_of(req.uri())) {
         let _ = http_body_util::BodyExt::collect(req.into_body()).await;
@@ -305,9 +315,29 @@ async fn mitm_http(
         page_cache::invalidate_after_write(&log, &host, req.uri().path());
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
-    let resp = page_cache::cache_put(&log, &req, &host, resp).await;
+    let mut resp = page_cache::cache_put(&log, &req, &host, resp).await;
+    // 不对口 IP 回的 301 曾没带缓存头被浏览器永久记住；codeload 一旦出 3xx 就禁缓存，
+    // 免得换 IP 修好后旧重定向还赖在浏览器里。
+    if host == "codeload.github.com" && resp.status().is_redirection() {
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
     write_upstream(resp, "direct", &info)
 }
+/// codeload 的规范路径：/owner/repo/(zip|tar.gz)/refs/... 只存在于 codeload.github.com。
+/// 出现在 github.com 上必然是那条被错 IP 踢回来的死路径，主站一律 404。
+fn is_codeload_alias_path(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segs.len() >= 4 && matches!(segs[2], "zip" | "tar.gz") && segs[3] == "refs"
+}
+
+/// 只在 github.com 上认这条死路径，别的主站/内容域同名路径一律不碰。
+fn codeload_alias_host(host: &str, path: &str) -> Option<&'static str> {
+    (host == "github.com" && is_codeload_alias_path(path)).then_some("codeload.github.com")
+}
+
 fn stream_decision(method: &Method, path: &str, declared_len: Option<u64>) -> Option<&'static str> {
     if *method == Method::GET || *method == Method::HEAD {
         return None;
