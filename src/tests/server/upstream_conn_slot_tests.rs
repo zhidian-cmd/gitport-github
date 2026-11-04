@@ -186,19 +186,24 @@ async fn pool_no_samples_takes_first_candidate() {
     let _ = lock(conn_pool()).remove(fast_ip);
 }
 
-/// 全局"正在拨"登记：认领期间别的 host 能看到，候选组有交集即命中；释放后立刻可拨。
+/// 全局"正在拨"登记按 IP 粒度：抢占期间别人看得到，同一 IP 只能有一个拨号者，释放后立刻可拨。
 #[test]
 fn inflight_registry_claim_blocks_and_release_frees() {
-    let ips = vec!["198.51.100.7".to_string()];
-    assert!(!inflight_busy(&ips));
-    let guard = DialingGuard::claim(&ips);
-    assert!(inflight_busy(&ips), "认领后应显示在拨");
+    let ip = "198.51.100.7";
+    pool::inflight::clear();
+    assert!(!pool::inflight::busy(ip));
+    let guard = pool::inflight::try_claim(ip).expect("首个应抢到");
+    assert!(pool::inflight::busy(ip), "认领后应显示在拨");
     assert!(
-        inflight_busy(&["203.0.113.9".to_string(), "198.51.100.7".to_string()]),
-        "候选组有交集即算命中"
+        pool::inflight::try_claim(ip).is_none(),
+        "同一 IP 第二个必须抢不到"
+    );
+    assert!(
+        pool::inflight::try_claim("203.0.113.9").is_some(),
+        "别的 IP 不受影响"
     );
     drop(guard);
-    assert!(!inflight_busy(&ips), "释放后应立刻可拨");
+    assert!(!pool::inflight::busy(ip), "释放后应立刻可拨");
 }
 
 /// 一次性探针（手动跑，走真网络）：实测 185.199 段每个边缘 IP 对每个内容域名的服务支持。
@@ -476,20 +481,19 @@ async fn probe_baseline_actions() {
     }
 }
 
-/// 拨号权抢占必须是原子的：两个 host 同时进来只有一个能领到，另一个等。
+/// 拨号权抢占必须是原子的：释放后能重新抢到（前半段见 inflight_registry_claim_blocks_and_release_frees）。
 #[test]
 fn inflight_try_claim_is_exclusive() {
-    let ips = vec!["198.51.100.21".to_string()];
-    let first = DialingGuard::try_claim(&ips).expect("第一枪应成功");
+    let ip = "198.51.100.21";
+    pool::inflight::clear();
+    let first = pool::inflight::try_claim(ip).expect("第一枪应成功");
     assert!(
-        DialingGuard::try_claim(&ips).is_none(),
-        "同一组 IP 第二个必须抢不到（旧实现会覆盖并双拨）"
+        pool::inflight::try_claim(ip).is_none(),
+        "同一 IP 第二个必须抢不到"
     );
-    assert!(inflight_busy(&ips));
     drop(first);
-    assert!(!inflight_busy(&ips), "释放后登记应清除");
     assert!(
-        DialingGuard::try_claim(&ips).is_some(),
+        pool::inflight::try_claim(ip).is_some(),
         "释放后应能重新抢到"
     );
 }

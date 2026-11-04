@@ -140,14 +140,21 @@ pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream>
         return None;
     }
     let pick = if want_slot.is_none() {
-        // 1/8 探索：按全局计数器在候选里轮转一圈，摊开别全堆一条；其余 7/8 走 EWMA 择优。
-        let explore = EXPLORE
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .is_multiple_of(8);
-        if explore {
-            // 探索：按全局计数器在候选里轮转一圈，摊开别全堆一条。
-            let offset = EXPLORE.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let i = offset % cands.len();
+        // 分摊策略：两条质量接近（EWMA 差不到 1.5 倍）就轮转，各吃一半；
+        // 只有差距明显时才全押快的。原来固定 1/8 探索，两条一样快时第二条也只吃 12.5%，
+        // 等于白建一条通道。
+        let (lo, hi) = cands.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), c| {
+            if c.0 > 0.0 {
+                (lo.min(c.0), hi.max(c.0))
+            } else {
+                (lo, hi)
+            }
+        });
+        let close = lo.is_finite() && hi / lo < 1.5;
+        let n = EXPLORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cands.len() > 1 && (close || n.is_multiple_of(8)) {
+            // 轮转：按全局计数器在候选里摊开，别全堆一条。
+            let i = n as usize % cands.len();
             cands.swap(0, i);
             0
         } else {
@@ -301,13 +308,10 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         }
     }
     let mut skip = occupied_ips(&ips);
-    // 正在拨的 IP 也不碰：前台可能正拨它，后台再打一条只会互相拖慢、加重对端限流。
-    {
-        let g = lock(inflight_map());
-        for ip in &ips {
-            if g.contains_key(ip) && !skip.contains(ip) {
-                skip.push(ip.clone());
-            }
+    // 正在拨的 IP 也不碰：拨号循环里同样会跳过，这里先排除，免得白发一次拨号。
+    for ip in &ips {
+        if pool::inflight::busy(ip) && !skip.contains(ip) {
+            skip.push(ip.clone());
         }
     }
     if skip.len() >= ips.len() {
@@ -478,83 +482,6 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     Ok(won)
 }
 
-/// 全局"正在拨"登记：IP → 认领时刻。多个 host 的候选组重叠时，后到的等先到的出结果再复用，
-/// 而不是各自拨一条——同一会话被拆到多个 IP，是风控最容易抓的破绽。
-static INFLIGHT: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
-    std::sync::OnceLock::new();
-static INFLIGHT_DONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
-/// 等别人拨号的上限：对端拨得慢也不能把请求挂住，超时自己拨。
-const INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-
-fn inflight_map() -> &'static Mutex<HashMap<String, std::time::Instant>> {
-    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn inflight_busy(ips: &[String]) -> bool {
-    let g = lock(inflight_map());
-    ips.iter().any(|ip| g.contains_key(ip))
-}
-
-/// 认领这批 IP 的拨号权；Drop 时注销并叫醒等待者（成功入池、失败退出都走）。
-struct DialingGuard {
-    ips: Vec<String>,
-}
-
-impl DialingGuard {
-    /// 原子抢占：任一 IP 已被别人认领就返回 None——查与领在同一把锁里，
-    /// 两个 host 同一毫秒进来也只有一个能拿到拨号权。绝不覆盖别人的登记。
-    fn try_claim(ips: &[String]) -> Option<Self> {
-        let now = std::time::Instant::now();
-        let mut g = lock(inflight_map());
-        if ips.iter().any(|ip| g.contains_key(ip)) {
-            return None;
-        }
-        for ip in ips {
-            g.insert(ip.clone(), now);
-        }
-        Some(Self { ips: ips.to_vec() })
-    }
-
-    /// 兜底认领：等过一轮仍抢不到（对端可能超时没清）时用，覆盖式，避免死等。
-    fn claim(ips: &[String]) -> Self {
-        let now = std::time::Instant::now();
-        let mut g = lock(inflight_map());
-        for ip in ips {
-            g.insert(ip.clone(), now);
-        }
-        Self { ips: ips.to_vec() }
-    }
-}
-
-impl Drop for DialingGuard {
-    fn drop(&mut self) {
-        {
-            let mut g = lock(inflight_map());
-            for ip in &self.ips {
-                g.remove(ip);
-            }
-        }
-        INFLIGHT_DONE.notify_waiters();
-    }
-}
-
-/// 等这批 IP 上的在拨拨号结束；true = 等过（调用方应回头查池再决定）。
-async fn wait_inflight(ips: &[String]) -> bool {
-    let deadline = std::time::Instant::now() + INFLIGHT_WAIT;
-    let mut waited = false;
-    while inflight_busy(ips) {
-        waited = true;
-        if std::time::Instant::now() >= deadline {
-            return waited;
-        }
-        tokio::select! {
-            _ = INFLIGHT_DONE.notified() => {}
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-        }
-    }
-    waited
-}
-
 /// 建连统一入口：候选全空走竞速（两个两个建），其余单发（单发也跳过池中占用的 IP）。
 /// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
@@ -567,20 +494,8 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 先抢拨号权（原子）：抢到才拨；抢不到说明别的 host 正在拨同组 IP，
-    // 等它出结果直接复用——同一会话别被拆到多条连接上。
-    let claim = match DialingGuard::try_claim(&ips) {
-        Some(c) => c,
-        None => {
-            wait_inflight(&ips).await;
-            if let Some(up) = cached_h2_in(&ips, None) {
-                return Ok((up, false)); // 池中已有（对方入的库），无需再存
-            }
-            // 等完还空（对方失败或超时未清）：自己拨，仍要登记，免得第三家也来。
-            DialingGuard::try_claim(&ips).unwrap_or_else(|| DialingGuard::claim(&ips))
-        }
-    };
-    let _claim = claim;
+    // 拨号权按 IP 粒度逐家抢（pool::inflight）：别的 host 正在拨的那家自动跳过、试下一家，
+    // 不在这里整组等待——整组等会挡住本来不冲突的域名。
     if occupied_ips(&ips).is_empty() {
         let up = dial_h2_race(host, log).await?;
         return Ok((up, false)); // 竞速任务内部已入库

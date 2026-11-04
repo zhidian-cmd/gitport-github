@@ -1,6 +1,7 @@
 //! 串发拨号：二部图（`ips` 节点 × `hosts` 行）唯一权威。成功驻留游标、失败前移；SNI 骗墙、证书按锚点校验。
 pub mod dial;
 pub mod edges;
+pub mod inflight;
 pub mod latency;
 pub mod route;
 
@@ -1028,6 +1029,7 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
+    let mut inflight_skipped = 0usize;
     // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
     let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_used = Duration::ZERO;
@@ -1050,6 +1052,12 @@ pub async fn serial_dial_skip(
                 continue;
             }
         }
+        // 别的 host 正在拨这个 IP：跳过，不等。等会把首屏拖住，跳过去试下一家更划算；
+        // 全被占时本轮直接失败，上层下一轮会先查池（对方建好就直接复用）。
+        let Some(_inflight) = inflight::try_claim(&p.ip) else {
+            inflight_skipped += 1;
+            continue;
+        };
         tried += 1;
         let t0 = Instant::now();
         let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
@@ -1141,7 +1149,7 @@ pub async fn serial_dial_skip(
     }
     if tried == 0 {
         return Err(format!(
-            "全部 {} 个候选处于死亡冷却([{key}], {host})",
+            "全部 {} 个候选不可用([{key}], {host}): 死亡冷却 {dead_skipped} 个, 他人正在拨 {inflight_skipped} 个",
             circle.len()
         ));
     }
