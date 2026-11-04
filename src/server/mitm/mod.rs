@@ -524,6 +524,12 @@ async fn mirror_or_direct(
     Ok(write_upstream(resp, route, info))
 }
 
+/// 失败发生在请求写出之前（连接已死、h2 拒绝接帧）：这条连接从没承载过该请求，
+/// 对已缓存 body 的非幂等方法也可以安全换连接重发。
+fn failed_before_send(why: &str) -> bool {
+    why.starts_with("h2 流配额") || why.starts_with("h2 发送")
+}
+
 async fn try_cached(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -533,6 +539,11 @@ async fn try_cached(
     is_simple: bool,
     body: &Option<Bytes>,
 ) -> Option<Result<hyper::Response<BoxBody>, String>> {
+    // 流式请求（body 未缓存，>1MB 上传/git push）发出去就收不回，复用一条可能已死的连接
+    // 等于赌命：这类请求直接新建连接，代价一次握手，换"失败不必整页重来"。
+    if !is_simple && body.is_none() {
+        return None;
+    }
     // path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
@@ -557,7 +568,9 @@ async fn try_cached(
                 "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
                 up.ip
             ));
-            (!is_simple).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
+            // 请求没写出去（连接已死）时，非幂等方法也能换连接重发。
+            let replayable = is_simple || (body.is_some() && failed_before_send(&why));
+            (!replayable).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
         }
     }
 }
@@ -596,7 +609,9 @@ pub(super) async fn get_direct(
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
     // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
-    if upstream::cached_h2_in(&ips, want_slot).is_some() {
+    let reusable_in_pool = !(!is_simple && body.is_none())
+        && upstream::cached_h2_in(&ips, want_slot).is_some();
+    if reusable_in_pool {
         guard.take();
         if let Some(r) = try_cached(log, out, host, &ips, info, is_simple, body).await {
             return r;
@@ -611,7 +626,13 @@ pub(super) async fn get_direct(
             _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
         };
         // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
-        let (up, fresh) = match upstream::cached_h2_in(&ips, want_slot) {
+        // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
+        let cached = if !is_simple && body.is_none() {
+            None
+        } else {
+            upstream::cached_h2_in(&ips, want_slot)
+        };
+        let (up, fresh) = match cached {
             Some(up) => (up, false),
             None => match upstream::dial_upstream(host, log).await {
                 Ok((up, fresh)) => (up, fresh),
@@ -624,9 +645,7 @@ pub(super) async fn get_direct(
                         "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
                         attempt + 1
                     ));
-                    if !is_simple {
-                        return Err(format!("POST 等非简单方法不重发({e})"));
-                    }
+                    // 拨号失败 = 请求体一个字节都没发出去，换候选重拨对任何方法都安全。
                     if is_content {
                         // 候选确实全灭：记熔断，后续请求直接走镜像链。
                         pool::CONTENT_BREAKER.set(host);
@@ -651,8 +670,9 @@ pub(super) async fn get_direct(
                     (log)(&format!(
                         "[MITM] {host} <- {up_ip} 421 边缘拒绝, 该边长冷却, 换候选"
                     ));
-                    if !is_simple {
-                        return Err("421 边缘拒绝(非简单方法不重发)".to_string());
+                    // 421 = 服务器声明未处理该请求；body 已缓存才能重发（流式已随旧连接消费掉）。
+                    if !is_simple && body.is_none() {
+                        return Err("421 边缘拒绝(流式请求不可重发)".to_string());
                     }
                     continue;
                 }
@@ -684,7 +704,8 @@ pub(super) async fn get_direct(
             "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
             attempt + 1
         ));
-        if !is_simple {
+        // 只有"连接没接住请求 + body 还在手里"才允许非幂等方法重发；半路断的不重试。
+        if !is_simple && !(body.is_some() && failed_before_send(&e)) {
             return Err(format!("POST 等非简单方法不重发({e})"));
         }
         if is_content {
