@@ -280,6 +280,11 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         if full || has_two {
             return;
         }
+        // 没有第二个"未占用"的候选 IP 就不补：同一 IP 再开一条只是多一次握手，
+        // 慢 IP 上还会把两份超时叠起来（原本单通道等 3s，凑两条等 6s）。
+        if !ips.iter().any(|ip| !g.contains_key(ip.as_str())) {
+            return;
+        }
         // 挑池中已有的那条所在 IP 记 filling（防重入）；全空则记首个。
         let anchor = ips
             .iter()
@@ -397,9 +402,16 @@ async fn h2_dial_slot(
 async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
-    (log)(&format!("[建连] {host} 冷启动竞速发射"));
-    // 会话域只发一条（同会话不跨 IP）；内容域保持双通道竞速。
-    let slots: &[u8] = if session_host(host) { &[1] } else { &[1, 2] };
+    // 会话域只发一条（同会话不跨 IP）；内容域要有第二个不同 IP 才发两条。
+    // 候选只剩一家时凑双通道 = 同一 IP 握手两次、超时也等两份，比单通道更慢。
+    let distinct = pool::route::dial_targets(host).map_or(0, |t| t.len());
+    let slots: &[u8] = if session_host(host) || distinct < 2 {
+        (log)(&format!("[建连] {host} 单通道(可用候选 {distinct} 家)"));
+        &[1]
+    } else {
+        (log)(&format!("[建连] {host} 冷启动竞速发射"));
+        &[1, 2]
+    };
     for &slot in slots {
         let tx = tx.clone();
         let host = host.to_string();
