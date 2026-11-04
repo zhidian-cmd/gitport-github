@@ -105,7 +105,10 @@ async function refreshLogs() {
     const box = $('logsBox');
     const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
     const frag = document.createDocumentFragment();
+    // 启动打点（[启动] 前缀）默认不显示：每页只出现一次，留着只为查开机慢，勾选后可见。
+    const showBoot = $('showBoot') && $('showBoot').checked;
     for (const l of lines) {
+      if (!showBoot && /^\[\d\d:\d\d:\d\d\]\[启动\]/.test(l)) continue;
       const row = document.createElement('div');
       row.className = 'lg ' + logTone(l);
       row.title = l; // 单行省略后，悬停看全文；「复制全部」也保留完整文本
@@ -125,6 +128,13 @@ async function refreshLogs() {
   }
   logSeq = d.latest;
 }
+
+// 勾选/取消"启动日志"：清屏从头拉一遍，让当前缓冲里的行按新规则重排。
+$('showBoot').onchange = () => {
+  $('logsBox').textContent = '';
+  logSeq = 0;
+  refreshLogs();
+};
 
 
 /* ---------- 开关 ---------- */
