@@ -19,7 +19,7 @@ flowchart TB
     B --> P1
     G --> P1
     P1 -->|"action=direct 行"| DL
-    P1 -->|"有 pac 的行"| PX
+    P1 -->|"非 direct 行"| PX
     P1 -->|"其余"| OD
     subgraph L3["③ 本地代理 127.0.0.1:7810"]
         C1["CONNECT / 明请求"]
@@ -77,7 +77,7 @@ flowchart TB
         R1b["回传压缩：github.com / api 强制 gzip 取上游<br/>解压嗅探前 4KB 判拦截页 · 原始压缩帧原样转发<br/>其余域名放行浏览器 br / zstd"]
         R2b["响应注入 X-GitPort-Route / X-GitPort-Upstream 诊断头"]
         CA["本地 CA（certgen）→ Windows 证书库<br/>只签受管域名，拒绝为表外域名签发"]
-        WUI["WebUI 7811<br/>概览二部图 · 状态 · 日志 · 镜像信任 · 开关"]
+        WUI["WebUI 7811<br/>状态 · 日志 · 镜像信任 · 测速 · 开关"]
         ROUTES["routes.json（二部图 + 镜像链）<br/>缺失时生成；测速后落 latency 键"]
         TRAY["托盘 + WebView2 桌面壳（-tray / -headless）"]
         LOG["日志环形 2000 条 + 崩溃捕获"]
@@ -95,7 +95,7 @@ flowchart TB
 
 v1 的池/族/对口规则已全部退役,替换为一张数据表(`routes.json`)+ 一台边状态机。设计动机与 openssl 实测证据见 [POOL-V2.md](POOL-V2.md),手改指南见 [CONFIG.md](CONFIG.md)。
 
-- **hosts 行(策略侧)**:域名键 → `pac`(进不进 PAC)/ `action:"direct"`(本机直连)/ `content`(内容域熔断与短预算)/ `fallback`(dns 或 mirror)。最长键胜,`*.` 只认子域,点边界防误吞。
+- **hosts 行(策略侧)**:域名键 → `action:"direct"`(本机直连)/ `content`(内容域熔断与短预算)/ `fallback`(dns 或 mirror)。**进不进 PAC 不需要单独字段**:非 direct 行自动进,运行时按路由键派生裸域名。最长键胜,`*.` 只认子域,点边界防误吞。
 - **ips 节点(身份侧)**:IP(末段支持 `a-b` 范围展开,笛卡尔积上限 64)→ `sni`(骗墙的伪装域)+ `verify`(证书校验锚点,空 = 按目标 host 校验)+ `hosts`(声明服务哪些路由键)。**伪装身份与目标 host 解耦**——业务路由全靠 h2 `:authority`,所以一条连接可以混发多个 host 的流。
 - **边状态机(运行时实测)**:表是预判,边是实测。`(IP, 路由键)` 三档坏态:421/证书不匹配 → 拉黑 4 小时(静态属性);超时/断连 → 降权 2 分钟(网络波动);风控拦截页 → 600 秒(对齐 GitHub 限流窗)。成功即清黑,坏边自愈的唯一通道。
 - 触发条件刻意收窄:**业务状态码 403/404/429 一律不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"。
@@ -139,9 +139,11 @@ flowchart TD
 
 连接池的 key 是 **IP 节点**(伪装身份统一):每节点最多 **2 条** h2 连接,**一条连接混发多个 host 的流**(h2 `:authority` 路由,业务身份与 TLS 身份解耦)。服务端视角"新建第一条"与"复用第一百条"不可区分——同 IP 同伪装身份同 `:authority`。
 
-**为什么是两条**:GitHub 边缘按连接限并发——单连接 24 并发实测全部同一时刻返回(p50 = p95 = 1036ms),两条压到 **332ms**,四条不再改善。一条 GOAWAY 打断多 host 时,靠双通道冗余 + 边状态机兜底。
+**为什么是两条**:GitHub 边缘按连接限并发——单连接 24 并发实测全部同一时刻返回(p50 = p95 = 1036ms),两条压到 **332ms**,四条不再改善。**但候选不足两个 IP 时不开第二条**:同一个 IP 拨两次只是双倍握手、超时也双倍,这时老实单通道。一条 GOAWAY 打断多 host 时,靠边状态机兜底。
 
-**取用策略**:热路径 EWMA 实测耗时择优直接复用(`:authority` = 真实 host);冷路径从游标起点串发,成功驻留、失败前移,副键跳过主通道占用的 IP。并发冷启动走**拨号单飞**:DialCrew 按 IP 认领,竞争只出一个赢家;`wait_inflight` 让同 IP 的后续请求等待首个拨号完成,不重拨。
+**取用策略**:热路径 EWMA 实测耗时择优直接复用(`:authority` = 真实 host),两条质量接近(差不到 1.5 倍)时轮转各吃一半,差距明显才全押快的;冷路径从游标起点串发,成功驻留、失败前移,副键跳过主通道占用的 IP。
+
+**拨号权按 IP 粒度抢占**:要拨哪个 IP 就先占哪个,拨完立刻放(成功、失败、panic 都放)。别的域名看到某个 IP 正在拨,跳过它试下一个,不等——只有全部候选都被占时才等一轮(最多 300ms),然后回头查连接池,对方建好的连接直接复用。
 
 **活跃窗口保活**:上游 h2 连接被边缘按空闲回收(实测 50-65 秒),跨导航会变成重新握手 1.3 秒。对策:有请求后每 30 秒对所有已缓存连接发 h2 PING 验活(不发 HTTP 请求、不触风控);静默 5 分钟自动停,空闲时零定时器。
 
@@ -161,10 +163,9 @@ GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能�
 
 ## 镜像链
 
-覆盖 8 个内容域（github.com 的 /archive 与 /releases/download 路径归属 codeload / release-assets 专属链）。CSS/JS 与 github.io 不过镜像（实测全 404）。
+覆盖 objects / release-assets 两族与 raw / gist / avatars / user-images / media 等图片文本域。github.com 的 `/releases/download` 路径归 release-assets 链；`/archive` 与 codeload 不进镜像，走主站池。CSS/JS 与 github.io 不过镜像（实测全 404）。
 
-- **大文件域分片竞速**（objects / release-assets，支持 Range 的域）：请求按字节均分给全部空闲候选（镜像 + 直连同台，键 direct/{host}），谁快谁多拿——慢段的尾巴按「接手划算才抢」的算术让给最快者（让位），停滞段收尸补发，交付线零缺口；候选全灭才失败
-- **codeload 源码包单流**：该域不支持 Range 无法分段——直连优先，失败按校准链序逐家；客户端带 Range 也按 200 整包回（HTTP 允许上游无视 Range）
+- **大文件域分片竞速**（objects / release-assets，支持 Range 的域）：按字节均分给空闲候选，**直连占两个槽位**（对应主/副两条 h2 通道），镜像一家一个——切出来就是「镜像数 + 2」段；谁快谁多拿，慢段的尾巴按「接手划算才抢」的算术让给最快者（让位），停滞段收尸补发，交付线零缺口；候选全灭才失败
 - **小文件域单请求单镜像**：avatars / raw / gist / media 串行逐家，单请求限前 5 家
 - **ECT 时间槽派发**：选家 = (在途字节 + 新请求) ÷ 上一窗(500ms)实收，即「还需几个槽跑完」，最小者胜、无容差；并列看在途流数、再并列轮转。零历史按 +∞ 垫底（档内闲者先试）；有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——三个 AtomicU64 + 一次除法，无 EWMA、无时间戳
 - **链序**：种子快照序（随表演化，代码零内置）→ 图片链/codeload 链 UI「校准」重排（TTFB）→ 手改 routes.json（`mirrors_big` / `mirrors_small` 两字典，codeload 已归 small）；大文件域链序只作失败顺延次序，选家由 ECT 动态调度；codeload 直连优先

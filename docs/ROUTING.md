@@ -22,7 +22,7 @@ flowchart TD
 
 ## 1. ① PAC:路由键派生的裸域名名单
 
-PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direct"` 行进 DIRECT 名单,表外域名 DIRECT。**名单值 = 路由键去 `*.` 的裸域名,运行时派生、不在 routes.json 落盘**(c3ece1d 起移除 pac 字段;写 `pac` 也兼容读取,但语义恒等于裸域名,没必要写)。
+PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direct"` 行进 DIRECT 名单,表外域名 DIRECT。**名单值 = 路由键去 `*.` 的裸域名,运行时派生、不在 routes.json 落盘**；`pac` 字段已从数据结构移除,写进 JSON 也不会被读取(未知字段直接忽略)——想让某行不进 PAC,用 `action:"direct"`。
 
 **与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(POOL-V2.md §8)。当前 GitHub 系 20 个路由键全部进代理。
 
@@ -47,7 +47,15 @@ codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪
 - **verify**:证书校验锚点,只求证明"对面是真 GitHub";留空 = 按目标 host 校验(安全默认)
 - **边状态机**:表是预判,边是实测。`(IP, 路由键)` 三档坏态——421/证书不匹配拉黑 **4h**(静态属性不会自愈)、超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗);成功即清黑,坏边自愈的唯一通道。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
 
-## 4. ④ 兜底与熔断
+## 4. 拨号权:按 IP 抢占,不是按域名整组
+
+要拨某个 IP 之前,先在全局表里占住它;拨完(成功、失败、panic)立刻放。别的域名看到这个 IP 正在拨,就跳过它试下一个,**不等**。
+
+- 全部候选都被占:等一轮(每 30ms 看一次,最多 300ms),然后回头查连接池——对方建好的连接直接复用
+- 后台补第二条通道走同一套规则,不会和前台同时打一个 IP
+- 候选不足两个 IP 时不开第二条通道:同一 IP 拨两次只是双倍握手、超时也双倍
+
+## 5. ④ 兜底与熔断
 
 | 机制 | 规则 |
 |---|---|
@@ -56,7 +64,7 @@ codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪
 | 大文件域整链全灭(镜像+直连) | 熔断 60s,窗口内同域毫秒级快速失败,502 页指引补镜像 |
 | 凭据查询串防护 | `token` / `sig` / `x-amz-*` 等参数 → 剥空镜像仅派直连;WebUI「信任」勾选的镜像例外(见 README) |
 
-## 5. v1 → v2 行为变化对照
+## 6. v1 → v2 行为变化对照
 
 | 域 / 机制 | v1(池/族/对口规则) | v2(二部图/边) |
 |---|---|---|

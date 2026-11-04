@@ -42,13 +42,13 @@ v2 把借道扶正为主干：**伪装是纯粹的建连手段，通道建好谁
       "hosts": ["*.githubusercontent.com", "raw.github.com", "support.github.com"] }
   ],
   "hosts": {
-    "github.com":              { "pac": "github.com", "fallback": "dns" },
-    "*.githubusercontent.com": { "pac": "githubusercontent.com", "content": true, "fallback": "mirror" }
+    "github.com":              { "fallback": "dns" },
+    "*.githubusercontent.com": { "content": true, "fallback": "mirror" }
   }
 }
 ```
 
-- **属性分层**：`sni`（骗墙）/ `verify`（锚点）跟 IP 走；`real`/`content`/`fallback`/`pac` 跟 host 走
+- **属性分层**：`sni`（骗墙）/ `verify`（锚点）跟 IP 走；`action`/`content`/`fallback` 跟 host 走
 - **段展开**：`ip` 末段支持 `a-b` 范围（`140.82.112-114.5-6` = 6 节点，`185.199.108-111.133` = 4 节点），只做末段，解析三行
 - **匹配语义保留**：`hosts` 里写的是路由键，裸键含子域、`*.` 仅子域、最长匹配胜——`hits()`/`rank` 原样平移
 - **缺省即真**：host 没出现在任何 `ips[].hosts` 里 = 不走池（direct / 纯 real 域），不写 `pool: false`

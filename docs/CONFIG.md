@@ -11,6 +11,8 @@
   "winRect": [641, 278, 1820, 1394],
   "githubPAC": true,
   "proxyBackup": "",
+  "lastPac": "http://127.0.0.1:7811/proxy.pac",
+  "workerMirrors": [],
   "lastIp": {
     "github.com": "140.82.121.3",
     "github.com_vice": "20.207.73.82",
@@ -21,6 +23,9 @@
   }
 }
 ```
+
+- `lastPac`：上次写进系统的 PAC 地址，用来区分“自己的残留”和别家同形态；手改无意义
+- `workerMirrors`：自定义镜像注册表，工作台里增删镜像时维护；手改可以，但界面保存会以内存状态覆盖
 
 - `lastIp` 的键由 `pool::circle_keys()` 派生：每条非直连路由两把（主键 / `_vice` 副键，对应双通道各记各的起点），**顺序固定、不可调换**；写盘恒为全量键位，未驻留的写 `""`
 - 旧版 `~2` 副键（0.5.4 及以前）读入时自动改名为 `_vice`，无需手工迁移
@@ -34,17 +39,13 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 
 ```json
 {
-  "hosts": {
-    "api.github.com": {},
-    "github.com": {},
-    "*.githubusercontent.com": { "content": true, "fallback": "mirror" }
-  },
   "ips": [
     {
       "ip": "140.82.112-114.5-6",
       "sni": "baidu.com",
       "verify": "github.com",
-      "hosts": ["api.github.com"]
+      "hosts": ["api.github.com"],
+      "latency": {"140.82.112.5": 188, "140.82.112.6": 201}
     },
     {
       "ip": "185.199.108.133",
@@ -53,6 +54,9 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
       "hosts": ["*.githubusercontent.com"]
     }
   ],
+  "hosts": {
+    "*.githubusercontent.com": {"content": true, "fallback": "mirror"}
+  },
   "mirrors_big": {
     "release-assets.githubusercontent.com": ["https://gh-proxy.com"]
   },
@@ -62,9 +66,11 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 }
 ```
 
+**落盘顺序是 `ips` → `hosts` → `mirrors_*`**：先看出口，再看域名策略。`hosts` 块只写带属性的行——全是默认配置的域名（`{}`）不落盘，它们的域名由节点的 `hosts` 声明推出来，启动时自动补回。所以文件里只有一两行 `hosts` 是正常的，不代表其他域名没被代理。
+
 - **hosts 行**（域名键）：`github.com` = 自己 + 任意级子域；`*.github.com` = 只认子域（裸域不命中）；多条同时命中取**最长的键**，不用操心书写顺序
   - `action: "direct"` 不进代理（缺省即进）；`content: true` 走内容域熔断与短响应预算；`fallback`：省略 = `dns`，`mirror` = 全灭后走镜像链
-  - **PAC 名单 = 非 direct 行的路由键去 `*.` 的裸域名**，运行时派生、不落盘（JSON 里写 `pac` 会被直接忽略）；想让某行不进 PAC，用 `action: "direct"`
+  - **PAC 名单 = 非 direct 行的路由键去 `*.` 的裸域名**，运行时派生、不落盘。`pac` 字段已经从数据结构里删掉，写了也不会读；想让某行不进 PAC，用 `action: "direct"`
 - **ips 节点**：伪装身份与目标 host 解耦——`sni` 只骗墙（写放行域，如 baidu.com），`verify` 是证书校验锚点（只求证明"对面是真 GitHub"，写节点实际返回证书 SAN 内的域；留空 = 按目标 host 校验，兼容旧写法）。**业务路由全靠 h2 的 `:authority`，与 TLS 身份无关**——所以一条连接能服务多个 host，加域名 = 往某节点的 `hosts` 里添个键
   - `ip` 末段支持范围展开：`140.82.112-114.5-6` = 6 个 IP（多段范围做笛卡尔积，上限 64）
   - `latency` 键（WebUI「IP 建连测速」写入，不手改）：每个展开 IP 的建连毫秒数，失败项删旧值；串发候选按它升序换位（无值排最后）
@@ -76,8 +82,8 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 - 默认安装**不带任何镜像**（双字典为空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502——502 页面会指引补镜像
 - 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
 - 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT 时间槽）；链序只决定失败时的顺延次序
-- **表序固定、运行时零重排**：串发从 settings.json 记忆的游标（上次驻留 IP）起步，沿候选顺序转圈——成功驻留、失败沿圈前进（dead 表跳过死位）；想让某条先被试，把它排到前面即可。运行时唯一写盘 = 故障转移时 settings.json 里几字节的游标更新
-- 手改**重启生效**；启动只在 routes.json 缺失时才生成，**不再重写手改表**；运行时唯一写盘 = WebUI「IP 建连测速」完成后落 latency 键（只动 latency，不动你排的序）
+- **物理顺序固定，拨号顺序不按表序**：文件里你怎么排就怎么存，程序不改你的顺序；但拨号时先从游标（上次驻留的 IP）起步，其余按 `latency` 实测升序试，没测过的垫底——想强制某条先试，把它写进游标或者跑一次测速
+- 手改**重启生效**；启动只在 routes.json 缺失时才生成，**不再重写手改表**。运行时会写盘只有两种：点「IP 建连测速」落 `latency`、在工作台增删或启停镜像时同步镜像链——两种都会把表按内存状态整份重写（格式规范化）
 - 表会自愈：缺节点/边时启动自动从内置种子补齐（只追加，不打乱你排的顺序）；池外镜像/未知 host 写了也会被剥掉
 - 镜像链数据权威：**任何支持拼接的 https 镜像都可写**（含自部署），顺序 = 优先级；无白名单校验，坏镜像运行期自然失败沉底；缺链 host = 无镜像腿
 - **seeds.json 是生成物**：routes.json 的全量快照（hosts 行 + IP 节点 + 镜像链），仅用于全新安装引导和补缺，**勿手改**——更新方式 = 停代理后用调好的 routes.json 覆盖它
@@ -117,7 +123,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | viewscreen / objects-origin / api.mcp | GLB 池伪装（140.82.x.21/.22，锚点 `actions…`） |
 | githubapp.com、githubassets、github.io | 池伪装串发 |
 | avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链 |
-| objects / release-assets | 镜像 only（分片竞速，ECT 时间槽派发） |
+| objects / release-assets | 镜像 + 直连分片竞速（直连占两份，ECT 时间槽派发） |
 | github.com 的 `/releases/download`（含 latest） | release-assets 专属镜像链，全灭 502 |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | 池伪装（Fastly 段锚点制，原真名分片腿退役） |
 | copilot-proxy.githubusercontent.com | 池伪装（Azure `4.249.131.160`） |
