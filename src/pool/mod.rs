@@ -921,7 +921,7 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool, slot: u8) {
     if ok {
         t.dead.remove(ip);
         t.cursor.insert(key, ip.to_string());
-        edges::clear(ip, &row.key); // 成功即清黑：坏边自愈的唯一通道
+        edges::clear(ip, &row.key); // 成功只清短冷却(超时/421)；风控冷却不可清，只随时间过期
         return;
     }
     // 失败：前移到下一候选(整圈后自然复测)。

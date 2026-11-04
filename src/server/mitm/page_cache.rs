@@ -407,9 +407,8 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
                 CacheMsg::Purge => {
                     let n = wipe_pages(dir);
                     (log)(&format!(
-                        "[缓存] 空闲超 {} 分钟, 整盘清空 {n} 条(会话#{} 从空白积累)",
-                        IDLE_SESSION_GAP_MS / 60_000,
-                        SESSION_EPOCH.load(Ordering::Relaxed)
+                        "[缓存] 空闲超 {} 分钟, 清空 {n} 条",
+                        IDLE_SESSION_GAP_MS / 60_000
                     ));
                 }
             }

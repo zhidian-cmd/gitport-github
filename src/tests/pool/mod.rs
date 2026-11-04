@@ -800,6 +800,29 @@ fn success_clears_bad_edge() {
     assert!(!edges::is_bad(&ip, "github.com"), "成功必须清黑");
 }
 
+/// 风控冷却免疫"成功"回写：block 页本身也是一次成功的 HTTP 交换，可清就会在风暴里
+/// 被并发回写当场洗掉（实测 26 家候选 3 轮回头的事件根因）。
+#[test]
+fn risk_cooldown_survives_success_note() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    let dir = tmpdir();
+    crate::settings::save_worker_mirrors(Vec::new());
+    serial_load(&dir, Vec::new(), None);
+    let ip = target_ips("github.com")[0].clone();
+    edges::mark_risk(&ip, "github.com");
+    assert!(edges::is_bad(&ip, "github.com"));
+    cursor_note("github.com", &ip, true, 1);
+    assert!(
+        edges::is_bad(&ip, "github.com"),
+        "风控冷却不得被成功回写清掉"
+    );
+    // 活着的风控冷却也不被短冷却降级成"可清"
+    edges::mark_stall(&ip, "github.com");
+    cursor_note("github.com", &ip, true, 1);
+    assert!(edges::is_bad(&ip, "github.com"), "短冷却不得降级活着的风控");
+}
+
 /// 串发重试引擎实机圈：TCP 拒 → 沿圈到活条 → 驻留 + 死亡退避。
 // 串行锁有意全程持有: 测试期间独占全局表, 跨 await 是本意。
 #[allow(clippy::await_holding_lock)]

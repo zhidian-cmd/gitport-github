@@ -123,7 +123,7 @@ fn forced_gzip_gated_on_client_accept() {
 fn single_channel_reason_separates_rule_from_shortage() {
     let rule = single_channel_reason(HostClass::Session, 26, 0);
     assert!(rule.contains("会话域"), "会话域优先，候选再多也按规则解释");
-    assert!(rule.contains("26"), "把候选数带上，省得看着像漏算");
+    assert!(rule.contains("不开第二条"), "规则单通道要说清是不开，不是没得开");
 
     let other = single_channel_reason(HostClass::Other, 5, 4);
     assert!(other.contains("大文件"), "大文件/文档站单通道要单独说");

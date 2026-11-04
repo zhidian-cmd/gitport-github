@@ -165,7 +165,9 @@ impl ProxyServer {
                 (s, r) if s > 0 && r > 0 => pool::cursor_note(&host, &ip, true, 1),
                 (s, r) if s > 0 && r == 0 => {
                     pool::cursor_note(&host, &ip, false, 1);
-                    (self.log)(&format!("[串发] {host} 客户端已握手但零回包, 垫底换下一个"));
+                    (self.log)(&format!(
+                        "[串发] {host} 客户端已握手但没收到回包, 换下一个 IP"
+                    ));
                 }
                 _ => {}
             }

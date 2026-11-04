@@ -4,12 +4,13 @@ use crate::server::protocol;
 #[test]
 fn defuse_retry_decision() {
     // 空归属：重试上限 3 次
-    assert!(defuse_retry(true, 0, false));
-    assert!(defuse_retry(true, 3, false));
-    assert!(!defuse_retry(true, 4, false));
-    // 有归属：新 IP 重试，同 IP 再现 = 全灭终止
-    assert!(defuse_retry(false, 0, false));
-    assert!(!defuse_retry(false, 0, true));
+    assert!(defuse_retry(true, 0, 0));
+    assert!(defuse_retry(true, 3, 0));
+    assert!(!defuse_retry(true, 4, 0));
+    // 有归属：试满 DEFUSE_MAX_TRIES 才停；同 IP 再现不再提前放弃（排除链有洞，由日志 IP 链取证）
+    assert!(defuse_retry(false, 0, 0));
+    assert!(defuse_retry(false, 0, DEFUSE_MAX_TRIES - 1));
+    assert!(!defuse_retry(false, 0, DEFUSE_MAX_TRIES));
 }
 
 #[tokio::test]

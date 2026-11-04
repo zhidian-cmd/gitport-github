@@ -3,8 +3,23 @@ use super::{get_direct, PeekRaw, UpstreamInfo};
 use crate::pool;
 use crate::server::protocol::BoxBody;
 use crate::server::upstream;
-use crate::util::LogFn;
+use crate::util::{lock, LogFn};
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// 「换尽 IP 仍是风控页」的落盘限频：同 host 30s 内只留首条。
+/// 风控风暴时十几个并发请求会各自走到这里，连刷十几行像系统出大事，实际只是同一个风控窗。
+static LAST_GIVEUP: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn giveup_logged_recently(host: &str) -> bool {
+    let map = LAST_GIVEUP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = lock(map);
+    let now = Instant::now();
+    g.retain(|_, t| now - *t < Duration::from_secs(30));
+    g.insert(host.to_string(), now).is_some()
+}
 
 /// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
@@ -64,12 +79,18 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
 }
 
-/// 解风控单步决策（纯函数）：归属缺失最多重试 3 次；同 IP 再现 = 全员拦截页，交回真实响应。
-fn defuse_retry(ip_empty: bool, empty_retries: u8, ip_seen: bool) -> bool {
+/// 风控重试记号上限：≈把路由表里的候选全试一遍。风控页偶尔换边缘真能通，
+/// 不替 GitHub 提前放弃；同一波并发的后续请求共享边冷却，不会各自重扫成请求风暴。
+const DEFUSE_MAX_TRIES: usize = 24;
+
+/// 解风控单步决策（纯函数）：归属缺失最多重试 3 次；正常分支试满 DEFUSE_MAX_TRIES 才停。
+/// 旧版"同 IP 再现 = 全员拦截页"不成立：3 轮就回头的根因是风控冷却被并发的"成功"回写洗掉
+/// （edges::clear 已改为只清短冷却），不是"所有 IP 都风控"。
+fn defuse_retry(ip_empty: bool, empty_retries: u8, tried: usize) -> bool {
     if ip_empty {
         return empty_retries <= 3;
     }
-    !ip_seen
+    tried < DEFUSE_MAX_TRIES
 }
 
 /// 解 gzip 的前 max 字节（page_cache 的未登录页检测共用：主站正文恒压缩）。
@@ -92,7 +113,7 @@ pub(super) async fn gh_defuse(
     let is_simple = true;
     let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
     let mut tried = 0; // 已垫底重试候选数(仅日志)
-    let mut seen = std::collections::HashSet::new(); // 本轮已试 IP
+    let mut seen: Vec<String> = Vec::new(); // 本轮已试 IP，保序只为日志链
     let mut empty_ip_retries = 0u8; // 归属缺失分支的重试上限
     loop {
         if !is_gh_block_page(&mut resp).await {
@@ -104,7 +125,7 @@ pub(super) async fn gh_defuse(
         }
         if ip.is_empty() {
             empty_ip_retries += 1;
-            if !defuse_retry(true, empty_ip_retries, false) {
+            if !defuse_retry(true, empty_ip_retries, tried) {
                 return Ok(resp);
             }
             resp = match get_direct(log, out, host, info, is_simple, body).await {
@@ -114,19 +135,24 @@ pub(super) async fn gh_defuse(
             continue;
         }
         pool::cursor_note(host, &ip, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
-                                                // 风控页也是"这条边暂时别碰"：记 10 分钟边冷却，同一波并发别再连续撞同一家。
+                                                // 风控页记 10 分钟边冷却, 免疫"成功"回写(否则会被并发的 block 页当场洗掉)。
         if let Some(row) = pool::route::route_for(host) {
             pool::edges::mark_risk(&ip, &row.key);
         }
         upstream::drop_h2(&ip);
         // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。
         tried += 1;
-        // 同 IP 再现 = 全员拦截页，再转只会重复；垫底与拔连接必须在终止判定之前，否则坏连接还挂在缓存里。
-        let ip_seen = !seen.insert(ip.to_string());
-        if !defuse_retry(false, empty_ip_retries, ip_seen) {
-            (log)(&format!(
-                "[MITM] {host} 全部可用边缘均返回拦截页({tried}), 交付真实响应"
-            ));
+        // 垫底与拔连接必须在判定之前，否则坏连接还挂在缓存里。
+        // seen 只为交付日志的 IP 链：正常应无重复，链尾重复 = 风控冷却又被洗掉了（留证）。
+        seen.push(ip.to_string());
+        if !defuse_retry(false, empty_ip_retries, tried) {
+            // 语气按真实严重度来：不是本程序故障，是 GitHub 对本机出口 IP 弹人机验证。
+            if !giveup_logged_recently(host) {
+                (log)(&format!(
+                    "[MITM] {host} 连换 {tried} 个 IP({}) 都是 GitHub 风控页, 原样返回该请求(后台请求页面未必看得见)",
+                    seen.join("→")
+                ));
+            }
             return Ok(resp);
         }
         // 每请求命中拦截页都打一条会在风控风暴时同秒刷十几行（看着像"一 IP 多通道"失效），

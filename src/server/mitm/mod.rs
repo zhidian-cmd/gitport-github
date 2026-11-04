@@ -260,7 +260,7 @@ async fn mitm_http(
                     .await
                     {
                         Ok(resp) => return resp,
-                        Err(_) => (log)(&format!("[MITM] {host}{path} 直连全灭且镜像链全灭")),
+                        Err(_) => (log)(&format!("[MITM] {host}{path} 直连和镜像都试不通")),
                     }
                 }
                 _ => {
@@ -274,7 +274,7 @@ async fn mitm_http(
                 match dns_direct_fetch(&log, &out_body, &host, &info, &replay).await {
                     Ok(r) => return write_upstream(r, "dns", &info),
                     Err(de) => {
-                        (log)(&format!("[MITM] {host}{path} DNS 直连腿也失败({de})"));
+                        (log)(&format!("[MITM] {host}{path} DNS 备用直连也失败({de})"));
                     }
                 }
             }
@@ -293,7 +293,7 @@ async fn mitm_http(
             Ok(r) => resp = r,
             Err(e) => {
                 (log)(&format!(
-                    "[MITM] {host}{} 拦截页化解失败: {e}",
+                    "[MITM] {host}{} 风控页重试也失败: {e}",
                     path_of(req.uri())
                 ));
                 return mitm_unavailable(
@@ -621,7 +621,7 @@ async fn try_cached(
         Err(why) => {
             upstream::drop_h2_id(&up.ip, up.id);
             (log)(&format!(
-                "[MITM] {host} 复用连接失效({}, {why}), 重走串发",
+                "[MITM] {host} 复用连接已断({}, {why}), 重新建连",
                 up.ip
             ));
             // 请求没写出去（连接已死）时，非幂等方法也能换连接重发。
@@ -715,7 +715,7 @@ pub(super) async fn get_direct(
                         return Err(e);
                     }
                     (log)(&format!(
-                        "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
+                        "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
                         attempt + 1
                     ));
                     // 拨号失败 = 请求体一个字节都没发出去，换候选重拨对任何方法都安全。
@@ -741,7 +741,7 @@ pub(super) async fn get_direct(
                     }
                     upstream::drop_h2_id(&up_ip, id);
                     (log)(&format!(
-                        "[MITM] {host} <- {up_ip} 421 边缘拒绝, 该边长冷却, 换候选"
+                        "[MITM] {host} <- {up_ip} 被拒(421), 该 IP 冷却 4 小时, 换下一个"
                     ));
                     // 421 = 服务器声明未处理该请求；body 已缓存才能重发（流式已随旧连接消费掉）。
                     if !is_simple && body.is_none() {
@@ -750,7 +750,8 @@ pub(super) async fn get_direct(
                     continue;
                 }
                 *info.lock().unwrap() = up_ip.clone();
-                pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶（内含成功清黑）
+                // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
+                pool::cursor_note(host, &up_ip, true, up_slot);
                 if fresh {
                     // 连接拨完即已入库，这里只负责补第二条（只会落在另一个 IP）。
                     upstream::maybe_spawn_second(host, log);
@@ -774,7 +775,7 @@ pub(super) async fn get_direct(
         pool::edges::mark_stall(&up.ip, host);
         upstream::drop_h2_id(&up.ip, up.id);
         (log)(&format!(
-            "[MITM] {host} 上游第 {} 次尝试失败({e}), 垫底换候选",
+            "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
             attempt + 1
         ));
         // 只有"连接没接住请求 + body 还在手里"才允许非幂等方法重发；半路断的不重试。

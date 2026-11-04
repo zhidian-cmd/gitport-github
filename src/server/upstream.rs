@@ -437,7 +437,7 @@ pub async fn h2_from_dialed(
         String::new()
     };
     (log)(&format!(
-        "[上游] {host} <- {ip} (boring {form} SNI, h2 握手{chan})"
+        "[上游] {host} <- {ip} ({form}SNI 直连, h2{chan})"
     ));
     Ok(H2Upstream {
         ip: ip.to_string(),
@@ -487,12 +487,10 @@ async fn h2_dial_slot(
 
 /// 单通道的原因：会话域/大文件是规则（候选再多也不开第二条），候选不足是没得选。
 /// 分开写是为了不出现「26 家候选却单通道」这种看不懂的日志。
-fn single_channel_reason(class: HostClass, distinct: usize, free: usize) -> String {
+fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> String {
     match class {
-        HostClass::Session => {
-            format!("会话域: 同会话固定一个 IP, 候选 {distinct} 家也不开第二条")
-        }
-        HostClass::Other => "大文件/文档站: 不维护第二条腿, 复用优先".to_string(),
+        HostClass::Session => "会话域固定同一 IP, 不开第二条(防风控)".to_string(),
+        HostClass::Other => "大文件/文档站: 单通道, 复用优先".to_string(),
         HostClass::Content => format!("可用候选仅 {free} 家, 不够开第二条"),
     }
 }
@@ -554,7 +552,7 @@ async fn dial_h2_race(
             // 先把现成的交上去：调用方立刻能发请求，主通道在后台慢慢拨。
             let _ = tx.send(Ok(up)).await;
             (log)(&format!(
-                "[建连] {host} 副通道复用现成通道{}",
+                "[建连] {host} 复用现成通道{}",
                 if legs.primary {
                     ", 主通道另起一条"
                 } else {
@@ -615,7 +613,7 @@ async fn dial_h2_race(
     drop(tx);
     // 两条腿都拨才叫竞速；只发主通道时说清为什么单通道（会话域 / 空 IP 不够）。
     if legs.primary && legs.vice_dial {
-        (log)(&format!("[建连] {host} 主副通道串发发射"));
+        (log)(&format!("[建连] {host} 主副双通道开拨(竞速)"));
     } else if legs.primary && !legs.vice_reuse {
         (log)(&format!(
             "[建连] {host} 单通道({})",
@@ -804,7 +802,7 @@ pub fn h2_spawn_pump(
                 Some(Ok(f)) => f,
                 Some(Err(e)) => {
                     (log)(&format!(
-                        "[上游] 请求体泵: 客户端体读取失败(已发 {sent}B), 弃流不补 EOS: {e}"
+                        "[上游] 请求体转发中止(已发 {sent}B): 客户端读取失败 {e}"
                     ));
                     return;
                 }
@@ -821,24 +819,26 @@ pub fn h2_spawn_pump(
                         let piece = chunk.split_to(n.min(chunk.len()));
                         sent += piece.len() as u64;
                         if let Err(e) = send.send_data(piece, false) {
-                            (log)(&format!("[上游] 请求体泵中止(已发 {sent}B): {e}"));
+                            (log)(&format!("[上游] 请求体转发中止(已发 {sent}B): {e}"));
                             return;
                         }
                     }
                     Some(Ok(_)) => {} // 授予 0：继续等下次窗口唤醒
                     Some(Err(e)) => {
-                        (log)(&format!("[上游] 请求体泵窗口错误(已发 {sent}B): {e}"));
+                        (log)(&format!(
+                            "[上游] 请求体转发流控窗口错误(已发 {sent}B): {e}"
+                        ));
                         return;
                     }
                     None => {
-                        (log)(&format!("[上游] 请求体泵: 上游重置流(已发 {sent}B)"));
+                        (log)(&format!("[上游] 请求体转发: 上游重置流(已发 {sent}B)"));
                         return;
                     }
                 }
             }
         }
         let _ = send.send_data(Bytes::new(), true); // 干净收尾: EOS
-        (log)(&format!("[上游] 请求体泵完成: {sent}B"));
+        (log)(&format!("[上游] 请求体转发完成: {sent}B"));
     })
 }
 /// 每路由拨号单飞闸：并发未命中只放一个进串发拨号（无闸时一波 27 条全新拨号，握手风暴触发边缘限流）。
