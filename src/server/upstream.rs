@@ -300,7 +300,26 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
             g.entry(anchor).or_default().filling = true;
         }
     }
-    let skip = occupied_ips(&ips);
+    let mut skip = occupied_ips(&ips);
+    // 正在拨的 IP 也不碰：前台可能正拨它，后台再打一条只会互相拖慢、加重对端限流。
+    {
+        let g = lock(inflight_map());
+        for ip in &ips {
+            if g.contains_key(ip) && !skip.contains(ip) {
+                skip.push(ip.clone());
+            }
+        }
+    }
+    if skip.len() >= ips.len() {
+        // 候选全在"已有连接 / 正在拨"：没有新 IP 可补，保持单通道。
+        let mut g = lock(conn_pool());
+        for ip in &ips {
+            if let Some(h) = g.get_mut(ip) {
+                h.filling = false;
+            }
+        }
+        return;
+    }
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
