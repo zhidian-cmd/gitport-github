@@ -845,13 +845,22 @@ async fn split_download(
         .map(|m| m.as_str())
         .collect();
     // 空闲优先：切段只分给零在途的源（链序内稳定序）——旧实现按链序取前 want 家，忙链头凭位置蹭段、链尾闲源落选，白浪费一路带宽。
-    let idle: Vec<&str> = healthy
+    let idle_src: Vec<&str> = healthy
         .iter()
         .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) == 0)
         .copied()
         .collect();
-    if idle.len() < 2 {
+    if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
+    }
+    // 直连有两条 h2 通道（主/副），初始分片按两份派，否则第二条通道全程闲着；
+    // 镜像一家一份。两份共享同一份负载记账，慢时 ECT 自然不给它补发。
+    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() + 1);
+    for m in &idle_src {
+        idle.push(*m);
+        if m.starts_with("direct/") {
+            idle.push(*m);
+        }
     }
     // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用。
     let tpl = direct_tpl(out);
