@@ -1,6 +1,6 @@
 # 路由（v2 二部图）
 
-> 判定逻辑唯一真相:`src/pool/route.rs`(route_for / dial_targets / master_route)+ `routes.json`(ips / hosts / mirrors_big / mirrors_small)。设计动机与 openssl 实测证据见 [POOL-V2.md](POOL-V2.md)。
+> 判定逻辑唯一真相:`src/pool/route.rs`(route_for / dial_targets / master_route)+ `routes.json`(ips / hosts / mirrors_big / mirrors_small)。
 > v1 时代(池/族/对口规则/真名分片腿)的实测矩阵作为历史存档保留在文末附录——其中 objects-origin、codeload、白名单腿的结论**已被 v2 推翻**,以本文为准;IP 死活与镜像质量的观察仍具参考价值。
 
 ## 0. 总览
@@ -12,7 +12,7 @@ flowchart TD
     P --> L2["② master_route<br/>未命中 → Tunnel · direct 行 → System<br/>大文件/附件 GET/HEAD → Mirror · 其余 → Pool"]
     L2 --> L3["③ dial_targets<br/>路由键 → 邻接 IP 节点展开（末段 a-b）<br/>→ 滤冷却中的黑边 → 去重"]
     L3 --> L4["④ 串发 NodeIp{ip, sni, verify}<br/>伪装 sni 骗墙 · verify 锚点验真<br/>业务路由全靠 h2 :authority"]
-    L4 --> OUT["成功：edges::clear + 游标驻留<br/>421 → 拉黑 4h · 超时 → 降权 2min<br/>风控页 → 冷却 600s + 换边"]
+    L4 --> OUT["成功：清短冷却 + 游标驻留<br/>421 → 拉黑 4h · 超时 → 降权 2min<br/>风控页 → 冷却 600s(免疫清黑) + 换边"]
     OUT -.->|"候选未走完"| L3
     OUT -->|"候选走完 / 全黑"| FB["fallback：content 行 → 镜像链<br/>其余 → 系统 DNS 腿"]
     FB --> UP["上游（GitHub 边缘 / 镜像站 / 系统 DNS）"]
@@ -24,7 +24,7 @@ flowchart TD
 
 PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direct"` 行进 DIRECT 名单,表外域名 DIRECT。**名单值 = 路由键去 `*.` 的裸域名,运行时派生、不在 routes.json 落盘**；`pac` 字段已从数据结构移除,写进 JSON 也不会被读取(未知字段直接忽略)——想让某行不进 PAC,用 `action:"direct"`。
 
-**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(POOL-V2.md §8)。当前 GitHub 系 20 个路由键全部进代理。
+**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(2026-11-03)。当前 GitHub 系 20 个路由键全部进代理。
 
 匹配语义:裸键含自身+任意级子域,`*.` 只认子域(裸域不命中),最长键胜,点边界(`evilgithub.com` 不命中 `github.com`),大小写无关。
 
@@ -45,7 +45,7 @@ codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪
 
 - **sni**:骗墙的伪装域(当前全线 `baidu.com`),与目标 host 无关——墙只看 ClientHello 明文,业务路由在加密的 h2 `:authority` 里
 - **verify**:证书校验锚点,只求证明"对面是真 GitHub";留空 = 按目标 host 校验(安全默认)
-- **边状态机**:表是预判,边是实测。`(IP, 路由键)` 三档坏态——421/证书不匹配拉黑 **4h**(静态属性不会自愈)、超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗);成功即清黑,坏边自愈的唯一通道。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
+- **边状态机**:表是预判,边是实测。`(IP, 路由键)` 三档坏态——421/证书不匹配拉黑 **4h**(静态属性不会自愈)、超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗),**免疫成功清黑**——风控页本身就是一次"成功"的 HTTP 交换,可清就会在风暴里被并发回写洗掉(实测 26 家候选 3 轮回头的事件根因);成功只清短冷却。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
 
 ## 4. 拨号仲裁:只在拨号那一瞬,且只管共享 IP
 
@@ -78,7 +78,7 @@ host 线程先查全局连接池,**确实没有现成通道**才走到拨号这�
 | `/archive` 源码包 | 归属 codeload 镜像链 | 不再镜像,走池 |
 | docs / support 等 10 子域 | 真名 SNI + ClientHello 分 3 片(wl* 四族) | **伪装通道 + verify 锚点**,真名分片腿与 real/donor 标志退役 |
 | 主站候选里的 Fastly 段 | 对口规则判据筛除 | 节点不声明该键即不服务(数据表达) |
-| "这个 IP 服务这个 host 吗" | 族判据(静态分类) | **边状态机(实测)**:三档冷却,成功洗白 |
+| "这个 IP 服务这个 host 吗" | 族判据(静态分类) | **边状态机(实测)**:三档冷却,成功洗白(风控冷却例外,只随时间过期) |
 | 池 / 族 / 对口规则 | route.rs POOL_ROUTES | 已删除,全部由 routes.json 数据表达 |
 
 ---

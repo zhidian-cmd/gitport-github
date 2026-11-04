@@ -73,7 +73,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
   - `ip` 末段支持范围展开：`140.82.112-114.5-6` = 6 个 IP（多段范围做笛卡尔积，上限 64）
   - `latency` 键（WebUI「IP 建连测速」写入，不手改）：每个展开 IP 的建连毫秒数，失败项删旧值；串发候选按它升序换位（无值排最后）
   - 节点的 `hosts` 列表里写的是 **hosts 行的路由键**（不是逐个子域）
-- **边状态机**（运行时实测，不落盘）：某 (IP, 路由键) 被服务端回 421 或 TLS 拒 → 该边长冷却（数小时）；请求超时 → 短冷却（2 分钟）；成功即清黑。全黑时该 host 走 fallback
+- **边状态机**（运行时实测，不落盘）：某 (IP, 路由键) 被服务端回 421 或 TLS 拒 → 该边长冷却（4 小时）；请求超时 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。成功只清短冷却。全黑时该 host 走 fallback
 - 旧格式仍能读（启动自动折算，原文件留 `.bak`）：0.5.4 的 `routes` 域名字典（`plans`/`realPlans`）、0.5.3 的 `routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）
 - 镜像链分两个字典：`mirrors_big` = 大文件域（objects / release-assets，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 routes.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
@@ -121,7 +121,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | viewscreen / objects-origin / api.mcp | GLB 池伪装（140.82.x.21/.22，锚点 `actions…`） |
 | githubapp.com、githubassets、github.io | 池伪装串发 |
 | avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链 |
-| objects / release-assets | 镜像 + 直连分片竞速（直连占两份，ECT 时间槽派发） |
+| objects / release-assets | 镜像 + 直连分片竞速（直连占一份——大文件域单通道，ECT 时间槽派发） |
 | github.com 的 `/releases/download`（含 latest） | release-assets 专属镜像链，全灭 502 |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | 池伪装（Fastly 段锚点制，原真名分片腿退役） |
 | copilot-proxy.githubusercontent.com | 池伪装（Azure `4.249.131.160`） |
