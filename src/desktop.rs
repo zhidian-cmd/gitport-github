@@ -135,6 +135,42 @@ unsafe fn tray_add(
     (ok.as_bool(), err)
 }
 
+/// 删掉已注册的托盘图标（重挂前清残留记录）。
+fn tray_delete(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..Default::default()
+    };
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+}
+
+/// 自检：NIM_ADD 返回 TRUE 不代表图标真进了通知区（Explorer 未就绪时会"假成功"）。
+/// 反查 GetRect 才作数；查不到就删残留重挂，仍不行转后台定时重试。
+fn tray_self_check(
+    hwnd: windows::Win32::Foundation::HWND,
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<String> {
+    let probe = tray_rect(hwnd);
+    if !probe.starts_with("GetRect 失败") {
+        return None;
+    }
+    tray_delete(hwnd);
+    let (ok, err) = unsafe { tray_add(hwnd, hicon) };
+    if ok {
+        let again = tray_rect(hwnd);
+        if !again.starts_with("GetRect 失败") {
+            return None;
+        }
+        return Some(format!("重加后仍查不到: {again}"));
+    }
+    use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+    let _ = unsafe { SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None) };
+    Some(format!("重加失败 err={err}, 已转后台重试"))
+}
+
 /// 问系统要图标矩形：拿到才算真进了通知区。
 fn tray_rect(hwnd: windows::Win32::Foundation::HWND) -> String {
     use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
@@ -329,13 +365,23 @@ fn spawn_tray(
                         err = err2; // 两次都失败时报后一次，才是当前真实原因
                     }
                 }
-                let _ = tx.send((ok, err));
-                // 注册成功不出声（图标本来就在托盘里）；失败才把错误码和完整性一起抛出来。
-                if !ok {
+                // NIM_ADD 的 TRUE 不可信：给 shell 200ms 落图标，再反查真实位置，最后才回执。
+                let mut settled = ok;
+                if ok {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    match tray_self_check(hwnd, hicon) {
+                        None => note(format!("[启动] 托盘: {}", tray_rect(hwnd))),
+                        Some(why) => {
+                            note(format!("[启动] 托盘: 自检未通过 —— {why}"));
+                            settled = false;
+                        }
+                    }
+                }
+                let _ = tx.send((settled, err));
+                if !settled {
                     note(format!(
-                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {}, 后台重试中",
-                        current_il(),
-                        tray_rect(hwnd)
+                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), 后台重试中",
+                        current_il()
                     ));
                     // 开机时 shell 未就绪是常态：交给消息循环里的定时器每 2s 重挂，
                     // 不再 sleep 干等，也不依赖 Explorer 恰好广播 TaskbarCreated。
