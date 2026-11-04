@@ -341,3 +341,20 @@ fn dial_targets_empty_vs_none() {
     assert!(dial_targets("other.example").is_none(), "表外 = None");
     crate::pool::edges::clear_all();
 }
+
+/// 通配键子域：边冷却必须按路由键记账才能滤到子域查询。
+/// mark_stall 曾按子域 host 记账，内容域的超时冷却从来没滤到过（421 路径早改对了，超时路径漏了）。
+#[test]
+fn wildcard_key_stall_filters_subdomain_dial() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    install_table(
+        &[("*.githubusercontent.com", r#"{"content":true}"#)],
+        &[r#"{"ip":"1.1.1.1","sni":"baidu.com","hosts":["*.githubusercontent.com"]}"#],
+    );
+    crate::pool::edges::mark_stall("1.1.1.1", "*.githubusercontent.com");
+    let t = dial_targets("raw.githubusercontent.com").expect("通配命中");
+    assert!(t.is_empty(), "按路由键记的冷却必须滤到子域查询");
+    crate::pool::edges::clear_all();
+}

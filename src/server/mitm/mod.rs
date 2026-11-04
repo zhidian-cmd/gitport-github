@@ -772,7 +772,10 @@ pub(super) async fn get_direct(
             pool::cursor_note(host, &up.ip, false, up.slot);
         }
         // 边级记账：超时/断连短冷却，这个 IP 对这个 host 稍后再说。
-        pool::edges::mark_stall(&up.ip, host);
+        // 键必须按路由键记（子域请求的 host ≠ 路由键，按 host 记 dial_targets 永远滤不到——同 421 路径）。
+        if let Some(row) = pool::route::route_for(host) {
+            pool::edges::mark_stall(&up.ip, &row.key);
+        }
         upstream::drop_h2_id(&up.ip, up.id);
         (log)(&format!(
             "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
