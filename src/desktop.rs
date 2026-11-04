@@ -291,7 +291,10 @@ fn spawn_tray(
             };
             let note = |s: String| {
                 thread_log(&s);
-                tray_log(&s);
+                // [启动] 行由 logger 统一落 .cache/tray.log，这里别再写一遍。
+                if !s.starts_with("[启动]") {
+                    tray_log(&s);
+                }
             };
             *TRAY_PROXY.lock().unwrap() = Some(proxy);
             unsafe {
@@ -400,8 +403,7 @@ fn spawn_tray(
         });
     if let Err(e) = spawned {
         let line = format!("[启动] 托盘: 线程起不来 {e}");
-        log(&line);
-        tray_log(&line);
+        log(&line); // logger 统一落盘，不再单独写 tray.log
     }
     rx
 }

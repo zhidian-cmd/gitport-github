@@ -90,15 +90,30 @@ pub async fn handle_connect_mitm(
             .await
     };
     if let Err(e) = result {
+        let msg = e.to_string();
         // 浏览器掐断本地连接是高频日常，不刷屏；协议类真错误仍保留。
-        let benign = e.to_string().contains("connection error")
+        let benign = msg.contains("connection error")
             || e.is_incomplete_message()
             || e.is_closed()
             || e.is_body_write_aborted();
-        if !benign {
+        // h1 侧写响应体失败不在 is_closed() 里，以前被印成「服务层错误」像真故障。
+        // 归回客户端断开，且同 host 只留首条（与隧道解密行共用 quiet 表）。
+        if client_gone_text(&msg) {
+            if quiet::first_time("client-gone", host) {
+                (srv.log)(&format!("[MITM] {host} 客户端已断开"));
+            }
+        } else if !benign {
             (srv.log)(&format!("[MITM] {host} 服务层错误: {e}"));
         }
     }
+}
+
+/// 客户端提前断开时 hyper / 系统 socket 给的文案：只认这几类，别把真故障吞掉。
+fn client_gone_text(msg: &str) -> bool {
+    msg.contains("error writing a body to connection")
+        || msg.contains("broken pipe")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
 }
 /// 本次请求实际命中的上游 IP（响应头 X-GitPort-Upstream 回填）；单写者、收尾时读一次。
 pub(super) type UpstreamInfo = Arc<Mutex<String>>;

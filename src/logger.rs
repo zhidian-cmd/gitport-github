@@ -56,6 +56,15 @@ impl Logger {
             now_str(format_description!("[hour]:[minute]:[second]")),
             msg
         );
+        // 启动打点不进 WebUI 环形缓冲：界面一律不显示，也不给开关。
+        // 仍写 .cache/tray.log 留开机慢的取证，headless 下照旧回显 stdout。
+        if msg.starts_with("[启动]") {
+            boot_log(&line);
+            if self.inner.lock().unwrap().echo_stdout {
+                println!("{line}");
+            }
+            return;
+        }
         let echo = {
             let mut g = self.inner.lock().unwrap();
             g.seq += 1;
@@ -85,6 +94,18 @@ impl Logger {
             .collect();
         (out, g.seq)
     }
+}
+
+/// 启动打点只落本地文件，不占 WebUI 日志流；与托盘日志同一份文件，不新增垃圾。
+fn boot_log(line: &str) {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".cache/tray.log")
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{line}");
 }
 
 /// 崩溃取证落点：未装（headless 以外的早期阶段）时静默丢弃。

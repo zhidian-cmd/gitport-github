@@ -143,3 +143,29 @@ fn failed_before_send_contract() {
     assert!(!failed_before_send("h2 响应: connection reset"));
     assert!(!failed_before_send("响应预算超时"));
 }
+
+/// 客户端掐断的文案只认断开类，真故障不能被静默吞掉。
+#[test]
+fn client_gone_text_only_matches_disconnects() {
+    assert!(client_gone_text("error writing a body to connection"));
+    assert!(client_gone_text("broken pipe (os error 32)"));
+    assert!(client_gone_text("connection reset by peer"));
+    assert!(client_gone_text("connection closed before message completed"));
+    // 这些是代理侧/协议侧真问题，仍要打「服务层错误」。
+    assert!(!client_gone_text("http2 handshake failed: unexpected frame"));
+    assert!(!client_gone_text("TLS alert received"));
+    assert!(!client_gone_text("service task panicked"));
+}
+
+/// 断开提示同 host 只留首条，第二个 host 不受影响；表满清空属既有行为。
+#[test]
+fn client_gone_log_is_first_per_host() {
+    let a = quiet::first_time("client-gone", "gone-a.test");
+    let again = quiet::first_time("client-gone", "gone-a.test");
+    let b = quiet::first_time("client-gone", "gone-b.test");
+    assert!(a, "首次应出声");
+    assert!(!again, "同 host 第二次不再刷");
+    assert!(b, "另一个 host 仍能出声");
+    // 隧道解密用的是另一个 tag，不共用名额。
+    assert!(quiet::first_time("tunnel", "gone-a.test"));
+}

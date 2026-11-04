@@ -421,15 +421,32 @@ async fn h2_dial_slot(
     h2_from_dialed(host, conn_io, &ip, form, slot, log).await
 }
 
+/// 单通道的原因：会话域是规则（候选再多也不开第二条），候选不足是没得选。
+/// 分开写是为了不出现「26 家候选却单通道」这种看不懂的日志。
+fn single_channel_reason(session: bool, distinct: usize) -> String {
+    if session {
+        format!("会话域: 同会话固定一个 IP, 候选 {distinct} 家也不开第二条")
+    } else {
+        format!("可用候选仅 {distinct} 家, 不够开第二条")
+    }
+}
+
 /// 双通道冷启动并行竞速：各领各的游标、跳过对方正在试的 IP，先成者服务、晚成者入库。
 async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
     // 会话域只发一条（同会话不跨 IP）；内容域要有第二个不同 IP 才发两条。
     // 候选只剩一家时凑双通道 = 同一 IP 握手两次、超时也等两份，比单通道更慢。
+    // 两种「只发一条」原因不同，日志分开写：会话域是规则（候选再多也不开第二条），
+    // 候选不足是没得选。混成一行会出现「26 家候选却单通道」这种看不懂的日志。
     let distinct = pool::route::dial_targets(host).map_or(0, |t| t.len());
-    let slots: &[u8] = if session_host(host) || distinct < 2 {
-        (log)(&format!("[建连] {host} 单通道(可用候选 {distinct} 家)"));
+    // 会话域优先：即使候选也只有 1 家，原因仍按规则算，不误报成「候选不足」。
+    let session = session_host(host);
+    let slots: &[u8] = if session || distinct < 2 {
+        (log)(&format!(
+            "[建连] {host} 单通道({})",
+            single_channel_reason(session, distinct)
+        ));
         &[1]
     } else {
         (log)(&format!("[建连] {host} 冷启动竞速发射"));

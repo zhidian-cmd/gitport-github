@@ -117,3 +117,19 @@ fn forced_gzip_gated_on_client_accept() {
         "非嗅探 host 不添加"
     );
 }
+
+/// 单通道日志必须说清是「会话域规则」还是「候选真的不够」，别再混成一行。
+#[test]
+fn single_channel_reason_separates_rule_from_shortage() {
+    let rule = single_channel_reason(true, 26);
+    assert!(rule.contains("会话域"), "会话域优先，候选再多也按规则解释");
+    assert!(rule.contains("26"), "把候选数带上，省得看着像漏算");
+
+    let short = single_channel_reason(false, 1);
+    assert!(short.contains("候选"), "候选不足单独说");
+    assert!(!short.contains("会话域"), "非会话域不许冒充规则");
+
+    // 会话域即使只剩 1 家，也仍按规则归因。
+    assert!(single_channel_reason(true, 1).contains("会话域"));
+    assert_ne!(rule, short, "两种原因不能印成同一句话");
+}
