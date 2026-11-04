@@ -724,8 +724,8 @@ pub(super) async fn get_direct(
                 *info.lock().unwrap() = up_ip.clone();
                 pool::cursor_note(host, &up_ip, true, up_slot); // 数据到手 = 真成功, 置顶（内含成功清黑）
                 if fresh {
-                    upstream::store_h2(&up_ip, up);
-                    upstream::maybe_spawn_second(host, log); // 后台补第二条
+                    // 连接拨完即已入库，这里只负责补第二条（只会落在另一个 IP）。
+                    upstream::maybe_spawn_second(host, log);
                 } // 竞速路径不补:race 的另一任务就是第二条,补建会与它抢跑
                 upstream::note_latency(&up_ip, id, ms); // 新连接也要记账，否则择优池没有它的样本
                 if is_content {
@@ -851,26 +851,32 @@ async fn dns_direct_fetch(
     let budget_content = pool::route::is_content(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        let conn = match pool::dial::dial_one(&ip, host, host, true).await {
-            Ok(c) => c,
-            Err(e) => {
-                (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
-                continue;
-            }
-        };
-        let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
-                continue;
-            }
+        // 这个 IP 已经有通道就直接用：兜底路径也绝不为了再发一次请求而并存两条。
+        let up = if let Some(up) = upstream::cached_h2_in(std::slice::from_ref(&ip), None) {
+            up
+        } else {
+            let conn = match pool::dial::dial_one(&ip, host, host, true).await {
+                Ok(c) => c,
+                Err(e) => {
+                    (log)(&format!("[DNS直连] {host} <- {ip} 拨号失败({e})"));
+                    continue;
+                }
+            };
+            let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
+                    continue;
+                }
+            };
+            // 拨完立刻入库：晚一秒都可能让别的 host 对同一 IP 又拨一条。
+            upstream::store_h2(&ip, up)
         };
         match send_once(&up, out, body, request_budget(budget_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;
                 *info.lock().unwrap() = ip.clone();
-                upstream::store_h2(&ip, up); // 入缓存: 后续请求走复用快路径
                 upstream::note_latency(&ip, id, ms);
                 (log)(&format!(
                     "[DNS直连] {host}{} 新连接 {ip}, 成功({ms}ms)",

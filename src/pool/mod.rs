@@ -985,7 +985,7 @@ pub struct DialSkip<'a> {
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
     log: Option<&LogFn>,
-) -> Result<(dial::Dialed, String, String), String> {
+) -> Result<(dial::Dialed, String, String, inflight::Guard), String> {
     let DialSkip {
         host,
         tls_handshake,
@@ -1030,6 +1030,8 @@ pub async fn serial_dial_skip(
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
     let mut inflight_skipped = 0usize;
+    // 仲裁驳回时记下"这个 IP 已经授权给谁"，全被占时把原因带进错误信息，不另起日志行。
+    let mut arbitrated_by: Option<String> = None;
     // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
     let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_used = Duration::ZERO;
@@ -1037,6 +1039,12 @@ pub async fn serial_dial_skip(
     let mut slow_n = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
+        // 这个 IP 已经有建好的通道：绝不拨第二条。上层会重查连接池拿到现成的那条。
+        // 放在所有检查最前面：连仲裁申请都不发，省掉一次握手和一次裁决。
+        if inflight::live(&p.ip) {
+            inflight_skipped += 1;
+            continue;
+        }
         {
             let g = lock(&SERIAL);
             if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
@@ -1052,9 +1060,23 @@ pub async fn serial_dial_skip(
                 continue;
             }
         }
-        // 别的 host 正在拨这个 IP：跳过，不等。等会把首屏拖住，跳过去试下一家更划算；
-        // 全被占时本轮直接失败，上层下一轮会先查池（对方建好就直接复用）。
-        let Some(_inflight) = inflight::try_claim(&p.ip) else {
+        // 共享 IP 才找仲裁器申请使用权：同一波撞车按内容优先级挑赢家，输的驳回换下一家。
+        // 独占 IP 只做原来的轻量登记（不裁决、不排序），别的 host 撞不上它。
+        // 抢不到一律不等：等会把首屏拖住，跳过去试下一家更划算。
+        let claim = if p.shared {
+            match inflight::apply(&p.ip, host).await {
+                inflight::Verdict::Granted(g) => Some(g),
+                inflight::Verdict::Rejected { winner } => {
+                    if arbitrated_by.is_none() && !winner.is_empty() {
+                        arbitrated_by = Some(winner);
+                    }
+                    None
+                }
+            }
+        } else {
+            inflight::try_claim(&p.ip)
+        };
+        let Some(claim) = claim else {
             inflight_skipped += 1;
             continue;
         };
@@ -1075,7 +1097,8 @@ pub async fn serial_dial_skip(
                         .collect()
                 };
                 crate::settings::set_last_ips(snap);
-                return Ok((conn, p.ip.clone(), p.sni.clone()));
+                // 凭据跟着连接走：拨号方要一直握到通道真正建好，别在中途撒手。
+                return Ok((conn, p.ip.clone(), p.sni.clone(), claim));
             }
             Err(e) => {
                 last_err = Some(e.to_string());
@@ -1158,9 +1181,12 @@ pub async fn serial_dial_skip(
                 }
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
+            let who = arbitrated_by
+                .map(|w| format!(", 已授权给 {w}"))
+                .unwrap_or_default();
             return Err(format!(
-                "候选全在拨号中({} 个), 已等待, 请重查连接池([{key}], {host})",
-                inflight_skipped
+                "候选均已有通道或正在拨号中({} 个{}), 请重查连接池([{key}], {host})",
+                inflight_skipped, who
             ));
         }
         return Err(format!(

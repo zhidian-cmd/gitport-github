@@ -55,39 +55,85 @@ async fn live_conn(ip: &str) -> H2Upstream {
     }
 }
 
+/// 硬约束：同一个 IP 永远只有一条通道。后到的连接当场作废、返回池里已有的那条。
+/// 顺带验证槽位过滤：主通道被摘后不回落到别的槽位，且登记随之撤销允许重拨。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn slot_filter_pins_search_to_primary() {
+async fn one_ip_one_channel_and_slot_filter() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let ip = "9.9.9.1";
-    store_h2(ip, mk_up(ip, 2).await); // 第二通道先入池
-    store_h2(ip, mk_up(ip, 1).await); // 主通道后入
+    pool::inflight::clear();
+    let first = mk_up(ip, 1).await;
+    let first_id = first.id;
+    assert_eq!(store_h2(ip, first).id, first_id, "第一条应入库");
+
+    let second = mk_up(ip, 2).await;
+    let second_id = second.id;
+    let kept = store_h2(ip, second);
+    assert_eq!(kept.id, first_id, "同 IP 的第二条必须作废, 返回已有连接");
+    assert_ne!(kept.id, second_id);
+    {
+        let g = lock(conn_pool());
+        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "池里该 IP 只能有一条");
+    }
+    assert!(pool::inflight::live(ip), "入库即登记'这个 IP 已有通道'");
+
     for _ in 0..4 {
         let up = cached_h2_in(&[ip.to_string()], Some(1)).expect("主通道应在池");
         assert_eq!(up.slot, 1, "Some(1) 永远拿主通道,轮转计数不动");
     }
-    // 主通道被摘后:Some(1) -> None(交拨号按主键重建),绝不误用第二通道
-    drop_h2_id(ip, {
-        let g = lock(conn_pool());
-        g.get(ip)
-            .unwrap()
-            .conns
-            .iter()
-            .find(|c| c.up.slot == 1)
-            .unwrap()
-            .up
-            .id
-    });
+    drop_h2_id(ip, first_id);
     assert!(
         cached_h2_in(&[ip.to_string()], Some(1)).is_none(),
-        "主通道被摘后应回 None 走重建,不得回落第二通道"
+        "主通道被摘后应回 None 走重建"
     );
-    // None = 原语义:池里剩下的第二通道照常服务
-    let up = cached_h2_in(&[ip.to_string()], None).expect("无过滤应命中");
-    assert_eq!(up.slot, 2);
+    assert!(
+        cached_h2_in(&[ip.to_string()], None).is_none(),
+        "同 IP 不该还留着第二条通道"
+    );
+    assert!(!pool::inflight::live(ip), "最后一条摘除后应允许重拨");
     let _ = lock(conn_pool()).remove(ip);
+}
+
+/// 两个 host 同时把新连接交上来，池里也只能留下一条；两条通道只能分落在两个不同 IP。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn concurrent_hosts_never_share_two_channels_on_one_ip() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let same = "9.9.9.2";
+    let other = "9.9.9.3";
+    let a = mk_up(same, 1).await;
+    let b = mk_up(same, 2).await;
+    let (ra, rb) = tokio::join!(
+        async move { store_h2(same, a) },
+        async move { store_h2(same, b) },
+    );
+    assert_eq!(ra.id, rb.id, "两边最终必须用同一条连接");
+    {
+        let g = lock(conn_pool());
+        assert_eq!(g.get(same).unwrap().conns.len(), 1);
+    }
+    // 第二条通道落在另一个 IP：仍然允许， EWMA 轮转也照旧。
+    store_h2(other, mk_up(other, 2).await);
+    let ips = vec![same.to_string(), other.to_string()];
+    assert_eq!(
+        lock(conn_pool())
+            .iter()
+            .filter(|(k, _)| ips.contains(k))
+            .map(|(_, h)| h.conns.len())
+            .sum::<usize>(),
+        2,
+        "两条通道 = 两个不同 IP 各一条"
+    );
+    assert!(cached_h2_in(&ips, None).is_some());
+    let _ = lock(conn_pool()).remove(same);
+    let _ = lock(conn_pool()).remove(other);
+    pool::inflight::clear();
 }
 
 /// v2 复用单元 = IP：给定候选 IP 集合，池里任一命中都可复用，:authority 保持目标 host。
@@ -189,6 +235,9 @@ async fn pool_no_samples_takes_first_candidate() {
 /// 全局"正在拨"登记按 IP 粒度：抢占期间别人看得到，同一 IP 只能有一个拨号者，释放后立刻可拨。
 #[test]
 fn inflight_registry_claim_blocks_and_release_frees() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let ip = "198.51.100.7";
     pool::inflight::clear();
     assert!(!pool::inflight::busy(ip));
@@ -484,6 +533,9 @@ async fn probe_baseline_actions() {
 /// 拨号权抢占必须是原子的：释放后能重新抢到（前半段见 inflight_registry_claim_blocks_and_release_frees）。
 #[test]
 fn inflight_try_claim_is_exclusive() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let ip = "198.51.100.21";
     pool::inflight::clear();
     let first = pool::inflight::try_claim(ip).expect("第一枪应成功");

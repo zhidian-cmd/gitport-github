@@ -820,7 +820,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     .unwrap();
     serial_load(&dir, Vec::new(), None);
 
-    let (conn, ip, _) = serial_dial_skip(
+    let (conn, ip, _, claim) = serial_dial_skip(
         DialSkip {
             host: "github.com",
             tls_handshake: false,
@@ -833,6 +833,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     .await
     .expect("第二个候选能拨通");
     drop(conn);
+    drop(claim); // 通道建好，交棒，别让本测试的凭据挡住下一轮拨号
     assert_eq!(ip, "127.0.0.2", "被拒的候选应垫底, 活着的那条胜出");
     {
         let g = SERIAL.lock().unwrap();
@@ -846,7 +847,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     }
 
     // 第二次：从驻留记号起步，直接拿 127.0.0.2（不再先撞被拒的那条）。
-    let (conn, ip, _) = serial_dial_skip(
+    let (conn, ip, _, claim) = serial_dial_skip(
         DialSkip {
             host: "github.com",
             tls_handshake: false,
@@ -859,6 +860,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     .await
     .expect("驻留后应直接命中");
     drop(conn);
+    drop(claim);
     assert_eq!(ip, "127.0.0.2");
     dial::set_dial_port(0); // 复位，别影响别的测试
 }
@@ -894,6 +896,7 @@ fn dial_order_cursor_first_then_latency_asc() {
         ip: ip.into(),
         sni: String::new(),
         verify: String::new(),
+        shared: false,
     };
     let circle = vec![mk("1.1.1.1"), mk("2.2.2.2"), mk("3.3.3.3"), mk("4.4.4.4")];
     latency::install(HashMap::new());
@@ -947,4 +950,168 @@ fn codeload_route_isolated_to_verified_ips() {
             targets.iter().map(|t| &t.ip).collect::<Vec<_>>()
         );
     }
+}
+
+/// 共享标记装表时算好：挂两个键算共享，只挂一个通配键也算（一个键背后几十个 host）。
+#[test]
+fn shared_ip_marks_come_from_topology() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    let rows: Vec<route::RouteRow> = [
+        r#"{"key":"github.com"}"#,
+        r#"{"key":"api.github.com"}"#,
+        r#"{"key":"*.githubusercontent.com","content":true}"#,
+    ]
+    .iter()
+    .map(|j| route::RouteRow::new(serde_json::from_str(j).unwrap()).unwrap())
+    .collect();
+    let nodes: Vec<route::IpNode> = [
+        r#"{"ip":"1.2.3.4","hosts":["github.com"]}"#,
+        r#"{"ip":"5.6.7.8","hosts":["github.com","api.github.com"]}"#,
+        r#"{"ip":"9.9.9.9","hosts":["*.githubusercontent.com"]}"#,
+    ]
+    .iter()
+    .map(|j| {
+        let spec: route::IpSpec = serde_json::from_str(j).unwrap();
+        build_node(spec).unwrap()
+    })
+    .collect();
+    route::install(rows, nodes);
+
+    let gh = route::dial_targets("github.com").unwrap();
+    let shared = |ip: &str| gh.iter().find(|t| t.ip == ip).unwrap().shared;
+    assert!(!shared("1.2.3.4"), "单个精确域名 = 独占，不必问仲裁器");
+    assert!(shared("5.6.7.8"), "两个键 = 共享");
+    let avatars = route::dial_targets("avatars.githubusercontent.com").unwrap();
+    assert!(
+        avatars.iter().all(|t| t.shared),
+        "只挂一个通配键也必须算共享，否则多个 host 撞上没人拦"
+    );
+}
+
+/// 优先级与同批裁决：主站 > api > 一般内容 > avatars；同档先到先得。
+#[test]
+fn arbitration_priority_and_batch_winner() {
+    assert!(inflight::priority("github.com") > inflight::priority("api.github.com"));
+    assert!(
+        inflight::priority("api.github.com")
+            > inflight::priority("raw.githubusercontent.com")
+    );
+    assert!(
+        inflight::priority("raw.githubusercontent.com")
+            > inflight::priority("avatars.githubusercontent.com")
+    );
+    assert_eq!(inflight::pick_winner(&[0, 3, 2]), 1, "主站压过后来者");
+    assert_eq!(inflight::pick_winner(&[1, 1, 1]), 0, "同档按入批先后");
+    assert_eq!(inflight::pick_winner(&[2, 0]), 0);
+    assert_eq!(inflight::pick_winner(&[]), 0);
+}
+
+/// 有先后就先到先得：晚一个节拍的申请哪怕更重要也不能反超；通道建好立刻交棒。
+#[tokio::test]
+async fn arbiter_first_come_wins_and_hands_off() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    inflight::clear();
+    let ip = "198.51.100.91";
+    let guard = match inflight::apply(ip, "avatars.githubusercontent.com").await {
+        inflight::Verdict::Granted(g) => g,
+        _ => panic!("首个申请应获批"),
+    };
+    assert!(inflight::busy(ip));
+    match inflight::apply(ip, "github.com").await {
+        inflight::Verdict::Rejected { winner } => {
+            assert_eq!(winner, "avatars.githubusercontent.com", "先到者不被反超")
+        }
+        _ => panic!("晚到的主站也必须当场驳回，不参与排序"),
+    }
+    drop(guard); // 通道建好，交棒给全局通道表
+    assert!(!inflight::busy(ip), "交棒后机器人立刻不再管这个 IP");
+    assert!(matches!(
+        inflight::apply(ip, "api.github.com").await,
+        inflight::Verdict::Granted(_)
+    ));
+}
+
+/// 同一瞬间分不出先后的申请算一批：只认已经入批的，不等后来者，按优先级挑赢家。
+#[tokio::test]
+async fn arbiter_same_batch_prefers_main_site() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    inflight::clear();
+    let ip = "198.51.100.92";
+    // join! 先 poll avatars（入批后让出一次），再 poll 主站（也入批），两者落在同一批。
+    let (a, b) = tokio::join!(
+        inflight::apply(ip, "avatars.githubusercontent.com"),
+        inflight::apply(ip, "github.com")
+    );
+    assert!(
+        matches!(a, inflight::Verdict::Rejected { .. }),
+        "同批里 avatars 该让位给主站"
+    );
+    let guard = match b {
+        inflight::Verdict::Granted(g) => g,
+        _ => panic!("同批里主站该赢"),
+    };
+    assert!(inflight::busy(ip), "赢家握着使用权");
+    drop(guard);
+    assert!(!inflight::busy(ip));
+}
+
+/// 申请刚入批就被取消：不能把这个 IP 卡在"有人在拨"，后来者要能正常拿到使用权。
+#[tokio::test]
+async fn cancelled_applicant_does_not_lock_ip() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    inflight::clear();
+    let ip = "198.51.100.93";
+    {
+        let mut fut = Box::pin(inflight::apply(ip, "github.com"));
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+    } // future 被丢掉，回执通道关闭，申请还留在待裁决队列里
+    assert!(!inflight::busy(ip), "被取消的申请不算占着这个 IP");
+    let guard = match inflight::apply(ip, "api.github.com").await {
+        inflight::Verdict::Granted(g) => g,
+        _ => panic!("僵尸申请不能挡住后来者"),
+    };
+    assert!(inflight::busy(ip));
+    drop(guard);
+    assert!(!inflight::busy(ip));
+}
+
+/// 通道建好入库后登记"已有通道"：谁再来申请这个 IP 的拨号权都驳回，
+/// 直到最后一条连接被摘除。这是同 IP 绝不并存两条的最后一道闸。
+#[tokio::test]
+async fn arbiter_refuses_ip_that_already_has_a_channel() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    inflight::clear();
+    let ip = "198.51.100.94";
+    // 先模拟一次完整的"申请 → 建好 → 交棒 → 入库登记"。
+    assert!(matches!(
+        inflight::apply(ip, "github.com").await,
+        inflight::Verdict::Granted(_)
+    ));
+    inflight::mark_live(ip);
+    assert!(inflight::live(ip));
+
+    assert!(
+        matches!(
+            inflight::apply(ip, "api.github.com").await,
+            inflight::Verdict::Rejected { .. }
+        ),
+        "已有通道就不该再拨第二次"
+    );
+    assert!(
+        inflight::try_claim(ip).is_none(),
+        "独占 IP 的轻量登记也不能放行"
+    );
+    assert!(!inflight::busy(ip), "登记已有通道不算'正在拨', 别让上层白等");
+
+    inflight::unmark_live(ip);
+    assert!(matches!(
+        inflight::apply(ip, "raw.githubusercontent.com").await,
+        inflight::Verdict::Granted(_)
+    ));
+    inflight::clear();
 }

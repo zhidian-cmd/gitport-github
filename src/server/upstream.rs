@@ -28,7 +28,7 @@ pub struct H2Upstream {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 一条连接 + 最近响应耗时（EWMA）：同 IP 两条连接可能一快一慢，轮转会把请求喂给慢的。
+/// 一条连接 + 最近响应耗时（EWMA）：跨 IP 的两条通道可能一快一慢，轮转会把请求喂给慢的。
 struct ConnSlot {
     up: H2Upstream,
     ewma: f64,
@@ -44,8 +44,11 @@ struct IpConns {
 
 static EXPLORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 每 IP 最多两条自管 h2 连接：一条承载全部并发但受服务端流上限，两条实测能把 p50 腰斩。
-const MAX_CONNS_PER_IP: usize = 2;
+/// 同一个 IP 永远只允许一条 h2 连接。要开第二条通道只能落在另一个 IP 上。
+/// 这是硬约束：无论多少个 host 同时拨到同一个 IP，入库时只留第一条，其余当场丢弃。
+const MAX_CONNS_PER_IP: usize = 1;
+/// 通道总数上限（跨不同 IP）：冷启动竞速两条，实测能把 p50 腰斩。
+const MAX_CHANNELS: usize = 2;
 
 /// 带会话（cookie/auth）的域：只留单通道单 IP。同一会话并发出现在两个 IP 上，
 /// 正是 GitHub 风控最容易抓的特征；内容域（图片/静态资源）才吃双通道加速。
@@ -206,19 +209,26 @@ pub fn note_latency(ip: &str, id: u64, ms: u64) {
     c.n = c.n.saturating_add(1);
 }
 
-pub fn store_h2(ip: &str, up: H2Upstream) {
+/// 新连接入库的唯一入口：同一把锁里保证每个 IP 只有一条通道。
+/// 该 IP 已有连接时，新拨的这条当场作废（句柄 drop 即关掉那条 TCP），返回池里现成的那条。
+/// 调用方必须改用返回的连接发请求——继续用自己手里那条，就等于绕过约束并存两条。
+pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
     let mut g = lock(conn_pool());
     let h = g.entry(ip.to_string()).or_default();
     h.filling = false;
-    // 同 IP 也允许并存：服务端并发上限是按连接算的，两条同 IP 的 TCP 同样能摊开。
     if h.conns.len() >= MAX_CONNS_PER_IP {
-        h.conns.remove(0); // 只留最新的两条，避免旧连接占位
+        return h.conns[0].up.clone();
     }
+    let keep = up.clone();
     h.conns.push(ConnSlot {
         up,
         ewma: 0.0,
         n: 0,
     });
+    drop(g);
+    // 登记"这个 IP 已有通道"：拨号循环据此不再拨第二次，不占用任何使用权，复用照旧。
+    pool::inflight::mark_live(ip);
+    keep
 }
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
@@ -235,6 +245,9 @@ pub fn drop_h2_id(ip: &str, id: u64) {
     };
     if empty {
         g.remove(ip);
+        drop(g);
+        // 最后一条连接没了：撤销登记，这个 IP 才允许重新拨号。
+        pool::inflight::unmark_live(ip);
     }
 }
 
@@ -253,7 +266,10 @@ pub fn drop_h2(ip: &str) {
 fn occupied_ips(ips: &[String]) -> Vec<String> {
     let g = lock(conn_pool());
     ips.iter()
-        .filter(|ip| g.contains_key(ip.as_str()))
+        .filter(|ip| {
+            g.get(ip.as_str())
+                .is_some_and(|h| !h.conns.is_empty() || h.filling)
+        })
         .cloned()
         .collect()
 }
@@ -273,22 +289,20 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     {
         let mut g = lock(conn_pool());
-        // 任一候选 IP 已有两条或正在补 → 不动；全部单条/空 → 需要补。
-        let full = ips.iter().any(|ip| {
-            g.get(ip)
-                .is_some_and(|h| h.conns.len() >= MAX_CONNS_PER_IP || h.filling)
-        });
-        let has_two = ips
+        // 通道数按"跨 IP 的连接条数"算：每 IP 至多一条，够两条就不再补。
+        // total == 0 说明首条还没建好，这里不该抢跑（冷启动由竞速自己发两条）。
+        let total: usize = ips
             .iter()
             .filter_map(|ip| g.get(ip))
             .map(|h| h.conns.len())
-            .sum::<usize>()
-            >= MAX_CONNS_PER_IP;
-        if full || has_two {
+            .sum();
+        let filling = ips
+            .iter()
+            .any(|ip| g.get(ip).is_some_and(|h| h.filling));
+        if total == 0 || total >= MAX_CHANNELS || filling {
             return;
         }
-        // 没有第二个"未占用"的候选 IP 就不补：同一 IP 再开一条只是多一次握手，
-        // 慢 IP 上还会把两份超时叠起来（原本单通道等 3s，凑两条等 6s）。
+        // 没有第二个"未占用"的候选 IP 就不补：同一个 IP 再开一条会并存两条通道。
         if !ips.iter().any(|ip| !g.contains_key(ip.as_str())) {
             return;
         }
@@ -327,20 +341,19 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     let host = host.to_string();
     let log = log.clone();
     tokio::spawn(async move {
-        match h2_dial_slot(&host, &log, &skip, 2, None).await {
-            Ok(up) => {
-                let ip = up.ip.clone();
-                store_h2(&ip, up)
-            }
-            Err(e) => {
-                (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
-                let mut g = lock(conn_pool());
-                for ip in &ips {
-                    if let Some(h) = g.get_mut(ip) {
-                        h.filling = false;
-                    }
+        // 新通道已在 h2_dial_slot 内部入库（同一个 IP 只会留一条），这里不再二次入库。
+        let r = h2_dial_slot(&host, &log, &skip, 2, None).await;
+        // 无论成败都把这一组候选的"正在补"标记清干净，残留会卡死以后的补建。
+        {
+            let mut g = lock(conn_pool());
+            for ip in &ips {
+                if let Some(h) = g.get_mut(ip) {
+                    h.filling = false;
                 }
             }
+        }
+        if let Err(e) = r {
+            (log)(&format!("[上游] {host} 第二条连接失败({e}), 保持单连接"));
         }
     });
 }
@@ -401,7 +414,7 @@ async fn h2_dial_slot(
     slot: u8,
     crew: Option<&pool::DialCrew>,
 ) -> Result<H2Upstream, String> {
-    let (conn_io, ip, sni) = pool::serial_dial_skip(
+    let (conn_io, ip, sni, claim) = pool::serial_dial_skip(
         pool::DialSkip {
             host,
             tls_handshake: true,
@@ -418,7 +431,13 @@ async fn h2_dial_slot(
     } else {
         "伪装"
     };
-    h2_from_dialed(host, conn_io, &ip, form, slot, log).await
+    // 凭据要一直握到"通道真正入库"：TCP+TLS+h2 通了还不算完，中途松手会放进第二条。
+    let up = h2_from_dialed(host, conn_io, &ip, form, slot, log).await?;
+    // 顺序不能反：先让池里出现这 IP 唯一的一条连接（并登记已有通道），再放开拨号权。
+    // 若期间别人已经建好同一个 IP，这里丢弃刚拨的、返回池里那条现成的。
+    let up = store_h2(&ip, up);
+    drop(claim);
+    Ok(up)
 }
 
 /// 单通道的原因：会话域是规则（候选再多也不开第二条），候选不足是没得选。
@@ -459,8 +478,8 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
         let crew = crew.clone();
         tokio::spawn(async move {
             match h2_dial_slot(&host, &log, &[], slot, Some(&crew)).await {
+                // 连接已在拨号函数内入库，这里只把最终该用的那条交上去。
                 Ok(up) => {
-                    store_h2(&up.ip, up.clone());
                     let _ = tx.send(Ok(up)).await;
                 }
                 Err(e) => {
@@ -515,11 +534,12 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
     // 不在这里整组等待——整组等会挡住本来不冲突的域名。
     if occupied_ips(&ips).is_empty() {
         let up = dial_h2_race(host, log).await?;
-        return Ok((up, false)); // 竞速任务内部已入库
+        return Ok((up, false)); // 竞速自带第二条，不用再补
     }
     let skip = occupied_ips(&ips);
     let up = h2_dial_slot(host, log, &skip, 1, None).await?;
-    Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
+    // 连接拨完即入库；返回的布尔只表示"单发路径"，成功后可以补第二条通道。
+    Ok((up, true))
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
