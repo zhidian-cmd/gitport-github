@@ -475,3 +475,21 @@ async fn probe_baseline_actions() {
         }
     }
 }
+
+/// 拨号权抢占必须是原子的：两个 host 同时进来只有一个能领到，另一个等。
+#[test]
+fn inflight_try_claim_is_exclusive() {
+    let ips = vec!["198.51.100.21".to_string()];
+    let first = DialingGuard::try_claim(&ips).expect("第一枪应成功");
+    assert!(
+        DialingGuard::try_claim(&ips).is_none(),
+        "同一组 IP 第二个必须抢不到（旧实现会覆盖并双拨）"
+    );
+    assert!(inflight_busy(&ips));
+    drop(first);
+    assert!(!inflight_busy(&ips), "释放后登记应清除");
+    assert!(
+        DialingGuard::try_claim(&ips).is_some(),
+        "释放后应能重新抢到"
+    );
+}

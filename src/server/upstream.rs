@@ -482,6 +482,21 @@ struct DialingGuard {
 }
 
 impl DialingGuard {
+    /// 原子抢占：任一 IP 已被别人认领就返回 None——查与领在同一把锁里，
+    /// 两个 host 同一毫秒进来也只有一个能拿到拨号权。绝不覆盖别人的登记。
+    fn try_claim(ips: &[String]) -> Option<Self> {
+        let now = std::time::Instant::now();
+        let mut g = lock(inflight_map());
+        if ips.iter().any(|ip| g.contains_key(ip)) {
+            return None;
+        }
+        for ip in ips {
+            g.insert(ip.clone(), now);
+        }
+        Some(Self { ips: ips.to_vec() })
+    }
+
+    /// 兜底认领：等过一轮仍抢不到（对端可能超时没清）时用，覆盖式，避免死等。
     fn claim(ips: &[String]) -> Self {
         let now = std::time::Instant::now();
         let mut g = lock(inflight_map());
@@ -533,19 +548,25 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 支路：别的 host 正在拨同组 IP，先等它出结果——成了直接复用，不重复拨。
-    if wait_inflight(&ips).await {
-        if let Some(up) = cached_h2_in(&ips, None) {
-            return Ok((up, false)); // 池中已有（对方入的库），无需再存
+    // 先抢拨号权（原子）：抢到才拨；抢不到说明别的 host 正在拨同组 IP，
+    // 等它出结果直接复用——同一会话别被拆到多条连接上。
+    let claim = match DialingGuard::try_claim(&ips) {
+        Some(c) => c,
+        None => {
+            wait_inflight(&ips).await;
+            if let Some(up) = cached_h2_in(&ips, None) {
+                return Ok((up, false)); // 池中已有（对方入的库），无需再存
+            }
+            // 等完还空（对方失败或超时未清）：自己拨，仍要登记，免得第三家也来。
+            DialingGuard::try_claim(&ips).unwrap_or_else(|| DialingGuard::claim(&ips))
         }
-    }
+    };
+    let _claim = claim;
     if occupied_ips(&ips).is_empty() {
-        let _claim = DialingGuard::claim(&ips);
         let up = dial_h2_race(host, log).await?;
         return Ok((up, false)); // 竞速任务内部已入库
     }
     let skip = occupied_ips(&ips);
-    let _claim = DialingGuard::claim(&ips);
     let up = h2_dial_slot(host, log, &skip, 1, None).await?;
     Ok((up, true)) // 尚不在池中,发送成功后由调用方入库
 }
