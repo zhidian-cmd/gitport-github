@@ -450,34 +450,75 @@ fn single_channel_reason(session: bool, distinct: usize) -> String {
     }
 }
 
-/// 双通道冷启动并行竞速：各领各的游标、跳过对方正在试的 IP，先成者服务、晚成者入库。
-async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+/// 这一轮发哪几条腿：主通道只管开新坑，副通道多一步「先看有没有现成的可捡」。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LegPlan {
+    /// 主通道：还有没被已有通道占用的 IP 就发，串发新建。
+    pub primary: bool,
+    /// 副通道拨号：没有现成通道可捡、且还剩两个以上空 IP 才发。
+    pub vice_dial: bool,
+    /// 副通道复用：本 host 候选里已有现成通道，直接拿来用，不拨号。
+    pub vice_reuse: bool,
+}
+
+/// 纯计算，把「主副分工」钉死：
+/// - 会话域不设副通道（同会话跨 IP 是风控特征）；
+/// - 有空 IP 才发主通道；
+/// - 副通道优先复用；没有现成的、且空 IP 够两家，才再发一条去拨。
+pub(crate) fn plan_legs(session: bool, free: usize, reusable: bool) -> LegPlan {
+    LegPlan {
+        primary: free > 0,
+        vice_dial: !session && !reusable && free >= 2,
+        vice_reuse: !session && reusable,
+    }
+}
+
+/// 双通道建连：主通道串发开新 IP，副通道起跑前先查「本 host 候选 ∩ 已有通道」，
+/// 有现成的直接复用（请求不用等握手），没有才跟主通道一样串发。
+/// 两条腿共享 crew：同一个 IP 只由一条腿试，绝不重复。
+async fn dial_h2_race(
+    host: &str,
+    log: &LogFn,
+    occupied: &[String],
+) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
-    // 会话域只发一条（同会话不跨 IP）；内容域要有第二个不同 IP 才发两条。
-    // 候选只剩一家时凑双通道 = 同一 IP 握手两次、超时也等两份，比单通道更慢。
-    // 两种「只发一条」原因不同，日志分开写：会话域是规则（候选再多也不开第二条），
-    // 候选不足是没得选。混成一行会出现「26 家候选却单通道」这种看不懂的日志。
-    let distinct = pool::route::dial_targets(host).map_or(0, |t| t.len());
-    // 会话域优先：即使候选也只有 1 家，原因仍按规则算，不误报成「候选不足」。
+    let targets = pool::route::dial_targets(host).unwrap_or_default();
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    let distinct = ips.len();
+    // 已有通道占掉的 IP 不再拨：主副两条腿都跳过，这是「更严格的主副通道」的底线。
+    let free = distinct.saturating_sub(occupied.len());
+    // 会话域优先：即使只剩一家，原因仍按规则算，不误报成「候选不足」。
     let session = session_host(host);
-    let slots: &[u8] = if session || distinct < 2 {
-        (log)(&format!(
-            "[建连] {host} 单通道({})",
-            single_channel_reason(session, distinct)
-        ));
-        &[1]
-    } else {
-        (log)(&format!("[建连] {host} 冷启动竞速发射"));
-        &[1, 2]
-    };
-    for &slot in slots {
+    // 副通道的「先查表」：只在这个 host 自己的候选里找现成通道；
+    // 别的 host 能用、但不在本 host 候选里的，不算数。
+    let reusable = if session { None } else { cached_h2_in(&ips, None) };
+    let legs = plan_legs(session, free, reusable.is_some());
+
+    let mut launched = 0usize;
+    if legs.vice_reuse {
+        if let Some(up) = reusable {
+            // 先把现成的交上去：调用方立刻能发请求，主通道在后台慢慢拨。
+            let _ = tx.send(Ok(up)).await;
+            (log)(&format!(
+                "[建连] {host} 副通道复用现成通道{}",
+                if legs.primary {
+                    ", 主通道另起一条"
+                } else {
+                    ""
+                }
+            ));
+            launched += 1;
+        }
+    }
+    if legs.primary {
         let tx = tx.clone();
         let host = host.to_string();
         let log = log.clone();
         let crew = crew.clone();
+        let skip: Vec<String> = occupied.to_vec();
         tokio::spawn(async move {
-            match h2_dial_slot(&host, &log, &[], slot, Some(&crew)).await {
+            match h2_dial_slot(&host, &log, &skip, 1, Some(&crew)).await {
                 // 连接已在拨号函数内入库，这里只把最终该用的那条交上去。
                 Ok(up) => {
                     let _ = tx.send(Ok(up)).await;
@@ -487,8 +528,40 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
                 }
             }
         });
+        launched += 1;
+    }
+    if legs.vice_dial {
+        let tx = tx.clone();
+        let host = host.to_string();
+        let log = log.clone();
+        let crew = crew.clone();
+        let skip: Vec<String> = occupied.to_vec();
+        tokio::spawn(async move {
+            match h2_dial_slot(&host, &log, &skip, 2, Some(&crew)).await {
+                Ok(up) => {
+                    let _ = tx.send(Ok(up)).await;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        });
+        launched += 1;
+    }
+    if launched == 0 {
+        // 候选全被已有通道占住、又没捡到现成的：只有池子刚被摘空的瞬间会这样。
+        return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
     drop(tx);
+    // 两条腿都拨才叫竞速；只发主通道时说清为什么单通道（会话域 / 空 IP 不够）。
+    if legs.primary && legs.vice_dial {
+        (log)(&format!("[建连] {host} 主副通道串发发射"));
+    } else if legs.primary && !legs.vice_reuse {
+        (log)(&format!(
+            "[建连] {host} 单通道({})",
+            single_channel_reason(session, if session { distinct } else { free })
+        ));
+    }
     // 等第一个成功;两个全败则整组失败
     let mut last: Option<String> = None;
     let won = loop {
@@ -518,7 +591,8 @@ async fn dial_h2_race(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     Ok(won)
 }
 
-/// 建连统一入口：候选全空走竞速（两个两个建），其余单发（单发也跳过池中占用的 IP）。
+/// 建连统一入口：主通道串发开新 IP，副通道先查交集、能复用就复用。
+/// 两条腿都跳过本 host 候选里已有通道的 IP，所以永远落在不同 IP 上。
 /// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool), String> {
     if pool::dial_cool_open(host) {
@@ -530,16 +604,12 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<(H2Upstream, bool)
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 拨号权按 IP 粒度逐家抢（pool::inflight）：别的 host 正在拨的那家自动跳过、试下一家，
-    // 不在这里整组等待——整组等会挡住本来不冲突的域名。
-    if occupied_ips(&ips).is_empty() {
-        let up = dial_h2_race(host, log).await?;
-        return Ok((up, false)); // 竞速自带第二条，不用再补
-    }
-    let skip = occupied_ips(&ips);
-    let up = h2_dial_slot(host, log, &skip, 1, None).await?;
-    // 连接拨完即入库；返回的布尔只表示"单发路径"，成功后可以补第二条通道。
-    Ok((up, true))
+    // 本 host 候选里已经被通道占掉的 IP：主副两条腿都跳过，绝不为这个 host 再拨一条。
+    // 拨号权仍按 IP 粒度逐家抢（pool::inflight），别的 host 正在拨的那家自动绕开。
+    let occupied = occupied_ips(&ips);
+    let up = dial_h2_race(host, log, &occupied).await?;
+    // 两腿都在这一轮处理完了（副腿可能直接复用了现成通道），调用方不必再补第二条。
+    Ok((up, false))
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;

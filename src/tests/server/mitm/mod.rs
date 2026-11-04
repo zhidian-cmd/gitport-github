@@ -42,6 +42,14 @@ use super::*;
 #[test]
 fn release_asset_path_gate() {
     use pool::route::{master_route, Route};
+    // 断言依赖种子表的 hosts 声明；别的测试会换全局表，先锁住并装回种子再判。
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_release_gate_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
     let mirror = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Mirror);
     let pool = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Pool);
     let not_mirror =

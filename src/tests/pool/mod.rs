@@ -8,6 +8,9 @@ static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 fn tmpdir() -> PathBuf {
     let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("gitport_test_{}_{n}", std::process::id()));
+    // 进程号会被系统复用：上一轮同 pid 的残留目录里可能留着 routes.json / plans.json，
+    // 不清掉会让"全新安装"的测试读到旧表，间歇性失败（本地实测踩到过）。
+    let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }

@@ -133,3 +133,62 @@ fn single_channel_reason_separates_rule_from_shortage() {
     assert!(single_channel_reason(true, 1).contains("会话域"));
     assert_ne!(rule, short, "两种原因不能印成同一句话");
 }
+
+/// 主副分工：主通道只开新坑，副通道先看有没有现成的可捡。
+#[test]
+fn leg_plan_primary_opens_new_vice_reuses_existing() {
+    // 会话域：只有主通道，绝不跨 IP。
+    assert_eq!(
+        plan_legs(true, 5, true),
+        LegPlan {
+            primary: true,
+            vice_dial: false,
+            vice_reuse: false,
+        }
+    );
+    // 池空、空 IP 够两家：主副都去拨。
+    assert_eq!(
+        plan_legs(false, 2, false),
+        LegPlan {
+            primary: true,
+            vice_dial: true,
+            vice_reuse: false,
+        }
+    );
+    // 池里已有现成通道：副通道直接复用，只剩主通道去开新 IP。
+    assert_eq!(
+        plan_legs(false, 1, true),
+        LegPlan {
+            primary: true,
+            vice_dial: false,
+            vice_reuse: true,
+        }
+    );
+    // 只剩一个空 IP、又没现成的：老实单通道，不硬凑。
+    assert_eq!(
+        plan_legs(false, 1, false),
+        LegPlan {
+            primary: true,
+            vice_dial: false,
+            vice_reuse: false,
+        }
+    );
+    // 全被已有通道占住：只剩复用这一条路。
+    assert_eq!(
+        plan_legs(false, 0, true),
+        LegPlan {
+            primary: false,
+            vice_dial: false,
+            vice_reuse: true,
+        }
+    );
+    // 全被占住又没有现成的：一条腿都发不出来，交给上层重查连接池。
+    assert_eq!(
+        plan_legs(false, 0, false),
+        LegPlan {
+            primary: false,
+            vice_dial: false,
+            vice_reuse: false,
+        }
+    );
+}
