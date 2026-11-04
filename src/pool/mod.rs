@@ -1148,8 +1148,23 @@ pub async fn serial_dial_skip(
         ));
     }
     if tried == 0 {
+        if inflight_skipped > 0 {
+            // 候选全在别人手里：不是 IP 坏，是暂时被占。等一小会儿再让上层重查连接池——
+            // 对方建好就能直接复用；直接报错会把好 IP 误判成不可用，还会白走兜底。
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                if !circle.iter().any(|p| inflight::busy(&p.ip)) {
+                    break; // 已经有人拨完，池里大概率有现成的
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            return Err(format!(
+                "候选全在拨号中({} 个), 已等待, 请重查连接池([{key}], {host})",
+                inflight_skipped
+            ));
+        }
         return Err(format!(
-            "全部 {} 个候选不可用([{key}], {host}): 死亡冷却 {dead_skipped} 个, 他人正在拨 {inflight_skipped} 个",
+            "全部 {} 个候选处于死亡冷却([{key}], {host})",
             circle.len()
         ));
     }
