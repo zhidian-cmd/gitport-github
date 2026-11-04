@@ -28,6 +28,7 @@ fn main() {
 }
 
 fn run() {
+    let t0 = std::time::Instant::now();
     if desktop::already_running() {
         if !desktop::signal_show(config::webui_port()) {
             desktop::notify_already_running();
@@ -45,6 +46,7 @@ fn run() {
     logger::set_crash_path(&cache_dir);
     settings::init_exe_dir(&exe_dir);
     settings::load();
+    let t_settings = t0.elapsed();
 
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "-headless");
@@ -64,7 +66,9 @@ fn run() {
         Arc::new(move |msg: &str| l.log(msg))
     };
     pool::serial_load(&exe_dir, settings::last_ips(), Some(log_fn.clone()));
+    let t_routes = t0.elapsed();
     let ca = certgen::load_or_generate(&exe_dir, Some(&log_fn)).ok();
+    let t_ca = t0.elapsed();
     if ca.is_none() {
         log_fn("CA 初始化失败, MITM 不可用");
     }
@@ -91,6 +95,16 @@ fn run() {
             log_fn(&format!("[启动] 系统代理: 未接管 —— {e}"));
         }
     }
+    let t_proxy = t0.elapsed();
+    // 开机慢的取证：一看就知道卡在路由表、证书还是系统代理接管。
+    log_fn(&format!(
+        "[启动] 核心 {}ms（配置 {} / 路由表 {} / CA {} / 代理 {}）",
+        t_proxy.as_millis(),
+        t_settings.as_millis(),
+        t_routes.saturating_sub(t_settings).as_millis(),
+        t_ca.saturating_sub(t_routes).as_millis(),
+        t_proxy.saturating_sub(t_ca).as_millis(),
+    ));
     let me = settings::exe_name();
     match settings::autostart_state() {
         // 登记的是本 exe（或本来就没登记）是常态，不出声；指向别处才是真问题。

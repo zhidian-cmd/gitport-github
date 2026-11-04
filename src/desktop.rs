@@ -58,6 +58,8 @@ const WIN_DY: f64 = 60.0;
 
 const TRAY_CLASS: windows::core::PCWSTR = windows::core::w!("GitPortTrayWnd");
 const TRAY_UID: u32 = 1;
+/// 托盘注册失败后的重试定时器（开机自启时 Explorer 未必就绪）。
+const TRAY_RETRY_TIMER: usize = 1;
 const WM_TRAY_NOTIFY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
 const ID_TRAY_SHOW: usize = 1;
 const ID_TRAY_QUIT: usize = 2;
@@ -192,8 +194,24 @@ unsafe extern "system" fn tray_proc(
     lp: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::LRESULT;
-    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_LBUTTONUP, WM_RBUTTONUP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, KillTimer, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+    };
     unsafe {
+        // 开机自启时 Explorer 往往还没就绪，第一次 NIM_ADD 会失败；定时器每 2s 重挂直到成功。
+        if msg == WM_TIMER && wp.0 == TRAY_RETRY_TIMER {
+            let (ok, err) = tray_add(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::HICON(
+                    TRAY_ICON.load(Ordering::Relaxed) as *mut _,
+                ),
+            );
+            tray_log(&format!("[托盘] 注册重试: {ok} err={err}"));
+            if ok {
+                let _ = KillTimer(Some(hwnd), TRAY_RETRY_TIMER);
+            }
+            return LRESULT(0);
+        }
         if msg == WM_TRAY_NOTIFY {
             match lp.0 as u32 {
                 WM_LBUTTONUP => tray_send(AppEvent::ShowWindow),
@@ -231,8 +249,9 @@ fn spawn_tray(
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
                 CreateWindowExW, DispatchMessageW, GetMessageW, LoadImageW, RegisterClassW,
-                RegisterWindowMessageW, TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON,
-                LR_DEFAULTCOLOR, LR_SHARED, MSG, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+                RegisterWindowMessageW, SetTimer, TranslateMessage, HICON, IDI_APPLICATION,
+                IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MSG, WNDCLASSW, WS_EX_TOOLWINDOW,
+                WS_OVERLAPPED,
             };
             let note = |s: String| {
                 thread_log(&s);
@@ -314,20 +333,18 @@ fn spawn_tray(
                 // 注册成功不出声（图标本来就在托盘里）；失败才把错误码和完整性一起抛出来。
                 if !ok {
                     note(format!(
-                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {}",
+                        "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), {}, 后台重试中",
                         current_il(),
                         tray_rect(hwnd)
                     ));
+                    // 开机时 shell 未就绪是常态：交给消息循环里的定时器每 2s 重挂，
+                    // 不再 sleep 干等，也不依赖 Explorer 恰好广播 TaskbarCreated。
+                    SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None);
                 }
                 TASKBAR_CREATED.store(
                     RegisterWindowMessageW(windows::core::w!("TaskbarCreated")),
                     Ordering::Relaxed,
                 );
-                if !ok {
-                    // 刚发的瞬间查不到是正常的，等 shell 收下再复问一次。
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    note(format!("[启动] 托盘: 1.5s 后 {}", tray_rect(hwnd)));
-                }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                     let _ = TranslateMessage(&msg);
@@ -612,16 +629,20 @@ pub fn run(args: DesktopArgs) -> ! {
     };
 
     let mut created_once = false;
-    // 上次退出未及清理的 WebView2 数据目录，启动即删（此刻无锁，单实例已保证）。
-    let _ = std::fs::remove_dir_all("gitport-github.exe.WebView2");
+    // 上次退出（关机/注销不走退出清理）留下的 WebView2 数据目录：后台删。
+    // 开机时磁盘忙、几千个小文件能删几十秒，绝不能挡在托盘前面；建窗口前会 join 等它。
+    *UDF_CLEANUP.lock().unwrap() = Some(std::thread::spawn(remove_webview_udf));
     // 托盘先挂、拿到回执再往下走：WebView2 起来后 Shell_NotifyIcon 会被系统拒（err=5），必须先托盘后窗口且等它真的注册上。
+    let t_desktop = std::time::Instant::now();
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
     // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。
-    if tray_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
-        (log)("[启动] 托盘: 回执超时");
+    match tray_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok((ok, _)) => (log)(&format!(
+            "[启动] 托盘{} +{}ms",
+            if ok { "就绪" } else { "未就绪(后台重试)" },
+            t_desktop.elapsed().as_millis()
+        )),
+        Err(_) => (log)("[启动] 托盘: 回执超时"),
     }
     event_loop.run(move |event, elwt, control_flow| {
         *control_flow = ControlFlow::Wait;
