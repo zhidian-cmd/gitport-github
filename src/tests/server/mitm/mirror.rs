@@ -657,3 +657,44 @@ async fn driver_gives_up_after_repeated_dead_fills() {
     let res = http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))).await;
     assert!(res.is_err(), "补不起来必须报错，不能假装下完");
 }
+
+/* ---------- 并发区间请求的段位分配 ---------- */
+
+/// 两个区间同时在下：8MB + 400KB，段位 9 个 → 大的吃 8 段、小的只拿 1 段。
+#[test]
+fn plan_quota_big_range_takes_slots_first() {
+    let pending = vec![(8_388_608u64, 1u64), (400_000u64, 2u64)];
+    assert_eq!(plan_quota(&pending, 1, 8_388_608, 9, 9), 8, "大区间先占位，给小区间留 1 段");
+    assert_eq!(plan_quota(&pending, 2, 400_000, 9, 9), 1, "小区间只拿 1 段");
+}
+
+/// 只有一个区间时，再小也要每个段位一段——小文件同样靠并发拿速度。
+#[test]
+fn plan_quota_single_range_uses_all_slots() {
+    assert_eq!(plan_quota(&[(400_000, 1)], 1, 400_000, 9, 9), 9);
+}
+
+/// 文件比段位还小：按字节数切，一段一字节，不能出现 0 段。
+#[test]
+fn plan_quota_tiny_range_still_splits_by_byte() {
+    assert_eq!(plan_quota(&[(3, 1)], 1, 3, 9, 9), 3);
+    assert_eq!(plan_quota(&[(1, 1)], 1, 1, 9, 9), 1);
+}
+
+/// 登记随响应体释放：大区间注销后，小区间可以重新吃满段位。
+#[test]
+fn range_plan_registry_frees_on_guard_drop() {
+    let key = "plan.test/asset";
+    let a = plan_range_segments(key, 8_388_608, 9, 9);
+    assert_eq!(a.want, 9, "单个大区间应吃满段位");
+    let b = plan_range_segments(key, 400_000, 9, 9);
+    assert_eq!(b.want, 1, "大区间在途时小区间只拿 1 段");
+    drop(b.guard);
+    let c = plan_range_segments(key, 400_000, 9, 9);
+    assert_eq!(c.want, 1, "大区间还在，小区间仍只 1 段");
+    drop(c.guard);
+    drop(a.guard);
+    let d = plan_range_segments(key, 400_000, 9, 9);
+    assert_eq!(d.want, 9, "全部注销后小区间可重新吃满段位");
+    drop(d.guard);
+}

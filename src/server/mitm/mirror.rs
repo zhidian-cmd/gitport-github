@@ -819,6 +819,110 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     }
 }
 
+/* ---------- 同 URL 并发区间请求的段位分配 ----------
+   下载器常对一个文件同时发好几个 Range 请求；每个请求各自切满所有镜像，
+   叠加起来就是把 7 家镜像同时按几十路打（日志里 4 秒内 4 次「切 N 段」）。
+   段大小改成按"这个 URL 上在途区间的总字节 ÷ 段位总数(镜像+2)"现算：
+   大区间先占段位，小区间只拿 1 段，总并发不超段位。 */
+
+/// 在途区间：请求进来登记，响应体释放时注销。
+struct RangePlan {
+    id: u64,
+    len: u64,
+    at: Instant,
+}
+
+static RANGE_PLANS: LazyLock<Mutex<HashMap<String, Vec<RangePlan>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RANGE_PLAN_SEQ: AtomicU64 = AtomicU64::new(1);
+/// 兜底：响应体没被正常丢弃时，登记最多留这么久，免得拖死后续分配。
+const RANGE_PLAN_TTL: Duration = Duration::from_secs(180);
+
+/// 注销登记：挂在响应体上，body drop 即释放。
+struct RangePlanGuard {
+    key: String,
+    id: u64,
+}
+
+impl Drop for RangePlanGuard {
+    fn drop(&mut self) {
+        let mut map = RANGE_PLANS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(list) = map.get_mut(&self.key) {
+            list.retain(|p| p.id != self.id);
+            if list.is_empty() {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+struct RangePlanOutcome {
+    want: usize,
+    pending: u64,
+    seg: u64,
+    guard: RangePlanGuard,
+}
+
+/// 段位分配（纯函数，便于测试）：段大小 = 在途总字节 ÷ 段位总数；
+/// 按区间从大到小依次占位，每个请求至少留 1 段。返回本区间该切几段。
+fn plan_quota(
+    pending: &[(u64, u64)],
+    my_id: u64,
+    my_len: u64,
+    capacity: usize,
+    slots: usize,
+) -> usize {
+    let total: u64 = pending.iter().map(|(l, _)| *l).sum();
+    let seg = total.div_ceil(capacity.max(1) as u64).max(1);
+    let mut order: Vec<(u64, u64)> = pending.to_vec();
+    order.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut remaining = slots.max(1);
+    let mut mine = 1usize;
+    for (i, (l, id)) in order.iter().enumerate() {
+        // 后面还有几个请求，各留 1 段，别让大区间把段位吃光。
+        let left = order.len() - i - 1;
+        let room = remaining.saturating_sub(left).max(1);
+        let take = ((*l).div_ceil(seg).max(1) as usize).min(room);
+        remaining = remaining.saturating_sub(take);
+        if *id == my_id {
+            mine = take;
+        }
+    }
+    mine.clamp(1, my_len.max(1) as usize)
+}
+
+/// 登记本次区间并给出段数。key 用 host+path，同一资源的不同签名查询串归到一起。
+fn plan_range_segments(
+    key: &str,
+    len: u64,
+    capacity: usize,
+    slots: usize,
+) -> RangePlanOutcome {
+    let id = RANGE_PLAN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = Instant::now();
+    let (pending, total) = {
+        let mut map = RANGE_PLANS.lock().unwrap_or_else(|p| p.into_inner());
+        let list = map.entry(key.to_string()).or_default();
+        list.retain(|p| now.saturating_duration_since(p.at) < RANGE_PLAN_TTL);
+        list.push(RangePlan { id, len, at: now });
+        let pending: Vec<(u64, u64)> = list.iter().map(|p| (p.len, p.id)).collect();
+        let total: u64 = pending.iter().map(|(l, _)| *l).sum();
+        (pending, total)
+    };
+    let want = plan_quota(&pending, id, len, capacity, slots);
+    // 日志用的每段字节：总量 ÷ 段位总数，与配额同一把尺子。
+    let seg = total.div_ceil(capacity.max(1) as u64).max(1);
+    RangePlanOutcome {
+        want,
+        pending: total / 1024,
+        seg: seg / 1024,
+        guard: RangePlanGuard {
+            key: key.to_string(),
+            id,
+        },
+    }
+}
+
 /// 切片下载：按空闲镜像数切段并发拉，按边界合成单条流；不足 2 段、探片或上游不支持 Range 则退回单流。
 async fn split_download(
     log: &LogFn,
@@ -903,8 +1007,21 @@ async fn split_download(
             }
         },
     };
-    // 段数按可用字节收缩：len 不够分时少切几段，派发表与段表保持对齐。
-    let want = ((idle.len() as u64).min(len)).max(1) as usize;
+    // 段数：非 Range 按空闲段位平均分；Range 按同 URL 在途总字节现算段大小，
+    // 大区间先占段位、小区间只拿 1 段——下载器开 N 条连接时不会每家各切满一份。
+    let (want, plan) = match range {
+        Some(_) => {
+            let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
+            // 段位总数 = 镜像数 + 直连两条通道；实际只能占空着的那几个。
+            let plan = plan_range_segments(&slice_key, len, mirrors + 2, idle.len());
+            (plan.want, Some(plan))
+        }
+        None => (
+            ((idle.len() as u64).min(len)).max(1) as usize,
+            None,
+        ),
+    };
+    let want = want.min(idle.len()).min(len as usize).max(1);
     let idle = &idle[..want];
     // 竞速切段：每家同等材料，快慢由段自己说话；慢段让位、补发走 ECT。
     let segs = merge::split_even(base, len, want);
@@ -912,9 +1029,13 @@ async fn split_download(
         return Ok(None);
     }
     (log)(&format!(
-        "[切片] {host}{path} 切 {} 段(候选 {} 家, 空闲 {want}), 并发拉取",
+        "[切片] {host}{path} 切 {} 段(候选 {} 家, 空闲 {want}{}), 并发拉取",
         segs.len(),
-        healthy.len()
+        healthy.len(),
+        match &plan {
+            Some(p) => format!(", 在途 {}KB 每段 {}KB", p.pending, p.seg),
+            None => String::new(),
+        }
     ));
     // 有镜像兜底才给直连设按跳预算；没镜像（用户没配/链全灭）时直连是唯一的路，不能掐，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
@@ -1104,6 +1225,10 @@ async fn split_download(
         log: log.clone(),
     };
     let mut mb = MergeBody::new(bodies, len);
+    // 区间登记跟着响应体走：body drop（播完/客户端断开）即注销，后续请求才算得准在途量。
+    if let Some(p) = plan {
+        mb = mb.hold(Box::new(p.guard));
+    }
     // 开场就失败的段立刻排队补发：不等交付线走到它——那块往往在末尾，干等就是几秒。
     for (a, b) in failed {
         mb.queue_fill(a, b);

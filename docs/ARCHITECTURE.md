@@ -165,7 +165,7 @@ GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能�
 
 覆盖 objects / release-assets 两族与 raw / gist / avatars / user-images / media 等图片文本域。github.com 的 `/releases/download` 路径归 release-assets 链；`/archive` 与 codeload 不进镜像，走主站池。CSS/JS 与 github.io 不过镜像（实测全 404）。
 
-- **大文件域分片竞速**（objects / release-assets，支持 Range 的域）：按字节均分给空闲候选，**直连占两个槽位**（对应主/副两条 h2 通道），镜像一家一个——切出来就是「镜像数 + 2」段；谁快谁多拿，慢段的尾巴按「接手划算才抢」的算术让给最快者（让位），停滞段收尸补发，交付线零缺口；候选全灭才失败
+- **大文件域分片竞速**（objects / release-assets，支持 Range 的域）：段位总数 = 镜像数 + 2（**直连占两个槽位**，对应主/副两条 h2 通道，镜像一家一个）。整包请求（无 Range）按空闲段位均分字节；下载器同时发多个 Range 时，把同一 URL 上在途区间的字节加总 ÷ 段位总数得到每段字节，按区间从大到小依次占位，大区间先拿、每个区间保底 1 段，避免几条连接各自切满一份把镜像挤爆。**不设最小切片尺寸**，文件再小也按段位切（最多切到一字节一段）。每个区间播完或客户端断开即注销登记，段位马上还回去。谁快谁多拿，慢段的尾巴按「接手划算才抢」的算术让给最快者（让位），停滞段收尸补发，交付线零缺口；候选全灭才失败
 - **小文件域单请求单镜像**：avatars / raw / gist / media 串行逐家，单请求限前 5 家
 - **ECT 时间槽派发**：选家 = (在途字节 + 新请求) ÷ 上一窗(500ms)实收，即「还需几个槽跑完」，最小者胜、无容差；并列看在途流数、再并列轮转。零历史按 +∞ 垫底（档内闲者先试）；有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——三个 AtomicU64 + 一次除法，无 EWMA、无时间戳
 - **链序**：种子快照序（随表演化，代码零内置）→ 图片链/codeload 链 UI「校准」重排（TTFB）→ 手改 routes.json（`mirrors_big` / `mirrors_small` 两字典，codeload 已归 small）；大文件域链序只作失败顺延次序，选家由 ECT 动态调度；codeload 直连优先

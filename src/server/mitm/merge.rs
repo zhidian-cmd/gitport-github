@@ -205,6 +205,8 @@ pub(super) struct MergeBody {
     /// 上次让位时刻（全局，不按段），用来给让位整体限速。
     last_cut_any: Option<Instant>,
     finished: bool,
+    /// 生命周期钩子：随 body 一起丢弃（切片计划里登记的在途区间靠它注销）。
+    _guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl MergeBody {
@@ -223,7 +225,14 @@ impl MergeBody {
             last_tick: Instant::now(),
             last_cut_any: None,
             finished: false,
+            _guard: None,
         }
+    }
+
+    /// 挂一个生命周期钩子：body 被丢弃时一起释放（用于注销在途区间登记）。
+    pub(super) fn hold(mut self, g: Box<dyn Send + Sync>) -> Self {
+        self._guard = Some(g);
+        self
     }
 
     pub(super) fn sent(&self) -> u64 {
