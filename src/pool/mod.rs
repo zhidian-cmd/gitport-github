@@ -1247,9 +1247,10 @@ pub async fn serial_dial_skip(
     }
     if tried == 0 {
         if inflight_skipped > 0 {
-            // 候选全在别人手里：不是 IP 坏，是暂时被占。等一小会儿再让上层重查连接池——
-            // 对方建好就能直接复用；直接报错会把好 IP 误判成不可用，还会白走兜底。
-            let deadline = Instant::now() + Duration::from_millis(300);
+            // 候选全在别人手里：不是 IP 坏，是暂时被占。自愈时代这里多半是
+            // "补拨正在建"——等它建成（上限 3s，30ms 步进提前退），上层重查
+            // 连接池直接复用；直接报错会把好 IP 误判成不可用，还会白走兜底。
+            let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
                 if !circle.iter().any(|p| inflight::busy(&p.ip)) {
                     break; // 已经有人拨完，池里大概率有现成的
