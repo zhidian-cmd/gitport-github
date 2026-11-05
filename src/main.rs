@@ -150,6 +150,8 @@ fn run() {
     }
 
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        // 运行时延迟回流是内存态：退出时落一次盘，下次冷启动还有排序基线（事件驱动，无定时器）。
+        pool::save_routes_now();
         settings::remove_system_proxy();
         let rt = rt.clone();
         std::thread::spawn(move || {

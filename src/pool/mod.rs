@@ -619,7 +619,8 @@ fn routes_path() -> PathBuf {
     dir.join(ROUTES_FILE)
 }
 
-/// 立即把内存表（含 latency 键）落盘：测速完成后由 webui 调用。
+/// 立即把内存表（含 latency 运行时回流键）落盘：退出时由 main 调用，
+/// 让下次冷启动仍有一份拨号延迟基线（运行时回流是内存态，重启即清）。
 pub fn save_routes_now() {
     write_routes_file(&routes_path(), &mirror_chains_snapshot());
 }

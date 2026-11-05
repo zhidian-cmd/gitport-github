@@ -1,4 +1,6 @@
-//! IP 建连测速：TCP+TLS 实测用时，作为 `latency` 键存进 routes.json；拨号失败时按延迟升序挑候选。
+//! IP 建连延迟：真实拨号的实测用时（事件驱动回流——每次建连成功记一笔，无定时器、
+//! 无主动探测），退出时经 pool::save_routes_now 落进 routes.json 的 `latency` 键；
+//! 拨号候选按延迟升序挑。
 use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -115,10 +115,6 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/calibrate",
             axum::routing::get(api_calib_status).post(api_calibrate),
         )
-        .route(
-            "/api/ip-test",
-            axum::routing::get(api_ip_test_status).post(api_ip_test),
-        )
         .with_state(app.clone())
         .layer(axum::middleware::from_fn(local_guard));
     let port = config::webui_port();
@@ -289,98 +285,6 @@ impl Drop for CalibDone {
     fn drop(&mut self) {
         crate::server::mitm::CALIB_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-/// IP 测速任务状态（与校准同款护栏）。
-static IP_TEST_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static IP_TEST_REPORT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-struct IpTestDone;
-
-impl Drop for IpTestDone {
-    fn drop(&mut self) {
-        IP_TEST_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn plain_text(msg: &str) -> Response {
-    (
-        [
-            ("content-type", "text/plain; charset=utf-8"),
-            ("cache-control", "no-store"),
-        ],
-        msg.to_string(),
-    )
-        .into_response()
-}
-
-/// 串行实测每个 IP 的 TCP+TLS 建连用时：成功值写进 routes.json 的 latency 键，失败项删旧值（排序垫底）。
-async fn api_ip_test() -> Response {
-    if IP_TEST_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return plain_text("IP 测速已在后台进行中，请等当前一轮结束");
-    }
-    tokio::spawn(async move {
-        let _done = IpTestDone;
-        let mut seen = std::collections::HashSet::new();
-        let mut rows: Vec<(String, Option<u64>)> = Vec::new();
-        for node in pool::route::nodes_snapshot() {
-            // 锚点为空 = 按目标 host 校验（与 dial_targets 同口径），取该节点服务的第一个域名。
-            let verify = if node.verify.is_empty() {
-                node.hosts.first().cloned().unwrap_or_default()
-            } else {
-                node.verify.clone()
-            };
-            for ip in node.ips {
-                if !seen.insert(ip.clone()) {
-                    continue;
-                }
-                let t0 = std::time::Instant::now();
-                let ok = pool::dial::dial_one(&ip, &node.sni, &verify, true)
-                    .await
-                    .is_ok();
-                let ms = t0.elapsed().as_millis() as u64;
-                rows.push((ip, ok.then_some(ms)));
-            }
-        }
-        pool::latency::replace(&rows);
-        pool::save_routes_now();
-        let mut ok_rows: Vec<(String, u64)> = rows
-            .iter()
-            .filter_map(|(ip, ms)| ms.map(|m| (ip.clone(), m)))
-            .collect();
-        ok_rows.sort_by_key(|(_, ms)| *ms);
-        let fail = rows.len() - ok_rows.len();
-        let mut rep = String::new();
-        for (ip, ms) in ok_rows.iter().take(40) {
-            rep.push_str(&format!("{ip:<18} {ms}ms\n"));
-        }
-        if ok_rows.len() > 40 {
-            rep.push_str("…\n");
-        }
-        if fail > 0 {
-            rep.push_str(&format!("{fail} 个 IP 建连失败（不记入排序，垫底）\n"));
-        }
-        rep.push_str(&format!(
-            "共 {} 个 IP，成功 {} 个；已写入 routes.json 的 latency 键。",
-            rows.len(),
-            ok_rows.len()
-        ));
-        *IP_TEST_REPORT
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(rep);
-    });
-    plain_text("IP 建连测速已在后台开始（串行实测 TCP+TLS 用时，约 1~2 分钟）")
-}
-
-async fn api_ip_test_status() -> Response {
-    write_json(&serde_json::json!({
-        "running": IP_TEST_RUNNING.load(std::sync::atomic::Ordering::SeqCst),
-        "report": IP_TEST_REPORT
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .unwrap_or_default(),
-    }))
 }
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
