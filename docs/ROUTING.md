@@ -35,6 +35,7 @@ PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direc
 | 未命中任何 hosts 行 | **Tunnel** | 系统 DNS 直拨(纯隧道,如 update.googleapis.com 经代理的流量) |
 | `action:"direct"` 行 | **System** | 本机直连,不进代理管线(当前 routes.json 无此行) |
 | GET/HEAD + objects / release-assets 域,或 github.com 的 `/releases/download`、`/releases/latest/download` 路径 | **Mirror** | 分片竞速(派发细节见 [ARCHITECTURE.md](ARCHITECTURE.md) 镜像链节) |
+| GET + 静态图片 CDN（raw / user-images / private-user-images / media / camo / gist / avatars）的 README 大图 | **Pool**（不进 Mirror） | 探片后纯直连切 4~8 段并发 Range、按字节边界合流；小图/非图片/池冷自动退回单流。见 [ARCHITECTURE.md](ARCHITECTURE.md)「README 大图」节 |
 | 其余(含 codeload——按子域命中 `github.com` 裸键) | **Pool** | 查询管线走二部图 |
 
 codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪装通道,直连优先,失败按校准链序逐家),`/archive` 源码包不再镜像——镜像链归属只剩 objects / release-assets 两族。

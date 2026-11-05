@@ -121,7 +121,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | uploads.github.com | 池伪装（alambic .161，锚点 `githubusercontent.com`） |
 | viewscreen / objects-origin / api.mcp | GLB 池伪装（140.82.x.21/.22，锚点 `actions…`） |
 | githubapp.com、githubassets、github.io | 池伪装串发 |
-| avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链 |
+| avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链；README 大图先走纯直连多段（不进镜像链，见 ARCHITECTURE.md） |
 | objects / release-assets | 镜像 + 直连分片竞速（直连占一份——大文件域单通道，ECT 时间槽派发） |
 | github.com 的 `/releases/download`（含 latest） | release-assets 专属镜像链，全灭 502 |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | 池伪装（Fastly 段锚点制，原真名分片腿退役） |

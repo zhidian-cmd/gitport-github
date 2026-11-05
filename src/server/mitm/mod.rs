@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod defuse;
+mod direct_split;
 mod merge;
 mod page_cache;
 pub(crate) mod quiet;
@@ -249,6 +250,15 @@ async fn mitm_http(
             &host,
             "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
         );
+    }
+    // README 大图：只用池里现成的伪装 SNI 直连连接，多段 Range 并发拉再按字节边界合流。
+    // 不进镜像链、不扩 IP、不新拨连接；池冷或任一段没回 206 就交回下面的单流路径。
+    if is_simple {
+        if let Some(resp) =
+            direct_split::try_direct_split(&log, &out_body, &host, &info).await
+        {
+            return write_upstream(resp, "direct-split", &info);
+        }
     }
     let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
         Ok(r) => r,
