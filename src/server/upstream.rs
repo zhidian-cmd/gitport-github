@@ -20,6 +20,7 @@ use tower_service::Service;
 pub struct H2Upstream {
     pub ip: String,
     /// 进程内唯一：同一 IP 的两条连接也要能精确区分，否则 keepalive 会删错。
+    /// 连接驱动结束时也靠它把自己从池里摘掉（对端回收空闲连接时不留僵尸）。
     pub id: u64,
     /// 游标槽位：1 主通道、2 副通道，记账跟着连接走，各记各的钥匙。
     pub slot: u8,
@@ -429,6 +430,26 @@ pub fn maybe_spawn_second(host: &str, log: &LogFn) {
         }
     });
 }
+
+/// 连接驱动：跑帧收发与 GOAWAY 处理，结束即这条通道已死。
+///
+/// 死的这一刻就要把自己从池里除名——池同时也是「这个 IP 已有通道」的登记表
+/// (`inflight::live`)：留着僵尸会让该 IP 一直占着名额，下一次请求还得先撞一次死连接、
+/// 白付一次发送、再打一行「复用连接已断」。对端回收空闲连接（边缘约 50~65s 静默，见
+/// `config::KEEPALIVE_PROBE_SECS` 注释）是天天发生的事，这条路径必须静默收尾。
+///
+/// 建连到入库之间有极小的窗口：若对端在这期间就关连接，摘除会先于 `store_h2` 落空，
+/// 那条仍会入库成僵尸——由保活和下一次请求兜底，与改动前行为一致，不额外加锁。
+fn spawn_conn_driver<T>(ip: String, id: u64, conn: h2::client::Connection<T, Bytes>)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _ = conn.await;
+        drop_h2_id(&ip, id);
+    });
+}
+
 pub async fn h2_from_dialed(
     host: &str,
     conn_io: Dialed,
@@ -459,9 +480,9 @@ pub async fn h2_from_dialed(
         .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
     // 服务端在 SETTINGS 里说了它一条连接能接多少流，照着用，不替它猜数字。
     let max_streams = conn.max_concurrent_send_streams().max(1) as u32;
-    tokio::spawn(async move {
-        let _ = conn.await; // 连接驱动：帧收发/GOAWAY 处理, 结束即连接死亡
-    });
+    // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    spawn_conn_driver(ip.to_string(), id, conn);
     // 第二通道在行尾标出;主通道与单发保持原样,免日志噪音。
     let chan = if slot > 1 {
         format!(", 通道{slot}")
@@ -473,7 +494,7 @@ pub async fn h2_from_dialed(
     ));
     Ok(H2Upstream {
         ip: ip.to_string(),
-        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        id,
         slot,
         owner: Some(host.to_string()),
         max_streams,

@@ -666,3 +666,64 @@ fn inflight_try_claim_is_exclusive() {
         "释放后应能重新抢到"
     );
 }
+
+/// 通道自己断掉必须自己除名：池同时是「这个 IP 已有通道」的登记表（`inflight::live`），
+/// 留一条僵尸会让该 IP 一直占着名额——下次请求先撞一次死连接、白付一次发送，日志里还
+/// 多一行「复用连接已断」。对端回收空闲连接（边缘 50~65s 静默）天天发生，这条路必须静默收尾。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn conn_end_removes_itself_from_pool() {
+    use std::time::Duration;
+
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let ip = "9.9.9.5";
+
+    // 内存 duplex 对拉：server 端只完成握手就收摊 = 对端回收连接（客户端读到 EOF）。
+    // 握手没赶上也不要紧：任务一 abort 就连 socket 一起丢，客户端照样读到 EOF。
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let mut server = tokio::spawn(async move {
+        let _ = h2::server::handshake(server_io).await;
+    });
+    let (send, conn) = h2::client::handshake(client_io)
+        .await
+        .expect("client 握手");
+
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let up = H2Upstream {
+        ip: ip.to_string(),
+        id,
+        slot: 1,
+        owner: None,
+        max_streams: 100,
+        inflight: Arc::new(AtomicU32::new(0)),
+        send,
+        ping: None,
+    };
+    assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
+    assert!(pool::inflight::live(ip), "入库即登记'这个 IP 已有通道'");
+
+    spawn_conn_driver(ip.to_string(), id, conn);
+    // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
+    let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+    server.abort();
+
+    // 不拿固定 sleep 赌时序：轮询到登记撤销为止。
+    let mut gone = false;
+    for _ in 0..100 {
+        if !pool::inflight::live(ip) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "连接结束后应撤销'已有通道'登记，该 IP 才能重新拨号");
+    assert!(
+        cached_h2_in(&[ip.to_string()], None).is_none(),
+        "死连接不该还留在池里被复用"
+    );
+    assert!(lock(conn_pool()).get(ip).is_none(), "池里不该留这条僵尸");
+    let _ = lock(conn_pool()).remove(ip);
+}
