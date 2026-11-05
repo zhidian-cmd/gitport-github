@@ -57,8 +57,12 @@ pub(crate) struct IpConns {
 /// 同一个 IP 永远只允许一条 h2 连接。要开第二条通道只能落在另一个 IP 上。
 /// 这是硬约束：无论多少个 host 同时拨到同一个 IP，入库时只留第一条，其余当场丢弃。
 const MAX_CONNS_PER_IP: usize = 1;
-/// 通道总数上限（跨不同 IP）：冷启动竞速两条，实测能把 p50 腰斩。
-const MAX_CHANNELS: usize = 2;
+/// 通道总数上限（跨不同 IP）：内容域冷启动三路竞速，赢了就位的两条已把 p50 腰斩，
+/// 第三条吃掉"两条腿都撞上 GFW 抖动"的尾部。
+const MAX_CHANNELS: usize = 3;
+
+/// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
+const DIAL_SLOW_MS: u64 = 1500;
 
 /// 这个错误重试没有意义：候选都被已有通道占着（或只剩 filling 标记），
 /// 换候选、再来一轮都是同一句话。上层看到它直接交兜底，别原地刷屏。
@@ -255,11 +259,11 @@ fn occupied_ips(ips: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 首条建好后后台补第二条：skip 池中活连接占用的 IP，游标用副键。
+/// 首条建好后后台补足到通道上限（内容域 3 条）：skip 池中活连接占用的 IP，游标用副键。
 /// 后台执行时点边状态可能已翻转：全黑（targets 空）直接放弃，绝不能索引越界。
 pub fn maybe_spawn_second(host: &str, log: &LogFn) {
     if !dual_channel(host) {
-        return; // 只有内容域才补第二条；会话域和"其他"都是单通道
+        return; // 只有内容域才补足；会话域和"其他"都是单通道
     }
     let Some(targets) = pool::route::dial_targets(host) else {
         return;
@@ -521,6 +525,12 @@ pub(crate) async fn h2_dial_slot(
     .await
     .map_err(|e| e.to_string())?;
     let dial_ms = t_dial.elapsed().as_millis();
+    // 运行时延迟回流：实测建连用时进排序表（内存态），慢 IP 自动沉底；
+    // 撞上 GFW 抖动（慢成功）时游标挪窝，别让"上次成功"把一页请求都黏在慢 IP 上。
+    pool::latency::note(&ip, dial_ms as u64);
+    if dial_ms as u64 >= DIAL_SLOW_MS {
+        pool::cursor_note(host, &ip, false, slot);
+    }
     let form = if sni.is_empty() || sni == host {
         "真名"
     } else {
@@ -565,17 +575,21 @@ pub(crate) struct LegPlan {
     pub vice_dial: bool,
     /// 副通道复用：本 host 候选里已有现成通道，直接拿来用，不拨号。
     pub vice_reuse: bool,
+    /// 第三条竞速腿：内容域冷启动多抽一次签，吃掉"两条腿都撞上抖动"的尾部。
+    pub third_dial: bool,
 }
 
 /// 纯计算，把「主副分工」钉死：
 /// - 会话域不设副通道（同会话跨 IP 是风控特征）；
 /// - 有空 IP 才发主通道；
-/// - 副通道优先复用；没有现成的、且空 IP 够两家，才再发一条去拨。
+/// - 副通道优先复用；没有现成的、且空 IP 够两家，才再发一条去拨；
+/// - 内容域空 IP 够三家时再发第三条竞速腿。
 pub(crate) fn plan_legs(session: bool, free: usize, reusable: bool) -> LegPlan {
     LegPlan {
         primary: free > 0,
         vice_dial: !session && !reusable && free >= 2,
         vice_reuse: !session && reusable,
+        third_dial: !session && !reusable && free >= 3,
     }
 }
 
@@ -657,6 +671,22 @@ async fn dial_h2_race(
         .await;
         launched += 1;
     }
+    if legs.third_dial {
+        // 第三条竞速腿：不分档按延迟序，吃掉"前两条都撞上抖动"的尾部。
+        dialer::submit(
+            dialer::DialOrder {
+                host: host.to_string(),
+                slot: 3,
+                crew: crew.clone(),
+                skip_ips: occupied.to_vec(),
+                prefer_shared: None,
+            },
+            log,
+            tx.clone(),
+        )
+        .await;
+        launched += 1;
+    }
     if launched == 0 {
         // 一条腿都发不出去：可能空 IP 用完了，也可能会话域本来就不设副通道。
         // 这时池里若已有本 host 候选的连接就直接用——把"已有通道"判成失败，
@@ -669,9 +699,10 @@ async fn dial_h2_race(
         return Err(format!("{host} {ERR_NO_FREE_IP}, 请重查连接池"));
     }
     drop(tx);
-    // 两条腿都拨才叫竞速；只发主通道时说清为什么单通道（会话域 / 空 IP 不够）。
+    // 两条以上同时拨才叫竞速；只发主通道时说清为什么单通道（会话域 / 空 IP 不够）。
     if legs.primary && legs.vice_dial {
-        (log)(&format!("[建连] {host} 主副双通道开拨(竞速)"));
+        let n = 1 + usize::from(legs.vice_dial) + usize::from(legs.third_dial);
+        (log)(&format!("[建连] {host} {n} 路竞速开拨"));
     } else if legs.primary && !legs.vice_reuse {
         (log)(&format!(
             "[建连] {host} 单通道({})",

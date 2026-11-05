@@ -32,6 +32,19 @@ pub fn replace(rows: &[(String, Option<u64>)]) {
     }
 }
 
+/// 运行时拨号延迟回流：每次真实建连都把实测用时写进排序表（内存态，重启回落
+/// routes.json 的测速基线）。有旧值时取均值——单次 GFW 抖动（4 秒抽签）不会把
+/// 一个 IP 一棍子打死，连续慢才会让它沉底。
+pub fn note(ip: &str, ms: u64) {
+    let mut g = lock(&TABLE);
+    let m = g.get_or_insert_with(HashMap::new);
+    let merged = match m.get(ip) {
+        Some(old) => (*old + ms) / 2,
+        None => ms,
+    };
+    m.insert(ip.to_string(), merged);
+}
+
 /// 落盘用全量快照（编码 routes.json 时写入 `latency` 键）。
 pub fn snapshot_all() -> HashMap<String, u64> {
     lock(&TABLE).clone().unwrap_or_default()
