@@ -137,10 +137,13 @@ pub fn note_activity() {
 }
 
 /// 启动保活任务：有请求每 PROBE 秒 PING 一次，静默超窗回睡，空闲零唤醒。
-pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
+pub fn start_keepalive(rt: &tokio::runtime::Runtime, log: LogFn) {
     rt.spawn(async move {
         loop {
             ACTIVITY_KICK.notified().await; // 空闲: 纯睡, 零周期唤醒
+            // 每个活动窗报一次"保活确实在跑": ping 成功是静默的, 没这行的话日志里只剩
+            // "怎么又新建连接了", 看不出是保活失败还是别的原因摘的。
+            let mut told = false;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(
                     crate::config::KEEPALIVE_PROBE_SECS,
@@ -151,32 +154,61 @@ pub fn start_keepalive(rt: &tokio::runtime::Runtime) {
                 if idle > crate::config::KEEPALIVE_WINDOW_SECS {
                     break; // 静默超窗: 停保活, 回 Notify 睡眠
                 }
-                keepalive_pass().await;
+                let (ok, bad) = keepalive_pass(&log).await;
+                if !told && ok > 0 {
+                    let tail = if bad > 0 {
+                        format!(", {bad} 条已摘(见上)")
+                    } else {
+                        ", 全部应答".to_string()
+                    };
+                    log(&format!("[保活] ping {ok} 条连接{tail}"));
+                    told = true;
+                }
             }
         }
     });
 }
 
-async fn keepalive_pass() {
+/// 一轮保活：每条连接 PING 一次（限时 5s），无应答即摘——死连接留着只会让下一个请求
+/// 先撞一次"复用连接已断"再重建，白付一次往返。
+async fn keepalive_pass(log: &LogFn) -> (usize, usize) {
     let conns: Vec<H2Upstream> = {
         let g = lock(conn_pool());
         g.values()
             .flat_map(|hc| hc.conns.iter().map(|c| c.up.clone()))
             .collect()
     };
+    let (mut ok, mut bad) = (0usize, 0usize);
     for up in conns {
         let Some(pp) = up.ping.clone() else { continue };
         let mut guard = pp.lock().await;
+        let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             guard.ping(h2::Ping::opaque()),
         )
         .await;
-        if !matches!(r, Ok(Ok(_))) {
-            drop(guard);
-            drop_h2_id(&up.ip, up.id); // 对端无答/连接已死: 只摘这一条
+        match r {
+            Ok(Ok(_)) => ok += 1,
+            _ => {
+                bad += 1;
+                drop(guard);
+                // 分清"连接已经没了"(立刻报错) 和"连接还在但 PONG 不回来"(5s 超时)：
+                // 前者是没来得及续命, 后者是链路把连接吃了, 处置不一样。
+                let why = match &r {
+                    Ok(Err(e)) => format!("连接已断: {e}"),
+                    _ => "5s 内没有 PONG".to_string(),
+                };
+                log(&format!(
+                    "[保活] {} ping 失败({:?}, {why}), 摘掉这条连接(下次请求重建)",
+                    up.ip,
+                    t0.elapsed()
+                ));
+                drop_h2_id(&up.ip, up.id); // 对端无答/连接已死: 只摘这一条
+            }
         }
     }
+    (ok, bad)
 }
 
 /// 在给定 IP 集合里取活连接：按「占用率 × 延迟」挑最闲且最快的那条。
