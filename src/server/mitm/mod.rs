@@ -749,7 +749,7 @@ pub(super) async fn get_direct(
             Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
             _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
         };
-        // 每轮再查一次池子：竞速任务可能已建成，排队者直接复用。
+        // 每轮再查一次池子：并行建连任务可能已建成，排队者直接复用。
         // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
         // 已经撞过一次复用失败的本请求不再碰池，只走确定刚拨出来的连接。
         let allow_reuse = !(!is_simple && body.is_none()) && !reuse_failed;
@@ -798,7 +798,7 @@ pub(super) async fn get_direct(
                 },
             }
         };
-        // 竞速内部也可能直接交回池里现成的连接，一并算「复用」，别让它冒充新拨失败。
+        // 并行建连内部也可能直接交回池里现成的连接，一并算「复用」，别让它冒充新拨失败。
         let from_pool = pool_pick || dial_reused;
         let e = match stream_on(&up, out, body, request_budget(is_content)).await {
             Ok((resp, ms)) => {
@@ -824,7 +824,7 @@ pub(super) async fn get_direct(
                 *info.lock().unwrap() = up_ip.clone();
                 // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
                 pool::cursor_note(host, &up_ip, true, up_slot);
-                // 第二条腿由 dial_h2_race 自己收尾补建，这里不重复补（会与竞速抢跑）。
+                // 第二条腿由 dial_h2_race 自己收尾补建，这里不重复补（会与并行建连抢跑）。
                 upstream::note_latency(&up_ip, id, ms); // 新连接也要记账，否则择优池没有它的样本
                 if is_content {
                     pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断

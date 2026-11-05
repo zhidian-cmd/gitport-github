@@ -977,7 +977,7 @@ fn dial_order(
     }
 }
 
-/// 冷启动竞速的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
+/// 冷启动双通道的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
 pub struct DialCrew {
     claimed: Mutex<HashSet<String>>,
 }
