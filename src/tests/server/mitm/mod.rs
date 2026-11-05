@@ -229,3 +229,17 @@ fn codeload_alias_rewrites_host_keeps_path() {
         "https://codeload.github.com/zhidian-cmd/gitport-github/zip/refs/heads/main"
     );
 }
+
+/// 复用失败的两种病不能混成一句话：超时要写明"响应超时(Ns)"，真断链才叫"连接已断"。
+/// 线上曾把 4s 预算超时印成"复用连接已断"，看着像链路故障，实际是边缘不答。
+#[test]
+fn reuse_failure_text_keeps_timeout_and_broken_conn_apart() {
+    assert_eq!(
+        reuse_failure_text(ERR_BUDGET_TIMEOUT, Duration::from_secs(4)),
+        "响应超时(4s) 放弃复用"
+    );
+    assert_eq!(
+        reuse_failure_text("h2 发送: connection closed", Duration::from_secs(8)),
+        "连接已断(h2 发送: connection closed)"
+    );
+}

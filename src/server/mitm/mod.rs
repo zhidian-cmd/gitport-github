@@ -26,6 +26,8 @@ use defuse::gh_defuse;
 use mirror::chain_fetch;
 
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
+/// 预算耗尽的统一文案：日志分叉与"能不能换连接重发"都认它，别再各写一份字面量。
+const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
@@ -504,7 +506,33 @@ async fn send_once(
     let t0 = Instant::now();
     match tokio::time::timeout(budget, upstream::h2_send(up, out, body)).await {
         Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
-        Err(_) => Err("响应预算超时".to_string()),
+        Err(_) => Err(ERR_BUDGET_TIMEOUT.to_string()),
+    }
+}
+
+/// 复用失败的文案：断链和超时是两种病，别用一句话糊过去。
+/// 断链 = 连接已经没了，发出去就报错（微秒级）；超时 = 请求发出去了、对端不答，烧满整个预算。
+/// 混成"连接已断"会让人把"边缘不答"误判成链路故障，排查方向直接跑偏。
+fn reuse_failure_text(why: &str, budget: Duration) -> String {
+    if why == ERR_BUDGET_TIMEOUT {
+        format!("响应超时({}s) 放弃复用", budget.as_secs())
+    } else {
+        format!("连接已断({why})")
+    }
+}
+
+/// 复用失败出声一次就够：一次页面加载会连着撞几条同 host 的连接，别拿同样的行刷屏。
+fn note_reuse_failure(log: &LogFn, host: &str, ip: &str, why: &str, budget: Duration) {
+    let tag = if why == ERR_BUDGET_TIMEOUT {
+        "reuse-timeout"
+    } else {
+        "reuse-broken"
+    };
+    if quiet::first_time(tag, host) {
+        (log)(&format!(
+            "[MITM] {host} {}({ip}), 重新建连",
+            reuse_failure_text(why, budget)
+        ));
     }
 }
 
@@ -605,7 +633,8 @@ async fn try_cached(
     } else {
         upstream::cached_h2_in(ips, want_slot)?
     };
-    match send_once(&up, out, body, request_budget(is_content)).await {
+    let budget = request_budget(is_content);
+    match send_once(&up, out, body, budget).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
@@ -620,10 +649,15 @@ async fn try_cached(
         }
         Err(why) => {
             upstream::drop_h2_id(&up.ip, up.id);
-            (log)(&format!(
-                "[MITM] {host} 复用连接已断({}, {why}), 重新建连",
-                up.ip
-            ));
+            // 超时说明这个 IP 对这块域此刻不答：跟拨号失败一样记短冷却，第二个请求别再撞它。
+            // 断链不记：那是连接老化（空闲被边缘回收），IP 本身没坏，冷却反而会把会话域赶到
+            // 别的 IP 上——同会话跨 IP 正是要躲的风控特征。
+            if why == ERR_BUDGET_TIMEOUT {
+                if let Some(row) = pool::route::route_for(host) {
+                    pool::edges::mark_stall(&up.ip, &row.key);
+                }
+            }
+            note_reuse_failure(log, host, &up.ip, &why, budget);
             // 请求没写出去（连接已死）时，非幂等方法也能换连接重发。
             let replayable = is_simple || (body.is_some() && failed_before_send(&why));
             (!replayable).then(|| Err("POST 等非简单方法不重发(复用连接失效)".to_string()))
