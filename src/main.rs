@@ -91,7 +91,6 @@ fn run() {
             .expect("tokio runtime 创建失败"),
     );
 
-    server::upstream::start_keepalive(&rt, log_fn.clone());
     server::mitm::mirror::start_ect_ticker();
 
     let srv = Arc::new(server::ProxyServer {

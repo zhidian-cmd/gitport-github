@@ -940,18 +940,41 @@ fn cursor_key(key: &str, slot: u8) -> String {
 }
 
 /// 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底并保持表序。
-fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
+/// 指定档位（prefer_shared）时独占/共享分档：优先档整档在前、另一档垫后，
+/// 档内同样游标优先 + 延迟升序——主/副通道的"独占优先/共享优先"在这里落成顺序。
+fn dial_order(
+    circle: &[route::NodeIp],
+    start_ip: Option<&str>,
+    prefer_shared: Option<bool>,
+) -> Vec<usize> {
     let mut order: Vec<usize> = (0..circle.len()).collect();
     order.sort_by_key(|&i| (latency::get(&circle[i].ip).unwrap_or(u64::MAX), i));
-    if let Some(ip) = start_ip {
-        if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
-            if let Some(at) = order.iter().position(|&j| j == pos) {
-                order.remove(at);
-                order.insert(0, pos);
+    // 游标置顶（在它所属的档内置顶）。
+    let bump = |part: &mut Vec<usize>| {
+        if let Some(ip) = start_ip {
+            if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
+                if let Some(at) = part.iter().position(|&j| j == pos) {
+                    part.remove(at);
+                    part.insert(0, pos);
+                }
             }
         }
+    };
+    match prefer_shared {
+        Some(prefer) => {
+            let (mut pref, mut rest): (Vec<usize>, Vec<usize>) = order
+                .into_iter()
+                .partition(|&i| circle[i].shared == prefer);
+            bump(&mut pref);
+            bump(&mut rest);
+            pref.extend(rest);
+            pref
+        }
+        None => {
+            bump(&mut order);
+            order
+        }
     }
-    order
 }
 
 /// 冷启动竞速的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
@@ -979,6 +1002,8 @@ pub struct DialSkip<'a> {
     pub skip_ips: &'a [String],
     pub slot: u8,
     pub crew: Option<&'a DialCrew>,
+    /// Some = 独占/共享分档排序（主副通道分家用）；None = 不分档，维持纯游标+延迟序。
+    pub prefer_shared: Option<bool>,
 }
 
 /// 证书校验失败？错误串随 BoringSSL 版本变化（`CERTIFICATE_VERIFY_FAILED` / `certificate verify failed` /
@@ -1037,6 +1062,7 @@ pub async fn serial_dial_skip(
         skip_ips,
         slot,
         crew,
+        prefer_shared,
     } = req;
     if SERIAL_COOL.open(host) {
         return Err("串发冷却中(全灭后 30s 内), 快速失败".to_string());
@@ -1069,7 +1095,7 @@ pub async fn serial_dial_skip(
         let g = lock(&SERIAL);
         g.as_ref().unwrap().cursor.get(&cursor_key).cloned()
     };
-    let order = dial_order(&circle, start_ip.as_deref());
+    let order = dial_order(&circle, start_ip.as_deref(), prefer_shared);
 
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;

@@ -1,5 +1,7 @@
 //! 代理服务：CONNECT 隧道（TLS 透传 / 池内域名 MITM）+ 明文 HTTP 转发。
 
+pub mod dialer;
+pub mod keeper;
 pub mod mitm;
 pub mod protocol;
 pub mod upstream;
@@ -348,6 +350,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
                 skip_ips: &[],
                 slot: 1,
                 crew: None,
+                prefer_shared: None,
             },
             None,
         )

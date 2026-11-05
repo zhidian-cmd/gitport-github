@@ -415,7 +415,7 @@ async fn probe_content_edges() {
                     continue;
                 }
             };
-            let up = match h2_from_dialed("probe", dialed, &ip, "probe", 1, &log).await {
+            let up = match h2_from_dialed("probe", dialed, &ip, 1, &log).await {
                 Ok(u) => u,
                 Err(e) => {
                     println!("PROBE\t{ip}\t{verify}\th2\tERR {e}");
@@ -516,7 +516,7 @@ async fn probe_new_hosts() {
                 println!("HOSTPROBE\t{ip}\t{host}\t-\tERR {last_err}");
                 continue;
             };
-            let up = match h2_from_dialed(host, dialed, ip, "probe", 1, &log).await {
+            let up = match h2_from_dialed(host, dialed, ip, 1, &log).await {
                 Ok(u) => u,
                 Err(e) => {
                     println!("HOSTPROBE\t{ip}\t{host}\t{anchor}\th2 ERR {e}");
@@ -563,7 +563,7 @@ async fn probe_cross_sni_reuse() {
     let dialed = dial_one(ip, "api.mcp.github.com", "api.mcp.github.com", true)
         .await
         .expect("api.mcp 握手应成功");
-    let up = h2_from_dialed("api.mcp.github.com", dialed, ip, "probe", 1, &log)
+    let up = h2_from_dialed("api.mcp.github.com", dialed, ip, 1, &log)
         .await
         .expect("h2 握手");
     for host in [
@@ -617,7 +617,7 @@ async fn probe_baseline_actions() {
                 continue;
             }
         };
-        let up = match h2_from_dialed("baseline", dialed, ip, "probe", 1, &log).await {
+        let up = match h2_from_dialed("baseline", dialed, ip, 1, &log).await {
             Ok(u) => u,
             Err(e) => {
                 println!("BASE\t{ip}\th2 ERR {e}");
@@ -745,9 +745,6 @@ async fn idle_window_end_retires_each_ip_from_its_own_task() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     pool::inflight::clear();
-    // 距上次活动已过 6 分钟：静默超窗立即成立，不必真等 5 分钟。
-    LAST_ACTIVITY.store(now_secs() - 400, std::sync::atomic::Ordering::Relaxed);
-
     let ips = ["9.9.9.10", "9.9.9.11"];
     for ip in ips {
         let (client_io, server_io) = tokio::io::duplex(4096);
@@ -773,6 +770,16 @@ async fn idle_window_end_retires_each_ip_from_its_own_task() {
         };
         store_h2(ip, up);
         assert!(pool::inflight::live(ip), "入库即登记");
+        // 空闲窗按每条连接自己的最后使用算：把它回拨 6 分钟，模拟"建好后无人问津"。
+        // 全局 LAST_ACTIVITY 不再参与——别的连接忙不代表这条有人用。
+        {
+            let mut g = lock(conn_pool());
+            if let Some(h) = g.get_mut(ip) {
+                if let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) {
+                    c.last_used = now_secs() - 400;
+                }
+            }
+        }
         spawn_conn_driver(
             ip.to_string(),
             id,

@@ -4,6 +4,7 @@ use super::upstream;
 use crate::certgen::Authority;
 use crate::config;
 use crate::pool;
+use crate::server::keeper::{stream_on, ERR_BUDGET_TIMEOUT};
 use crate::util::LogFn;
 use bytes::Bytes;
 use http::{HeaderValue, Method, StatusCode};
@@ -28,7 +29,6 @@ use mirror::chain_fetch;
 
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
 /// 预算耗尽的统一文案：日志分叉与"能不能换连接重发"都认它，别再各写一份字面量。
-const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
 const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
@@ -510,20 +510,6 @@ fn is_search_path(path: &str) -> bool {
     path.starts_with("/search")
 }
 
-/// 在给定连接上发一次请求、等响应头；三处调用点共用，请求每次重建（BoxBody 不可克隆）。
-async fn send_once(
-    up: &upstream::H2Upstream,
-    out: &hyper::Request<BoxBody>,
-    body: &Option<Bytes>,
-    budget: Duration,
-) -> Result<(hyper::Response<BoxBody>, u64), String> {
-    let t0 = Instant::now();
-    match tokio::time::timeout(budget, upstream::h2_send(up, out, body)).await {
-        Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
-        Err(_) => Err(ERR_BUDGET_TIMEOUT.to_string()),
-    }
-}
-
 /// 复用失败的文案：断链和超时是两种病，别用一句话糊过去。
 /// 断链 = 连接已经没了，发出去就报错（微秒级）；超时 = 请求发出去了、对端不答，烧满整个预算。
 /// 混成"连接已断"会让人把"边缘不答"误判成链路故障，排查方向直接跑偏。
@@ -665,7 +651,7 @@ async fn try_cached(
         }
     };
     let budget = request_budget(is_content);
-    match send_once(&up, out, body, budget).await {
+    match stream_on(&up, out, body, budget).await {
         Ok((resp, ms)) => {
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
@@ -814,7 +800,7 @@ pub(super) async fn get_direct(
         };
         // 竞速内部也可能直接交回池里现成的连接，一并算「复用」，别让它冒充新拨失败。
         let from_pool = pool_pick || dial_reused;
-        let e = match send_once(&up, out, body, request_budget(is_content)).await {
+        let e = match stream_on(&up, out, body, request_budget(is_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;
                 let up_slot = up.slot;
@@ -995,8 +981,7 @@ async fn dns_direct_fetch(
                     continue;
                 }
             };
-            let up = match upstream::h2_from_dialed(host, conn, &ip, "真名(系统DNS)", 1, log).await
-            {
+            let up = match upstream::h2_from_dialed(host, conn, &ip, 1, log).await {
                 Ok(u) => u,
                 Err(e) => {
                     (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));
@@ -1006,7 +991,7 @@ async fn dns_direct_fetch(
             // 拨完立刻入库：晚一秒都可能让别的 host 对同一 IP 又拨一条。
             upstream::store_h2(&ip, up)
         };
-        match send_once(&up, out, body, request_budget(budget_content)).await {
+        match stream_on(&up, out, body, request_budget(budget_content)).await {
             Ok((resp, ms)) => {
                 let id = up.id;
                 *info.lock().unwrap() = ip.clone();

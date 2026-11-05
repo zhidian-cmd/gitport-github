@@ -11,7 +11,9 @@ fn tmpdir() -> PathBuf {
     // 进程号会被系统复用：上一轮同 pid 的残留目录里可能留着 routes.json / plans.json，
     // 不清掉会让"全新安装"的测试读到旧表，间歇性失败（本地实测踩到过）。
     let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    if let Err(e) = std::fs::create_dir_all(&d) {
+        panic!("测试临时目录创建失败 {d:?}: {e}");
+    }
     d
 }
 
@@ -853,6 +855,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             skip_ips: &[],
             slot: 1,
             crew: None,
+            prefer_shared: None,
         },
         None,
     )
@@ -880,6 +883,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             skip_ips: &[],
             slot: 1,
             crew: None,
+            prefer_shared: None,
         },
         None,
     )
@@ -929,9 +933,9 @@ fn dial_order_cursor_first_then_latency_asc() {
     latency::seed("2.2.2.2", 300);
     latency::seed("3.3.3.3", 200);
     latency::seed("4.4.4.4", 100);
-    assert_eq!(dial_order(&circle, Some("1.1.1.1")), vec![0, 3, 2, 1]);
-    assert_eq!(dial_order(&circle, None), vec![3, 2, 1, 0]);
-    assert_eq!(dial_order(&circle, Some("3.3.3.3")), vec![2, 3, 1, 0]);
+    assert_eq!(dial_order(&circle, Some("1.1.1.1"), None), vec![0, 3, 2, 1]);
+    assert_eq!(dial_order(&circle, None, None), vec![3, 2, 1, 0]);
+    assert_eq!(dial_order(&circle, Some("3.3.3.3"), None), vec![2, 3, 1, 0]);
     latency::install(HashMap::new());
 }
 
@@ -1140,4 +1144,75 @@ async fn arbiter_refuses_ip_that_already_has_a_channel() {
         inflight::Verdict::Granted(_)
     ));
     inflight::clear();
+}
+
+/// 拨号层整单级预检：候选（扣 skip）全部在建/已有通道 → 当场驳回、不 spawn 拨号任务。
+#[tokio::test]
+async fn dialer_rejects_order_when_all_candidates_busy() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    inflight::clear();
+    let dir = tmpdir();
+    crate::settings::save_worker_mirrors(Vec::new());
+    serial_load(&dir, Vec::new(), None);
+    // 把 github.com 的全部候选都标成"正在拨"。
+    let ips = target_ips("github.com");
+    assert!(!ips.is_empty(), "种子表应有 github.com 候选");
+    let guards: Vec<_> = ips.iter().filter_map(|ip| inflight::try_claim(ip)).collect();
+    assert_eq!(guards.len(), ips.len(), "全部候选都应能标成在建");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let log: LogFn = Arc::new(|_: &str| {});
+    crate::server::dialer::submit(
+        crate::server::dialer::DialOrder {
+            host: "github.com".to_string(),
+            slot: 1,
+            crew: crate::pool::DialCrew::new(),
+            skip_ips: vec![],
+            prefer_shared: None,
+        },
+        &log,
+        tx,
+    )
+    .await;
+    let r = rx.recv().await.expect("驳回也要有回执");
+    let msg = match r {
+        Err(e) => e,
+        Ok(_) => panic!("全候选在建 → 整单驳回"),
+    };
+    assert!(
+        msg.contains(crate::server::upstream::ERR_NO_FREE_IP),
+        "驳回文案应指向候选占用: {msg}"
+    );
+    drop(guards);
+    edges::clear_all();
+    inflight::clear();
+}
+
+/// dial_order 档位排序：指定 prefer_shared 时独占/共享分档，优先档整档在前、
+/// 档内游标优先 + 延迟升序；None 保持纯游标+延迟序。
+#[test]
+fn dial_order_partitions_exclusive_and_shared() {
+    let mk = |ip: &str, shared: bool| route::NodeIp {
+        ip: ip.to_string(),
+        sni: String::new(),
+        verify: String::new(),
+        shared,
+    };
+    // 1.1.1.1 独占；2.2.2.2/3.3.3.3 共享。未测延迟 → 各档内保持表序。
+    let circle = vec![mk("1.1.1.1", false), mk("2.2.2.2", true), mk("3.3.3.3", true)];
+    let ips = |o: Vec<usize>| o.into_iter().map(|i| circle[i].ip.clone()).collect::<Vec<_>>();
+
+    let o = ips(dial_order(&circle, None, Some(true)));
+    assert_eq!(o, ["2.2.2.2", "3.3.3.3", "1.1.1.1"], "共享档整档在前");
+    let o = ips(dial_order(&circle, None, Some(false)));
+    assert_eq!(o, ["1.1.1.1", "2.2.2.2", "3.3.3.3"], "独占档整档在前");
+    // 游标置顶只发生在它所属的档内：游标在共享 3.3.3.3 → 共享档内它提前，独占档不动。
+    let o = ips(dial_order(&circle, Some("3.3.3.3"), Some(true)));
+    assert_eq!(o, ["3.3.3.3", "2.2.2.2", "1.1.1.1"]);
+    // 游标在另一档时不越档：它只在自己档内置顶（3.3.3.3 属共享档），独占档保持延迟序。
+    let o = ips(dial_order(&circle, Some("3.3.3.3"), Some(false)));
+    assert_eq!(o, ["1.1.1.1", "3.3.3.3", "2.2.2.2"]);
+    let o = ips(dial_order(&circle, None, None));
+    assert_eq!(o.len(), 3, "不分档 = 全体一个序");
 }
