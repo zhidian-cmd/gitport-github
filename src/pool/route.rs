@@ -292,7 +292,19 @@ pub fn route_for(host: &str) -> Option<Hit> {
             let lower = host.to_ascii_lowercase();
             let mut best: Option<usize> = None;
             for (i, r) in topo.rows.iter().enumerate() {
-                if r.hits(&lower) && best.is_none_or(|b| r.rank > topo.rows[b].rank) {
+                if !r.hits(&lower) {
+                    continue;
+                }
+                // 同 rank 时更具体的声明胜：`*.x`（仅子域）压过等长的裸键 `x`（自身+任意级子域）。
+                // 没有这条，`github.com` 与 `*.github.com` 就靠文件顺序决定谁赢。
+                let better = match best {
+                    None => true,
+                    Some(b) => {
+                        let cur = &topo.rows[b];
+                        r.rank > cur.rank || (r.rank == cur.rank && r.sub_only && !cur.sub_only)
+                    }
+                };
+                if better {
                     best = Some(i);
                 }
             }

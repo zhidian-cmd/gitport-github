@@ -61,6 +61,36 @@ fn longest_key_wins() {
     }
 }
 
+/// `*.x` 与裸 `x` 同 rank：子域必须落到 `*.x`，裸域仍走 `x`，与书写顺序无关。
+#[test]
+fn star_row_wins_subdomains_on_tie() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for order in [0, 1] {
+        let mut spec = vec![("github.com", "{}"), ("*.github.com", "{}")];
+        if order == 1 {
+            spec.reverse();
+        }
+        install_table(
+            &spec,
+            &[
+                r#"{"ip":"2.2.2.2","hosts":["github.com"]}"#,
+                r#"{"ip":"1.1.1.1","hosts":["*.github.com"]}"#,
+            ],
+        );
+        assert_eq!(
+            dial_targets("maintainers.github.com").expect("子域应命中")[0].ip,
+            "1.1.1.1",
+            "同 rank 时 *. 行压过裸键"
+        );
+        assert_eq!(
+            dial_targets("github.com").expect("裸域应命中")[0].ip,
+            "2.2.2.2"
+        );
+    }
+}
+
 /// 裸域名键 = 自己 + 任意级子域；`*.` 键只认子域，裸域不命中。
 #[test]
 fn key_covers_self_and_subdomains() {
