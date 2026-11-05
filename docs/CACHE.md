@@ -29,7 +29,7 @@
 |---|---|---|---|
 | 1 | 首页骨架 | path `/` | `keep/`（跨会话，7 天） |
 | 2 | 搜索列表 | path `/search`，文档导航与软导航均可 | `pages/` |
-| 3 | 跟班 XHR | 固定前缀清单：`/search/count`、`/search/blackbird_count`、`/search/warm_blackbird_caches`、`/in-product-messaging/`、`/github-copilot/chat/repositories_search`、`/dashboard/`、`/productivity_dashboard/`、`/_filter/`、`/_side-panels/`、`/notifications/indicator`、`/cmc_internal/` | `pages/` |
+| 3 | 跟班 XHR | 固定前缀清单：`/search/count`、`/search/blackbird_count`、`/search/warm_blackbird_caches`、`/search/custom_scopes`、`/in-product-messaging/`、`/github-copilot/chat/repositories_search`、`/dashboard/`、`/productivity_dashboard/`、`/_filter/`、`/_side-panels/`、`/notifications/indicator`、`/cmc_internal/` | `pages/` |
 | 4 | 其他列表页 | 末段命中 `issues / pulls / commits / releases / discussions / notifications / feed / trending / explore / topics / stargazers / watchers / forks / activity`，或列表词后跟**非数字**段；仅文档导航 | `pages/` |
 
 列表页两条细则：末段是**纯数字**当详情页，不缓存（`/issues/123`）；`new`/`edit` 表单不缓存（防伪 token 可能已轮换）。

@@ -57,6 +57,7 @@ const XHR_PREFIXES: &[&str] = &[
     "/search/count",
     "/search/blackbird_count",
     "/search/warm_blackbird_caches",
+    "/search/custom_scopes",
     "/in-product-messaging/",
     "/github-copilot/chat/repositories_search",
     // 首页的跟班：会变的全在这些接口里（见 README 的首页那节）

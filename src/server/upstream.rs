@@ -374,9 +374,34 @@ fn conn_idle_secs(ip: &str, id: u64) -> Option<u64> {
 /// 不同 IP 在不同时刻建连，各自按自己的节拍到期、各自摘自己，不存在「整池同一时刻」。
 /// 建连到入库之间有极小窗口，若对端恰在此时关连接，摘除会先于 `store_h2` 落空；
 /// 那条随后入库，下一轮探测发现 `conn_is_mine` 为真、PING 不通，仍会自行除名。
+/// 看护退出后要不要后台补一条：被动死亡（对端关闭/静默超窗/ping失败）都补——
+/// 让边缘回收对浏览器不可见；「已被摘除」是主动行为（换 IP 重试等），
+/// 拨号请求自己会旋转，补拨反而打架。一次死亡只补一条，失败不重试。
+fn should_replenish(reason: &str) -> bool {
+    reason != "已被摘除"
+}
+
+/// 补拨节流：边缘进入狂回收模式时（实测 5 秒一次），无节流的补拨会变成
+/// 过墙握手风暴，反而招 GFW 注意。每 host 最小补拨间隔——间隔内的死亡
+/// 不补，让请求当场拨（退回老行为），风暴过去自动恢复。
+const REPLENISH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+static LAST_REPLENISH: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
+
+fn replenish_throttled(host: &str) -> bool {
+    let now = std::time::Instant::now();
+    let last = {
+        let mut g = LAST_REPLENISH.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(host.to_string(), now).map(|t| now - t)
+    };
+    last.is_some_and(|age| age < REPLENISH_MIN_INTERVAL)
+}
+
 fn spawn_conn_driver<T>(
+    host: String,
     ip: String,
     id: u64,
+    slot: u8,
     conn: h2::client::Connection<T, Bytes>,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
     log: LogFn,
@@ -447,6 +472,28 @@ fn spawn_conn_driver<T>(
         // 原因落一行——通道死亡从此可见，不再只留下一条无声消失的连接。
         drop_h2_id(&ip, id);
         log(&format!("[通道] {ip}#{id} 看护退出({why})"));
+        // 被动死亡就后台补一条：边缘回收对浏览器不可见，下一个请求零拨号直达。
+        // 主动摘除不补（请求路径自己会旋转）；失败不重试，等下一次死亡再说。
+        if should_replenish(why) && pool::route::is_managed(&host) {
+            if replenish_throttled(&host) {
+                (log)(&format!("[拨号] {host} 补拨节流中, 本轮跳过(下一个请求当场拨)"));
+                return;
+            }
+            (log)(&format!("[拨号] {host} 通道被回收, 已下单补拨"));
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            dialer::submit(
+                dialer::DialOrder {
+                    host: host.clone(),
+                    slot,
+                    crew: pool::DialCrew::new(),
+                    skip_ips: vec![],
+                    prefer_shared: None,
+                },
+                &log,
+                tx,
+            )
+            .await;
+        }
     });
 }
 
@@ -483,8 +530,10 @@ pub async fn h2_from_dialed(
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 从此这条连接归它自己的任务管：续命、停保活、除名，全是这一个任务的事。
     spawn_conn_driver(
+        host.to_string(),
         ip.to_string(),
         id,
+        slot,
         conn,
         ping,
         log.clone(),

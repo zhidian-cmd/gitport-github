@@ -698,6 +698,7 @@ fn list_path_gate() {
         "/search/count",
         "/search/blackbird_count",
         "/search/warm_blackbird_caches",
+        "/search/custom_scopes",
         "/in-product-messaging/",
         "/github-copilot/chat/repositories_search",
     ] {

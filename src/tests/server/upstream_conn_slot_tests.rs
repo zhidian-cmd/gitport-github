@@ -704,7 +704,9 @@ async fn conn_end_removes_itself_from_pool() {
 
     spawn_conn_driver(
         ip.to_string(),
+        ip.to_string(),
         id,
+        1,
         conn,
         None,
         Arc::new(|_| {}),
@@ -782,7 +784,9 @@ async fn idle_window_end_retires_each_ip_from_its_own_task() {
         }
         spawn_conn_driver(
             ip.to_string(),
+            ip.to_string(),
             id,
+            1,
             conn,
             ping,
             Arc::new(|_| {}),
@@ -913,7 +917,9 @@ async fn busy_tunnel_requests_keep_channels_alive() {
     LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
     spawn_conn_driver(
         ip.to_string(),
+        ip.to_string(),
         id,
+        1,
         conn,
         None,
         Arc::new(|_| {}),
@@ -921,6 +927,7 @@ async fn busy_tunnel_requests_keep_channels_alive() {
     );
 
     // 模拟隧道里连着来 30 个请求：每个都打点，中间不该出现任何假空窗。
+    // （此测试的 ip 是假地址，看护退出后 is_managed=false，不会触发补拨下单。）
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(10)).await;
         note_activity();
@@ -940,4 +947,27 @@ async fn busy_tunnel_requests_keep_channels_alive() {
     LAST_ACTIVITY.store(0, std::sync::atomic::Ordering::Relaxed);
     let _ = lock(conn_pool()).remove(ip);
     pool::inflight::clear();
+}
+
+/// 看护退出补拨的判定：被动死亡（对端关闭/超窗/ping失败）都补——
+/// 让边缘回收对浏览器不可见；「已被摘除」是主动行为（换 IP 重试等），补拨反而打架。
+#[test]
+fn replenish_only_after_passive_death() {
+    assert!(should_replenish("对端关闭"));
+    assert!(should_replenish("ping 失败"));
+    assert!(should_replenish("静默超窗/漏探测"));
+    assert!(
+        !should_replenish("已被摘除"),
+        "主动摘除(换IP重试等)不该触发补拨"
+    );
+}
+
+/// 补拨节流：边缘狂回收时（实测 5 秒一次）不能变成过墙握手风暴。
+#[test]
+fn replenish_throttle_caps_per_host_rate() {
+    let host = "throttle-probe.test.invalid";
+    assert!(!replenish_throttled(host), "首次不节流");
+    assert!(replenish_throttled(host), "间隔内第二次应节流");
+    let other = "throttle-other.test.invalid";
+    assert!(!replenish_throttled(other), "不同 host 互不影响");
 }
