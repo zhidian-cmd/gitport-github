@@ -743,7 +743,10 @@ pub(super) async fn get_direct(
         }
         guard = Some(dial_lock.lock().await);
     }
-    let _dial_guard = guard;
+    // 外层这把锁只负责「排队等拨号 + 等完重查池」，到这里就该放手。
+    // 发送若一直攥着它，同 host 的并发请求只能一个发完才轮到下一个
+    // （历史踩过：129 并发串行 34s FCP）。改成每轮只在「查池 + 拨号」那一小段拿锁。
+    drop(guard);
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
         // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。
         let ips: Vec<String> = match pool::route::dial_targets(host) {
@@ -754,45 +757,50 @@ pub(super) async fn get_direct(
         // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
         // 已经撞过一次复用失败的本请求不再碰池，只走确定刚拨出来的连接。
         let allow_reuse = !(!is_simple && body.is_none()) && !reuse_failed;
-        let cached = if !allow_reuse {
-            None
-        } else if upstream::prefer_own_channel(host) {
-            upstream::cached_h2_own(host, &ips, want_slot)
-        } else {
-            upstream::cached_h2_in(&ips, want_slot)
-        };
-        let pool_pick = cached.is_some();
-        let (up, dial_reused) = match cached {
-            Some(up) => (up, false),
-            None => match upstream::dial_upstream(host, log, allow_reuse).await {
-                Ok((up, reused)) => (up, reused),
-                Err(e) => {
-                    // 候选被已有通道占满：换候选、再来一轮都是同一句话，直接交兜底。
-                    // 这里放过会变成 24 行完全相同的失败日志（实测发生过）。
-                    if e.contains(upstream::ERR_NO_FREE_IP) {
-                        return Err(e);
-                    }
-                    // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
-                    if pool::dial_cool_open(host) {
-                        return Err(e);
-                    }
-                    // 拨号失败 = 请求体一个字节都没发出去，换候选重拨对任何方法都安全。
-                    if is_content {
-                        // 内容域这一步是直接转镜像链，不是「换下一个 IP」，别写假话。
-                        pool::CONTENT_BREAKER.set(host);
+        // 单飞只罩「查池 + 拨号」：连接一到手（新拨或池里现成）立刻放锁，
+        // 下面的 send_once 与同 host 其它请求并发跑，不再排队过闸。
+        let (up, dial_reused, pool_pick) = {
+            let _dial_guard = dial_lock.lock().await;
+            let cached = if !allow_reuse {
+                None
+            } else if upstream::prefer_own_channel(host) {
+                upstream::cached_h2_own(host, &ips, want_slot)
+            } else {
+                upstream::cached_h2_in(&ips, want_slot)
+            };
+            let pool_pick = cached.is_some();
+            match cached {
+                Some(up) => (up, false, pool_pick),
+                None => match upstream::dial_upstream(host, log, allow_reuse).await {
+                    Ok((up, reused)) => (up, reused, pool_pick),
+                    Err(e) => {
+                        // 候选被已有通道占满：换候选、再来一轮都是同一句话，直接交兜底。
+                        // 这里放过会变成 24 行完全相同的失败日志（实测发生过）。
+                        if e.contains(upstream::ERR_NO_FREE_IP) {
+                            return Err(e);
+                        }
+                        // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
+                        if pool::dial_cool_open(host) {
+                            return Err(e);
+                        }
+                        // 拨号失败 = 请求体一个字节都没发出去，换候选重拨对任何方法都安全。
+                        if is_content {
+                            // 内容域这一步是直接转镜像链，不是「换下一个 IP」，别写假话。
+                            pool::CONTENT_BREAKER.set(host);
+                            (log)(&format!(
+                                "[MITM] {host} 第 {} 次拨号失败({e}), 直连暂时不可用, 转镜像链",
+                                attempt + 1
+                            ));
+                            return Err(format!("内容域直连全灭({e})"));
+                        }
                         (log)(&format!(
-                            "[MITM] {host} 第 {} 次拨号失败({e}), 直连暂时不可用, 转镜像链",
+                            "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
                             attempt + 1
                         ));
-                        return Err(format!("内容域直连全灭({e})"));
+                        continue;
                     }
-                    (log)(&format!(
-                        "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
-                        attempt + 1
-                    ));
-                    continue;
-                }
-            },
+                },
+            }
         };
         // 竞速内部也可能直接交回池里现成的连接，一并算「复用」，别让它冒充新拨失败。
         let from_pool = pool_pick || dial_reused;
