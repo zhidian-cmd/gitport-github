@@ -981,6 +981,51 @@ pub struct DialSkip<'a> {
     pub crew: Option<&'a DialCrew>,
 }
 
+/// 证书校验失败？错误串随 BoringSSL 版本变化（`CERTIFICATE_VERIFY_FAILED` / `certificate verify failed` /
+/// `hostname mismatch`），统一按小写子串认。只认"校验不过"，不认「系统根证书缺失」那类（`unable to get
+/// local issuer certificate`），后者跟锚点无关，别把人往错方向带。
+fn cert_miss(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "certificate_verify",
+        "certificate verify",
+        "verify failed",
+        "hostname mismatch",
+    ]
+    .iter()
+    .any(|k| m.contains(*k))
+}
+
+/// 锚点选错的提示：同一 (IP, 锚点) 只打一次——坏锚点会在换 IP 时反复撞上，刷屏没有信息量。
+/// 留空时拿目标域名当锚点（[`route::dial_targets`]），所以空锚点失败 = 默认证书没覆盖这个域名。
+fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&LogFn>) {
+    let Some(log) = log else { return };
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    {
+        let mut g = lock(&SEEN);
+        let seen = g.get_or_insert_with(HashSet::new);
+        let key = format!("{ip}|{verify}");
+        if seen.contains(&key) {
+            return;
+        }
+        if seen.len() >= 512 {
+            seen.clear();
+        }
+        seen.insert(key);
+    }
+    // 空锚点在 route::dial_targets 里已被换成了目标域名，所以"等于 host"就是"这行没填 verify"。
+    let blank = verify.is_empty() || verify.eq_ignore_ascii_case(host);
+    let what = if blank {
+        format!("默认证书没覆盖 {host}(verify 留空 = 拿目标域名当锚点)")
+    } else {
+        format!("锚点 {verify} 没印在这张证书上")
+    };
+    log(&format!("[串发] {ip} 证书校验失败: {what}, SNI={sni}"));
+    log(&format!(
+        "[串发]   这行 verify 填证书 SAN 里任意一个域名即可(不必等于目标域名)。查法: openssl s_client -connect {ip}:443 -servername {sni} </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName"
+    ));
+}
+
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
@@ -1113,6 +1158,10 @@ pub async fn serial_dial_skip(
                 }
                 // TCP 失败 = IP 对谁都死，进死亡退避；TLS 失败是按域干扰，只前移。
                 let msg = e.to_string();
+                // 证书校验失败 = 锚点没印在这张证书上，不是 IP 坏：留一行能照做的提示。
+                if msg.contains("TLS") && cert_miss(&msg) {
+                    log_cert_miss(&p.ip, &p.sni, &p.verify, host, log);
+                }
                 let tcp_level = msg.starts_with("TCP")
                     || matches!(
                         e.kind(),

@@ -54,7 +54,8 @@ pub struct IpSpec {
     /// ClientHello SNI：骗墙用，与目标 host 无关。
     #[serde(default)]
     pub sni: String,
-    /// 证书校验锚点：空 = 按目标 host 校验（迁移期安全默认）。
+    /// 证书校验锚点：空 = 拿目标 host 当锚点。只有目标 host 不在该 IP 默认证书的 SAN 上时才需要填，
+    /// 填哪个都行（证明"对面持有 GitHub 证书"即可，域名由 h2 的 `:authority` 说了算）。
     #[serde(default)]
     pub verify: String,
     /// 本节点服务的路由键列表。
