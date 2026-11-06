@@ -2,7 +2,9 @@
 
 ## settings.json 键位契约
 
-位置固定：**exe 同目录**（与 routes.json 同级）。启动读一次，任一开关变更即整份重写。
+位置固定：**exe 同目录**（与 routes.json 同级）。启动读一次，之后多处路径都会触发**整份重写**（`save()` 无增量写）：开关变更、窗口尺寸、PAC 自愈/还原、拨号成功回写游标、镜像注册表变更、首次启动生成模板。不是「只有界面保存才重写」，也不是「只有开关变更才重写」。
+
+字段顺序按 `SettingsFile` 声明顺序落盘（`serde` derive），示例如下：
 
 ```json
 {
@@ -12,21 +14,24 @@
   "githubPAC": true,
   "proxyBackup": "",
   "lastPac": "http://127.0.0.1:7811/proxy.pac",
-  "workerMirrors": [],
   "lastIp": {
     "github.com": "140.82.121.3",
     "api.github.com": "20.200.245.245",
     "*.githubusercontent.com": "185.199.110.133",
-    "*.githubusercontent.com_vice": "185.199.110.133"
-  }
+    "*.githubusercontent.com_vice": "",
+    "objects-origin.githubusercontent.com": ""
+  },
+  "workerMirrors": []
 }
 ```
 
-- `lastPac`：上次写进系统的 PAC 地址，用来区分“自己的残留”和别家同形态；手改无意义
-- `workerMirrors`：自定义镜像注册表，工作台里增删镜像时维护。手改也认，三种写法都收：`["https://反代地址"]`（只写地址 = 默认启用）、`[{"url":"https://反代地址","on":true,"trusted":false}]`、单个字符串/对象（忘写数组括号也收）；键名写成 `worker_mirrors` 同样识别。只收 `https://` 开头且不含空格的地址，其余忽略；整段写坏只丢这一段，不影响其他开关。手写的启用镜像启动时会对齐进内存镜像链（**不重写 routes.json**）；只有界面保存才会按内存状态整份重写 settings.json
+上面为节选，实际落盘是 `circle_keys()` 派生的**全量键位**，当前种子表约 23 把（示例只列了 5 把），未驻留的一律写 `""`。首次启动时 `settings::load()` 早于路由表装载，落盘其实是 `"lastIp": {}`，要等第一次成功拨号 `set_last_ips` 才铺开成全量键。
 
-- `lastIp` 的键由 `pool::circle_keys()` 派生：每条非直连路由一把主键；**只有内容域再加 `_vice` 副键**（双通道各记各的起点），会话域固定单通道、不记副键。**顺序固定、不可调换**；写盘恒为全量键位，未驻留的写 `""`
-- 旧版 `~2` 副键（0.5.4 及以前）读入时自动改名为 `_vice`，无需手工迁移
+- `lastPac`：上次写进系统的 PAC 地址，用来区分“自己的残留”和别家同形态；手改无意义
+- `workerMirrors`：自定义镜像注册表，工作台里增删镜像时维护。手改也认，三种写法都收：`["https://反代地址"]`（只写地址 = 默认启用）、`[{"url":"https://反代地址","on":true,"trusted":false}]`、单个字符串/对象（忘写数组括号也收）；键名写成 `worker_mirrors` 同样识别。只收 `https://` 开头且不含空格的地址，其余忽略；整段写坏只丢这一段，不影响其他开关。手写的启用镜像启动时会对齐进内存镜像链（**不重写 routes.json**）；此后任何一次 `save()` 都会按内存状态整份重写 settings.json，不限于界面保存
+
+- `lastIp` 的键由 `pool::circle_keys()` 派生：每条非 direct 行一把主键；**只有内容域再加 `_vice` 副键**（双通道各记各的起点），会话域固定单通道、不记副键。键序由派生顺序决定、数量随路由表变，不是写死的固定表；写盘恒为全量键位，未驻留的写 `""`
+- 旧版 `~2` 副键（**0.5.3 及以前 / v2 之前**）读入时自动改名为 `_vice`，无需手工迁移。改名逻辑本身就发生在 0.5.4 的 v2 重写里，所以当前版本 0.5.4 已经是改名后的形态
 - `""` / 缺键 / 整段 `lastIp` 缺失，三者行为等价：该路由游标为空，冷启动串发从候选序 0 号位起步。写空串的唯一意义是让 schema 一眼看全、diff 稳定
 - 手改容错：漏键 → 该键回默认；某字段类型写坏（如 `winRect` 写成字符串）→ **只回退该字段**，不连坐整份配置；`lastIp` 读兼容对象与 `[[k,v],…]` 数组两种形态（写只写对象）
 - 布尔键缺失 = `false`；`winRect` 缺失或宽高小于 400×300 时按默认位置开窗
@@ -68,17 +73,17 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 
 - **hosts 行**（域名键）：`github.com` = 自己 + 任意级子域；`*.github.com` = 只认子域（裸域不命中）；多条同时命中取**最长的键**，不用操心书写顺序
   - `action: "direct"` 不进代理（缺省即进）；`content: true` 走内容域熔断与短响应预算；`fallback`：省略 = `dns`，`mirror` = 全灭后走镜像链
-  - **PAC 名单 = 非 direct 行的路由键去 `*.` 的裸域名**，运行时派生、不落盘。`pac` 字段已经从数据结构里删掉，写了也不会读；想让某行不进 PAC，用 `action: "direct"`
+  - **PAC 名单 = 非 direct 行的路由键去 `*.` 的裸域名**，运行时派生、不落盘。`pac` 字段已从 `HostSpec` 数据结构里删掉，写进 JSON 也不会被读取（无 `deny_unknown_fields`，静默忽略），落盘时也不会写出；想让某行不进 PAC，用 `action: "direct"`。注意内置种子 `src/pool/seeds.json` 的 hosts 行**仍带着 `pac` 键**（删 `pac` 字段那次提交没动种子），只是读表时被忽略，不影响行为
 - **ips 节点**：伪装身份与目标 host 解耦——`sni` 只骗墙（写放行域，如 baidu.com），`verify` 是证书校验锚点（只求证明"对面是真 GitHub"，写节点实际返回证书 SAN 内的域；留空 = 按目标 host 校验，兼容旧写法）。**业务路由全靠 h2 的 `:authority`，与 TLS 身份无关**——所以一条连接能服务多个 host，加域名 = 往某节点的 `hosts` 里添个键
   - `ip` 末段支持范围展开：`140.82.112-114.5-6` = 6 个 IP（多段范围做笛卡尔积，上限 64）
-  - `latency` 键（运行时每次真实拨号自动回写，退出时落盘，不手改）：每个展开 IP 的建连毫秒数；串发候选按它升序换位（无值排最后）
+  - `latency` 键（运行时每次**真实拨号事件**自动回写，退出时落盘，不手改）：每个展开 IP 的建连毫秒数；串发候选按它升序换位（无值排最后）。**没有后台定时全量测速，WebUI 也没有「建连测速」按钮**——延迟数据全部来自真实请求的拨号结果
   - 节点的 `hosts` 列表里写的是 **hosts 行的路由键**（不是逐个子域）
-- **边状态机**（运行时实测，不落盘）：某 (IP, 路由键) 被服务端回 421 → 该边长冷却（4 小时）；请求超时 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。成功只清短冷却。全黑时该 host 走 fallback
+- **边状态机**（运行时实测，不落盘，**只在响应处理层写边，拨号层一次都不写**）：某 (IP, 路由键) 被服务端回 421 → 该边长冷却（4 小时）；**新拨连接**发送超时/断连 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。TCP 连不上不写边、走 60/300/1800 秒死亡退避；**复用旧连接失败也不写边、不熔断、不转镜像**，只按 id 摘掉那条连接。成功只清短冷却。全黑时该 host 走 fallback
   - TLS 握手失败（锚点选错）**不记边、不冷却**，只把游标前移，并打一行 `证书校验失败` 提示——那是本地校验没过，不是对端拒绝；换个 SAN 内任意域名即可，不必等于目标域名
-- 旧格式仍能读（启动自动折算，原文件留 `.bak`）：0.5.4 的 `routes` 域名字典（`plans`/`realPlans`）、0.5.3 的 `routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）
+- 旧格式仍能读（启动自动折算，原文件留 `.bak`）：**0.5.3 及以前（v2 之前）**的 `routes` 域名字典（`plans`/`realPlans`）、`routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）。当前 0.5.4 已经是 v2 二部图格式，别把当前版本当成旧格式
 - 镜像链分两个字典：`mirrors_big` = 大文件域（objects / release-assets，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 routes.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
-- 默认安装**不带任何镜像**（双字典为空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502——502 页面会指引补镜像
+- 默认安装**不带任何镜像**（`seeds.json` 顶层只有 `hosts` / `ips`，双字典为空，`builtin_mirror_urls()` 也返回空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**；要镜像得自己在工作台填。README 里「默认镜像链来自 gh-proxy.org 等公益服务」是历史文案，代码里没有硬编码默认镜像
 - 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
 - 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT 时间槽）；链序只决定失败时的顺延次序
 - **物理顺序固定，拨号顺序不按表序**：文件里你怎么排就怎么存，程序不改你的顺序；但拨号时先从游标（上次驻留的 IP）起步，其余按 `latency` 实测升序试，没测过的垫底——想强制某条先试，把它写进游标
@@ -106,11 +111,11 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | `140.82.x.21` / `.22` | GLB 全服务族 | viewscreen / objects-origin / api.mcp（锚点 `actions.githubusercontent.com`） | 伪装 |
 | `4.249.131.160` | Azure（Copilot 代理） | copilot-proxy.githubusercontent.com（锚点 `actions.githubusercontent.com`） | 伪装 |
 
-> **v2 起白名单域全部转伪装**（2026-11-03 实测推翻"伪装会被上游判非法"）：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` 在 Fastly 各段上伪装握手全通、HTTP 层零 421/403，TLS 身份（SNI+锚点）与目标 host 解耦，业务路由走 `:authority`。真名分片腿整体退役。
+> **v2 起白名单域全部转伪装**（2026-11-03 实测推翻"伪装会被上游判非法"）：`docs` / `support` / `resources` / `desktop` / `pages` / `skills` / `archiveprogram` / `socialimpact` / `raw.github.com` 在 Fastly 各段上伪装握手全通、HTTP 层零 421/403，TLS 身份（SNI+锚点）与目标 host 解耦，业务路由走 `:authority`。退役的是 **v1 为这 10 个子域专设的真名 SNI 腿**与 `real`/`donor` 标志，不是所有真名 SNI：CONNECT 纯透传由客户端自持 SNI、全灭 DNS 兜底腿也用真名；**ClientHello 首包分片仍在跑**，总闸是编译期常量 `HELLO_SPLIT_ENABLED = true`，没有运行时开关。
 
 即：**末段 .3/.4 = 网页，.5/.6 = API，.21/.22 = GLB 全服务，.29/.30 = 授权；185.199 段看末段——.133 = 内容，.215 = 静态（新），.154 = 静态（旧），.153 = Pages**。此分工由边缘行为实测标定，routes.json 里的段位置改变不了它。
 
-> 2026-10-19 晚全量测绘补充：① web 族（.3/.4 与 Azure 杂段）对其余 vhost 一律 301 正确重定向——接得住但不交付，不可当多面手使；**唯一的全服务 IP 是 140.82.113.22**（objects-origin 的 GLB 族，9/10 服务直出 200）。② Fastly 四段（.133/.153/.154/.215）服务互通：raw/avatars/io/assets 在四段上都有响应，按段分族是负载与历史划分，非服务边界。③ 伪装 SNI 在 .133 上亦出内容且**默认证书 SAN 覆盖 `*.githubusercontent.com`**（证书校验可过）——2026-10-19 晚 content 族已切换为伪装（当时真名反遭 RST）；若某窗口伪装失效，应急回退 = 手改 routes.json 该条 `"sni": "sni"`（关代理改，重启生效）。④ IP 退役清单机制已整体删除——死活全凭串发实测（失败沉底、成功置顶），routes.json 写什么就试什么，代码不再持有任何 IP 名单。
+> 2026-10-19 晚全量测绘补充：① web 族（.3/.4 与 Azure 杂段）对其余 vhost 一律 301 正确重定向——接得住但不交付，不可当多面手使；**唯一的全服务 IP 是 140.82.113.22**（objects-origin 的 GLB 族，9/10 服务直出 200）。② Fastly 四段（.133/.153/.154/.215）服务互通：raw/avatars/io/assets 在四段上都有响应，按段分族是负载与历史划分，非服务边界。③ 伪装 SNI 在 .133 上亦出内容且**默认证书 SAN 覆盖 `*.githubusercontent.com`**（证书校验可过）——2026-10-19 晚 content 族已切换为伪装（当时真名反遭 RST）。旧版曾提供「手改 `"sni": "sni"` 切回真名」的应急回退，**该实现已随 v1 真名腿一起删除，现在写了也没用**；`sni` 字段只作骗墙的伪装域。④ IP 退役清单机制已整体删除——死活全凭串发实测（失败沉底、成功置顶），routes.json 写什么就试什么，代码不再持有任何 IP 名单。
 
 ## 分流域名总表
 
@@ -122,7 +127,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | viewscreen / objects-origin / api.mcp | GLB 池伪装（140.82.x.21/.22，锚点 `actions…`） |
 | githubapp.com、githubassets、github.io | 池伪装串发 |
 | avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链；README 大图先走纯直连多段（不进镜像链，见 ARCHITECTURE.md） |
-| objects / release-assets | 镜像 + 直连分片竞速（直连占一份——大文件域单通道，ECT 时间槽派发） |
+| objects / release-assets | 镜像 + 直连分片竞速（整包请求直连入列两次、主/副两条通道各一份，镜像一家一份；ECT 时间槽派发） |
 | github.com 的 `/releases/download`（含 latest） | release-assets 专属镜像链，全灭 502 |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | 池伪装（Fastly 段锚点制，原真名分片腿退役） |
 | copilot-proxy.githubusercontent.com | 池伪装（Azure `4.249.131.160`） |

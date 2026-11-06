@@ -38,9 +38,10 @@ const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// 只认不带登录态的静态图片 CDN。github.com / api.github.com 是会话域，
-/// README 的 /owner/repo/raw/... 第一跳带 user_session，绝不能在这里切：
-/// 子请求会把 Cookie 复制 N 份、从 N 条通道同时冒出来，正是代码里明令禁止的风控特征。
+/// 只按 host 白名单准入：静态图片 CDN 才切，github.com / api.github.com 等会话域
+/// 与 README 的 /owner/repo/raw/... 第一跳都不在表内（那跳是 302）。URL 与凭据头
+/// 原样保留，段请求只换 Range——签名可能落在 query 或 Authorization 里，剥掉只会
+/// 把请求改坏（403/签名校验失败），能不能切交给上游的 206 回答。
 pub(super) fn is_image_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -74,8 +75,9 @@ impl Tpl {
         }
     }
 
-    /// [s, e) 半开区间 → Range: bytes=s-(e-1)。凭据头一律剥掉：这些域本来就不带
-    /// Cookie，显式剥是为了哪天请求形状变了也不会把登录态复制成 N 份。
+    /// [s, e) 半开区间 → Range: bytes=s-(e-1)。URL 与凭据头原样保留：签名可能在
+    /// query 里、凭据可能在 Authorization 里，剥掉会直接把请求改坏；只剥会改变段
+    /// 语义的头（Range / 条件头 / Accept-Encoding）与逐跳头。
     fn build(&self, s: u64, e: u64) -> Result<hyper::Request<BoxBody>, String> {
         let mut b = hyper::Request::builder()
             .method(self.method.clone())
@@ -96,10 +98,7 @@ impl Tpl {
 fn skip_request_header(k: &str) -> bool {
     matches!(
         k,
-        "cookie"
-            | "authorization"
-            | "proxy-authorization"
-            | "range"
+        "range"
             | "if-range"
             | "if-none-match"
             | "if-modified-since"

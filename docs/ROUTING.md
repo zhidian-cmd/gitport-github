@@ -1,7 +1,7 @@
 # 路由（v2 二部图）
 
 > 判定逻辑唯一真相:`src/pool/route.rs`(route_for / dial_targets / master_route)+ `routes.json`(ips / hosts / mirrors_big / mirrors_small)。
-> v1 时代(池/族/对口规则/真名分片腿)的实测矩阵作为历史存档保留在文末附录——其中 objects-origin、codeload、白名单腿的结论**已被 v2 推翻**,以本文为准;IP 死活与镜像质量的观察仍具参考价值。
+> **文末附录整体是 v1 历史存档，不是现行依据**：池/族/对口规则、真名分片腿、`POOL_ROUTES`、白名单腿、`real`/`donor` 标志均已退役，附录里的路由判定结论（含 objects-origin、codeload、白名单腿）**已被 v2 推翻**；只有 IP 死活与镜像质量的观察还有参考价值。正文以 `src/` 代码为准。
 
 ## 0. 总览
 
@@ -12,7 +12,7 @@ flowchart TD
     P --> L2["② master_route<br/>未命中 → Tunnel · direct 行 → System<br/>大文件/附件 GET/HEAD → Mirror · 其余 → Pool"]
     L2 --> L3["③ dial_targets<br/>路由键 → 邻接 IP 节点展开（末段 a-b）<br/>→ 滤冷却中的黑边 → 去重"]
     L3 --> L4["④ 串发 NodeIp{ip, sni, verify}<br/>伪装 sni 骗墙 · verify 锚点验真<br/>业务路由全靠 h2 :authority"]
-    L4 --> OUT["成功：清短冷却 + 游标驻留<br/>421 → 拉黑 4h · 超时 → 降权 2min<br/>风控页 → 冷却 600s(免疫清黑) + 换边"]
+    L4 --> OUT["成功：清短冷却 + 游标驻留<br/>响应 421 → 拉黑 4h · 新拨连接超时 → 降权 2min<br/>证书校验失败/TCP 连不上：不写边<br/>风控页 → 冷却 600s(免疫清黑) + 换边"]
     OUT -.->|"候选未走完"| L3
     OUT -->|"候选走完 / 全黑"| FB["fallback：content 行 → 镜像链<br/>其余 → 系统 DNS 腿"]
     FB --> UP["上游（GitHub 边缘 / 镜像站 / 系统 DNS）"]
@@ -24,7 +24,7 @@ flowchart TD
 
 PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direct"` 行进 DIRECT 名单,表外域名 DIRECT。**名单值 = 路由键去 `*.` 的裸域名,运行时派生、不在 routes.json 落盘**；`pac` 字段已从数据结构移除,写进 JSON 也不会被读取(未知字段直接忽略)——想让某行不进 PAC,用 `action:"direct"`。
 
-**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(2026-11-03)。当前 GitHub 系 20 个路由键全部进代理。
+**与 v1 的关键差异**:v1 有 4 个域名(objects-origin / uploads / viewscreen / api.mcp)走 PAC DIRECT 绕过代理;v2 起它们全部入池——各配专节点与证书锚点(viewscreen / objects-origin / api.mcp → GLB 族 `140.82.112-114.21-22`,verify=`actions.githubusercontent.com`;uploads → alambic `20.205.243.161`,verify=`githubusercontent.com`),伪装握手 openssl 实测全通过(2026-11-03)。当前受管域名全部进代理;路由键数量由 `seeds.json` 的 `hosts` 行加节点声明推导,会随表变化,不写死数字。
 
 匹配语义:裸键含自身+任意级子域,`*.` 只认子域(裸域不命中),最长键胜,点边界(`evilgithub.com` 不命中 `github.com`),大小写无关。
 
@@ -38,7 +38,7 @@ PAC 由 `pool::pac_lists()` 生成:非 direct 行进 PROXY 名单,`action:"direc
 | GET + 静态图片 CDN（raw / user-images / private-user-images / media / camo / gist / avatars）的 README 大图 | **Pool**（不进 Mirror） | 探片后纯直连切 4~8 段并发 Range、按字节边界合流；小图/非图片/池冷自动退回单流。见 [ARCHITECTURE.md](ARCHITECTURE.md)「README 大图」节 |
 | 其余(含 codeload——按子域命中 `github.com` 裸键) | **Pool** | 查询管线走二部图 |
 
-codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪装通道,直连优先,失败按校准链序逐家),`/archive` 源码包不再镜像——镜像链归属只剩 objects / release-assets 两族。
+codeload 与 archive 的变化:**codeload 并入池**——`master_route` 里没有 codeload 专属分支,它作为 `github.com` 的子域按点边界命中 `github.com` 裸键走 `Pool`,直连全灭后走所有 Pool 域通用的 `dns_direct_fetch` 系统 DNS 兜底,不是 codeload 专属兜底,也不按校准链序逐家。`mirrors_small` 里的 codeload 校准模板是迁池后的残留:镜像链只按内容域白名单建键、装载时丢弃非白名单链,那条模板永不触发。`/archive` 源码包不再镜像——镜像链归属只剩 objects / release-assets 两族。
 
 ## 3. ③ dial_targets:二部图查询与边状态机
 
@@ -46,19 +46,20 @@ codeload 与 archive 的变化:**codeload 并入池**(走 `github.com` 键的伪
 
 - **sni**:骗墙的伪装域(当前全线 `baidu.com`),与目标 host 无关——墙只看 ClientHello 明文,业务路由在加密的 h2 `:authority` 里
 - **verify**:证书校验锚点,只求证明"对面是真 GitHub";留空 = 按目标 host 校验(安全默认)
-- **边状态机**:表是预判,边是实测。`(IP, 路由键)` 三档坏态——421/证书不匹配拉黑 **4h**(静态属性不会自愈)、超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗),**免疫成功清黑**——风控页本身就是一次"成功"的 HTTP 交换,可清就会在风暴里被并发回写洗掉(实测 26 家候选 3 轮回头的事件根因);成功只清短冷却。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
+- **边状态机**:表是预判,边是实测,`写边只发生在响应处理层,拨号层一次都不写`。(IP, 路由键) 三档坏态——**响应 421** 拉黑 **4h**(静态属性不会自愈)、**新拨连接**发送超时/断连降权 **2min**(网络波动)、风控拦截页冷却 **600s**(对齐 GitHub 限流窗),**免疫成功清黑**——风控页本身就是一次"成功"的 HTTP 交换,可清就会在风暴里被并发回写洗掉(实测 26 家候选 3 轮回头的事件根因);成功只清短冷却。**TLS 证书 SAN 不覆盖不记边、不冷却**,只前移游标并打一行 `证书校验失败`(本地校验没过,不是对端拒绝);**TCP 连不上也不写边**,走 60/300/1800 秒死亡退避。业务状态码 403/404/429 **不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"
 
 ## 4. 拨号仲裁:只在拨号那一瞬,且只管共享 IP
 
-host 线程先查全局连接池,**确实没有现成通道**才走到拨号这一步(拿每 host 拨号锁前后、每轮重试都会重查,结果永远是新的)。
+host 线程先查全局连接池,**确实没有现成通道**才走到拨号这一步(拿每 host 拨号锁前后、每轮重试都会重查,结果永远是新的)。**per-host 拨号锁只罩「查池 + 拨号」,发送之前就放掉**;外层锁只罩「排队等拨号 + 等完重查池」。
 
 装表时按具体 IP 聚合它服务的路由键:挂了 **2 个以上键**或含 **`*.` 通配键**(一个键背后几十个 host)就算**共享 IP**,标记跟着候选一起带出来,零额外查表。只有共享 IP 才找独立仲裁器申请使用权;独占 IP 不进裁决,只保留原有的"正在拨"轻量登记,供后台补第二条通道时防两个任务撞同一 IP。
 
 - 同一瞬间已经入批的申请算一批:按 **主站 > api > 一般内容 > avatars** 挑一个赢家,其余当场驳回、换候选里的下一个 IP。只认已经到的,不等还没来的,零计时窗口
 - 有先后就先到先得:晚一个节拍的申请看到 IP 已授出直接驳回,优先级更高也不反超、不参与排序
-- 授权一直握到通道建好(h2 握手完成)才交棒,盖住"TCP+TLS 已通、连接还没可用"那段空档;之后交给连接池,多个 host 复用同一条连接,仲裁器退场
+- 授权一直握到**通道入库**才交棒,顺序是 `h2 握手 → store_h2 写进连接池 → 放开拨号权`,不是只到握手完成;发请求在入库之后。之后多个 host 复用同一条连接,仲裁器退场
+- 「已有通道」登记(`inflight::live`)的增删与池里增删连接都在**同一把池锁内**完成,不交错;最后一条连接被摘除才撤销登记,此后才允许重拨
 - 拨号失败、panic、请求取消都自动交还,不会把 IP 永久占死
-- 全部候选都被占:等一轮(每 30ms 看一次,最多 300ms),然后回头查连接池——对方建好的连接直接复用
+- 全部候选被占 / 已有通道(`ERR_NO_FREE_IP`):**3 秒内每 50ms** 重查连接池,等后台补拨或并行建连把连接入库后直接复用现成的;超时才交兜底,流式请求不等立即交兜底。不是「等自愈补拨建成再复用」以外的固定短等
 - 候选不足两个 IP 时不开第二条通道:同一个 IP 绝不拨第二次(入库时后到的连接当场丢弃),多拨一次也换不来新通道
 
 ## 5. ④ 兜底与熔断
@@ -67,16 +68,16 @@ host 线程先查全局连接池,**确实没有现成通道**才走到拨号这�
 |---|---|
 | 全黑 / 候选走完(content 行) | → 镜像链(`mirrors_small`)→ 系统 DNS 腿 |
 | 全黑 / 候选走完(其余行) | → 系统 DNS 腿 |
-| 大文件域整链全灭(镜像+直连) | 熔断 60s,窗口内同域毫秒级快速失败,502 页指引补镜像 |
+| 大文件域整链全灭(镜像+直连) | 熔断 60s,窗口内同域毫秒级快速失败;502 提示页**每 8 秒自动刷新**,只有「暂时不可用 / 代理正在按表自动重试」和工作台链接,**没有任何「补镜像」指引** |
 | 复用旧连接失败 | **不算直连失败**:只按 id 摘掉这条连接,本次请求后续只走新拨的连接;不记边冷却、不熔断、不转镜像。只有新拨出来的连接/拨号本身失败,才说明这个 IP 或这批候选不行 |
-| 凭据查询串防护 | `token` / `sig` / `x-amz-*` 等参数 → 剥空镜像仅派直连;WebUI「信任」勾选的镜像例外(见 README) |
+| 凭据查询串防护 | `token` / `sig` / `jwt` / `x-amz-*` 等参数 → 默认剥空镜像仅派直连;WebUI「信任」勾选的镜像例外(见 README)。判断依据是 URL 形状,不是仓库公私 |
 
 ## 6. v1 → v2 行为变化对照
 
 | 域 / 机制 | v1(池/族/对口规则) | v2(二部图/边) |
 |---|---|---|
 | objects-origin / uploads / viewscreen / api.mcp | PAC DIRECT,绕过代理 | **入池**:专节点 + verify 锚点,伪装握手 |
-| codeload.github.com | Mirror 整包竞速 | **Pool**(github.com 键),直连优先 |
+| codeload.github.com | Mirror 整包竞速 | **Pool**——按子域命中 `github.com` 裸键,无专属分支;全灭走通用系统 DNS 兜底,不走镜像链 |
 | `/archive` 源码包 | 归属 codeload 镜像链 | 不再镜像,走池 |
 | docs / support 等 10 子域 | 真名 SNI + ClientHello 分 3 片(wl* 四族) | **伪装通道 + verify 锚点**,真名分片腿与 real/donor 标志退役 |
 | 主站候选里的 Fastly 段 | 对口规则判据筛除 | 节点不声明该键即不服务(数据表达) |
@@ -109,7 +110,7 @@ host 线程先查全局连接池,**确实没有现成通道**才走到拨号这�
 | release-assets / objects 域 | GET/HEAD | Mirror | ✅ 无效 URL 全链试后 502 不回落(设计如此) |
 | github.com | GET `/releases/download`、`/releases/latest/download` | Mirror | ✅ 206 + 归属 release-assets 链 |
 | github.com | POST `/releases/download` | Pool core | ✅ 422(附件路径只对 GET/HEAD 镜像) |
-| api.github.com | 任意 | Pool api | ✅ API 专用边缘 .5/.6 与 core 的 .3/.4 互斥,落错返 404/301 |
+| api.github.com | 任意 | Pool api | ⚠ 原记录写「.5/.6 与 core 的 .3/.4 互斥,落错返 404/301」并打了 ✅,但同文附-6「局限」明确写「core/api 落错互斥未构造」——两者自相矛盾,以附-6 为准:该项未实测 |
 | 非池域名 | 任意 | Tunnel | ✅ 强制代理 example.com → 200 直通 |
 
 ### 附-3:v1 池内族路由与实表快照
@@ -164,4 +165,4 @@ host 线程先查全局连接池,**确实没有现成通道**才走到拨号这�
 
 ---
 
-*历史实测时间:2026-10-19 10:33-10:41(UTC+8),代理 6151063;2026-10-27 补白名单腿。v2 重写:2026-11-04。*
+*历史实测时间:2026-10-19 10:33-10:41(UTC+8),代理 6151063;2026-10-27 补白名单腿。v2 路由重写核心提交 2026-11-03,收尾(含删 `pac` 字段、二部图落盘)延至 2026-11-04——文档里出现的「11-03 实测」「11-04 收尾」指这两批,不是两个互相矛盾的版本。*

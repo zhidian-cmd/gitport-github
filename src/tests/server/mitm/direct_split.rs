@@ -1,5 +1,5 @@
-//! 纯直连多段的不变量：准入只认静态 CDN、子请求不带凭据、段边界严格、
-//! 合并后的字节与单流逐字节一致。这些是「图会不会花 / 会不会踩风控」的底线。
+//! 纯直连多段的不变量：准入只认静态 CDN、URL 与凭据头原样保留、段边界严格、
+//! 合并后的字节与单流逐字节一致。这些是「图会不会花 / 请求会不会被改坏」的底线。
 use super::{
     is_image_split_host, seg_count, skip_request_header, skip_response_header, SegmentedBody, Tpl,
     MAX_SEGS, MIN_SPLIT_BYTES,
@@ -16,8 +16,11 @@ fn tpl() -> Tpl {
     headers.insert("host", HeaderValue::from_static("raw.githubusercontent.com"));
     headers.insert("cookie", HeaderValue::from_static("user_session=SECRET"));
     headers.insert("authorization", HeaderValue::from_static("Bearer SECRET"));
+    headers.insert("proxy-authorization", HeaderValue::from_static("Basic SECRET"));
     headers.insert("if-none-match", HeaderValue::from_static("\"etag\""));
+    headers.insert("if-range", HeaderValue::from_static("\"etag\""));
     headers.insert("accept-encoding", HeaderValue::from_static("gzip"));
+    headers.insert("connection", HeaderValue::from_static("keep-alive"));
     headers.insert("range", HeaderValue::from_static("bytes=9-9"));
     Tpl {
         method: Method::GET,
@@ -28,8 +31,8 @@ fn tpl() -> Tpl {
 
 #[test]
 fn session_hosts_never_enter_direct_split() {
-    // README 的 /o/r/raw/... 第一跳在 github.com 上、带 user_session；切它等于把
-    // 同一登录态复制 N 份从多条通道同时发出去，正是上游代码明令禁止的风控特征。
+    // README 的 /o/r/raw/... 第一跳在 github.com 上，是 302；会话域本就不在静态
+    // 图片 CDN 白名单里，不会进纯直连切片。
     for h in ["github.com", "api.github.com", "github.githubassets.com", "objects.githubusercontent.com"] {
         assert!(!is_image_split_host(h), "{h} 不该进纯直连切片");
     }
@@ -53,7 +56,7 @@ fn readme_image_cdns_are_allowed() {
 }
 
 #[test]
-fn segment_request_drops_credentials_and_sets_exact_range() {
+fn segment_request_keeps_credentials_and_sets_exact_range() {
     let req = tpl().build(262_144, 524_288).expect("构造段请求");
     assert_eq!(req.method(), Method::GET);
     assert_eq!(
@@ -61,14 +64,40 @@ fn segment_request_drops_credentials_and_sets_exact_range() {
         "bytes=262144-524287",
         "Range 是半开区间 [s,e) → s-(e-1)"
     );
-    for k in ["cookie", "authorization", "if-none-match", "accept-encoding"] {
-        assert!(req.headers().get(k).is_none(), "{k} 不该被复制到每个段");
+    // URL 与凭据头一字不改：签名可能在 query 里，Authorization 也可能是取图凭据，
+    // 剥掉只会把请求改坏（403 / 签名校验失败），不是更安全。
+    assert_eq!(req.headers().get("cookie").unwrap(), "user_session=SECRET");
+    assert_eq!(req.headers().get("authorization").unwrap(), "Bearer SECRET");
+    assert_eq!(
+        req.headers().get("proxy-authorization").unwrap(),
+        "Basic SECRET"
+    );
+    // 这几类会改变段语义或属于逐跳头，必须剥掉。
+    for k in ["if-none-match", "if-range", "accept-encoding", "connection"] {
+        assert!(req.headers().get(k).is_none(), "{k} 不该被复制进段请求");
     }
     assert_eq!(req.headers().get("user-agent").unwrap(), "bench/1.0");
     assert_eq!(
         req.headers().get("host").unwrap(),
         "raw.githubusercontent.com"
     );
+}
+
+#[test]
+fn signed_query_survives_segment_template() {
+    // 带签名 query 的 URL 进段模板后一个字都不能丢，凭据头同样保留。
+    let mut t = tpl();
+    t.uri =
+        "/o/r/main/assets/big.png?jwt=eyJhbGciOiJIUzI1NiJ9&sig=deadbeef&X-Amz-Credential=AKIA"
+            .parse()
+            .unwrap();
+    let req = t.build(0, 1).expect("构造段请求");
+    assert_eq!(
+        req.uri().path_and_query().unwrap().as_str(),
+        "/o/r/main/assets/big.png?jwt=eyJhbGciOiJIUzI1NiJ9&sig=deadbeef&X-Amz-Credential=AKIA"
+    );
+    assert_eq!(req.headers().get("cookie").unwrap(), "user_session=SECRET");
+    assert_eq!(req.headers().get("range").unwrap(), "bytes=0-0");
 }
 
 #[test]
@@ -137,7 +166,11 @@ fn hop_by_hop_and_range_headers_are_not_carried_to_client() {
     }
     assert!(!skip_response_header("content-type"), "图片 content-type 必须保留");
     assert!(!skip_response_header("etag"));
-    assert!(skip_request_header("cookie"));
+    assert!(!skip_request_header("cookie"));
+    assert!(!skip_request_header("authorization"));
+    assert!(!skip_request_header("proxy-authorization"));
+    assert!(skip_request_header("if-none-match"));
+    assert!(skip_request_header("if-range"));
     assert!(!skip_request_header("user-agent"));
 }
 
