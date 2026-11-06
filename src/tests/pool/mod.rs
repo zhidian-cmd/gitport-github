@@ -1,3 +1,6 @@
+// TEST_LOCK 要在整个异步用例期间独占全局路由表/连接池，跨 await 持 std Mutex 是刻意的；
+// 这些用例跑在 current_thread runtime 上，不会被别的任务抢锁。
+#![allow(clippy::await_holding_lock)]
 use super::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

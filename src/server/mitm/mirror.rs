@@ -819,6 +819,28 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     }
 }
 
+/// 206 收口统一校验：Content-Range 起点必须等于本段请求起点。
+/// 起点不符的段一旦拼进合并流，后面所有字节都会错位——宁可当段失败走补发。
+/// 302 跟跳只传回最终响应，所以这里校验的正是落点那一跳的 206。
+fn check_segment_start(resp: &hyper::Response<BoxBody>, s: u64) -> Result<(), String> {
+    let cr = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok());
+    match merge::content_range_start(cr) {
+        Some(got) if got == s => Ok(()),
+        Some(got) => Err(format!("206 起点不符: 要 {s}, 拿到 {got}")),
+        None => Err("206 缺 Content-Range".to_string()),
+    }
+}
+
+/// 段请求的 Range 头：end 是闭区间末端（含）。
+/// 主切片的 (s,e) 是半开区间要传 e-1，补发的 e 已经是闭区间末端直接传 e——
+/// 统一走这里，免得再出现「末端又减一次 1」那种少一字节的笔误。
+fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
+    http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
+}
+
 /* ---------- 同 URL 并发区间请求的段位分配 ----------
    下载器常对一个文件同时发好几个 Range 请求；每个请求各自切满所有镜像，
    叠加起来就是把 7 家镜像同时按几十路打（日志里 4 秒内 4 次「切 N 段」）。
@@ -875,7 +897,7 @@ fn plan_quota(
     let total: u64 = pending.iter().map(|(l, _)| *l).sum();
     let seg = total.div_ceil(capacity.max(1) as u64).max(1);
     let mut order: Vec<(u64, u64)> = pending.to_vec();
-    order.sort_by(|a, b| b.0.cmp(&a.0));
+    order.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut remaining = slots.max(1);
     let mut mine = 1usize;
     for (i, (l, id)) in order.iter().enumerate() {
@@ -1049,8 +1071,7 @@ async fn split_download(
             let is_direct = m.starts_with("direct/");
             let got = if is_direct {
                 // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
-                let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
-                    .map_err(|err| err.to_string())?;
+                let range = segment_range(s, e - 1)?;
                 let attempt = segment_direct(
                     log,
                     &tpl,
@@ -1089,6 +1110,7 @@ async fn split_download(
             }
             match got {
                 Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                    check_segment_start(&resp, s)?;
                     let at = Instant::now();
                     Ok((guard.segment_from(at), at, resp))
                 }
@@ -1270,8 +1292,9 @@ async fn split_fetch(
     if m.starts_with("direct/") {
         let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
         let has_mirror = cands.len() > 1;
-        let range = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
-            .map_err(|err| err.to_string())?;
+        // e 已经是闭区间末端（base+to-1）：补发直接用它，别再减 1。
+        // 少一字节会让合并层为末字节反复补发，而 1 字节补发的 Range 会变成起点>终点。
+        let range = segment_range(s, e)?;
         let attempt = segment_direct(
             log,
             tpl,
@@ -1297,6 +1320,7 @@ async fn split_fetch(
         }
         match got {
             Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                check_segment_start(&resp, s)?;
                 let at = Instant::now();
                 let guard = guard.segment_from(at);
                 Ok(account_seg(
@@ -1320,11 +1344,12 @@ async fn split_fetch(
             .method(http::Method::GET)
             .uri(format!("{m}/{orig_url}"))
             .header(http::header::USER_AGENT, MIRROR_UA)
-            .header(http::header::RANGE, format!("bytes={s}-{}", base + to - 1))
+            .header(http::header::RANGE, segment_range(s, base + to - 1)?)
             .body(protocol::empty_body())
             .map_err(|e| e.to_string())?;
         match mirror_do(req, &m, log).await {
             Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                check_segment_start(&resp, s)?;
                 let at = Instant::now();
                 let guard = guard.segment_from(at);
                 Ok(account_seg(

@@ -128,22 +128,8 @@ fn skip_response_header(k: &str) -> bool {
     )
 }
 
-fn content_range_total(v: Option<&str>) -> Option<u64> {
-    let t = v?.trim().rsplit('/').next()?.trim();
-    if t == "*" {
-        return None;
-    }
-    t.parse().ok()
-}
-
-fn range_start(v: Option<&str>) -> Option<u64> {
-    // 标准头是 "bytes 262144-524287/1608296"（空格），别按 "bytes=" 那套 Range 请求的写法猜。
-    let s = v?.trim();
-    let rest = s
-        .strip_prefix("bytes ")
-        .or_else(|| s.strip_prefix("bytes="))?;
-    rest.split('-').next()?.trim().parse().ok()
-}
+// Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
+// 与镜像链的 206 校验用同一套标准，别再各写一份。
 
 /// 探片/总长记忆：命中省一次真实往返；记 0 表示这个 URL 不支持 Range，10 分钟内别再探。
 static MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> = LazyLock::new(Default::default);
@@ -192,8 +178,12 @@ async fn fetch_segment(
         .headers()
         .get("content-range")
         .and_then(|v| v.to_str().ok());
-    if range_start(cr) != Some(s) {
+    if merge::content_range_start(cr) != Some(s) {
         return Err(format!("段边界不符: 要 {s}, 拿到 {cr:?}"));
+    }
+    // 起点对但终点越界也不能收：多出来的字节会吃掉总长预算，尾段就发不完了。
+    if merge::content_range_end(cr).is_some_and(|end| end >= e) {
+        return Err(format!("段终点越界: 要 <= {}, 拿到 {cr:?}", e - 1));
     }
     let (parts, body) = resp.into_parts();
     Ok((body, parts.headers))
@@ -239,7 +229,7 @@ pub(super) async fn try_direct_split(
                 memo_put(&key, 0); // 上游忽略 Range：10 分钟内别再白探
                 return None;
             }
-            let Some(t) = content_range_total(
+            let Some(t) = merge::content_range_total(
                 resp.headers()
                     .get("content-range")
                     .and_then(|v| v.to_str().ok()),
@@ -424,6 +414,14 @@ impl hyper::body::Body for SegmentedBody {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Ok(d) = frame.into_data() {
                         seg.got += d.len();
+                        // 单段只能交自己那 (e-s) 个字节。上游起点对但终点超长时，
+                        // 多出的字节会吃掉全局总长预算，尾段就发不出去了。
+                        if seg.got > seg.expected {
+                            me.finished = true;
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                "直连段超出本段字节数",
+                            ))));
+                        }
                         seg.buffered += d.len();
                         seg.buf.push_back(d);
                     }

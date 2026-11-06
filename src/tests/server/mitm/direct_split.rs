@@ -1,9 +1,10 @@
 //! 纯直连多段的不变量：准入只认静态 CDN、子请求不带凭据、段边界严格、
 //! 合并后的字节与单流逐字节一致。这些是「图会不会花 / 会不会踩风控」的底线。
 use super::{
-    content_range_total, is_image_split_host, range_start, seg_count, skip_request_header,
-    skip_response_header, SegmentedBody, Tpl, MAX_SEGS, MIN_SPLIT_BYTES,
+    is_image_split_host, seg_count, skip_request_header, skip_response_header, SegmentedBody, Tpl,
+    MAX_SEGS, MIN_SPLIT_BYTES,
 };
+use crate::server::mitm::merge::{content_range_end, content_range_start, content_range_total};
 use crate::server::protocol::{self, BoxBody};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
@@ -117,10 +118,16 @@ fn range_helpers_parse_206_headers() {
     assert_eq!(content_range_total(Some("bytes 0-0/*")), None);
     assert_eq!(content_range_total(None), None);
     assert_eq!(
-        range_start(Some("bytes 262144-524287/1608296")),
+        content_range_start(Some("bytes 262144-524287/1608296")),
         Some(262_144)
     );
-    assert_eq!(range_start(Some("bytes 0-0/*")), Some(0));
+    assert_eq!(content_range_start(Some("bytes 0-0/*")), Some(0));
+    assert_eq!(
+        content_range_end(Some("bytes 262144-524287/1608296")),
+        Some(524_287)
+    );
+    assert_eq!(content_range_end(Some("bytes=0-0/*")), Some(0));
+    assert_eq!(content_range_end(None), None);
 }
 
 #[test]
@@ -170,4 +177,14 @@ async fn segmented_body_stops_at_declared_total() {
         .to_bytes();
     assert_eq!(got.len(), 40);
     assert!(got.iter().all(|b| *b == 3));
+}
+
+#[tokio::test]
+async fn segmented_body_rejects_overlong_segment() {
+    // 上游给的字节超过本段声明长度：报错重取，别让多出来的尾巴吃掉后面段的预算。
+    let entries = vec![(protocol::full_body(Bytes::from(vec![9u8; 100])), 64usize)];
+    assert!(
+        BodyExt::collect(SegmentedBody::new(entries, 64)).await.is_err(),
+        "超长段必须暴露成错误"
+    );
 }

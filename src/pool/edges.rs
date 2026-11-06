@@ -15,10 +15,12 @@ const RISK_SECS: u64 = 600;
 const CAP: usize = 8192;
 
 /// 值 = (到期时刻, 是否风控冷却)。风控项免疫 clear()，只能到期自愈。
-static EDGES: std::sync::Mutex<Option<HashMap<(String, String), (Instant, bool)>>> =
-    std::sync::Mutex::new(None);
+type EdgeMap = HashMap<(String, String), (Instant, bool)>;
+type EdgeTable = std::sync::Mutex<Option<EdgeMap>>;
 
-fn map() -> &'static std::sync::Mutex<Option<HashMap<(String, String), (Instant, bool)>>> {
+static EDGES: EdgeTable = std::sync::Mutex::new(None);
+
+fn map() -> &'static EdgeTable {
     &EDGES
 }
 

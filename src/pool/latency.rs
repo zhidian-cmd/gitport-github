@@ -18,22 +18,6 @@ pub fn get(ip: &str) -> Option<u64> {
     g.as_ref()?.get(ip).copied()
 }
 
-/// 本轮结果覆盖：成功记用时，失败删除旧值（下次排序按未测垫底）。
-pub fn replace(rows: &[(String, Option<u64>)]) {
-    let mut g = lock(&TABLE);
-    let m = g.get_or_insert_with(HashMap::new);
-    for (ip, ms) in rows {
-        match ms {
-            Some(ms) => {
-                m.insert(ip.clone(), *ms);
-            }
-            None => {
-                m.remove(ip);
-            }
-        }
-    }
-}
-
 /// 运行时拨号延迟回流：每次真实建连都把实测用时写进排序表（内存态，重启回落
 /// routes.json 的测速基线）。有旧值时取均值——单次 GFW 抖动（4 秒抽签）不会把
 /// 一个 IP 一棍子打死，连续慢才会让它沉底。

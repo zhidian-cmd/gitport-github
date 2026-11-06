@@ -702,16 +702,16 @@ async fn conn_end_removes_itself_from_pool() {
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
     assert!(pool::inflight::live(ip), "入库即登记'这个 IP 已有通道'");
 
-    spawn_conn_driver(
-        ip.to_string(),
-        ip.to_string(),
+    spawn_conn_driver(ConnDriver {
+        host: ip.to_string(),
+        ip: ip.to_string(),
         id,
-        1,
+        slot: 1,
         conn,
-        None,
-        Arc::new(|_| {}),
-        Duration::from_secs(30),
-    );
+        ping: None,
+        log: Arc::new(|_| {}),
+        probe: Duration::from_secs(30),
+    });
     // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
     let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
     server.abort();
@@ -782,16 +782,16 @@ async fn idle_window_end_retires_each_ip_from_its_own_task() {
                 }
             }
         }
-        spawn_conn_driver(
-            ip.to_string(),
-            ip.to_string(),
+        spawn_conn_driver(ConnDriver {
+            host: ip.to_string(),
+            ip: ip.to_string(),
             id,
-            1,
+            slot: 1,
             conn,
             ping,
-            Arc::new(|_| {}),
-            Duration::from_millis(20),
-        );
+            log: Arc::new(|_| {}),
+            probe: Duration::from_millis(20),
+        });
     }
 
     let mut all_gone = false;
@@ -915,16 +915,16 @@ async fn busy_tunnel_requests_keep_channels_alive() {
         },
     );
     LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
-    spawn_conn_driver(
-        ip.to_string(),
-        ip.to_string(),
+    spawn_conn_driver(ConnDriver {
+        host: ip.to_string(),
+        ip: ip.to_string(),
         id,
-        1,
+        slot: 1,
         conn,
-        None,
-        Arc::new(|_| {}),
-        Duration::from_millis(20),
-    );
+        ping: None,
+        log: Arc::new(|_| {}),
+        probe: Duration::from_millis(20),
+    });
 
     // 模拟隧道里连着来 30 个请求：每个都打点，中间不该出现任何假空窗。
     // （此测试的 ip 是假地址，看护退出后 is_managed=false，不会触发补拨下单。）

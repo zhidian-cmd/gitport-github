@@ -644,7 +644,7 @@ fn create_window(
             // 留住窗口并写明原因：窗口对象在这里被 drop 会触发 Destroyed，
             // 不记标志就会「销毁→自愈重建→再失败」的死循环。
             WV_FAILED.store(true, Ordering::SeqCst);
-            let _ = window.set_title("GitPort — WebView2 不可用，请安装或修复 WebView2 Runtime");
+            window.set_title("GitPort — WebView2 不可用，请安装或修复 WebView2 Runtime");
             g.win = Some(window);
             WIN_ALIVE.store(true, Ordering::SeqCst);
             // 这条必须落到 tray.log：GUI 版没有 stdout，不写盘就永远不知道失败原因。

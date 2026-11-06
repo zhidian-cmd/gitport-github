@@ -82,6 +82,25 @@ pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
     t.parse().ok()
 }
 
+/// 取 `bytes 262144-524287/1608296` 里的区间部分。标准头用空格，也容忍 "bytes=" 写法。
+fn range_span(v: Option<&str>) -> Option<&str> {
+    let s = v?.trim();
+    s.strip_prefix("bytes ")
+        .or_else(|| s.strip_prefix("bytes="))?
+        .split('/')
+        .next()
+}
+
+/// 本段起点。206 的起点必须等于请求段的起点，否则字节会错位拼进合并流。
+pub(super) fn content_range_start(v: Option<&str>) -> Option<u64> {
+    range_span(v)?.split('-').next()?.trim().parse().ok()
+}
+
+/// 本段闭区间终点。用于确认 206 没有越过请求的段边界。
+pub(super) fn content_range_end(v: Option<&str>) -> Option<u64> {
+    range_span(v)?.split_once('-')?.1.trim().parse().ok()
+}
+
 /// 让位时持有者留多少：按双方速率反比切（DEMS），帮手的建连+爬坡折进分母；结果钳在 [MIN_PIECE, remaining−MIN_PIECE]。
 pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64, setup_secs: f64) -> u64 {
     if remaining < 2 * MIN_PIECE {

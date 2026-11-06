@@ -211,8 +211,9 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         n: 0,
         last_used: now_secs(),
     });
-    drop(g);
     // 登记"这个 IP 已有通道"：拨号循环据此不再拨第二次，不占用任何使用权，复用照旧。
+    // 必须在池锁内完成：放到锁外时，"最后一条被摘除并 unmark" 可能插在中间，
+    // 随后的 mark_live 会把池里已经清空、也没有 empty 分支可撤销的 IP 永久标成已有通道。
     pool::inflight::mark_live(ip);
     keep
 }
@@ -231,8 +232,8 @@ pub fn drop_h2_id(ip: &str, id: u64) {
     };
     if empty {
         g.remove(ip);
-        drop(g);
         // 最后一条连接没了：撤销登记，这个 IP 才允许重新拨号。
+        // 与 store_h2 的 mark_live 同在池锁内，避免「池已空但 live 仍为真」的错位。
         pool::inflight::unmark_live(ip);
     }
 }
@@ -397,7 +398,8 @@ fn replenish_throttled(host: &str) -> bool {
     last.is_some_and(|age| age < REPLENISH_MIN_INTERVAL)
 }
 
-fn spawn_conn_driver<T>(
+/// 连接驱动任务的全部入参收成一个结构体，别再摊成 8 个散参数。
+struct ConnDriver<T> {
     host: String,
     ip: String,
     id: u64,
@@ -406,9 +408,21 @@ fn spawn_conn_driver<T>(
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
     log: LogFn,
     probe: std::time::Duration,
-) where
+}
+
+fn spawn_conn_driver<T>(d: ConnDriver<T>) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let ConnDriver {
+        host,
+        ip,
+        id,
+        slot,
+        conn,
+        ping,
+        log,
+        probe,
+    } = d;
     tokio::spawn(async move {
         let mut conn = Box::pin(conn);
         let probe_ms = probe.as_millis() as u64;
@@ -529,16 +543,16 @@ pub async fn h2_from_dialed(
     // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 从此这条连接归它自己的任务管：续命、停保活、除名，全是这一个任务的事。
-    spawn_conn_driver(
-        host.to_string(),
-        ip.to_string(),
+    spawn_conn_driver(ConnDriver {
+        host: host.to_string(),
+        ip: ip.to_string(),
         id,
         slot,
         conn,
         ping,
-        log.clone(),
-        std::time::Duration::from_secs(crate::config::KEEPALIVE_PROBE_SECS),
-    );
+        log: log.clone(),
+        probe: std::time::Duration::from_secs(crate::config::KEEPALIVE_PROBE_SECS),
+    });
     Ok(H2Upstream {
         ip: ip.to_string(),
         id,
