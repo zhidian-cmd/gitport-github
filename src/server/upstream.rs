@@ -488,7 +488,14 @@ pub(crate) async fn h2_dial_slot(
         "伪装"
     };
     let t_h2 = std::time::Instant::now();
-    let up = h2_from_dialed(host, conn_io, &ip, slot, log).await?;
+    // h2 谈不成（TCP+TLS 都过、SETTINGS 不回）也是"这个 IP 现在建不成通道"：
+    // 进全局死亡退避，别 host 的串发直接跳过，不再对着同一个 IP 重复付 5s。
+    let up = h2_from_dialed(host, conn_io, &ip, slot, log)
+        .await
+        .map_err(|e| {
+            pool::note_dead(&ip);
+            e
+        })?;
     let h2_ms = t_h2.elapsed().as_millis();
     // 顺序不能反：先让池里出现这 IP 唯一的一条连接，调用方拿到手的就是池里那条。
     // 若期间别人已经建好同一个 IP，这里丢弃刚拨的、返回池里那条现成的。

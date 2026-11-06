@@ -1051,6 +1051,21 @@ fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&Log
     ));
 }
 
+/// IP 级死亡退避（全局共享，所有 host 的串发都跳过）：TCP 连不上 / h2 谈不成 = 这个 IP
+/// 现在建不成通道，跟 SNI 无关。60s 起步，重复失败逐级加重（60/300/1800s），自动过期。
+pub fn note_dead(ip: &str) {
+    let mut g = lock(&SERIAL);
+    if let Some(t) = g.as_mut() {
+        let n = t.dead.get(ip).map(|(_, n)| *n).unwrap_or(0) + 1;
+        let secs = match n {
+            1 => 60,
+            2 => 300,
+            _ => 1800,
+        };
+        t.dead.insert(ip.to_string(), (Instant::now() + Duration::from_secs(secs), n));
+    }
+}
+
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
 /// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
@@ -1076,6 +1091,7 @@ pub async fn serial_dial_skip(
     }
     let key = row.key.clone();
     let mut circle = route::dial_targets(host).unwrap_or_default();
+    let total_candidates = circle.len();
     if !skip_ips.is_empty() {
         let filtered: Vec<route::NodeIp> = circle
             .iter()
@@ -1086,6 +1102,8 @@ pub async fn serial_dial_skip(
             circle = filtered;
         }
     }
+    // 已有通道被 skip 掉的数量（过滤全部滤空时保留原表走入库去重，不计）。
+    let occupied_n = total_candidates - circle.len();
     if circle.is_empty() {
         return Err(format!("路由 [{key}] 没有可用候选 IP({host})"));
     }
@@ -1101,6 +1119,7 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
+    let mut crew_skipped = 0usize;
     // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
     let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_used = Duration::ZERO;
@@ -1120,6 +1139,7 @@ pub async fn serial_dial_skip(
         // 同组互斥：对方试过/在试的 IP 绕行。
         if let Some(crew) = crew {
             if !crew.claim(&p.ip) {
+                crew_skipped += 1;
                 continue;
             }
         }
@@ -1167,21 +1187,7 @@ pub async fn serial_dial_skip(
                             | std::io::ErrorKind::ConnectionAborted
                     );
                 if tcp_level {
-                    {
-                        let mut g = lock(&SERIAL);
-                        if let Some(t) = g.as_mut() {
-                            let n = t.dead.get(&p.ip).map(|(_, n)| *n).unwrap_or(0) + 1;
-                            let secs = match n {
-                                1 => 60,
-                                2 => 300,
-                                _ => 1800,
-                            };
-                            t.dead.insert(
-                                p.ip.clone(),
-                                (Instant::now() + Duration::from_secs(secs), n),
-                            );
-                        }
-                    }
+                    note_dead(&p.ip);
                 }
                 // 慢失败烧预算；快速失败不烧——连续拒连也拦不住把圈走完。
                 if e.kind() == std::io::ErrorKind::TimedOut
@@ -1218,8 +1224,8 @@ pub async fn serial_dial_skip(
     }
     if tried == 0 {
         return Err(format!(
-            "全部 {} 个候选不可拨(死亡冷却或被同组占用)([{key}], {host})",
-            circle.len()
+            "[{key}] {host} 无可拨候选: 共 {total_candidates} 个, {occupied_n} 个已有通道被跳过, \
+             {dead_skipped} 个死亡冷却, {crew_skipped} 个同组在建"
         ));
     }
     // 绕表全灭：无镜像兜底才冷却（camo 无链，豁免会让每张徽章重烧整表）。
