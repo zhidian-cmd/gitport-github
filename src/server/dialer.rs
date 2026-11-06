@@ -1,5 +1,5 @@
 //! 拨号层：host 侧下订单，这里受理/驳回、一单一任务拨号、回执结果。
-//! 拨号权仲裁、防撞圈、黑边、游标、入库去重都在池与仲裁器里——本层只换"谁调用"，
+//! 防撞圈、黑边、游标、入库去重都在池里——本层只换"谁调用"，
 //! 让"下单 → 拨号 → 回执"这段有独立的日志与计时，慢在哪一段一眼可见。
 
 use crate::pool::{self, DialCrew};
@@ -18,22 +18,22 @@ pub struct DialOrder {
     pub prefer_shared: Option<bool>,
 }
 
-/// 受理一张订单。整单级预检：候选（扣 skip）全部在建/已有通道 → 当场驳回、不白发任务；
-/// 通过则一单一任务拨号，结果回执 tx——先到先得，输者的连接已在拨号内入库成为第二条通道。
+/// 受理一张订单。整单级预检：候选（扣 skip）全部已有通道 → 当场驳回、不白发任务；
+/// 通过则一单一任务拨号，结果回执 tx。同 IP 并发拨不设仲裁：
+/// 两条都建成，入库时 store_h2 按"每 IP 一条"去重。
 pub async fn submit(
     order: DialOrder,
     log: &LogFn,
     tx: mpsc::Sender<Result<(H2Upstream, bool), String>>,
 ) {
     let targets = pool::route::dial_targets(&order.host).unwrap_or_default();
-    let dialable = targets.iter().any(|p| {
-        !order.skip_ips.contains(&p.ip)
-            && !pool::inflight::busy(&p.ip)
-            && !pool::inflight::live(&p.ip)
-    });
+    let occupied = upstream::occupied_ips(&targets.iter().map(|t| t.ip.clone()).collect::<Vec<_>>());
+    let dialable = targets
+        .iter()
+        .any(|p| !order.skip_ips.contains(&p.ip) && !occupied.contains(&p.ip));
     if !dialable {
         (log)(&format!(
-            "[拨号] {} 订单驳回(候选全在建/已有通道), 去门房问",
+            "[拨号] {} 订单驳回(候选全已有通道), 去门房问",
             order.host
         ));
         let _ = tx.send(Err(format!("{} {ERR_NO_FREE_IP}", order.host))).await;

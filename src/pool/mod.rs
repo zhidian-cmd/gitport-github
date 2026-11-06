@@ -1,7 +1,6 @@
 //! 串发拨号：二部图（`ips` 节点 × `hosts` 行）唯一权威。成功驻留游标、失败前移；SNI 骗墙、证书按锚点校验。
 pub mod dial;
 pub mod edges;
-pub mod inflight;
 pub mod latency;
 pub mod route;
 
@@ -1053,10 +1052,11 @@ fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&Log
 }
 
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
+/// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
     log: Option<&LogFn>,
-) -> Result<(dial::Dialed, String, String, inflight::Guard), String> {
+) -> Result<(dial::Dialed, String, String), String> {
     let DialSkip {
         host,
         tls_handshake,
@@ -1101,9 +1101,6 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
-    let mut inflight_skipped = 0usize;
-    // 仲裁驳回时记下"这个 IP 已经授权给谁"，全被占时把原因带进错误信息，不另起日志行。
-    let mut arbitrated_by: Option<String> = None;
     // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
     let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
     let mut budget_used = Duration::ZERO;
@@ -1111,12 +1108,6 @@ pub async fn serial_dial_skip(
     let mut slow_n = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
-        // 这个 IP 已经有建好的通道：绝不拨第二条。上层会重查连接池拿到现成的那条。
-        // 放在所有检查最前面：连仲裁申请都不发，省掉一次握手和一次裁决。
-        if inflight::live(&p.ip) {
-            inflight_skipped += 1;
-            continue;
-        }
         {
             let g = lock(&SERIAL);
             if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
@@ -1132,26 +1123,6 @@ pub async fn serial_dial_skip(
                 continue;
             }
         }
-        // 共享 IP 才找仲裁器申请使用权：同一波撞车按内容优先级挑赢家，输的驳回换下一家。
-        // 独占 IP 只做原来的轻量登记（不裁决、不排序），别的 host 撞不上它。
-        // 抢不到一律不等：等会把首屏拖住，跳过去试下一家更划算。
-        let claim = if p.shared {
-            match inflight::apply(&p.ip, host).await {
-                inflight::Verdict::Granted(g) => Some(g),
-                inflight::Verdict::Rejected { winner } => {
-                    if arbitrated_by.is_none() && !winner.is_empty() {
-                        arbitrated_by = Some(winner);
-                    }
-                    None
-                }
-            }
-        } else {
-            inflight::try_claim(&p.ip)
-        };
-        let Some(claim) = claim else {
-            inflight_skipped += 1;
-            continue;
-        };
         tried += 1;
         let t0 = Instant::now();
         let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
@@ -1169,8 +1140,7 @@ pub async fn serial_dial_skip(
                         .collect()
                 };
                 crate::settings::set_last_ips(snap);
-                // 凭据跟着连接走：拨号方要一直握到通道真正建好，别在中途撒手。
-                return Ok((conn, p.ip.clone(), p.sni.clone(), claim));
+                return Ok((conn, p.ip.clone(), p.sni.clone()));
             }
             Err(e) => {
                 last_err = Some(e.to_string());
@@ -1247,27 +1217,8 @@ pub async fn serial_dial_skip(
         ));
     }
     if tried == 0 {
-        if inflight_skipped > 0 {
-            // 候选全在别人手里：不是 IP 坏，是暂时被占。自愈时代这里多半是
-            // "补拨正在建"——等它建成（上限 3s，30ms 步进提前退），上层重查
-            // 连接池直接复用；直接报错会把好 IP 误判成不可用，还会白走兜底。
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline {
-                if !circle.iter().any(|p| inflight::busy(&p.ip)) {
-                    break; // 已经有人拨完，池里大概率有现成的
-                }
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
-            let who = arbitrated_by
-                .map(|w| format!(", 已授权给 {w}"))
-                .unwrap_or_default();
-            return Err(format!(
-                "候选均已有通道或正在拨号中({} 个{}), 请重查连接池([{key}], {host})",
-                inflight_skipped, who
-            ));
-        }
         return Err(format!(
-            "全部 {} 个候选处于死亡冷却([{key}], {host})",
+            "全部 {} 个候选不可拨(死亡冷却或被同组占用)([{key}], {host})",
             circle.len()
         ));
     }

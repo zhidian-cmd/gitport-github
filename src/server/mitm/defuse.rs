@@ -156,7 +156,7 @@ pub(super) async fn gh_defuse(
             return Ok(resp);
         }
         // 每请求命中拦截页都打一条会在风控风暴时同秒刷十几行（看着像"一 IP 多通道"失效），
-        // 实际同 IP 拨号已被仲裁器拦死；物理换 IP 有 [上游] 拨号日志，这里静默重试。
+        // 物理换 IP 有 [上游] 拨号日志，这里静默重试。
         resp = match get_direct(log, out, host, info, is_simple, body).await {
             Ok(r) => r,
             Err(e) => return Err(e), // 重试全灭(所有候选试遍): 交回错误

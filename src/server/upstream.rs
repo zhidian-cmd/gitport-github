@@ -244,30 +244,22 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         n: 0,
         last_used: now_secs(),
     });
-    // 登记"这个 IP 已有通道"：拨号循环据此不再拨第二次，不占用任何使用权，复用照旧。
-    // 必须在池锁内完成：放到锁外时，"最后一条被摘除并 unmark" 可能插在中间，
-    // 随后的 mark_live 会把池里已经清空、也没有 empty 分支可撤销的 IP 永久标成已有通道。
-    pool::inflight::mark_live(ip);
     keep
 }
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
 pub fn drop_h2_id(ip: &str, id: u64) {
     let mut g = lock(conn_pool());
-    let empty = match g.get_mut(ip) {
+    match g.get_mut(ip) {
         Some(h) => {
             if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
                 h.conns.remove(pos);
             }
-            h.conns.is_empty()
+            if h.conns.is_empty() {
+                g.remove(ip);
+            }
         }
-        None => false,
-    };
-    if empty {
-        g.remove(ip);
-        // 最后一条连接没了：撤销登记，这个 IP 才允许重新拨号。
-        // 与 store_h2 的 mark_live 同在池锁内，避免「池已空但 live 仍为真」的错位。
-        pool::inflight::unmark_live(ip);
+        None => {}
     }
 }
 
@@ -283,7 +275,8 @@ pub fn drop_h2(ip: &str) {
 }
 
 /// 池中该组 IP 里**已经有活连接**的地址(供拨号 skip:同一个 IP 不再拨第二次)。
-fn occupied_ips(ips: &[String]) -> Vec<String> {
+/// 全仓"这个 IP 有没有通道"的唯一口径：拨号预检与双通道 skip 都从这里取。
+pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
     let g = lock(conn_pool());
     ips.iter()
         .filter(|ip| g.get(ip.as_str()).is_some_and(|h| !h.conns.is_empty()))
@@ -469,7 +462,7 @@ pub(crate) async fn h2_dial_slot(
     prefer_shared: Option<bool>,
 ) -> Result<H2Upstream, String> {
     let t_dial = std::time::Instant::now();
-    let (conn_io, ip, sni, claim) = pool::serial_dial_skip(
+    let (conn_io, ip, sni) = pool::serial_dial_skip(
         pool::DialSkip {
             host,
             tls_handshake: true,
@@ -494,14 +487,12 @@ pub(crate) async fn h2_dial_slot(
     } else {
         "伪装"
     };
-    // 凭据要一直握到"通道真正入库"：TCP+TLS+h2 通了还不算完，中途松手会放进第二条。
     let t_h2 = std::time::Instant::now();
     let up = h2_from_dialed(host, conn_io, &ip, slot, log).await?;
     let h2_ms = t_h2.elapsed().as_millis();
-    // 顺序不能反：先让池里出现这 IP 唯一的一条连接（并登记已有通道），再放开拨号权。
+    // 顺序不能反：先让池里出现这 IP 唯一的一条连接，调用方拿到手的就是池里那条。
     // 若期间别人已经建好同一个 IP，这里丢弃刚拨的、返回池里那条现成的。
     let up = store_h2(&ip, up);
-    drop(claim);
     // 分段计时落一行：慢在拨号(TCP+TLS)还是 h2 握手，一眼可辨。
     let chan = if slot > 1 {
         format!(", 通道{slot}")
@@ -689,7 +680,8 @@ pub async fn dial_upstream(
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     // 本 host 候选里已经被通道占掉的 IP：主副两条腿都跳过，绝不为这个 host 再拨一条。
-    // 拨号权仍按 IP 粒度逐家抢（pool::inflight），别的 host 正在拨的那家自动绕开。
+    // 同 IP 并发拨不设仲裁：两条都建，入库时 store_h2 按"每 IP 一条"去重，
+    // 输家的握手是接受的代价；别的 host 已建好的那家由 skip_ips 绕开。
     let occupied = occupied_ips(&ips);
     let (up, reused) = dial_h2_race(host, log, &occupied, allow_reuse).await?;
     // 两腿都在这一轮处理完了（副腿可能直接复用了现成通道），调用方不必再补第二条。

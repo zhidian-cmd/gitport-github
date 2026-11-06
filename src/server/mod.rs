@@ -342,7 +342,7 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::route::is_managed(host) {
-        let (conn, ip, _shape, claim) = pool::serial_dial_skip(
+        let (conn, ip, _shape) = pool::serial_dial_skip(
             pool::DialSkip {
                 host,
                 tls_handshake: false,
@@ -354,7 +354,6 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
             None,
         )
         .await?;
-        drop(claim); // TCP 连接已交到调用方手上，通道建好即交棒
         return Ok((conn, ip));
     }
     let addr = format!("{host}:{port}");

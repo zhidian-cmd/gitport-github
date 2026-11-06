@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "gitport-github"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "axum",
  "boring",

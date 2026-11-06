@@ -84,7 +84,7 @@ pub struct NodeIp {
     pub ip: String,
     pub sni: String,
     pub verify: String,
-    /// 装表时算好：这个 IP 会被多个 host 用到，拨号前要找仲裁器申请使用权。
+    /// 装表时算好：这个 IP 会被多个 host 用到（prefer_shared 分档排序用）。
     pub shared: bool,
 }
 
@@ -235,7 +235,7 @@ impl Topology {
                 }
             }
         }
-        // 宁可多标（只是多查一次表），不能漏标（漏了就没人仲裁）。
+        // 宁可多标（只是多个标记），不能漏标（漏了 prefer_shared 分档就失真）。
         let shared: HashSet<String> = keys_per_ip
             .into_iter()
             .filter(|(ip, keys)| keys.len() >= 2 || wildcard.contains(ip))
