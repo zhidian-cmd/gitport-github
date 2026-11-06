@@ -1,14 +1,34 @@
-# Windows-only 项目的构建约定：把 BoringSSL 的两处 MSVC 坑一次固化，免去每次手动 export。
+# Windows-only 项目的构建约定：把 BoringSSL 的 MSVC 坑一次固化，免去每次手动 export。
 
 [env]
-# 1) VS 生成器的 nasm.targets 在 MSBuild 18 上会报
+# 0) C 编译器统一指到 clang-cl（自行定位 MSVC 头文件与库）。原因：
+#    a) 本机 MSVC 工具集（v145 14.51 与 v143 14.44 均实测）的 cl.exe / link.exe 在
+#       「gitport-github 项目子树内」被 cargo 构建脚本（cc-rs/cmake）拉起时，
+#       cl 的 c1.dll 报 D8050、link 报 LNK1104；同一命令手工执行、或把构建目录挪到
+#       项目子树外就正常——判定为有进程对项目子树做文件监控/过滤，与工具集版本无关。
+#       clang-cl 的 IO 模式不同，不受影响。
+#    b) 2026-11-07 的 VS 更新把 v145(14.51) 更新残了（cl.exe 新、include/lib 大半缺失），
+#       修复也没补回来；v143(14.44) 完整，INCLUDE/LIB 下方统一指向它。
+#    切回原生 MSVC 的条件：项目子树的文件监控消失 + v145 修复完好，删掉本段四行即验。
+CC = "D:\\Runtimelibrary\\Visual Studio\\LLVM\\bin\\clang-cl.exe"
+CXX = "D:\\Runtimelibrary\\Visual Studio\\LLVM\\bin\\clang-cl.exe"
+CC_x86_64_pc_windows_msvc = "D:\\Runtimelibrary\\Visual Studio\\LLVM\\bin\\clang-cl.exe"
+CXX_x86_64_pc_windows_msvc = "D:\\Runtimelibrary\\Visual Studio\\LLVM\\bin\\clang-cl.exe"
+
+# 1) 头文件与库路径统一指向完好的 v143 工具集 + Windows SDK 10.0.26100.0。
+#    用途：clang-cl / libclang(bindgen) 的自动探测、rustc 拉起的 link.exe 库解析，
+#    避免它们探测到被更新残了的 v145 空目录。换 SDK/工具集版本时同步改这里。
+INCLUDE = "D:\\Runtimelibrary\\Visual Studio\\buildtools\\VC\\Tools\\MSVC\\14.44.35207\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\winrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\cppwinrt"
+LIB = "D:\\Runtimelibrary\\Visual Studio\\buildtools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64"
+
+# 2) VS 生成器的 nasm.targets 在 MSBuild 18 上会报
 #    "XamlTaskFactory ... 客户端没有所需的特权"，BoringSSL 编译中断。
 #    Ninja 直接调 nasm，不经过 MSBuild。
 #    前提：ninja.exe 与 nasm.exe 在 PATH 中（VS BuildTools 自带，通常在
 #    ...\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja 与 ...\nasm\nasm-<ver>）。
 CMAKE_GENERATOR = "Ninja"
 
-# 2) boring-sys 按 OPT_LEVEL/DEBUG 推 CMAKE_BUILD_TYPE。dev 默认 Debug → /MDd，
+# 3) boring-sys 按 OPT_LEVEL/DEBUG 推 CMAKE_BUILD_TYPE。dev 默认 Debug → /MDd，
 #    而 Rust 固定 /MD，链接报 LNK2019 __imp__CrtDbgReport。
 #    只把 boring-sys 抬到 opt-level=1、关调试信息，让 CMake 走 Release CRT；
 #    主 crate 与其他依赖的 dev 调试信息不受影响。
