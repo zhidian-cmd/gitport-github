@@ -34,9 +34,14 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。
 pub const SERIAL_DIAL_BUDGET_SECS: u64 = 20;
 
-/// h2 连接空闲 50-65s 被边缘回收，30s 探测可稳定续命。
-pub const KEEPALIVE_PROBE_SECS: u64 = 30;
-pub const KEEPALIVE_WINDOW_SECS: u64 = 300;
+/// 批窗：30s 内用过 = 还在本批，可复用；过窗视同不存在，取用时惰性摘除重拨。
+/// 取值 ≈ 边缘空闲回收窗（实测 50-65s）的一半，能被复用的通道最多这么老，
+/// 陈旧复用（撞死连接）被构造性消灭。通道不做任何主动保活。
+pub const REUSE_WINDOW_SECS: u64 = 30;
+/// 会话域通道闲置超过此秒数，取用前先 ping 验活；刚用过的直接信。
+pub const SESSION_PING_GATE_SECS: u64 = 10;
+/// 会话域按需 ping 的 PONG 等待上限（驱动任务侧计时）。
+pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 

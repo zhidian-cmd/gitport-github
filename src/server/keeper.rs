@@ -1,6 +1,7 @@
 //! 通道管理层：门房（按 IP 列表挑通道的公式）与开流（请求头级别动作，字节不过这里）。
-//! 通道的生死看护在连接驱动任务里（upstream::spawn_conn_driver）：30 秒 PING、5 分钟
-//! 空闲窗（按每条连接自己的最后使用时间算）、PING 失败/对端关闭即按 id 自摘。本层只管"选"和"用"。
+//! 通道没有主动看护：内容域批窗外的连接由取用前的 `evict_stale` 惰性摘除，会话域
+//! 由 `session_pick` 的按需 ping 验活；连接驱动任务只负责 poll h2 帧和断开自摘。
+//! 本层只管"选"和"用"。
 
 use crate::server::protocol::BoxBody;
 use crate::server::upstream::{self, H2Upstream};

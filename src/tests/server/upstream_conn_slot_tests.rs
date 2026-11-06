@@ -17,6 +17,7 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
+        ping_tx: None,
         send,
     }
 }
@@ -55,6 +56,7 @@ async fn live_conn(ip: &str) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
+        ping_tx: None,
         send,
     }
 }
@@ -101,11 +103,11 @@ async fn one_ip_one_channel_and_slot_filter() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 只有 filling 标记（没连接）的 IP 不算"已有通道"。把它算进去会让候选被误判为
-/// 全被占住、请求原地重试到死（实测 api.github.com 连刷 24 行同样的失败）。
+/// 只有真连接才算"已有通道"；空壳条目不算占用（防的是"候选全被占住"的误判，
+/// 实测 api.github.com 曾连刷 24 行同样的失败）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn filling_mark_is_not_an_occupied_channel() {
+async fn empty_entry_is_not_an_occupied_channel() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -113,11 +115,11 @@ async fn filling_mark_is_not_an_occupied_channel() {
     let ip = "9.9.9.4";
     {
         let mut g = lock(conn_pool());
-        g.entry(ip.to_string()).or_default().filling = true;
+        g.entry(ip.to_string()).or_default();
     }
     assert!(
         occupied_ips(&[ip.to_string()]).is_empty(),
-        "filling 只是补第二条的防重入标记，不是可用通道"
+        "没有连接的条目不算占用"
     );
     store_h2(ip, mk_up(ip, 1).await);
     assert_eq!(
@@ -698,19 +700,18 @@ async fn conn_end_removes_itself_from_pool() {
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
         send,
+        ping_tx: None,
     };
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
     assert!(pool::inflight::live(ip), "入库即登记'这个 IP 已有通道'");
 
     spawn_conn_driver(ConnDriver {
-        host: ip.to_string(),
         ip: ip.to_string(),
         id,
-        slot: 1,
         conn,
         ping: None,
+        ping_rx: None,
         log: Arc::new(|_| {}),
-        probe: Duration::from_secs(30),
     });
     // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
     let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
@@ -734,240 +735,108 @@ async fn conn_end_removes_itself_from_pool() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 「停 ping」的那一刻，每个 IP 就该各自从「已有通道」表里滚出去。
-/// 改前：全局保活任务超窗只 `break` 回睡，池里的连接和 live 登记都原样留着 →
-/// 5 分钟后回来的第一个请求撞尸体、烧满 4s 预算，内容域还会误判「直连全灭」转镜像。
-/// 现在每条连接是自己的任务，任务一停就在出口按 id 摘自己，谁建得早谁先走。
+/// 批窗外通道的就地除名：过窗且空闲的摘掉（跨批重建/睡眠唤醒共用这一条路），
+/// 刚用过的留着；挂着在途流的（长下载 last_used 停在开流时刻）不按空闲论处；
+/// 会话域通道归 ping 闸管，批窗摘除永远跳过。摘除连带撤销「已有通道」登记。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn idle_window_end_retires_each_ip_from_its_own_task() {
-    use std::time::Duration;
-
+async fn evict_stale_removes_only_expired_idle_conns() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     pool::inflight::clear();
-    let ips = ["9.9.9.10", "9.9.9.11"];
-    for ip in ips {
-        let (client_io, server_io) = tokio::io::duplex(4096);
-        // server 端握完手就攥着不放：客户端不会读到 EOF，任务只能因「停保活」退出。
-        tokio::spawn(async move {
-            if let Ok(_c) = h2::server::handshake(server_io).await {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        });
-        let (send, mut conn) = h2::client::handshake(client_io).await.expect("client 握手");
-        let ping = conn
-            .ping_pong()
-            .map(|p| Arc::new(tokio::sync::Mutex::new(p)));
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let up = H2Upstream {
-            ip: ip.to_string(),
-            id,
-            slot: 1,
-            owner: None,
-            max_streams: 100,
-            inflight: Arc::new(AtomicU32::new(0)),
-            send,
-        };
-        store_h2(ip, up);
-        assert!(pool::inflight::live(ip), "入库即登记");
-        // 空闲窗按每条连接自己的最后使用算：把它回拨 6 分钟，模拟"建好后无人问津"。
-        // 全局 LAST_ACTIVITY 不再参与——别的连接忙不代表这条有人用。
-        {
-            let mut g = lock(conn_pool());
+    let fresh_ip = "9.9.9.20";
+    let stale_ip = "9.9.9.21";
+    let busy_ip = "9.9.9.22";
+    let session_ip = "9.9.9.23";
+    store_h2(fresh_ip, mk_up(fresh_ip, 1).await);
+    store_h2(stale_ip, mk_up(stale_ip, 1).await);
+    store_h2(busy_ip, mk_up(busy_ip, 1).await);
+    let mut session_up = mk_up(session_ip, 1).await;
+    session_up.owner = Some("github.com".to_string());
+    store_h2(session_ip, session_up);
+    // 除批内那条外全部回拨过窗，模拟跨批/睡眠唤醒。
+    {
+        let mut g = lock(conn_pool());
+        for ip in [stale_ip, busy_ip, session_ip] {
             if let Some(h) = g.get_mut(ip) {
-                if let Some(c) = h.conns.iter_mut().find(|c| c.up.id == id) {
-                    c.last_used = now_secs() - 400;
+                for c in h.conns.iter_mut() {
+                    c.last_used = now_secs() - crate::config::REUSE_WINDOW_SECS - 1;
                 }
             }
         }
-        spawn_conn_driver(ConnDriver {
-            host: ip.to_string(),
-            ip: ip.to_string(),
-            id,
-            slot: 1,
-            conn,
-            ping,
-            log: Arc::new(|_| {}),
-            probe: Duration::from_millis(20),
-        });
     }
+    // busy 那条挂一个在途流：guard drop 时归还，断言前一直算「忙」。
+    let inflight_arc = {
+        let g = lock(conn_pool());
+        g.get(busy_ip).unwrap().conns[0].up.inflight.clone()
+    };
+    let _busy = StreamGuard::new(inflight_arc);
 
-    let mut all_gone = false;
-    for _ in 0..100 {
-        if ips.iter().all(|ip| !pool::inflight::live(ip)) {
-            all_gone = true;
-            break;
+    evict_stale(&[
+        fresh_ip.to_string(),
+        stale_ip.to_string(),
+        busy_ip.to_string(),
+        session_ip.to_string(),
+    ]);
+
+    assert!(lock(conn_pool()).get(fresh_ip).is_some(), "批内通道不摘");
+    assert!(
+        lock(conn_pool()).get(stale_ip).is_none(),
+        "过窗且空闲的摘掉，该 IP 立刻可重拨"
+    );
+    assert!(
+        !pool::inflight::live(stale_ip),
+        "摘除要连带撤销「已有通道」登记"
+    );
+    assert!(
+        lock(conn_pool()).get(busy_ip).is_some(),
+        "挂着在途流的不按空闲论处"
+    );
+    assert!(
+        lock(conn_pool()).get(session_ip).is_some(),
+        "会话域归 ping 闸管，批窗摘除跳过"
+    );
+    let _ = lock(conn_pool()).remove(fresh_ip);
+    let _ = lock(conn_pool()).remove(busy_ip);
+    let _ = lock(conn_pool()).remove(session_ip);
+    pool::inflight::clear();
+}
+
+/// 会话域取用闸：ping 端已死（驱动不在/全部句柄释放）= 通道必死，就地摘除返回 None；
+/// 刚用过的通道跳过 ping 直接信——哪怕 ping 端也是死的，取用路径零额外延迟。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn session_pick_gates_on_ping_end_health() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pool::inflight::clear();
+    let ip = "9.9.9.24";
+    let mut up = mk_up(ip, 1).await;
+    up.owner = Some("github.com".to_string());
+    let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<bool>>(1);
+    drop(dead_rx); // 接收端没了 = 驱动任务不在，任何 ping 都发不进去
+    up.ping_tx = Some(dead_tx);
+    store_h2(ip, up);
+    // 刚入库（last_used = 现在）：跳过 ping 直接信，死 ping 端轮不到出场。
+    let fresh = session_pick("github.com", &[ip.to_string()], None).await;
+    assert!(fresh.is_some(), "刚用过的会话通道不该被 ping 闸拦下");
+    // 回拨过闸限：这次必须验活，ping 端已死 → 通道判死摘除。
+    {
+        let mut g = lock(conn_pool());
+        if let Some(h) = g.get_mut(ip) {
+            for c in h.conns.iter_mut() {
+                c.last_used = now_secs() - crate::config::SESSION_PING_GATE_SECS - 1;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(all_gone, "静默超窗后每个 IP 的任务都应自行除名");
-    assert!(
-        ips.iter().all(|ip| lock(conn_pool()).get(*ip).is_none()),
-        "池里不该留没任务管的连接"
-    );
-    assert!(
-        cached_h2_in(&ips.iter().map(|s| s.to_string()).collect::<Vec<_>>(), None).is_none(),
-        "表里不该还有可取用的尸体"
-    );
-    LAST_ACTIVITY.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 机器睡眠 / 进程被冻住：这一段时间里**没有任何任务跑过**，等各任务自己的
-/// 定时节拍来摘已经晚了——醒来第一个请求会先撞上去。请求入口必须同步逐条除名。
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn wake_after_suspend_retires_unprobed_before_any_reuse() {
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    pool::inflight::clear();
-    let ips = ["9.9.9.12", "9.9.9.13", "9.9.9.14"];
-    for ip in ips {
-        let up = mk_up(ip, 1).await;
-        store_h2(ip, up);
-        assert!(pool::inflight::live(ip));
-    }
-    // 睡前最后一次活动，进程冻结 28 分钟，池里三条都成了没人验过活的登记。
-    LAST_ACTIVITY.store(now_secs() - 28 * 60, std::sync::atomic::Ordering::Relaxed);
-
-    note_activity(); // 请求处理的第一行
-
-    assert!(
-        ips.iter().all(|ip| !pool::inflight::live(ip)),
-        "空窗后的第一个请求到达前，每个 IP 的「已有通道」登记都要撤销，才允许重新拨号"
-    );
-    assert!(lock(conn_pool()).is_empty(), "池里不该留任何尸体");
-    assert!(
-        cached_h2_in(&ips.iter().map(|s| s.to_string()).collect::<Vec<_>>(), None).is_none(),
-        "取用时看不到尸体，本次请求会直接新建"
-    );
-    LAST_ACTIVITY.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 别把「正常连续使用」也当成空窗。这条防的是同步除名写宽了、每次请求都清池。
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn normal_activity_keeps_channels_registered() {
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    pool::inflight::clear();
-    let ip = "9.9.9.15";
-    store_h2(ip, mk_up(ip, 1).await);
-    LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
-
-    note_activity();
-
-    assert!(pool::inflight::live(ip), "刚活动过的通道不该被摘");
-    assert!(lock(conn_pool()).get(ip).is_some());
-    LAST_ACTIVITY.store(0, std::sync::atomic::Ordering::Relaxed);
-    let _ = lock(conn_pool()).remove(ip);
-}
-
-/// 判定边界：一轮探测内的正常抖动不摘；漏了一整轮（进程被挂起）或静默超窗才摘。
-#[test]
-fn probe_expired_only_when_missed_or_window_elapsed() {
-    let probe = 30_000;
-    let window = 300;
-    assert!(!probe_expired(probe, probe, 10, window));
-    assert!(!probe_expired(probe + PROBE_SLACK_MS, probe, 10, window));
-    assert!(probe_expired(probe + PROBE_SLACK_MS + 1, probe, 10, window));
-    assert!(probe_expired(28 * 60 * 1000, probe, 10, window));
-    assert!(probe_expired(probe, probe, window + 1, window));
-    assert!(!probe_expired(probe, probe, window, window));
-}
-
-/// 一条 CONNECT 隧道会连着跑几十个请求，TCP 只在建隧道时经过 handle。
-/// 只在那里打点，隧道越忙越会被误判「静默超窗」，把健康通道全摘光。
-/// 钉住：每个解密请求都刷新「最后活动」，池里的通道一直留着可复用。
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn busy_tunnel_requests_keep_channels_alive() {
-    use std::time::Duration;
-
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    pool::inflight::clear();
-    let ip = "9.9.9.16";
-    let (client_io, server_io) = tokio::io::duplex(4096);
-    let server = tokio::spawn(async move {
-        if let Ok(_c) = h2::server::handshake(server_io).await {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
-    let (send, conn) = h2::client::handshake(client_io)
-        .await
-        .expect("client 握手");
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    store_h2(
-        ip,
-        H2Upstream {
-            ip: ip.to_string(),
-            id,
-            slot: 1,
-            owner: None,
-            max_streams: 100,
-            inflight: Arc::new(AtomicU32::new(0)),
-            send,
-        },
-    );
-    LAST_ACTIVITY.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
-    spawn_conn_driver(ConnDriver {
-        host: ip.to_string(),
-        ip: ip.to_string(),
-        id,
-        slot: 1,
-        conn,
-        ping: None,
-        log: Arc::new(|_| {}),
-        probe: Duration::from_millis(20),
-    });
-
-    // 模拟隧道里连着来 30 个请求：每个都打点，中间不该出现任何假空窗。
-    // （此测试的 ip 是假地址，看护退出后 is_managed=false，不会触发补拨下单。）
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        note_activity();
-    }
-
-    assert!(
-        pool::inflight::live(ip),
-        "隧道一直在发请求，通道不该被当成静默超窗摘掉"
-    );
-    assert!(lock(conn_pool()).get(ip).is_some(), "池里的健康连接还在");
-    assert!(
-        cached_h2_in(&[ip.to_string()], None).is_some(),
-        "后续请求仍可复用这条通道"
-    );
-
-    server.abort();
-    LAST_ACTIVITY.store(0, std::sync::atomic::Ordering::Relaxed);
-    let _ = lock(conn_pool()).remove(ip);
+    let gated = session_pick("github.com", &[ip.to_string()], None).await;
+    assert!(gated.is_none(), "ping 端已死 = 通道必死");
+    assert!(!pool::inflight::live(ip), "摘除要连带撤销「已有通道」登记");
+    assert!(lock(conn_pool()).get(ip).is_none(), "池里不该留死通道");
     pool::inflight::clear();
 }
 
-/// 看护退出补拨的判定：被动死亡（对端关闭/超窗/ping失败）都补——
-/// 让边缘回收对浏览器不可见；「已被摘除」是主动行为（换 IP 重试等），补拨反而打架。
-#[test]
-fn replenish_only_after_passive_death() {
-    assert!(should_replenish("对端关闭"));
-    assert!(should_replenish("ping 失败"));
-    assert!(should_replenish("静默超窗/漏探测"));
-    assert!(
-        !should_replenish("已被摘除"),
-        "主动摘除(换IP重试等)不该触发补拨"
-    );
-}
-
-/// 补拨节流：边缘狂回收时（实测 5 秒一次）不能变成过墙握手风暴。
-#[test]
-fn replenish_throttle_caps_per_host_rate() {
-    let host = "throttle-probe.test.invalid";
-    assert!(!replenish_throttled(host), "首次不节流");
-    assert!(replenish_throttled(host), "间隔内第二次应节流");
-    let other = "throttle-other.test.invalid";
-    assert!(!replenish_throttled(other), "不同 host 互不影响");
-}
+// 看护任务不再做保活与补拨（批窗 + ping 闸取代），旧的隧道打点与补拨节流测试随之退役：
+// 连接死亡一律由请求结果或批窗发现，通道重建是下一批请求自己的事。

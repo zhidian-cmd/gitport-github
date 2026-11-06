@@ -99,7 +99,6 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
 impl ProxyServer {
     async fn handle(&self, mut client: TcpStream) -> std::io::Result<()> {
         let _ = client.set_nodelay(true);
-        upstream::note_activity();
         let head = read_head(&mut client).await?;
         // 头块以空行收尾，之后的字节是同包到达的体首段，必须原样续传。
         let Some(end) = find_head_end(&head) else {

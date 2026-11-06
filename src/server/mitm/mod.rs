@@ -127,10 +127,6 @@ async fn mitm_http(
     log: LogFn,
     mut req: hyper::Request<Incoming>,
 ) -> axum::response::Response<BoxBody> {
-    // 一条 CONNECT 隧道会连着跑几十上百个请求，TCP 只在隧道建立时经过 handle。
-    // 只在那里打点的话，隧道明明一直忙，全局「最后活动」却停在握手那一刻：
-    // 各连接任务会误判静默超窗，把正在服务的健康通道当成尸体摘掉。按请求打点。
-    upstream::note_activity();
     // h2 用 :authority；隧道内 h1 origin-form 无 host，回退 Host 头。
     let mut host = {
         let from_uri = crate::server::host_only(req.uri().host().unwrap_or("")).to_lowercase();
@@ -638,9 +634,10 @@ async fn try_cached(
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     let is_content = pool::route::is_content(host);
-    // 会话域（含 api）优先用自己建的通道；内容域双通道，池里谁快用谁。
+    // 会话域（含 api）优先用自己建的通道：闲置久的先过 ping 闸验活，死了就地摘掉
+    // 走拨号（游标钉着原 IP，重拨落回原家，会话不漂移）。内容域双通道，池里谁快用谁。
     let up = if upstream::prefer_own_channel(host) {
-        match upstream::cached_h2_own(host, ips, want_slot) {
+        match upstream::session_pick(host, ips, want_slot).await {
             Some(up) => up,
             None => return CachedOutcome::NoChannel,
         }
@@ -705,6 +702,10 @@ pub(super) async fn get_direct(
         return Err(format!("{host} 候选 IP 全部在边冷却中"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    // 批界第一步：过批窗的空闲通道就地除名。不先摘，store_h2 会把新拨的作废、
+    // 把旧通道塞回手里，拨号订单也会被「已有通道」驳回——「下批重建」就落不了地。
+    // 会话域自己的通道在这里被豁免，由 try_cached 的 ping 闸验活。
+    upstream::evict_stale(&ips);
     if is_content && pool::CONTENT_BREAKER.open(host) {
         return Err("内容域直连熔断中, 直接走镜像链".to_string());
     }
@@ -746,11 +747,13 @@ pub(super) async fn get_direct(
     // 自愈时代"候选全在建"的等待总量上限：等补拨建成直接复用，超时才交兜底。
     let no_free_wait_deadline = Instant::now() + Duration::from_secs(3);
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。
+        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。等锁、等待补拨的
+        // 3s 里通道也可能过批窗——同样先清场再选。
         let ips: Vec<String> = match pool::route::dial_targets(host) {
             Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
             _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
         };
+        upstream::evict_stale(&ips);
         // 每轮再查一次池子：并行建连任务可能已建成，排队者直接复用。
         // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
         // 已经撞过一次复用失败的本请求不再碰池，只走确定刚拨出来的连接。
@@ -864,6 +867,11 @@ pub(super) async fn get_direct(
         // 而 1 秒后同一个 IP 新建连接 334ms 就回了 200。
         if from_pool {
             reuse_failed = true;
+            // 通道不可复用 ≠ IP 不行，但「下一个请求别从这家开始」还是要记的：
+            // 挪游标不罚 IP（不记边冷却），批内自愈回到 v1 的速度。
+            if is_simple && !is_content {
+                pool::cursor_note(host, &up.ip, false, up.slot);
+            }
             (log)(&format!(
                 "[MITM] {host} 复用通道失效({e}), 丢掉这条换新连接"
             ));
