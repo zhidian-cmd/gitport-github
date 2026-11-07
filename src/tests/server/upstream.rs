@@ -214,7 +214,15 @@ fn host_classes_split_content_session_and_other() {
         HostClass::Session,
         "api 也是会话域"
     );
-    assert_eq!(host_class("githubapp.com"), HostClass::Session);
+    // 会话域按风控面划界(主站族之外的数据不是主站): githubassets/github.io/githubapp
+    // 一律批窗内容域语义——githubassets 的长寿命通道不再占据 185.199.154/215
+    // 这 8 个三类横跨的共享 IP。
+    assert_eq!(host_class("githubassets.com"), HostClass::Other);
+    assert_eq!(host_class("github.githubassets.com"), HostClass::Other);
+    assert_eq!(host_class("github.io"), HostClass::Other);
+    assert_eq!(host_class("githubapp.com"), HostClass::Other);
+    assert_eq!(host_class("codeload.github.com"), HostClass::Other);
+    assert!(!prefer_own_channel("githubassets.com"));
 
     assert_eq!(host_class("raw.githubusercontent.com"), HostClass::Content);
     assert_eq!(

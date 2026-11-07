@@ -109,11 +109,24 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     // 大文件域虽然挂着 content 标记（走镜像链），但不再开第二条腿：
     // 一条长流就能把槽位占满，两条反而互相抢带宽。
     if pool::route::is_big_file_host(host) || is_other_host(host) {
-        HostClass::Other
-    } else if pool::route::is_content(host) {
-        HostClass::Content
-    } else {
+        return HostClass::Other;
+    }
+    if pool::route::is_content(host) {
+        return HostClass::Content;
+    }
+    // 会话域按风控面划界：拦截页(Whoa)实测只出现在主站族(github.com / api.github.com /
+    // *.github.com)，只有它们配长期通道 + ping 闸。其余(githubassets / github.io /
+    // githubapp / codeload…)的数据不是主站，一律批窗内容域语义(单通道变体)——
+    // 否则 githubassets 的长寿命通道会把 185.199.154/215 这 8 个三类横跨的共享 IP
+    // 从内容域的可拨池里长期占走。按路由键判而非域名后缀，codeload.github.com
+    // 这类独立行才不会被通配误捞回会话。
+    let session_keys = ["github.com", "*.github.com", "api.github.com"];
+    let on_risk_surface = pool::route::route_for(host)
+        .is_some_and(|row| session_keys.contains(&row.key.as_str()));
+    if on_risk_surface {
         HostClass::Session
+    } else {
+        HostClass::Other
     }
 }
 
