@@ -705,11 +705,8 @@ pub(super) async fn get_direct(
     // 把旧通道塞回手里，拨号订单也会被「已有通道」驳回——「下批重建」就落不了地。
     // 会话域自己的通道在这里被豁免，由 try_cached 的 ping 闸验活。
     upstream::evict_stale(&ips);
-    if is_content && pool::CONTENT_BREAKER.open(host) {
-        return Err("内容域直连熔断中, 直接走镜像链".to_string());
-    }
-    // 本请求是否已经撞过一条坏复用连接。撞过之后就别再碰池，只走新拨的：
-    // 复用失败说的是「这条旧连接死了」，不是「这批 IP 都不行」。
+    // 熔断只拦「拨新通道」，不拦「骑池里现成的通道」：骑不到、拨不出，才交镜像链。
+    // 所以这里的复用尝试在熔断检查之前跑——串发全灭 ≠ 直连没了，池里的活通道照用。
     let mut reuse_failed = false;
     match try_cached(log, out, host, &ips, info, is_simple, body).await {
         CachedOutcome::Done(r) => return r,
@@ -719,9 +716,6 @@ pub(super) async fn get_direct(
     // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
     let dial_lock = upstream::host_dial_lock(host);
     let mut guard = Some(dial_lock.lock().await);
-    if is_content && pool::CONTENT_BREAKER.open(host) {
-        return Err("内容域直连熔断中, 直接走镜像链".to_string());
-    }
     // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
     let reusable_in_pool = !(!is_simple && body.is_none())
         && !reuse_failed
@@ -743,9 +737,11 @@ pub(super) async fn get_direct(
     // 发送若一直攥着它，同 host 的并发请求只能一个发完才轮到下一个
     // （历史踩过：129 并发串行 34s FCP）。改成每轮只在「查池 + 拨号」那一小段拿锁。
     drop(guard);
+    // 串发已全灭：不再拨新通道，只骑池里剩下的活通道；骑不到才交镜像/报错。
+    let mut serial_exhausted = false;
+    let mut last_serial_err: Option<String> = None;
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。等锁的 3s 里
-        // 通道也可能过批窗——同样先清场再选。
+        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。批窗过界同样先清场再选。
         let ips: Vec<String> = match pool::route::dial_targets(host) {
             Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
             _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
@@ -769,6 +765,13 @@ pub(super) async fn get_direct(
             let pool_pick = cached.is_some();
             match cached {
                 Some(up) => (up, false, pool_pick),
+                // 串发已全灭（或熔断拦着拨号）：池里也没有可骑的了——
+                // 直连这条路本请求走完，交镜像/报错。
+                None if serial_exhausted || (is_content && pool::CONTENT_BREAKER.open(host)) => {
+                    return Err(last_serial_err
+                        .clone()
+                        .unwrap_or_else(|| "直连暂不可用, 交兜底".into()));
+                }
                 None => match upstream::dial_upstream(host, log, allow_reuse).await {
                     Ok((up, reused)) => (up, reused, pool_pick),
                     Err(e) => {
@@ -778,25 +781,21 @@ pub(super) async fn get_direct(
                         if e.contains(upstream::ERR_NO_FREE_IP) {
                             return Err(e);
                         }
-                        // 候选全在死亡冷却/被同组占用：分钟级状态，请求内不会复活，
-                        // 24 次原地重试只会刷同样的日志——立即定生死。
-                        if e.contains("无可拨候选") {
-                            if is_content {
-                                pool::CONTENT_BREAKER.set(host);
-                                (log)(&format!(
-                                    "[MITM] {host} 候选全在死亡冷却, 直连暂时不可用, 转镜像链"
-                                ));
-                                return Err(format!("内容域直连全灭({e})"));
-                            }
-                            return Err(e);
+                        // 串发拨不出新的（全灭/预算耗尽/全在死亡冷却/冷却中）：
+                        // 不再原地重试，也不急着熔断——池里的活通道下一轮
+                        // cached 接着骑，池也空了才熔断交镜像。
+                        let exhausted = e.contains("无可拨候选")
+                            || e.contains("慢失败预算耗尽")
+                            || e.contains("直连串发全灭")
+                            || e.contains("串发冷却中");
+                        if exhausted {
+                            serial_exhausted = true;
+                            last_serial_err = Some(e.clone());
+                            continue;
                         }
-                        // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
-                        if pool::dial_cool_open(host) {
-                            return Err(e);
-                        }
-                        // 拨号失败 = 请求体一个字节都没发出去，换候选重拨对任何方法都安全。
+                        // 单候选真实拨号失败（TCP/TLS/h2 超时等，已进死亡退避）：
+                        // 内容域原语义保留——立即熔断转镜像（实测设计）。
                         if is_content {
-                            // 内容域这一步是直接转镜像链，不是「换下一个 IP」，别写假话。
                             pool::CONTENT_BREAKER.set(host);
                             (log)(&format!(
                                 "[MITM] {host} 第 {} 次拨号失败({e}), 直连暂时不可用, 转镜像链",

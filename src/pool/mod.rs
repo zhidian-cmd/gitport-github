@@ -1295,7 +1295,10 @@ pub async fn serial_dial_skip(
             last_err.as_deref().unwrap_or("未知")
         ));
     }
-    Err(last_err.unwrap_or_else(|| "串发全灭".to_string()))
+    Err(format!(
+        "直连串发全灭: {}",
+        last_err.as_deref().unwrap_or("未知")
+    ))
 }
 
 /// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。
