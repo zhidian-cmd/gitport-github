@@ -652,9 +652,6 @@ async fn try_cached(
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
             upstream::note_latency(&up.ip, up.id, ms);
-            if is_content {
-                pool::CONTENT_BREAKER.clear(host);
-            }
             // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
             redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
             quiet::note_reuse(log, host, ms);
@@ -767,7 +764,7 @@ pub(super) async fn get_direct(
                 Some(up) => (up, false, pool_pick),
                 // 串发已全灭（或熔断拦着拨号）：池里也没有可骑的了——
                 // 直连这条路本请求走完，交镜像/报错。
-                None if serial_exhausted || (is_content && pool::CONTENT_BREAKER.open(host)) => {
+                None if serial_exhausted => {
                     return Err(last_serial_err
                         .clone()
                         .unwrap_or_else(|| "直连暂不可用, 交兜底".into()));
@@ -794,14 +791,13 @@ pub(super) async fn get_direct(
                             continue;
                         }
                         // 单候选真实拨号失败（TCP/TLS/h2 超时等，已进死亡退避）：
-                        // 内容域原语义保留——立即熔断转镜像（实测设计）。
+                        // 内容域拨号失败交调用方按 fallback 转镜像；其余换下一个候选。
                         if is_content {
-                            pool::CONTENT_BREAKER.set(host);
                             (log)(&format!(
-                                "[MITM] {host} 第 {} 次拨号失败({e}), 直连暂时不可用, 转镜像链",
+                                "[MITM] {host} 第 {} 次拨号失败({e}), 转镜像链",
                                 attempt + 1
                             ));
-                            return Err(format!("内容域直连全灭({e})"));
+                            return Err(e);
                         }
                         (log)(&format!(
                             "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
@@ -840,9 +836,6 @@ pub(super) async fn get_direct(
                 pool::cursor_note(host, &up_ip, true, up_slot);
                 // 第二条腿由 dial_h2_race 自己收尾补建，这里不重复补（会与并行建连抢跑）。
                 upstream::note_latency(&up_ip, id, ms); // 新连接也要记账，否则择优池没有它的样本
-                if is_content {
-                    pool::CONTENT_BREAKER.clear(host); // 直连恢复：清除熔断
-                }
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
                 (log)(&format!("[上游] {host}{path} 新连接 {up_ip}, {ms}ms"));
@@ -882,12 +875,11 @@ pub(super) async fn get_direct(
         if let Some(row) = pool::route::route_for(host) {
             pool::edges::mark_stall(&up.ip, &row.key);
         }
+        // 内容域新拨失败交调用方按 fallback 转镜像（不做 host 级熔断——
+        // 死亡退避已逐 IP 记账，全试完之前不判定「直连没救」）。
         if is_content {
-            // 先熔断再走镜像链，让下一条请求少走一轮必败的拨号。这里直接转链，
-            // 别再写「换下一个 IP」——那是假话。
-            pool::CONTENT_BREAKER.set(host);
             (log)(&format!(
-                "[MITM] {host} 第 {} 次新拨连接失败({e}), 直连暂时不可用, 转镜像链",
+                "[MITM] {host} 第 {} 次新拨连接失败({e}), 转镜像链",
                 attempt + 1
             ));
             return Err(format!("内容域直连全灭({e})"));

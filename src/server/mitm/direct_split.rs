@@ -202,10 +202,6 @@ pub(super) async fn try_direct_split(
     if !is_image_split_host(host) {
         return None;
     }
-    // 直连熔断开着说明这个域此刻确实不通，交给主路径按既有规则兜底，别在切片里绕过去。
-    if pool::route::is_content(host) && pool::CONTENT_BREAKER.open(host) {
-        return None;
-    }
     let key = format!("{host}{}", path_of(out.uri()));
     let total = match memo_get(&key) {
         Some(0) => return None,

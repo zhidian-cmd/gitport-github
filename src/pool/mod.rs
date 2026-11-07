@@ -1465,8 +1465,6 @@ impl Breaker {
     }
 }
 
-/// 内容域直连熔断 120s。
-pub static CONTENT_BREAKER: Breaker = Breaker::new(120);
 /// 镜像链全灭熔断 60s。
 pub static MIRROR_BREAKER: Breaker = Breaker::new(60);
 

@@ -38,17 +38,18 @@ fn target_ips(host: &str) -> Vec<String> {
 
 #[test]
 fn breakers_open_set_clear_by_host() {
+    // CONTENT_BREAKER 已删除，Breaker 类型的行为由 SERIAL_COOL 覆盖验证。
     let raw = "raw.githubusercontent.com";
     let camo = "camo.githubusercontent.com";
-    assert!(!CONTENT_BREAKER.open(raw));
-    CONTENT_BREAKER.set(raw);
-    assert!(CONTENT_BREAKER.open(raw));
+    assert!(!SERIAL_COOL.open(raw));
+    SERIAL_COOL.set(raw);
+    assert!(SERIAL_COOL.open(raw));
     assert!(
-        !CONTENT_BREAKER.open(camo),
-        "熔断按 host 记账，不得串到同池其他域"
+        !SERIAL_COOL.open(camo),
+        "冷却按 host 记账，不得串到同池其他域"
     );
-    CONTENT_BREAKER.clear(raw);
-    assert!(!CONTENT_BREAKER.open(raw));
+    SERIAL_COOL.clear(raw);
+    assert!(!SERIAL_COOL.open(raw));
 
     assert!(!MIRROR_BREAKER.open(camo));
     MIRROR_BREAKER.set(camo);
