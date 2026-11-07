@@ -47,7 +47,7 @@ pub(crate) struct ConnSlot {
     pub(crate) up: H2Upstream,
     pub(crate) ewma: f64,
     n: u32,
-    /// 这条连接自己最后一次被使用（开流刷新）；看护的 5 分钟空闲窗按它算，不看全局。
+    /// 这条连接自己最后一次被使用（开流刷新）；批窗与 ping 闸的空闲期按它算。
     last_used: u64,
 }
 
@@ -460,11 +460,11 @@ where
                 }
             }
         };
-        // 唯一出口：连接结束（对端关闭/回收/错误）。摘自己 + 撤销「已有通道」登记；
+        // 唯一出口：连接结束（对端关闭/回收/错误）。把自己从池里摘掉；
         // 已被 evict_stale 先摘过的，这里 no-op。不做任何补拨——通道重建是
         // 下一批请求自己的事。
         drop_h2_id(&ip, id);
-        log(&format!("[通道] {ip}#{id} 看护退出({why})"));
+        log(&format!("[通道] {ip}#{id} 断开出池({why})"));
     });
 }
 
@@ -849,7 +849,7 @@ pub async fn h2_open_stream(
     ),
     String,
 > {
-    // 每次开流刷新这条连接自己的空闲期：看护的 5 分钟窗按它算，不看全局活动。
+    // 每次开流刷新这条连接自己的空闲期：批窗与 ping 闸的空闲期按它算。
     {
         let mut g = lock(conn_pool());
         if let Some(h) = g.get_mut(&up.ip) {
