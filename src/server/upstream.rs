@@ -379,12 +379,14 @@ fn conn_idle_secs(ip: &str, id: u64) -> Option<u64> {
 /// 通道不再是需要续命的资产：内容域没有定时器、没有 PING——死没死由请求结果说了算，
 /// 批窗外的通道由 `evict_stale` 在取用时惰性清场，还挂在池里的由边缘 50-65s 空闲回收
 /// 收尾（对端关连接时 conn.await 返回，这里自摘）。会话域额外挂一个按需 ping 的应答
-/// 端：取用闸要验活时发一个 oneshot 过来，这里代答。所有出口都按 id 自摘并撤销
-/// 「已有通道」登记；不做任何补拨——通道重建是下一批请求自己的事。
+/// 端：取用闸要验活时发一个 oneshot 过来，这里代答。所有出口都按 id 自摘出池；
+/// 不做任何补拨——通道重建是下一批请求自己的事。断开日志只给会话域：
+/// 内容域的连接断掉是家常便饭（边缘回收在预期内），记了全是噪音。
 struct ConnDriver<T> {
     ip: String,
     id: u64,
     conn: h2::client::Connection<T, Bytes>,
+    session: bool,
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
     /// 会话域才有：取用闸的 ping 请求队列；全部发送端释放后退化为纯 conn 模式。
     ping_rx: Option<tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<bool>>>,
@@ -399,6 +401,7 @@ where
         ip,
         id,
         conn,
+        session,
         ping,
         mut ping_rx,
         log,
@@ -464,7 +467,10 @@ where
         // 已被 evict_stale 先摘过的，这里 no-op。不做任何补拨——通道重建是
         // 下一批请求自己的事。
         drop_h2_id(&ip, id);
-        log(&format!("[通道] {ip}#{id} 断开出池({why})"));
+        if session {
+            // 只有会话域的断开值得记：长寿命资产没了，下一个会话请求会重拨落回原家。
+            log(&format!("[会话通道] {ip}#{id} 断开出池({why}), 下次会话请求重拨"));
+        }
     });
 }
 
@@ -510,11 +516,12 @@ pub async fn h2_from_dialed(
     } else {
         (None, None)
     };
-    // 从此这条连接归它自己的任务管：驱动帧收发、按需代答 ping、断开自摘。
+    // 从此这条连接归它自己的任务管：驱动帧收发、按需代答 ping（会话域）、断开自摘。
     spawn_conn_driver(ConnDriver {
         ip: ip.to_string(),
         id,
         conn,
+        session,
         ping,
         ping_rx,
         log: log.clone(),

@@ -662,6 +662,7 @@ async fn conn_end_removes_itself_from_pool() {
         ip: ip.to_string(),
         id,
         conn,
+        session: false,
         ping: None,
         ping_rx: None,
         log: Arc::new(|_| {}),
