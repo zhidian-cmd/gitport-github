@@ -36,13 +36,16 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 pub const SERIAL_DIAL_BUDGET_SECS: u64 = 12;
 
 /// 内容域/其他探活间隔：闲置超此秒数发 1 字节 Range 请求验活（PING 探不了黑洞）。
-pub const PROBE_INTERVAL_SECS: u64 = 10;
+/// 须卡在边缘 50~65s 空闲回收窗内，保活才有效。
+pub const PROBE_INTERVAL_SECS: u64 = 30;
 /// 探活响应头等待上限：超时 = 连接已黑洞，当场自摘出池。
 pub const PROBE_TIMEOUT_SECS: u64 = 2;
 /// 会话域 PING 探活间隔（闲置超此秒数才探）。
 pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
 /// 会话域 PING 的 PONG 等待上限。
 pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
+/// 内容域/其他闲置（无真实流量）超此秒数主动放手，稳态不多养连接；会话域不限。
+pub const CONN_IDLE_RETIRE_SECS: u64 = 600;
 /// 内容域/其他同 IP 通道上限（常态 2，全忙溢出补）。
 pub const MAX_CONNS_CONTENT: usize = 3;
 /// 会话域同 IP 通道上限：恒 1 条。

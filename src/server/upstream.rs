@@ -395,6 +395,11 @@ where
                     if overflow && inflight == 0 {
                         break 'keep "溢出通道用毕回收";
                     }
+                    // 内容域/其他闲置超限放手：在途流不为零不算闲置（长下载的
+                    // last_used 停在开流时刻）。会话域不限，长期资产。
+                    if !session && inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
+                        break 'keep "闲置超限放手";
+                    }
                     // 刚用过的通道不必探；探的是闲置期黑洞。
                     if idle < probe_every {
                         continue;
