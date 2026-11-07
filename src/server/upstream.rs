@@ -115,10 +115,13 @@ pub(crate) fn host_class(host: &str) -> HostClass {
         return HostClass::Content;
     }
     // 会话域按风控面划界：拦截页(Whoa)实测只出现在主站族，只有它们配长期通道 + ping 闸。
-    // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译。
-    // githubassets/github.io/githubapp/codeload 等不标 session——数据不是主站，批窗内容域语义；
-    // 否则 githubassets 的长寿命通道会把 185.199.154/215 这 8 个三类横跨的共享 IP 占走。
-    let on_risk_surface = pool::route::route_for(host).is_some_and(|row| row.flags.session);
+    // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译；
+    // 通配键里的个别内容型子域用 session_exclude 豁免。githubassets/github.io/githubapp/
+    // codeload 等不标 session——数据不是主站，批窗内容域语义；否则 githubassets 的
+    // 长寿命通道会把 185.199.154/215 这 8 个三类横跨的共享 IP 占走。
+    let on_risk_surface = pool::route::route_for(host).is_some_and(|row| {
+        row.flags.session && !row.flags.session_exclude.iter().any(|x| x == host)
+    });
     if on_risk_surface {
         HostClass::Session
     } else {

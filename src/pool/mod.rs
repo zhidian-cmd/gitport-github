@@ -326,7 +326,9 @@ fn v1_route_spec(
         action: None,
         content: spec.content,
         // v1 格式没有会话概念：迁移时按主站族补上风控面标记。
-        session: matches!(key, "github.com" | "api.github.com"),        fallback: spec.fallback.clone(),
+        session: matches!(key, "github.com" | "api.github.com"),
+        fallback: spec.fallback.clone(),
+        ..Default::default()
     };
     let mut ips = Vec::new();
     for p in spec.plans.iter().chain(spec.real_plans.iter()) {
@@ -440,6 +442,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: true,
             fallback: None,
+            ..Default::default()
         },
         route::HostSpec {
             key: "api.github.com".into(),
@@ -447,6 +450,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: true,
             fallback: None,
+            ..Default::default()
         },
         route::HostSpec {
             key: "*.githubusercontent.com".into(),
@@ -454,6 +458,7 @@ fn legacy_pools_to_v2(
             content: true,
             session: false,
             fallback: Some("mirror".into()),
+            ..Default::default()
         },
         route::HostSpec {
             key: "githubassets.com".into(),
@@ -461,6 +466,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: false,
             fallback: None,
+            ..Default::default()
         },
         route::HostSpec {
             key: "github.io".into(),
@@ -468,6 +474,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: false,
             fallback: None,
+            ..Default::default()
         },
         route::HostSpec {
             key: "githubapp.com".into(),
@@ -475,6 +482,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: false,
             fallback: None,
+            ..Default::default()
         },
     ];
     for h in LEGACY_HOST_ROWS {
@@ -484,6 +492,7 @@ fn legacy_pools_to_v2(
             content: false,
             session: false,
             fallback: None,
+            ..Default::default()
         });
     }
     (hosts, ips)

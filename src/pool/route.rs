@@ -16,7 +16,7 @@ pub enum Route {
 }
 
 /// host 侧开关位；全部来自 routes.json 的 hosts 块。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Flags {
     /// 本机直连，不进代理。
     pub direct: bool,
@@ -25,6 +25,9 @@ pub struct Flags {
     /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
     /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
     pub session: bool,
+    /// 会话排除名单：通配键里个别内容型子域在这里豁免会话语义。
+    /// 按请求 host 精确匹配；有自己的路由键的子域不需要进名单（最长键自然胜出）。
+    pub session_exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +50,9 @@ pub struct HostSpec {
     /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
     #[serde(default)]
     pub session: bool,
+    /// 会话排除名单：通配键里个别内容型子域豁免会话语义。
+    #[serde(default)]
+    pub session_exclude: Vec<String>,
     /// "dns"（默认）或 "mirror"。
     #[serde(default)]
     pub fallback: Option<String>,
@@ -152,6 +158,7 @@ impl RouteRow {
                 direct,
                 content: spec.content,
                 session: spec.session,
+                session_exclude: spec.session_exclude,
             },
             fallback,
             bare,
@@ -425,7 +432,7 @@ pub fn hosts_snapshot() -> Vec<HostMeta> {
         .iter()
         .map(|r| HostMeta {
             key: r.key.clone(),
-            flags: r.flags,
+            flags: r.flags.clone(),
             fallback: r.fallback,
         })
         .collect()
