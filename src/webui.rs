@@ -92,6 +92,7 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
         .route("/proxy.pac", axum::routing::get(proxy_pac))
         .route("/api/status", axum::routing::get(api_status))
         .route("/api/logs", axum::routing::get(api_logs))
+        .route("/api/logs/clear", axum::routing::post(api_logs_clear))
         .route("/api/mitm", axum::routing::post(api_mitm))
         .route("/api/settings", axum::routing::get(api_settings))
         .route(
@@ -338,6 +339,11 @@ async fn api_logs(State(st): State<Arc<App>>, Query(q): Query<LogsQuery>) -> Res
         })
         .collect();
     write_json(&serde_json::json!({ "logs": logs, "latest": latest }))
+}
+
+async fn api_logs_clear(State(st): State<Arc<App>>) -> Response {
+    st.logs.clear();
+    write_json(&serde_json::json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]

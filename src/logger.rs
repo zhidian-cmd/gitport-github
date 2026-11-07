@@ -84,6 +84,12 @@ impl Logger {
         }
     }
 
+    /// 清空 WebUI 环形缓冲。seq 保持单调不清零——增量拉取的客户端按旧 after 查询
+    /// 只会得到空增量，不会把清空前后的日志序搅乱。
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().buf.clear();
+    }
+
     pub fn since(&self, after: u64) -> (Vec<(u64, String)>, u64) {
         let g = self.inner.lock().unwrap();
         let out = g

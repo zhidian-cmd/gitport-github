@@ -125,6 +125,11 @@ async function refreshLogs() {
   logSeq = d.latest;
 }
 
+async function clearLogs() {
+  try { await fetch('/api/logs/clear', { method: 'POST' }); } catch (e) { return; }
+  document.getElementById('logsBox').textContent = '';
+}
+
 /* ---------- 开关 ---------- */
 async function postJSON(url, body) {
   return (await fetch(url, {method:'POST', headers:{'Content-Type':'application/json','X-GitPort-Request':'1'}, body: JSON.stringify(body || {})})).json();

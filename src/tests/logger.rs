@@ -37,3 +37,20 @@ fn boot_lines_never_reach_webui() {
     // 序号不因被丢弃的行产生空洞：拉取游标仍连续可判。
     assert_eq!(latest, 1);
 }
+
+/// 清空只清缓冲、seq 保持单调：按旧 after 增量拉取只会得到空增量，客户端游标不乱。
+#[test]
+fn clear_empties_buffer_keeps_seq_monotonic() {
+    let lg = Logger::new(false);
+    lg.log("before");
+    let (entries, latest) = lg.since(0);
+    assert_eq!(entries.len(), 1);
+    lg.clear();
+    assert!(lg.since(0).0.is_empty(), "清空后缓冲必须为空");
+    assert_eq!(lg.since(0).1, latest, "seq 不回退");
+    lg.log("after");
+    let (entries, latest2) = lg.since(latest);
+    assert_eq!(entries.len(), 1, "按旧游标增量拉取只拿清空后的新行");
+    assert!(entries[0].1.ends_with("after"));
+    assert_eq!(latest2, latest + 1);
+}
