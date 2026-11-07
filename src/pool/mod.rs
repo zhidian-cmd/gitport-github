@@ -1367,7 +1367,7 @@ pub async fn get_or_build(
             return Ok((up, false));
         }
         // 建造：内容域主副双腿、其他单通道、会话域自建单条，全在 dial_upstream 内。
-        let (up, _reused) = chan::dial_upstream(host, log, false).await?;
+        let up = chan::dial_upstream(host, log).await?;
         return Ok((up, true));
     }
 }

@@ -68,11 +68,6 @@ pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
 /// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
 const DIAL_SLOW_MS: u64 = 1500;
 
-/// 这个错误重试没有意义：候选都被已有通道占着，
-/// 换候选、再来一轮都是同一句话。上层看到它直接交兜底，别原地刷屏。
-/// 仅会话域会产生（内容域/其他已放开多通道并存）。
-pub const ERR_NO_FREE_IP: &str = "候选均已有通道";
-
 /// host 三类：
 /// - 内容域：多通道并存，池里按"空闲且快"选。
 /// - 会话域：单通道单 IP，建连优先自己拨一条，不蹭公共通道（带会话，跨 IP 是风控特征）。
@@ -200,9 +195,8 @@ pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream>
     pick(ips, want_slot, None)
 }
 
-/// 会话域取用：**只认这个 host 自己建的通道**。没有就返回 None，让调用方去自建。
-/// 自建不出来时的兜底复用放在拨号链路末尾（`cached_h2_in`），不在入口抢跑——
-/// 自己拨一条并不慢，但一上来就蹭公共通道会跟一堆 host 抢同一条 h2 的流窗口。
+/// 会话域取用：**只认这个 host 自己建的通道**。没有就返回 None，让调用方去自建——
+/// 一上来就蹭公共通道，等于带会话的请求骑在别人建的连接上，风控面直接漂移。
 pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
     pick(ips, want_slot, Some(host))
 }
@@ -555,37 +549,31 @@ fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> Str
 pub(crate) struct LegPlan {
     /// 主通道：还有没被已有通道占用的 IP 就发，串发新建。
     pub primary: bool,
-    /// 副通道拨号：没有现成通道可捡、且还剩两个以上空 IP 才发。
+    /// 副通道拨号：还剩两个以上空 IP 才发（复用归池子的骑池，这里只拨新）。
     pub vice_dial: bool,
-    /// 副通道复用：本 host 候选里已有现成通道，直接拿来用，不拨号。
-    pub vice_reuse: bool,
 }
 
 /// 纯计算，把「主副分工」钉死：
 /// - 会话域不设副通道（同会话跨 IP 是风控特征）；
 /// - 有空 IP 才发主通道；
-/// - 副通道优先复用；没有现成的、且空 IP 够两家，才再发一条去拨。
-pub(crate) fn plan_legs(session: bool, free: usize, reusable: bool) -> LegPlan {
+/// - 空 IP 够两家才发副腿去拨。
+pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     LegPlan {
         primary: free > 0,
-        vice_dial: !session && !reusable && free >= 2,
-        vice_reuse: !session && reusable,
+        vice_dial: !session && free >= 2,
     }
 }
 
-/// 双通道建连：主通道串发开新 IP，副通道起跑前先查「本 host 候选 ∩ 已有通道」，
-/// 有现成的直接复用（请求不用等握手），没有才跟主通道一样串发。
+/// 双腿建连：主副各拨各的新连接（串发选 IP → h2 握手 → 入库），
 /// 两条腿共享 crew：同一个 IP 只由一条腿试，绝不重复。
-/// 返回的 bool：这条连接是不是**池里现成的**（而不是本轮刚拨出来的）。
-/// 上层要靠它区分「旧连接死了」和「这个 IP 不行」，两者处置完全不同。
+/// 返回的连接必是本轮新拨的——骑池里现成通道归 `pool::get_or_build` 的骑池步骤，不归这里。
 async fn dial_h2_race(
     host: &str,
     log: &LogFn,
     occupied: &[String],
-    allow_reuse: bool,
-) -> Result<(H2Upstream, bool), String> {
+) -> Result<H2Upstream, String> {
     let crew = pool::DialCrew::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(H2Upstream, bool), String>>(4);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
     let targets = pool::route::dial_targets(host).unwrap_or_default();
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let distinct = ips.len();
@@ -600,71 +588,41 @@ async fn dial_h2_race(
     };
     // 单通道判定：内容域之外都是。即使只剩一家，原因也按规则算，不误报成「候选不足」。
     let single = !dual_channel(host);
-    // 副通道的「先查表」：只在这个 host 自己的候选里找现成通道；
-    // 别的 host 能用、但不在本 host 候选里的，不算数。
-    // 流式请求（allow_reuse=false）不许捡：body 发出去就收不回，只能走确定属于它的新连接。
-    let reusable = if single || !allow_reuse {
-        None
-    } else {
-        cached_h2_in(&ips, None)
-    };
-    let legs = plan_legs(single, free, reusable.is_some());
+    let legs = plan_legs(single, free);
 
     let mut launched = 0usize;
     // 一条腿 = 一个拨号任务：串发选 IP → h2 握手 → 入库，结果回执 tx。
-    let dial_leg = |slot: u8, prefer_shared: Option<bool>, tx: tokio::sync::mpsc::Sender<Result<(H2Upstream, bool), String>>| {
+    let dial_leg = |slot: u8, prefer_shared: Option<bool>, tx: tokio::sync::mpsc::Sender<Result<H2Upstream, String>>| {
         let host = host.to_string();
         let log2 = log.clone();
         let skip = occupied.to_vec();
         let crew2 = crew.clone();
         tokio::spawn(async move {
-            let r = h2_dial_slot(&host, &log2, &skip, slot, Some(&crew2), prefer_shared)
-                .await
-                .map(|up| (up, true));
+            let r = h2_dial_slot(&host, &log2, &skip, slot, Some(&crew2), prefer_shared).await;
             let _ = tx.send(r).await;
         });
     };
-    if legs.vice_reuse {
-        if let Some(up) = reusable {
-            // 先把现成的交上去：调用方立刻能发请求，主通道在后台慢慢拨。
-            let _ = tx.send(Ok((up, true))).await;
-            (log)(&format!(
-                "[建连] {host} 复用现成通道{}",
-                if legs.primary {
-                    ", 主通道另起一条"
-                } else {
-                    ""
-                }
-            ));
-            launched += 1;
-        }
-    }
     if legs.primary {
         // 主通道：独占档在前（独占用尽才轮到共享），游标用主键。
         dial_leg(1, Some(false), tx.clone());
         launched += 1;
     }
     if legs.vice_dial {
-        // 副通道：共享档在前（没得捡才自己拨），游标用 _vice 副键。
+        // 副通道：共享档在前，游标用 _vice 副键。
         dial_leg(2, Some(true), tx.clone());
         launched += 1;
     }
     if launched == 0 {
-        // 一条腿都发不出去：可能空 IP 用完了，也可能会话域本来就不设副通道。
-        // 这时池里若已有本 host 候选的连接就直接用——把"已有通道"判成失败，
-        // 上层只会拿同一句话重试到死（实测 api.github.com 连刷 24 行）。
-        if allow_reuse {
-            if let Some(up) = cached_h2_in(&ips, None) {
-                return Ok((up, true));
-            }
-        }
-        return Err(format!("{host} {ERR_NO_FREE_IP}, 请重查连接池"));
+        // 一条腿都发不出去：会话域的候选全被已有通道占住——重拨只能落在同批 IP 上
+        // 再被 store_h2 作废，这句话重试到死没有意义（实测 api.github.com 连刷 24 行），
+        // 立即交上层走兜底。
+        return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
     drop(tx);
     // 两条腿同时拨 = 一次等待把两条容量通道都建好；只发主通道时说清为什么单通道。
     if legs.primary && legs.vice_dial {
         (log)(&format!("[建连] {host} 主副双通道同时开建"));
-    } else if legs.primary && !legs.vice_reuse {
+    } else if legs.primary {
         (log)(&format!(
             "[建连] {host} 单通道({})",
             single_channel_reason(host_class(host), distinct, free)
@@ -676,33 +634,19 @@ async fn dial_h2_race(
         match rx.recv().await {
             Some(Ok(up)) => break up,
             Some(Err(e)) => last = Some(e),
-            None => {
-                // 候选全试完才看现成的：会话域宁可自己拨，也不要一上来就蹭公共通道；
-                // 但真拨不出来时，有一条能用的总比整组失败好。
-                if allow_reuse {
-                    if let Some(up) = cached_h2_in(&ips, None) {
-                        return Ok((up, true));
-                    }
-                }
-                return Err(last.unwrap_or_else(|| "并行建连全败".into()));
-            }
+            None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
         }
     };
     // 晚成腿的收尾：连接已在拨号任务内自入库（store_h2），这里不再等待也不再补建——
-    // 批模型下通道重建是下一批请求自己的事，一成一败就本批单通道跑。
+    // 通道重建是下一个请求自己的事，一成一败就本轮单通道跑。
     // rx 就地丢弃：dialer 的回执发送对已关闭的通道是 no-op（let _ = tx.send），无副作用。
     drop(rx);
     Ok(won)
 }
 
-/// 建连统一入口：主通道串发开新 IP，副通道先查交集、能复用就复用。
-/// 两条腿都跳过本 host 候选里已有通道的 IP，所以永远落在不同 IP 上。
+/// 建连统一入口：双腿各拨各的新连接（会话域跳过已有通道的 IP，内容域/其他不管）。
 /// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
-pub async fn dial_upstream(
-    host: &str,
-    log: &LogFn,
-    allow_reuse: bool,
-) -> Result<(H2Upstream, bool), String> {
+pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     if pool::dial_cool_open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
@@ -720,10 +664,7 @@ pub async fn dial_upstream(
     } else {
         Vec::new()
     };
-    let (up, reused) = dial_h2_race(host, log, &occupied, allow_reuse).await?;
-    // 两腿都在这一轮处理完了（副腿可能直接复用了现成通道），调用方不必再补第二条。
-    // reused 如实交代来源：池里现成的连接失败只能说明它自己死了，不能据此判 IP 不行。
-    Ok((up, reused))
+    dial_h2_race(host, log, &occupied).await
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;

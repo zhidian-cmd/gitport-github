@@ -411,8 +411,8 @@ async fn stream_passthrough(
             }
         }
         // 流式请求不许捡现成连接：body 没有副本，发出去就收不回。
-        match upstream::dial_upstream(host, log, false).await {
-            Ok((up, _fresh)) => match upstream::h2_open_stream(&up, out, false).await {
+        match upstream::dial_upstream(host, log).await {
+            Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
                     upstream::drop_h2_id(&up.ip, up.id);
