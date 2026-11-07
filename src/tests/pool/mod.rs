@@ -1020,43 +1020,6 @@ fn shared_ip_marks_come_from_topology() {
     );
 }
 
-/// 拨号层整单级预检：候选（扣 skip）全部已有通道/被 skip → 当场驳回、不 spawn 拨号任务。
-#[tokio::test]
-async fn dialer_rejects_order_when_all_candidates_skipped() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    let dir = tmpdir();
-    crate::settings::save_worker_mirrors(Vec::new());
-    serial_load(&dir, Vec::new(), None);
-    let ips = target_ips("github.com");
-    assert!(!ips.is_empty(), "种子表应有 github.com 候选");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let log: LogFn = Arc::new(|_: &str| {});
-    crate::server::dialer::submit(
-        crate::server::dialer::DialOrder {
-            host: "github.com".to_string(),
-            slot: 1,
-            crew: crate::pool::DialCrew::new(),
-            skip_ips: ips,
-            prefer_shared: None,
-        },
-        &log,
-        tx,
-    )
-    .await;
-    let r = rx.recv().await.expect("驳回也要有回执");
-    let msg = match r {
-        Err(e) => e,
-        Ok(_) => panic!("全候选被 skip → 整单驳回"),
-    };
-    assert!(
-        msg.contains(crate::server::upstream::ERR_NO_FREE_IP),
-        "驳回文案应指向候选占用: {msg}"
-    );
-    edges::clear_all();
-}
-
 /// dial_order 档位排序：指定 prefer_shared 时独占/共享分档，优先档整档在前、
 /// 档内游标优先 + 延迟升序；None 保持纯游标+延迟序。
 #[test]

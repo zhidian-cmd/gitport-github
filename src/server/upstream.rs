@@ -1,12 +1,13 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
+//! 通道池的记账、挑选、开流全在本文件：池只有一个口径，选和用不另设管理层。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
-use crate::server::dialer;
 use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use h2::client::SendRequest;
-use http::Uri;
+use http::{Request, Uri};
 use http_body_util::BodyExt;
+use hyper::Response;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tower_service::Service;
 /// 池按 IP 记账：一条连接可被该 IP 服务着的所有路由键共用（v2 复用单元 = IP）。
 #[derive(Clone)]
@@ -166,6 +168,70 @@ pub(crate) fn evict_stale(ips: &[String]) {
     }
 }
 
+/// 响应头预算超时：上层按它区分"真等超了"和别的失败。
+pub const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
+
+/// 门房公式：在给定 IP 集合里挑活连接——占用率 × 延迟，最闲且最快的胜出。
+/// only_owner = 会话域只认自己建的通道；want_slot = 搜索路径固定骑主通道。
+pub(crate) fn pick(
+    ips: &[String],
+    want_slot: Option<u8>,
+    only_owner: Option<&str>,
+) -> Option<H2Upstream> {
+    let mut g = lock(conn_pool());
+    // (分数, 是否顶到并发上限, 连接)
+    let mut cands: Vec<(f64, bool, H2Upstream)> = Vec::new();
+    for ip in ips {
+        let Some(h) = g.get_mut(ip) else { continue };
+        for c in &h.conns {
+            if let Some(want) = want_slot {
+                if c.up.slot != want {
+                    continue;
+                }
+            }
+            if let Some(owner) = only_owner {
+                if c.up.owner.as_deref() != Some(owner) {
+                    continue;
+                }
+            }
+            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let cap = c.up.max_streams.max(1);
+            // 占用率 × 延迟：闲着又快的分最小；都忙时也自然挑"最快腾出槽位"的那条。
+            // 还没发过请求的连接 ewma=0，用 1ms 兜底，免得白捡成永远第一。
+            let ewma = if c.ewma > 0.0 { c.ewma } else { 1.0 };
+            let score = (inflight as f64 + 1.0) / cap as f64 * ewma;
+            cands.push((score, inflight >= cap, c.up.clone()));
+        }
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // 优先没顶到上限的；全满时才按分数排在队首那条（h2 自己会在服务端配额上排队）。
+    let any_free = cands.iter().any(|c| !c.1);
+    let pick = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !any_free || !c.1)
+        .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
+        .map_or(0, |(i, _)| i);
+    Some(cands.remove(pick).2)
+}
+
+/// 门房开流：把请求递进通道。字节不过这里——hyper 的泵直接在请求体/响应体与
+/// socket 之间搬运，本层加一跳都不该加；每次开流顺带刷新这条连接的空闲期。
+pub async fn stream_on(
+    up: &H2Upstream,
+    out: &Request<BoxBody>,
+    body: &Option<Bytes>,
+    budget: Duration,
+) -> Result<(Response<BoxBody>, u64), String> {
+    let t0 = Instant::now();
+    match tokio::time::timeout(budget, h2_send(up, out, body)).await {
+        Ok(r) => r.map(|resp| (resp, t0.elapsed().as_millis() as u64)),
+        Err(_) => Err(ERR_BUDGET_TIMEOUT.to_string()),
+    }
+}
+
 /// 会话域取用闸：闲置超过阈值的通道先 ping 验活——活着直接复用（同 IP 保住会话，
 /// 风控面不漂移），死了当场摘掉返回 None，调用方走拨号（游标钉着原 IP，重拨落回原家）。
 /// ping 由连接驱动任务代答（PingPong 只有 poll conn 的人能驱动），本侧另设兜底超时：
@@ -175,7 +241,7 @@ pub(crate) async fn session_pick(
     ips: &[String],
     want_slot: Option<u8>,
 ) -> Option<H2Upstream> {
-    let up = crate::server::keeper::pick(ips, want_slot, Some(host))?;
+    let up = pick(ips, want_slot, Some(host))?;
     let idle = conn_idle_secs(&up.ip, up.id).unwrap_or(u64::MAX);
     if idle < crate::config::SESSION_PING_GATE_SECS {
         return Some(up); // 刚用过的连接：零额外延迟，直接信
@@ -206,14 +272,14 @@ pub(crate) async fn session_pick(
 
 /// 在给定 IP 集合里取活连接：按「占用率 × 延迟」挑最闲且最快的那条（公式在 keeper 层）。
 pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
-    crate::server::keeper::pick(ips, want_slot, None)
+    pick(ips, want_slot, None)
 }
 
 /// 会话域取用：**只认这个 host 自己建的通道**。没有就返回 None，让调用方去自建。
 /// 自建不出来时的兜底复用放在拨号链路末尾（`cached_h2_in`），不在入口抢跑——
 /// 自己拨一条并不慢，但一上来就蹭公共通道会跟一堆 host 抢同一条 h2 的流窗口。
 pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
-    crate::server::keeper::pick(ips, want_slot, Some(host))
+    pick(ips, want_slot, Some(host))
 }
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
@@ -576,6 +642,19 @@ async fn dial_h2_race(
     let legs = plan_legs(single, free, reusable.is_some());
 
     let mut launched = 0usize;
+    // 一条腿 = 一个拨号任务：串发选 IP → h2 握手 → 入库，结果回执 tx。
+    let dial_leg = |slot: u8, prefer_shared: Option<bool>, tx: tokio::sync::mpsc::Sender<Result<(H2Upstream, bool), String>>| {
+        let host = host.to_string();
+        let log2 = log.clone();
+        let skip = occupied.to_vec();
+        let crew2 = crew.clone();
+        tokio::spawn(async move {
+            let r = h2_dial_slot(&host, &log2, &skip, slot, Some(&crew2), prefer_shared)
+                .await
+                .map(|up| (up, true));
+            let _ = tx.send(r).await;
+        });
+    };
     if legs.vice_reuse {
         if let Some(up) = reusable {
             // 先把现成的交上去：调用方立刻能发请求，主通道在后台慢慢拨。
@@ -593,34 +672,12 @@ async fn dial_h2_race(
     }
     if legs.primary {
         // 主通道：独占档在前（独占用尽才轮到共享），游标用主键。
-        dialer::submit(
-            dialer::DialOrder {
-                host: host.to_string(),
-                slot: 1,
-                crew: crew.clone(),
-                skip_ips: occupied.to_vec(),
-                prefer_shared: Some(false),
-            },
-            log,
-            tx.clone(),
-        )
-        .await;
+        dial_leg(1, Some(false), tx.clone());
         launched += 1;
     }
     if legs.vice_dial {
         // 副通道：共享档在前（没得捡才自己拨），游标用 _vice 副键。
-        dialer::submit(
-            dialer::DialOrder {
-                host: host.to_string(),
-                slot: 2,
-                crew: crew.clone(),
-                skip_ips: occupied.to_vec(),
-                prefer_shared: Some(true),
-            },
-            log,
-            tx.clone(),
-        )
-        .await;
+        dial_leg(2, Some(true), tx.clone());
         launched += 1;
     }
     if launched == 0 {
