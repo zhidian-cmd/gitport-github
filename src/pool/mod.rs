@@ -325,7 +325,8 @@ fn v1_route_spec(
         // v2 实测后 direct 4 域进池；迁移时旧 direct 标志一并解除，IP 边由种子补。
         action: None,
         content: spec.content,
-        fallback: spec.fallback.clone(),
+        // v1 格式没有会话概念：迁移时按主站族补上风控面标记。
+        session: matches!(key, "github.com" | "api.github.com"),        fallback: spec.fallback.clone(),
     };
     let mut ips = Vec::new();
     for p in spec.plans.iter().chain(spec.real_plans.iter()) {
@@ -437,36 +438,42 @@ fn legacy_pools_to_v2(
             key: "github.com".into(),
             action: None,
             content: false,
+            session: true,
             fallback: None,
         },
         route::HostSpec {
             key: "api.github.com".into(),
             action: None,
             content: false,
+            session: true,
             fallback: None,
         },
         route::HostSpec {
             key: "*.githubusercontent.com".into(),
             action: None,
             content: true,
+            session: false,
             fallback: Some("mirror".into()),
         },
         route::HostSpec {
             key: "githubassets.com".into(),
             action: None,
             content: false,
+            session: false,
             fallback: None,
         },
         route::HostSpec {
             key: "github.io".into(),
             action: None,
             content: false,
+            session: false,
             fallback: None,
         },
         route::HostSpec {
             key: "githubapp.com".into(),
             action: None,
             content: false,
+            session: false,
             fallback: None,
         },
     ];
@@ -475,6 +482,7 @@ fn legacy_pools_to_v2(
             key: (*h).to_string(),
             action: None,
             content: false,
+            session: false,
             fallback: None,
         });
     }
@@ -848,8 +856,20 @@ fn fill_hosts_from_nodes(doc: &mut TopoDoc) {
             if key.is_empty() || doc.hosts.iter().any(|x| x.key == key) {
                 continue;
             }
+            // 通配键继承父域的标志：`*.github.com` 从 `github.com` 拿 session 等，
+            // 别让派生行把主站族的会话语义丢了（www.github.com 也带主站会话）。
+            let inherited = key
+                .strip_prefix("*.")
+                .and_then(|bare| doc.hosts.iter().find(|x| x.key == bare));
+            let (session, content, fallback) = match inherited {
+                Some(p) => (p.session, p.content, p.fallback.clone()),
+                None => Default::default(),
+            };
             doc.hosts.push(route::HostSpec {
                 key: key.to_string(),
+                session,
+                content,
+                fallback,
                 ..Default::default()
             });
         }

@@ -22,6 +22,9 @@ pub struct Flags {
     pub direct: bool,
     /// 内容域：走熔断与短响应预算。
     pub content: bool,
+    /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
+    /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
+    pub session: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +44,9 @@ pub struct HostSpec {
     pub action: Option<String>,
     #[serde(default)]
     pub content: bool,
+    /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
+    #[serde(default)]
+    pub session: bool,
     /// "dns"（默认）或 "mirror"。
     #[serde(default)]
     pub fallback: Option<String>,
@@ -145,6 +151,7 @@ impl RouteRow {
             flags: Flags {
                 direct,
                 content: spec.content,
+                session: spec.session,
             },
             fallback,
             bare,
