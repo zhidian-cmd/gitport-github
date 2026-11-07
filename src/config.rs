@@ -26,13 +26,14 @@ pub fn set_webui_port(p: u16) {
 }
 
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
-/// 单候选拨号超时（TCP 与 TLS 握手共用）：黑洞型死 IP 不许拖住整轮串发。
-pub const CONNECT_TIMEOUT_SECS: u64 = 3;
+/// 单阶段拨号上限（TCP 连接与 TLS 握手各自独立计时，各 2s）：黑洞型死 IP 不许拖住整轮串发。
+/// 健康全流程实测 ~334ms，2s 是 5-10 倍余量；须 > DIAL_SLOW_MS(1500) 保住"慢成功"检测窗。
+pub const CONNECT_TIMEOUT_SECS: u64 = 2;
 /// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。
-pub const SERIAL_DIAL_BUDGET_SECS: u64 = 20;
+/// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。2s/IP 上限下 ≈ 走完 6 个候选就交镜像链。
+pub const SERIAL_DIAL_BUDGET_SECS: u64 = 12;
 
 /// 批窗：30s 内用过 = 还在本批，可复用；过窗视同不存在，取用时惰性摘除重拨。
 /// 取值 ≈ 边缘空闲回收窗（实测 50-65s）的一半，能被复用的通道最多这么老，

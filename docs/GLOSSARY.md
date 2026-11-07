@@ -66,9 +66,9 @@
 |---|---|---|
 | 代理 / 工作台端口 | 7810 / 7811 | `config.rs` |
 | 入口读请求头 | 30s | `config.rs::HEAD_TIMEOUT_SECS` |
-| 单候选 TCP + TLS 握手（共用） | 3s | `config.rs::CONNECT_TIMEOUT_SECS` |
+| 单候选 TCP / TLS 握手（各自独立计时） | 各 2s | `config.rs::CONNECT_TIMEOUT_SECS` |
 | h2 SETTINGS 握手 | 5s | `config.rs::H2_HANDSHAKE_TIMEOUT_SECS` |
-| 串发慢失败总预算 | 20s | `config.rs::SERIAL_DIAL_BUDGET_SECS` |
+| 串发慢失败总预算 | 12s | `config.rs::SERIAL_DIAL_BUDGET_SECS` |
 | 响应头 / 内容域短预算 | 8s / 4s | `protocol.rs`、`mitm/mod.rs` |
 | 镜像响应头 | 5s | `mirror.rs::MIRROR_HEAD_TIMEOUT` |
 | 直连每跳 / 整段 | 2s / 4s | `mirror.rs` |
