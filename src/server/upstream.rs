@@ -81,47 +81,25 @@ pub(crate) enum HostClass {
     Other,
 }
 
-/// 归「其他」的 github.com 子域：单通道、复用优先，不值得养一条专属通道。
-/// 前十个只去 Fastly 边缘、不走主站（docs/CONFIG.md 实测表，2026-11-03 全量测绘），
-/// 拿主站 IP 去拨是白试；后两个是超低频入口（上传附件、MCP 调用），
-/// 长期吃灰的通道不如直接蹭一条热的。
-const REUSE_FIRST_HOSTS: &[&str] = &[
-    "docs.github.com",
-    "support.github.com",
-    "resources.github.com",
-    "desktop.github.com",
-    "pages.github.com",
-    "skills.github.com",
-    "archiveprogram.github.com",
-    "socialimpact.github.com",
-    "raw.github.com",
-    "agent.github.com",
-    "uploads.github.com",
-    "api.mcp.github.com",
-];
-
-fn is_other_host(host: &str) -> bool {
-    let h = host.to_ascii_lowercase();
-    REUSE_FIRST_HOSTS.contains(&h.as_str())
-}
-
+/// host 三类全部由 routes.json/seeds.json 的 hosts 标志决定（数据，改类别不用重编译）：
+/// - content 标记：内容域（双通道，池里按"空闲且快"选）。
+/// - big 标记：大文件域（单通道——一条长流占满槽位，两条互相抢带宽；大镜像链）。
+/// - session 标记：会话域（单通道单 IP 长期资产 + ping 闸，只标实测出拦截页的主站族）。
+/// - 三个都不标：「其他」——单通道、批窗临时通道，不值得养专属资产。
 pub(crate) fn host_class(host: &str) -> HostClass {
-    // 大文件域虽然挂着 content 标记（走镜像链），但不再开第二条腿：
-    // 一条长流就能把槽位占满，两条反而互相抢带宽。
-    if pool::route::is_big_file_host(host) || is_other_host(host) {
+    if pool::route::is_big_file_host(host) {
         return HostClass::Other;
     }
     if pool::route::is_content(host) {
         return HostClass::Content;
     }
     // 会话域按风控面划界：拦截页(Whoa)实测只出现在主站族，只有它们配长期通道 + ping 闸。
-    // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译；
-    // 通配键里的个别内容型子域用 session_exclude 豁免。githubassets/github.io/githubapp/
-    // codeload 等不标 session——数据不是主站，批窗内容域语义；否则 githubassets 的
-    // 长寿命通道会把 185.199.154/215 这 8 个三类横跨的共享 IP 占走。
-    let on_risk_surface = pool::route::route_for(host).is_some_and(|row| {
-        row.flags.session && !row.flags.session_exclude.iter().any(|x| x == host)
-    });
+    // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译。
+    // 内容型的子域不做通配排除——写进 ips 节点的 hosts（写完整即豁免，具体键最长匹配
+    // 天然压过通配）。githubassets/github.io/githubapp/codeload 等不标 session——
+    // 数据不是主站，批窗内容域语义；否则 githubassets 的长寿命通道会把
+    // 185.199.154/215 这 8 个三类横跨的共享 IP 占走。
+    let on_risk_surface = pool::route::route_for(host).is_some_and(|row| row.flags.session);
     if on_risk_surface {
         HostClass::Session
     } else {

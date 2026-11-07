@@ -3,6 +3,15 @@ use bytes::Bytes;
 
 #[test]
 fn mirror_chain_cap_scope() {
+    // is_big_file_host 走路由表（数据），先装种子表。
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_mirror_cap_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+
     for h in [
         "raw.githubusercontent.com",
         "camo.githubusercontent.com",
@@ -69,6 +78,15 @@ fn mirror_request_strips_identity_and_hop_by_hop() {
 
 #[test]
 fn calibrate_templates_cover_small_hosts_only() {
+    // is_big_file_host 走路由表（数据），先装种子表。
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join("gitport_calibrate_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+
     for h in pool::CONTENT_HOSTS {
         let covered = CALIBRATE_TEMPLATES.iter().any(|(host, _)| host == h);
         if pool::route::is_big_file_host(h) {

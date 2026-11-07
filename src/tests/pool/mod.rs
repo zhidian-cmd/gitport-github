@@ -553,6 +553,7 @@ fn toggle_gates_big_file_chains_only() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
+  "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
   "core": [],
   "mirrors_big":   {"objects.githubusercontent.com": ["https://on.example", "https://off.example"]},
   "mirrors_small": {"raw.githubusercontent.com": ["https://on.example"]}

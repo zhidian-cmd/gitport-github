@@ -24,10 +24,11 @@ pub struct Flags {
     pub content: bool,
     /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
     /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
+    /// 内容型的子域不做通配排除——直接写进 ips 节点的 hosts（写完整即豁免，
+    /// 具体键最长匹配天然压过通配）。
     pub session: bool,
-    /// 会话排除名单：通配键里个别内容型子域在这里豁免会话语义。
-    /// 按请求 host 精确匹配；有自己的路由键的子域不需要进名单（最长键自然胜出）。
-    pub session_exclude: Vec<String>,
+    /// 大文件域：单通道（一条长流占满槽位）+ 大镜像链。数据源自 mirrors_big 键集。
+    pub big: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,9 +51,9 @@ pub struct HostSpec {
     /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
     #[serde(default)]
     pub session: bool,
-    /// 会话排除名单：通配键里个别内容型子域豁免会话语义。
+    /// 大文件域：单通道 + 大镜像链。
     #[serde(default)]
-    pub session_exclude: Vec<String>,
+    pub big: bool,
     /// "dns"（默认）或 "mirror"。
     #[serde(default)]
     pub fallback: Option<String>,
@@ -158,7 +159,7 @@ impl RouteRow {
                 direct,
                 content: spec.content,
                 session: spec.session,
-                session_exclude: spec.session_exclude,
+                big: spec.big,
             },
             fallback,
             bare,
@@ -471,11 +472,9 @@ pub fn ip_count() -> usize {
 // ---- 镜像链归属（与拨号路由正交，仍按 host 形状判定）----
 
 /// 大文件下载域（分片竞速）：objects/release-assets=附件 302 落点。
+/// 大文件域判定：routes.json/seeds.json 的 hosts 标志 `big: true`（数据，不再硬编码域名）。
 pub fn is_big_file_host(host: &str) -> bool {
-    matches!(
-        host,
-        "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
-    )
+    route_for(host).is_some_and(|r| r.flags.big)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
