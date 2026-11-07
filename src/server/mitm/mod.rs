@@ -778,6 +778,18 @@ pub(super) async fn get_direct(
                         if e.contains(upstream::ERR_NO_FREE_IP) {
                             return Err(e);
                         }
+                        // 候选全在死亡冷却/被同组占用：分钟级状态，请求内不会复活，
+                        // 24 次原地重试只会刷同样的日志——立即定生死。
+                        if e.contains("无可拨候选") {
+                            if is_content {
+                                pool::CONTENT_BREAKER.set(host);
+                                (log)(&format!(
+                                    "[MITM] {host} 候选全在死亡冷却, 直连暂时不可用, 转镜像链"
+                                ));
+                                return Err(format!("内容域直连全灭({e})"));
+                            }
+                            return Err(e);
+                        }
                         // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
                         if pool::dial_cool_open(host) {
                             return Err(e);
