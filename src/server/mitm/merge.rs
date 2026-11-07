@@ -101,6 +101,16 @@ pub(super) fn content_range_end(v: Option<&str>) -> Option<u64> {
     range_span(v)?.split_once('-')?.1.trim().parse().ok()
 }
 
+/// 206 起点校验（直连切片与镜像竞速共用一条规则）：起点必须等于本段请求起点，
+/// 否则字节会错位拼进合并流——宁可当段失败走补发。
+pub(super) fn check_segment_start(v: Option<&str>, start: u64) -> Result<(), String> {
+    match content_range_start(v) {
+        Some(got) if got == start => Ok(()),
+        Some(got) => Err(format!("206 起点不符: 要 {start}, 拿到 {got}")),
+        None => Err("206 缺 Content-Range".to_string()),
+    }
+}
+
 /// 让位时持有者留多少：按双方速率反比切（DEMS），帮手的建连+爬坡折进分母；结果钳在 [MIN_PIECE, remaining−MIN_PIECE]。
 pub(super) fn split_keep(remaining: u64, holder: f64, helper: f64, setup_secs: f64) -> u64 {
     if remaining < 2 * MIN_PIECE {

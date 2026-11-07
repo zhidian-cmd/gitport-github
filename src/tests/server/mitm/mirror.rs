@@ -729,23 +729,15 @@ fn segment_range_uses_inclusive_end() {
 /// 206 起点不符或缺 Content-Range 都不能拼进合并流。
 #[test]
 fn segment_206_must_match_requested_start() {
-    let ok = hyper::Response::builder()
-        .status(206)
-        .header("content-range", "bytes 262144-524287/1608296")
-        .body(crate::server::protocol::empty_body())
-        .unwrap();
-    assert!(check_segment_start(&ok, 262_144).is_ok());
+    let cr = "bytes 262144-524287/1608296";
+    assert!(merge::check_segment_start(Some(cr), 262_144).is_ok());
     assert!(
-        check_segment_start(&ok, 0).is_err(),
+        merge::check_segment_start(Some(cr), 0).is_err(),
         "第三方镜像回了错段，起点不符必须当段失败"
     );
 
-    let bad = hyper::Response::builder()
-        .status(206)
-        .body(crate::server::protocol::empty_body())
-        .unwrap();
     assert!(
-        check_segment_start(&bad, 0).is_err(),
+        merge::check_segment_start(None, 0).is_err(),
         "206 缺 Content-Range 不能收"
     );
 }

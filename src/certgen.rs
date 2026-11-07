@@ -187,7 +187,8 @@ fn generate() -> Result<Arc<Authority>, String> {
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::CrlSign,
     ];
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // pathlen 0：根证书只能签叶子，不能再签子 CA——收窄被滥用的理论面。
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     let cert_der = cert.der().to_vec();
     let cert_pem = cert.pem();

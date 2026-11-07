@@ -57,15 +57,16 @@ pub(super) fn seg_count(total: u64) -> usize {
 }
 
 /// 段请求的模板：原请求的 method/uri/headers，每次重建一份干净的 GET。
+/// 直连切片与镜像竞速（mirror.rs 的 segment_direct）共用这一个模板。
 #[derive(Clone)]
-struct Tpl {
-    method: Method,
-    uri: http::Uri,
-    headers: HeaderMap,
+pub(super) struct Tpl {
+    pub(super) method: Method,
+    pub(super) uri: http::Uri,
+    pub(super) headers: HeaderMap,
 }
 
 impl Tpl {
-    fn of(out: &hyper::Request<BoxBody>) -> Self {
+    pub(super) fn of(out: &hyper::Request<BoxBody>) -> Self {
         Tpl {
             method: out.method().clone(),
             uri: out.uri().clone(),
@@ -199,14 +200,10 @@ async fn fetch_segment(
     Ok((body, parts.headers))
 }
 
-/// 206 段边界校验（直连与镜像救援共用一套标准）：Content-Range 起点必须等于本段请求
-/// 起点、终点不越过本段末端——拼错边界的字节会吃掉总长预算，尾段就发不完了。
+/// 206 段边界校验：起点规则共用 merge::check_segment_start，另加终点不越界——
+/// 越界字节会吃掉总长预算，尾段就发不完了。
 fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), String> {
-    match merge::content_range_start(cr) {
-        Some(got) if got == start => {}
-        Some(_) => return Err(format!("段边界不符: 要 {start}, 拿到 {cr:?}")),
-        None => return Err("段缺 Content-Range".to_string()),
-    }
+    merge::check_segment_start(cr, start)?;
     if merge::content_range_end(cr).is_some_and(|end| end >= e) {
         return Err(format!("段终点越界: 要 <= {}, 拿到 {cr:?}", e - 1));
     }
@@ -214,10 +211,11 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
 }
 
 /// 段的镜像救援：从 start 续传到 e（直连已交付的不重拉），链序逐个试，全灭记熔断。
-/// 整段单流取回、不分段。
+/// 整段单流取回、不分段。chain 由调用方快照传入（构造时机已判空），这里只管逐个试。
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
+    chain: &[String],
     start: u64,
     e: u64,
     log: &LogFn,
@@ -226,12 +224,11 @@ async fn rescue_segment(
     if MEDIA_RESCUE_BREAKER.open(chain_key) {
         return None;
     }
-    let chain = pool::mirror_chain(chain_key);
     if chain.is_empty() {
         return None;
     }
     let orig = tpl.uri.to_string();
-    for m in &chain {
+    for m in chain {
         let Ok(seg_req) = tpl.build(start, e) else { return None };
         let Ok(req) = mirror::mirror_request(&seg_req, m, &orig) else { continue };
         match mirror::mirror_do(req, m, log).await {
@@ -350,10 +347,12 @@ pub(super) async fn try_direct_split(
     }
     // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
     let t0 = Instant::now();
+    let chain = pool::mirror_chain(kind.chain());
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let up = chans[i % n].clone();
         let log2 = log.clone();
+        let chain = chain.clone();
         async move {
             match tokio::time::timeout(
                 Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
@@ -366,7 +365,7 @@ pub(super) async fn try_direct_split(
                     hs,
                     rescued: false,
                 }),
-                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, s, e, &log2).await {
+                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -374,7 +373,7 @@ pub(super) async fn try_direct_split(
                     }),
                     None => Err("段失败且镜像救援不可用".to_string()),
                 },
-                Err(_) => match rescue_segment(tpl_ref, kind, s, e, &log2).await {
+                Err(_) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -429,6 +428,8 @@ pub(super) async fn try_direct_split(
             Some(RescueCtx {
                 tpl: tpl.clone(),
                 kind,
+                chain,
+                host: host.to_string(),
                 log: log.clone(),
             }),
             t0,
@@ -475,11 +476,14 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// 段的镜像救援上下文：模板（按偏移重建 Range 请求）、媒体类别（选链）、日志。
+/// 段的镜像救援上下文：模板（按偏移重建 Range 请求）、媒体类别（选链）、
+/// 链快照（构造时机判空，运行期不再查全局）、host（缺链告警按它节流）、日志。
 #[derive(Clone)]
 struct RescueCtx {
     tpl: Tpl,
     kind: MediaKind,
+    chain: Vec<String>,
+    host: String,
     log: LogFn,
 }
 
@@ -509,6 +513,21 @@ struct Seg {
     no_rescue: bool,
     /// 段起点计时：5s 界从开流算起，不是从拼装算起。
     started: Instant,
+}
+
+impl Seg {
+    /// 镜像救援换体：直连残体与缓冲一并丢弃，期望字节从续传点重算——
+    /// 已交付的都是连续前缀，镜像从同一偏移接着发，流内无重复无缺口。
+    fn install_rescue(&mut self, body: BoxBody, start: u64) {
+        self.buf.clear();
+        self.buffered = 0;
+        self.got = 0;
+        self.expected = (self.e - start) as usize;
+        self.body = body;
+        self.handle = None;
+        self.no_rescue = true; // 换上来的就是镜像体，不再二次救援
+        self.rescue_due = false;
+    }
 }
 
 /// 按段序交付，但每轮把所有段都 poll 一次——只盯队首会让未读段占死连接级流控窗口。
@@ -592,13 +611,33 @@ impl hyper::body::Body for SegmentedBody {
                 continue;
             }
             // 5s 界：没拉完就冻结直连体，buf 榨干后从已交付偏移起镜像续传。
+            // 链没配置或熔断开着 = 救援注定失败：不冻结不判死，继续骑直连流（慢会自己恢复）。
             if !seg.no_rescue
                 && !seg.rescue_due
-                && me.rescue.is_some()
                 && seg.got < seg.expected
                 && seg.started.elapsed() >= me.rescue_after
             {
-                seg.rescue_due = true;
+                match &me.rescue {
+                    Some(ctx)
+                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain())
+                            && !ctx.chain.is_empty() =>
+                    {
+                        seg.rescue_due = true;
+                    }
+                    _ => {
+                        seg.no_rescue = true;
+                        // 空链/熔断：救援注定失败，改为静默等直连——但要让"图卡住"有据可查。
+                        if let Some(ctx) = &me.rescue {
+                            if super::quiet::first_time("split-nochain", &ctx.host) {
+                                (ctx.log)(&format!(
+                                    "[直连切片] {} 无{}救援链可用, 段停滞改为等待直连",
+                                    ctx.host,
+                                    ctx.kind.chain()
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             if seg.rescue_due {
                 if let Some(ctx) = &me.rescue {
@@ -606,7 +645,7 @@ impl hyper::body::Body for SegmentedBody {
                         let c = ctx.clone();
                         let (s, e, got) = (seg.s, seg.e, seg.got as u64);
                         seg.handle = Some(tokio::spawn(async move {
-                            rescue_segment(&c.tpl, c.kind, s + got, e, &c.log)
+                            rescue_segment(&c.tpl, c.kind, &c.chain, s + got, e, &c.log)
                                 .await
                                 .map(|(body, _hs)| (body, s + got))
                         }));
@@ -615,15 +654,7 @@ impl hyper::body::Body for SegmentedBody {
                 if let Some(handle) = &mut seg.handle {
                     match Pin::new(handle).poll(cx) {
                         Poll::Ready(Ok(Some((body, start)))) => {
-                            // 换体：期望字节从续传点重算——已交付的都是连续前缀，流内无重复无缺口。
-                            seg.buf.clear();
-                            seg.buffered = 0;
-                            seg.got = 0;
-                            seg.expected = (seg.e - start) as usize;
-                            seg.body = body;
-                            seg.handle = None;
-                            seg.no_rescue = true; // 换上来的就是镜像体，不再二次救援
-                            seg.rescue_due = false;
+                            seg.install_rescue(body, start);
                         }
                         Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
                             me.finished = true;

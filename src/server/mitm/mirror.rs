@@ -591,20 +591,11 @@ pub(super) async fn chain_fetch(
     };
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
-/// 直连段请求模板：原请求的方法/URI/头。补发起流跑在旁路任务里，原请求不能跨任务借用——克隆一次，各自拼 Range。
-#[derive(Clone)]
-pub(super) struct DirectTpl {
-    method: http::Method,
-    uri: http::Uri,
-    headers: http::HeaderMap,
-}
+/// 直连段请求模板：与直连切片共用同一个 Tpl（direct_split.rs），不再各养一份双胞胎。
+use super::direct_split::Tpl;
 
-fn direct_tpl(out: &hyper::Request<BoxBody>) -> DirectTpl {
-    DirectTpl {
-        method: out.method().clone(),
-        uri: out.uri().clone(),
-        headers: out.headers().clone(),
-    }
+fn direct_tpl(out: &hyper::Request<BoxBody>) -> Tpl {
+    Tpl::of(out)
 }
 
 /// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 下一条无 Range 请求不必再白跑探测；只存 206 Content-Range 的权威总长。
@@ -644,7 +635,7 @@ async fn probe_total(
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
-    tpl: &DirectTpl,
+    tpl: &Tpl,
 ) -> Result<Probe, String> {
     let mut last = "无健康候选".to_string();
     for m in cands {
@@ -668,7 +659,7 @@ async fn probe_total_one(
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
-    tpl: &DirectTpl,
+    tpl: &Tpl,
 ) -> Result<Probe, String> {
     let tag = if mirror.starts_with("direct/") {
         "direct"
@@ -735,7 +726,7 @@ fn mark_unsliceable(key: String) {
 /// 预算按跳记：有镜像兜底时每跳 2s 等响应头，无兜底不设预算。
 async fn segment_direct(
     log: &LogFn,
-    tpl: &DirectTpl,
+    tpl: &Tpl,
     host: &str,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
@@ -816,21 +807,6 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
         http::header::IF_RANGE,
     ] {
         req.headers_mut().remove(h);
-    }
-}
-
-/// 206 收口统一校验：Content-Range 起点必须等于本段请求起点。
-/// 起点不符的段一旦拼进合并流，后面所有字节都会错位——宁可当段失败走补发。
-/// 302 跟跳只传回最终响应，所以这里校验的正是落点那一跳的 206。
-fn check_segment_start(resp: &hyper::Response<BoxBody>, s: u64) -> Result<(), String> {
-    let cr = resp
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok());
-    match merge::content_range_start(cr) {
-        Some(got) if got == s => Ok(()),
-        Some(got) => Err(format!("206 起点不符: 要 {s}, 拿到 {got}")),
-        None => Err("206 缺 Content-Range".to_string()),
     }
 }
 
@@ -1110,7 +1086,12 @@ async fn split_download(
             }
             match got {
                 Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                    check_segment_start(&resp, s)?;
+                    merge::check_segment_start(
+                    resp.headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    s,
+                )?;
                     let at = Instant::now();
                     Ok((guard.segment_from(at), at, resp))
                 }
@@ -1271,7 +1252,7 @@ async fn split_fetch(
     from: u64,
     to: u64,
     log: &LogFn,
-    tpl: &DirectTpl,
+    tpl: &Tpl,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
 ) -> Result<BoxBody, String> {
@@ -1320,7 +1301,12 @@ async fn split_fetch(
         }
         match got {
             Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                check_segment_start(&resp, s)?;
+                merge::check_segment_start(
+                    resp.headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    s,
+                )?;
                 let at = Instant::now();
                 let guard = guard.segment_from(at);
                 Ok(account_seg(
@@ -1349,7 +1335,12 @@ async fn split_fetch(
             .map_err(|e| e.to_string())?;
         match mirror_do(req, &m, log).await {
             Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                check_segment_start(&resp, s)?;
+                merge::check_segment_start(
+                    resp.headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    s,
+                )?;
                 let at = Instant::now();
                 let guard = guard.segment_from(at);
                 Ok(account_seg(

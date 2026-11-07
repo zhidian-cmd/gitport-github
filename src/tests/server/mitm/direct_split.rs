@@ -237,11 +237,10 @@ impl hyper::body::Body for StallBody {
     }
 }
 
-/// 5s 界拨到 0、救援链为空（SERIAL 未装表 = 空"图片"链）：直连段当场冻结，
-/// 救援返回不可用 → 整流报错。冻结先行意味着一个字节都不许先交付——
-/// 这个不变量钉住"冻结点之后绝不数据错位"。
+/// 5s 界拨到 0、救援链为空：直连段不得被判死——标记 no_rescue 后继续骑直连流
+/// （回归：冻结后救援必败曾把能自愈的停滞毁成整图错误）。
 #[tokio::test]
-async fn stalled_segment_freezes_before_rescue_fails() {
+async fn empty_rescue_chain_never_kills_stalled_segment() {
     use super::{RescueCtx, MediaKind};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -249,36 +248,102 @@ async fn stalled_segment_freezes_before_rescue_fails() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let entries = vec![(BoxBody::new(StallBody {
-        prefix: Bytes::from_static(b"abcdef"),
-        sent: false,
-    }), 30usize, 0u64, false)];
+    let entries = vec![(
+        BoxBody::new(StallBody {
+            prefix: Bytes::from_static(b"abcdef"),
+            sent: false,
+        }),
+        30usize,
+        0u64,
+        false,
+    )];
     let mut body = SegmentedBody::build(
         entries,
         30,
         Some(RescueCtx {
             tpl: tpl(),
             kind: MediaKind::Image,
+            chain: Vec::new(), // 未配置救援链
+            host: "raw.example.com".to_string(),
             log: Arc::new(|_| {}),
         }),
         Instant::now(),
         Duration::ZERO,
     );
-    // 串行手动 poll：不许有数据帧出来，第一拍就该在冻结/救援里走到报错。
     let mut delivered = 0usize;
     let mut err = false;
-    for _ in 0..10 {
-        match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-            Some(Ok(frame)) => delivered += frame.into_data().unwrap().len(),
-            Some(Err(_)) => {
+    for _ in 0..5 {
+        match tokio::time::timeout(
+            Duration::from_millis(50),
+            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)),
+        )
+        .await
+        {
+            Ok(Some(Ok(frame))) => delivered += frame.into_data().unwrap().len(),
+            Ok(Some(Err(_))) => {
                 err = true;
                 break;
             }
-            None => break,
+            Ok(None) | Err(_) => {} // Pending：直连流挂着等数据，正是期望
         }
     }
-    assert!(err, "救援不可用时必须以错误收场");
-    assert_eq!(delivered, 0, "冻结先行：救援判定之前一个字节都不许交付");
+    assert!(!err, "空链不许把停滞段判死");
+    assert_eq!(delivered, 6, "只交付直连已到的字节");
+    assert!(body.segs[0].no_rescue, "空链应标记不可救援并解冻");
+}
+
+/// 救援换体算术：直连交付的连续前缀 + 镜像续传 = 与整文件逐字节一致（图会不会花的核心）。
+#[tokio::test]
+async fn rescue_swap_continues_byte_stream() {
+    use super::{RescueCtx, MediaKind};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entries = vec![(
+        BoxBody::new(StallBody {
+            prefix: Bytes::from_static(b"abcdef"),
+            sent: false,
+        }),
+        30usize,
+        0u64,
+        false,
+    )];
+    let mut body = SegmentedBody::build(
+        entries,
+        30,
+        Some(RescueCtx {
+            tpl: tpl(),
+            kind: MediaKind::Image,
+            chain: vec!["https://unused.example.com".to_string()],
+            host: "raw.example.com".to_string(),
+            log: Arc::new(|_| {}),
+        }),
+        Instant::now(),
+        Duration::MAX, // 不自动冻结：换体由测试手动驱动
+    );
+    // 先收直连的 6 字节前缀。StallBody 只吐这一帧、之后永久 Pending 且不注册唤醒，
+    // 所以只能取一次：连 poll 第二次会永远等下去（本测试曾因此挂死）。
+    let mut got: Vec<u8> = Vec::new();
+    match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        Some(Ok(f)) => got.extend_from_slice(f.data_ref().unwrap()),
+        x => panic!("首帧必须是直连数据: {:?}", x.map(|r| r.is_err())),
+    }
+    assert_eq!(got, b"abcdef");
+    // 模拟救援成功：镜像从 6 续传到 30（install_rescue 的算术：期望 = 30-6 = 24）。
+    let rest: Vec<u8> = (6u8..30).map(|i| b'a' + i % 26).collect();
+    body.segs[0].install_rescue(BoxBody::new(protocol::full_body(Bytes::from(rest.clone()))), 6);
+    assert_eq!(body.segs[0].expected, 24, "期望字节从续传点重算");
+    // 续传体接着交付，拼起来与整文件逐字节一致。
+    let tail = BodyExt::collect(body)
+        .await
+        .expect("换体后不许报错")
+        .to_bytes();
+    got.extend_from_slice(&tail);
+    let whole = [b"abcdef".as_slice(), rest.as_slice()].concat();
+    assert_eq!(got, whole, "前缀 + 续传必须逐字节还原整文件");
 }
 
 #[test]
