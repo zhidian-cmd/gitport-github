@@ -1,11 +1,6 @@
-//! README 大图/视频的纯直连多段：同一批字节拆成多个 Range，摊到池里的多条伪装 SNI
-//! 直连通道上并发拉（每条通道一个独立拥塞窗口），按字节边界顺序合成一条 200 流交回浏览器。
-//!
-//! 与 mirror::split_download 是两回事：那边按「镜像源 + 直连」分配段位、走 ECT 记账和
-//! 跨源补发；这边只认池子给的直连通道，段不够时经池子按需溢出补临时通道（上限内、
-//! 用毕即焚），自己从不拨号，也不经过 get_direct 的兜底，因而不会把一次段失败误判成
-//! 「内容域直连全灭」而转镜像。并发是两层叠加：同通道多 stream + 多通道多窗口——
-//! 实测单连接 8 段 73.8s→45.0s（1.6 倍封顶），多通道摊段就是为了突破这个天花板。
+//! README 大图/视频的纯直连多段：字节拆成多个 Range 摊到池内多条直连通道并发拉，
+//! 按字节边界合成一条 200 流。自己从不拨号（通道不够经池子溢出补临时通道），
+//! 也不进 get_direct 的兜底——段失败不会被误判成「直连全灭」而转镜像。
 use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
@@ -25,25 +20,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// 小于这个尺寸别切：探片多一次往返，省下的时间抵不过它。实测 512KB 切 8 段仍有 2.7x，门槛就放这。
+/// 门槛：探片多一次往返，小图省不回来。
 const MIN_SPLIT_BYTES: u64 = 512 * 1024;
-/// 目标段大小；按总长算段数，钳在 4~8。实测 8 段最好，但一页十几张图不能每张都开满 8 段。
+/// 目标段大小；段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
-/// 同时在途的「多段响应」个数。浏览器一页十几个 <img> 一起到，全切会把 h2 连接级
-/// 流控窗口（4MB）占死；闸按「响应体还在流」计数，靠 body 的生命周期自动归还。
-/// 段已摊到多条通道上（单连接压力被摊薄），闸从 3 放宽到 6。
+/// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
 /// 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它。
 const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
-/// 段响应头预算。段本身是 Range 请求，头应该毫秒级；8s 只是防上游装死。
+/// 段响应头预算：头应毫秒级，8s 只防上游装死。
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// 只按 host 白名单准入：静态图片 CDN 才切，github.com / api.github.com 等会话域
-/// 与 README 的 /owner/repo/raw/... 第一跳都不在表内（那跳是 302）。URL 与凭据头
-/// 原样保留，段请求只换 Range——签名可能落在 query 或 Authorization 里，剥掉只会
-/// 把请求改坏（403/签名校验失败），能不能切交给上游的 206 回答。
+/// host 白名单：静态图片 CDN 才切；会话域与 /raw/ 302 第一跳不在表内。
 pub(super) fn is_image_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -57,8 +47,7 @@ pub(super) fn is_image_split_host(host: &str) -> bool {
     )
 }
 
-/// 探片与收口共用的媒体判定：图片之外放行视频（README 嵌的 mp4/webm 走同一套
-/// Range 切片）。只在白名单 host 内生效，会话域永远不在名单上。
+/// 媒体判定：图片与视频都切；非媒体探一次记 10 分钟不再探。
 fn is_media(ct: Option<&str>) -> bool {
     MediaKind::of_content_type(ct).is_some()
 }
@@ -84,9 +73,7 @@ impl Tpl {
         }
     }
 
-    /// [s, e) 半开区间 → Range: bytes=s-(e-1)。URL 与凭据头原样保留：签名可能在
-    /// query 里、凭据可能在 Authorization 里，剥掉会直接把请求改坏；只剥会改变段
-    /// 语义的头（Range / 条件头 / Accept-Encoding）与逐跳头。
+    /// [s, e) → Range: bytes=s-(e-1)；URL 与凭据头原样保留，只剥改变段语义的头与逐跳头。
     fn build(&self, s: u64, e: u64) -> Result<hyper::Request<BoxBody>, String> {
         let mut b = hyper::Request::builder()
             .method(self.method.clone())
@@ -165,8 +152,7 @@ impl MediaKind {
     }
 }
 
-/// 探片记忆：总长 + 媒体类别（救援链按类别分流）。总长 0 = 这个 URL 探明不可切
-/// （上游忽略 Range / 非媒体），10 分钟内别再探。
+/// 探片记忆（10min）：总长 + 类别；0 = 探明不可切，不再探。
 static MEMO: LazyLock<Mutex<HashMap<String, (u64, MediaKind, Instant)>>> =
     LazyLock::new(Default::default);
 
@@ -186,7 +172,7 @@ fn memo_put(key: &str, total: u64, kind: MediaKind) {
     g.insert(key.to_string(), (total, kind, Instant::now()));
 }
 
-/// 媒体救援链全灭熔断 60s：链死透时别让每个大图的每段都白付一遍链序尝试。
+/// 救援链全灭熔断 60s：链死透时别让每段白付链序尝试。
 static MEDIA_RESCUE_BREAKER: pool::Breaker = pool::Breaker::new(60);
 
 async fn fetch_segment(
@@ -227,9 +213,8 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// 段的镜像救援（"先直连后镜像"的镜像半场）：Range 从 `start` 续到 `e`——直连已交付
-/// 的字节不重拉，镜像只补剩下的。按链序逐个试；全灭记 60s 熔断并返回 None。
-/// 整段单流取回、不分段——镜像永远一枪一个 Range。
+/// 段的镜像救援：从 start 续传到 e（直连已交付的不重拉），链序逐个试，全灭记熔断。
+/// 整段单流取回、不分段。
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
@@ -357,15 +342,13 @@ pub(super) async fn try_direct_split(
     if segs.len() < 2 {
         return None;
     }
-    // 段摊到池内多条通道上：每条通道一个独立拥塞窗口，比单连接多路复用高一截。
-    // 一次响应最多借 3 条；通道不够（上限/建造失败）就按现有的摊，单条也能跑。
+    // 段摊到池内多条通道（一次最多借 3 条），不够按现有的摊。
     let chans: std::sync::Arc<[upstream::H2Upstream]> =
         std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
     if chans.is_empty() {
         return None;
     }
-    // 先直连后镜像：每段一个 5s 界——响应头拿不到/段失败，立刻换镜像重取该段 Range；
-    // 5s 内拿到头的，体在 SegmentedBody 里继续受 5s 界约束（没拉完的部分由镜像续传）。
+    // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
     let t0 = Instant::now();
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
@@ -518,7 +501,7 @@ struct Seg {
     s: u64,
     /// 本段终点（Range 尾 +1），换体时期望字节按它重算。
     e: u64,
-    /// 5s 界触发：冻结本段（不再 poll 直连体），buf 榨干后起镜像救援续传剩余 Range。
+    /// 5s 界触发：冻结直连体，buf 榨干后起救援。
     rescue_due: bool,
     /// 在途的镜像救援任务；就绪即换体。
     handle: Option<tokio::task::JoinHandle<Option<(BoxBody, u64)>>>,
@@ -528,9 +511,8 @@ struct Seg {
     started: Instant,
 }
 
-/// 按段序交付，但每轮把所有段都 poll 一次：h2 的连接级流控窗口是所有 stream 共享的，
-/// 只盯着队首那一段读，后面几段的数据会把窗口占满、反过来把队首也卡死。
-/// 每段另挂 5s 界（先直连后镜像）：没拉完的段冻结直连侧，由镜像按已交付偏移续传。
+/// 按段序交付，但每轮把所有段都 poll 一次——只盯队首会让未读段占死连接级流控窗口。
+/// 每段挂 5s 界：没拉完的段冻结直连侧，镜像按已交付偏移续传。
 pub(super) struct SegmentedBody {
     segs: Vec<Seg>,
     idx: usize,
@@ -609,8 +591,7 @@ impl hyper::body::Body for SegmentedBody {
             if seg.done {
                 continue;
             }
-            // 5s 界：直连还没拉完就冻结本段——不再 poll 直连体（got 定格）；
-            // buf 榨干后起镜像救援，从已交付偏移续传剩余 Range，成功的段一字节不重拉。
+            // 5s 界：没拉完就冻结直连体，buf 榨干后从已交付偏移起镜像续传。
             if !seg.no_rescue
                 && !seg.rescue_due
                 && me.rescue.is_some()
@@ -634,8 +615,7 @@ impl hyper::body::Body for SegmentedBody {
                 if let Some(handle) = &mut seg.handle {
                     match Pin::new(handle).poll(cx) {
                         Poll::Ready(Ok(Some((body, start)))) => {
-                            // 换体：直连残体与缓冲一并丢弃，期望字节从续传点重算。
-                            // 已交付的字节都是直连的连续前缀，镜像从同一偏移接着发。
+                            // 换体：期望字节从续传点重算——已交付的都是连续前缀，流内无重复无缺口。
                             seg.buf.clear();
                             seg.buffered = 0;
                             seg.got = 0;
@@ -665,8 +645,7 @@ impl hyper::body::Body for SegmentedBody {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Ok(d) = frame.into_data() {
                         seg.got += d.len();
-                        // 单段只能交自己那 (e-s) 个字节。上游起点对但终点超长时，
-                        // 多出的字节会吃掉全局总长预算，尾段就发不出去了。
+                        // 终点超长的字节会吃掉全局总长预算，尾段发不完——直接报错。
                         if seg.got > seg.expected {
                             me.finished = true;
                             return Poll::Ready(Some(Err(std::io::Error::other(

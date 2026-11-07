@@ -35,8 +35,7 @@ pub struct H2Upstream {
     pub max_streams: u32,
     /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 延迟"挑最闲且最快的。
     pub inflight: Arc<AtomicU32>,
-    /// 溢出临时通道标记：句柄只归触发那次溢出的调用方，pick/通道清单不再外发；
-    /// 驱动在它空闲（在途流归零）后的第一个探活拍单方面掐断——用完即焚。
+    /// 溢出临时通道：句柄不再外发，空闲（在途归零）即被驱动掐断出池。
     pub overflow: bool,
     send: SendRequest<Bytes>,
 }
@@ -59,8 +58,7 @@ pub(crate) struct IpConns {
 }
 
 
-/// 同 IP 通道上限：会话域恒 1 条（风控面不漂移，全忙骑现有连接排队）；
-/// 内容域/其他 3 条——常态 2 条（主副双腿），两条顶满才同 IP 溢出补。
+/// 同 IP 通道上限：会话域恒 1；内容域/其他 3（常态 2，全忙溢出补）。
 pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
     match class {
         HostClass::Session => crate::config::MAX_CONNS_SESSION,
@@ -155,7 +153,7 @@ pub(crate) fn pick(
                     continue;
                 }
             }
-            // 溢出临时通道不外发句柄：它只归触发那次溢出的调用方用。
+            // 溢出临时通道：句柄只归触发者，不外发。
             if c.up.overflow {
                 continue;
             }
@@ -202,14 +200,12 @@ pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream>
     pick(ips, want_slot, None)
 }
 
-/// 会话域取用：**只认这个 host 自己建的通道**。没有就返回 None，让调用方去自建——
-/// 一上来就蹭公共通道，等于带会话的请求骑在别人建的连接上，风控面直接漂移。
+/// 会话域只认自己建的通道；没有就返回 None 让调用方自建——蹭公共通道 = 风控漂移。
 pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
     pick(ips, want_slot, Some(host))
 }
 
-/// 候选 IP 集合内**全部**可用通道，按「占用率 × 延迟」升序；溢出临时通道不在列
-/// （即取即用的一次品，句柄不再外发）。摊段/批量取通道的调用方用这个。
+/// 候选内全部可用通道（不含溢出临时通道），按占用率 × 延迟升序。
 pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
     let g = lock(conn_pool());
     let mut cands: Vec<(f64, H2Upstream)> = Vec::new();
@@ -241,8 +237,7 @@ pub fn note_latency(ip: &str, id: u64, ms: u64) {
     c.n = c.n.saturating_add(1);
 }
 
-/// 新连接入库的唯一入口。会话域同 IP 去重；内容域/其他并存（赌 IP 能扛多通道）。
-/// 会话域该 IP 已有连接时，新拨的当场作废，返回池里现成的那条。
+/// 新连接入库唯一入口：会话域同 IP 去重（后到作废返现成的），内容域/其他并存。
 pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
     let mut g = lock(conn_pool());
     let h = g.entry(ip.to_string()).or_default();
@@ -317,10 +312,8 @@ fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     }
 }
 
-/// 内容域/其他探活的单次实现：在现有 h2 连接上开 stream 发 GET Range:bytes=0-0，
-/// `PROBE_TIMEOUT_SECS` 内等到响应头 = 通道活着（响应体随 stream 一起丢弃，h2 自动
-/// 发 RST_STREAM 收尾）。PING 帧被 GFW 放行但数据被丢，探不了黑洞；1 字节 Range 是
-/// 正常 HTTP 请求，与真实流量无异。单独拎成函数：驱动循环里跑，单测里对本地假上游跑。
+/// 内容域探活单次实现：现有连接上开 stream 发 1 字节 Range 请求，超时无响应头 = 黑洞。
+/// PING 帧探不了黑洞（放行帧、丢数据），故用真请求；体随 stream 丢弃。
 pub(crate) async fn probe_liveness(send: &SendRequest<Bytes>, owner: &str) -> bool {
     let probe = async {
         let send = send.clone();
@@ -345,14 +338,9 @@ pub(crate) async fn probe_liveness(send: &SendRequest<Bytes>, owner: &str) -> bo
     )
 }
 
-/// 一条连接 = 一个任务。它只干三件事：持续 poll conn 让 h2 帧收发活着（这是 h2 协议
-/// 的硬要求，不是保活）、按类探活、连接结束时把自己从池里摘掉。
-///
-/// 通道持续存在（无批窗），健康由探活保证——驱动自己的 select 里挂一个计时器，闲置的
-/// 通道按类验活：内容域/其他发极小请求（[`probe_liveness`]），会话域发 PING。
-/// 超时无响应 = 连接已黑洞 → 当场自摘出池，不再等下一个请求骑上去 4-8s 才发现。
-/// 所有出口都按 id 自摘出池；不做任何补拨——通道重建是下一个请求自己的事。
-/// 断开日志只给会话域：内容域的连接断掉是家常便饭（边缘回收在预期内），记了全是噪音。
+/// 一条连接 = 一个任务：持续 poll conn（协议硬要求）、按类探活闲置通道、结束自摘出池。
+/// 死通道最迟一个探活拍出池，不等请求撞；不做补拨，重建是下一个请求自己的事。
+/// 断开日志只给会话域——内容域断连是家常便饭，记了全是噪音。
 struct ConnDriver<T> {
     ip: String,
     id: u64,
@@ -402,8 +390,7 @@ where
             match step {
                 Step::ConnEnd => break 'keep "对端关闭",
                 Step::Probe => {
-                    // 溢出通道是临时工：在途流归零就单方面掐断出池（句柄已不再外发），
-                    // 最多滞后一个探活拍——用完即焚。
+                    // 溢出通道用毕即焚：空闲（在途归零）即出池。
                     let (idle, inflight, overflow) = conn_probe_state(&ip, id);
                     if overflow && inflight == 0 {
                         break 'keep "溢出通道用毕回收";
@@ -414,8 +401,7 @@ where
                     }
                     let alive = if session {
                         let Some(pp) = &ping else { continue };
-                        // PONG 靠 conn 被 poll 才收得到，所以等 PONG 时 conn 仍要在
-                        // 同一个 select 里跑；连接恰在此刻断开就当场收摊。
+                        // PONG 靠 conn 被 poll 才收得到，等 PONG 时 conn 留在同一个 select 里跑。
                         let pong = async {
                             let mut guard = pp.lock().await;
                             tokio::time::timeout(
@@ -442,11 +428,10 @@ where
                 }
             }
         };
-        // 唯一出口：连接结束（对端关闭/回收/错误）或探活判死。把自己从池里摘掉；
-        // 已被先摘过的，这里 no-op。不做任何补拨——通道重建是下一个请求自己的事。
+        // 唯一出口：断开或探活判死，按 id 自摘（已被摘过则 no-op）。
         drop_h2_id(&ip, id);
         if session {
-            // 只有会话域的断开值得记：长寿命资产没了，下一个会话请求会重拨落回原家。
+            // 会话域的断开值得记一行，内容域是噪音。
             log(&format!("[会话通道] {ip}#{id} 断开出池({why}), 下次会话请求重拨"));
         }
     });
@@ -572,8 +557,7 @@ pub(crate) async fn h2_dial_slot(
     Ok(up)
 }
 
-/// 单通道的原因：会话域/大文件是规则（候选再多也不开第二条），候选不足是没得选。
-/// 分开写是为了不出现「26 家候选却单通道」这种看不懂的日志。
+/// 单通道原因：会话域/大文件是规则，候选不足是没得选——日志要能看懂。
 fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> String {
     match class {
         HostClass::Session => "会话域固定同一 IP, 不开第二条(防风控)".to_string(),
@@ -587,14 +571,11 @@ fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> Str
 pub(crate) struct LegPlan {
     /// 主通道：还有没被已有通道占用的 IP 就发，串发新建。
     pub primary: bool,
-    /// 副通道拨号：还剩两个以上空 IP 才发（复用归池子的骑池，这里只拨新）。
+    /// 副通道拨号：空 IP 够两家才发。
     pub vice_dial: bool,
 }
 
-/// 纯计算，把「主副分工」钉死：
-/// - 会话域不设副通道（同会话跨 IP 是风控特征）；
-/// - 有空 IP 才发主通道；
-/// - 空 IP 够两家才发副腿去拨。
+/// 主副分工：会话域不设副腿（跨 IP 是风控特征），其余空 IP 够两家才拨副腿。
 pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     LegPlan {
         primary: free > 0,
@@ -602,9 +583,8 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     }
 }
 
-/// 双腿建连：主副各拨各的新连接（串发选 IP → h2 握手 → 入库），
-/// 两条腿共享 crew：同一个 IP 只由一条腿试，绝不重复。
-/// 返回的连接必是本轮新拨的——骑池里现成通道归 `pool::get_or_build` 的骑池步骤，不归这里。
+/// 双腿建连：主副各拨各的新连接，crew 互斥保证同一个 IP 只由一条腿试。
+/// 只拨新不骑池——骑池归 get_or_build。
 async fn dial_h2_race(
     host: &str,
     log: &LogFn,
@@ -615,16 +595,14 @@ async fn dial_h2_race(
     let targets = pool::route::dial_targets(host).unwrap_or_default();
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let distinct = ips.len();
-    // 会话域：已有通道的 IP 不再拨（同 IP 只留一条，风控面不漂移）。
-    // 内容域/其他：不管已有通道——同 IP 并发拨出来的都保留（赌 IP 能扛多通道），
-    // store_h2 按类处置（会话域去重，内容域并存）。
+    // 会话域跳过已有通道的 IP；内容域/其他不管——store_h2 按类处置。
     let session = host_class(host) == HostClass::Session;
     let free = if session {
         distinct.saturating_sub(occupied.len())
     } else {
         distinct
     };
-    // 单通道判定：内容域之外都是。即使只剩一家，原因也按规则算，不误报成「候选不足」。
+    // 单通道判定：内容域之外都是。
     let single = !dual_channel(host);
     let legs = plan_legs(single, free);
 
@@ -651,9 +629,7 @@ async fn dial_h2_race(
         launched += 1;
     }
     if launched == 0 {
-        // 一条腿都发不出去：会话域的候选全被已有通道占住——重拨只能落在同批 IP 上
-        // 再被 store_h2 作废，这句话重试到死没有意义（实测 api.github.com 连刷 24 行），
-        // 立即交上层走兜底。
+        // 会话域候选全被占：重拨必被 store_h2 作废，立即交兜底。
         return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
     drop(tx);
@@ -675,15 +651,12 @@ async fn dial_h2_race(
             None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
         }
     };
-    // 晚成腿的收尾：连接已在拨号任务内自入库（store_h2），这里不再等待也不再补建——
-    // 通道重建是下一个请求自己的事，一成一败就本轮单通道跑。
-    // rx 就地丢弃：dialer 的回执发送对已关闭的通道是 no-op（let _ = tx.send），无副作用。
+    // 晚成腿已自入库，不等不补——重建是下一个请求自己的事。
     drop(rx);
     Ok(won)
 }
 
-/// 建连统一入口：双腿各拨各的新连接（会话域跳过已有通道的 IP，内容域/其他不管）。
-/// 串发全灭冷却中直接快速失败：调用方走兜底（镜像/DNS），绝不空转重试刷屏。
+/// 建连统一入口：双腿各拨各的新连接；串发全灭冷却中快速失败，调用方走兜底。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     if pool::dial_cool_open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
@@ -694,9 +667,7 @@ pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 会话域：已有通道的 IP 不再拨（同 IP 只留一条，风控面不漂移）。
-    // 内容域/其他：不管已有通道——同 IP 并发拨出来的都保留（赌 IP 能扛多通道），
-    // skip_ips 传空让串发试全部候选。
+    // 会话域跳过已有通道的 IP；内容域/其他传空让串发试全部候选。
     let occupied = if host_class(host) == HostClass::Session {
         occupied_ips(&ips)
     } else {

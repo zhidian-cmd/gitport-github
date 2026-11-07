@@ -35,22 +35,19 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。2s/IP 上限下 ≈ 走完 6 个候选就交镜像链。
 pub const SERIAL_DIAL_BUDGET_SECS: u64 = 12;
 
-/// 通道持续存在（无批窗）：健康由驱动探活保证，死了立即出池。
-/// 内容域/其他探活间隔：闲置超此秒数的通道，驱动在现有连接上开 stream 发
-/// GET Range:bytes=0-0（1 字节 Range 是正常 HTTP 请求，与真实流量无异）。
+/// 内容域/其他探活间隔：闲置超此秒数发 1 字节 Range 请求验活（PING 探不了黑洞）。
 pub const PROBE_INTERVAL_SECS: u64 = 10;
 /// 探活响应头等待上限：超时 = 连接已黑洞，当场自摘出池。
 pub const PROBE_TIMEOUT_SECS: u64 = 2;
-/// 会话域 PING 探活间隔（闲置超此秒数才探，驱动计时器驱动）。
+/// 会话域 PING 探活间隔（闲置超此秒数才探）。
 pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
-/// 会话域按需 ping 的 PONG 等待上限（驱动任务侧计时）。
+/// 会话域 PING 的 PONG 等待上限。
 pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
-/// 内容域/其他同 IP 通道上限：常态 2 条（主副双腿），两条顶满才同 IP 溢出补。
+/// 内容域/其他同 IP 通道上限（常态 2，全忙溢出补）。
 pub const MAX_CONNS_CONTENT: usize = 3;
-/// 会话域同 IP 通道上限：恒 1 条（风控面不漂移，全忙骑现有连接排队）。
+/// 会话域同 IP 通道上限：恒 1 条。
 pub const MAX_CONNS_SESSION: usize = 1;
-/// 直连切片的等待上限：开流后 5s 还没拉完的段，剩余 Range 由镜像链续传
-/// （成功的段一字节不重拉；段失败则立即换镜像不等 5s）。
+/// 直连切片 5s 界：没拉完的段由镜像链续传，段失败立即换镜像。
 pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;

@@ -596,10 +596,8 @@ async fn mirror_or_direct(
     Ok(write_upstream(resp, route, info))
 }
 
-/// 直连腿：通道获取全在 `pool::get_or_build` 一站式（骑池 → 建造 → 溢出），这里只管
-/// 在通道上发请求、成功记账与失败上报。通道失败 = 摘通道换一条重试一次——两次内有救
-/// 是通道级故障，再败就是候选全坏，交上层按 fallback 走镜像/DNS。
-/// 全部候选的死亡退避/边冷却/建造排队都在池与串发层记账，这里不再有自己的重试循环。
+/// 直连腿：通道获取一站式在 pool::get_or_build，这里只管发请求与记账。
+/// 通道失败摘掉换一条重试一次，再败交上层按 fallback 走镜像/DNS。
 pub(super) async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,

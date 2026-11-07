@@ -38,9 +38,8 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 媒体救援链（直连切片 5s 未完成的段换镜像续传）：保留键——不是 host，加载/落盘
-/// 需要专门伺候，但对齐与小文件链同一套：工作台"我的镜像"启用的镜像自动进这两条链，
-/// 手改成员位置照旧不动。图片段走"图片"链、视频段走"视频"链。
+/// 媒体救援链（直连切片 5s 没拉完的段换镜像续传）：保留键，加载/落盘专门伺候，
+/// 对齐与小文件链同一套。图片段走"图片"链、视频段走"视频"链。
 pub const MEDIA_IMAGE_CHAIN: &str = "图片";
 pub const MEDIA_VIDEO_CHAIN: &str = "视频";
 pub const MEDIA_CHAINS: &[&str] = &[MEDIA_IMAGE_CHAIN, MEDIA_VIDEO_CHAIN];
@@ -1321,8 +1320,7 @@ pub async fn serial_dial_skip(
 
 /* ---------- 通道池统一入口 ---------- */
 
-/// per-host 建造锁：同 host 的取通道未命中只放一个进拨号（雷群去重），
-/// 等锁的人重查池子，建造落地就骑现成的，绝不一波请求各拨一条。
+/// per-host 建造锁：未命中只放一个进拨号，等锁者重查池子骑现成的。
 static BUILD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     std::sync::OnceLock::new();
 
@@ -1336,10 +1334,8 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// 通道获取统一入口。骑池 → 没有 → 建造（内容域主副双腿）；全部通道顶满 →
-/// 会话域骑现有连接排队（恒单通道），内容域/其他同 IP 溢出补一条。
-/// 请求路径只调这一个函数，不管通道怎么来的。
-/// 返回 (通道, 是否本轮新拨)：新拨的通道失败要罚边冷却，骑来的只摘不罚（见 report_failure）。
+/// 通道获取统一入口：骑池 → 建造 → 溢出，请求路径只调这一个。
+/// 返回 (通道, 是否本轮新拨)：新拨的失败要罚边冷却，骑来的只摘不罚（见 report_failure）。
 pub async fn get_or_build(
     host: &str,
     want_slot: Option<u8>,
@@ -1387,7 +1383,7 @@ pub async fn get_or_build(
         if let Some(up) = pick_channel(host, &ips, want_slot, session) {
             return Ok((up, false));
         }
-        // 建造：内容域主副双腿、其他单通道、会话域自建单条，全在 dial_upstream 内。
+        // 建造：内容域双腿、其他/会话域单条，全在 dial_upstream 内。
         let up = chan::dial_upstream(host, log).await?;
         return Ok((up, true));
     }
@@ -1407,11 +1403,9 @@ fn pick_channel(
     }
 }
 
-/// 溢出补一条**临时通道**：目标挑候选里"现役通道最少且未到上限"的 IP（天然把通道往
-/// 空 IP 上摊，全部到顶才补不动）。直接拨不走串发——溢出失败不牵动游标/冷却，那是
-/// 建造路径的记账。建成的通道打 overflow 标记：pick/通道清单不再外发它的句柄（只归
-/// 触发本次溢出的调用方），驱动在它空闲后的第一个探活拍单方面掐断——用完即焚。
-/// 会话域不溢出（恒单通道）。补不出返回 None，调用方用现有通道凑合。
+/// 溢出补一条临时通道：目标 = 现役通道最少且未到上限的候选 IP，直接拨不走串发
+/// （失败不牵动游标/冷却）。建成即打 overflow 标记——句柄不再外发，驱动在它空闲后
+/// 的探活拍掐断出池。会话域不溢出；补不出返回 None。
 async fn overflow_build(
     host: &str,
     targets: &[route::NodeIp],
@@ -1451,9 +1445,8 @@ async fn overflow_build(
     }
 }
 
-/// 把 host 候选内最多 `want` 条通道收齐给调用方摊并发用——**申报需求量**的接口：
-/// 现成的直接给；不够先建腿（池空走 dial_upstream 双腿，长期通道），再溢出补
-/// （上限内的临时通道，用毕即焚）；补不动就交现有的。返回可能少于 want，空 = 直连暂不可用。
+/// 收齐 host 候选内最多 want 条通道（申报需求量接口）：现成的直接给，不够先建腿
+/// 再溢出补临时通道，补不动交现有的。返回可少于 want，空 = 直连暂不可用。
 pub async fn gather_channels(
     host: &str,
     want: usize,
@@ -1472,7 +1465,7 @@ pub async fn gather_channels(
         got.truncate(want);
         return got;
     }
-    // 池空先建：双腿建造可能直接带回两条（主副分落不同 IP），一并收进来。
+    // 池空先建（双腿可能直接带回两条），一并收进来。
     if got.is_empty() {
         match get_or_build(host, None, log).await {
             Ok((up, _)) => got.push(up),
@@ -1494,9 +1487,8 @@ pub async fn gather_channels(
     got
 }
 
-/// 通道失败上报：摘通道 + 记账。fresh=本轮新拨（IP 真试过了，罚边冷却 + 游标前移）；
-/// false=池里骑来的旧通道（只说明这条连接死了，IP 一点没试过，不罚——
-/// 实测复用超时后 1 秒同 IP 新建 334ms 就回 200，冤枉好 IP 会把直连逼进镜像链）。
+/// 通道失败上报：摘通道 + 记账。新拨的（IP 真试过了）罚边冷却 + 游标前移；
+/// 骑来的旧通道只摘不罚——IP 没被试过，罚了会把直连逼进镜像链。
 pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fresh: bool) {
     use crate::server::upstream as chan;
     chan::drop_h2_id(&up.ip, up.id);
