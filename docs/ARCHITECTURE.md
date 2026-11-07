@@ -195,15 +195,15 @@ GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能�
 
 ## README 大图：纯直连多段（与镜像链正交）
 
-`master_route` 判为 **Pool** 的静态图片域请求，在进 `get_direct` 之前先过一遍 `mitm/direct_split.rs`。它和上面的「大文件分片竞速」不是一回事：那边按镜像源分派段位、走 ECT 记账与跨源补发；这边**只认池里现成的伪装 SNI 直连连接**，一个字节都不经过 gh-proxy。
+`master_route` 判为 **Pool** 的静态图片域请求，在进 `get_direct` 之前先过一遍 `mitm/direct_split.rs`。它和上面的「大文件分片竞速」不是一回事：那边按镜像源分派段位、走 ECT 记账与跨源补发；这边**只认池子给的伪装 SNI 直连通道**，段不够时经池子按需溢出补临时通道（上限内、用毕即焚），自己从不拨号，一个字节都不经过 gh-proxy。
 
-- **准入**：GET、客户端没带 Range、host 在七个静态图片 CDN 白名单内（raw / user-images / private-user-images / media / camo / gist / avatars）、内容域熔断未开、池里得有现成的直连连接。会话域 `github.com` / `api.github.com` 本就不在白名单里，README 的 `/owner/repo/raw/...` 第一跳是 302，天然不参与。**准入只看请求形状和 host，不看有没有凭据**——带签名或登录态的图也照切。
-- **探片**：发 `Range: bytes=0-0`，拿 `Content-Range` 总长与 `Content-Type`。≥512KB 且是 `image/*` 才切；结果按 URL 记 10 分钟，上游忽略 Range 或非图片记「不可切」不再白探。
-- **段数与派发**：按总长 ≈192KB 一段，钳在 4~8 段。每段一个 `Range`，由 `cached_h2_in` 按占用率×延迟打分挑连接（不绑定 IP，也**不新拨连接**）；池冷就整体退回单流，让主路径自己拨号。**URL 查询串与 Cookie / Authorization / Proxy-Authorization 原样保留**——签名可能在 query 里、凭据可能在 Authorization 里，剥掉只会把请求改坏（403 / 签名校验失败）；段请求只换 Range，并剥掉会改变段语义的头（原始 Range、If-Range / If-None-Match / If-Modified-Since、Accept-Encoding、逐跳头与 body 相关头）。带 `jwt` / `sig` / `X-Amz-Credential` 的 URL 一个字不动地跟着 8 个段请求发出去。
-- **合并**：只有**所有**段都回 206、且 `Content-Range` **起点等于本段 `s`、终点不越过本段末端**，才组装 200 响应（`content-length` = 总长，搬 `content-type` / `etag` 等头、剥逐跳头），body 按段序交付；补发段用同一套校验。单段 body 读到的字节超出自己那份预算会直接报错，不让多出来的尾巴吃掉全局总长；响应体总长仍按 `content-length` 截断（设计内保护）。每轮 poll 所有段，避免未读的段把 h2 连接级流控窗口占死。任一段失败就丢弃全部段响应、交回单流，不会出现「头已发出、图却花掉」。
-- **闸**：同时在途的多段响应最多 3 个（挂在响应体生命周期上自动归还），单段用户态缓冲 2MiB、段响应头预算 8s，一页十几个 `<img>` 一起到也不会把连接窗口打满。
+- **准入**：GET、客户端没带 Range、host 在七个静态图片 CDN 白名单内（raw / user-images / private-user-images / media / camo / gist / avatars）。会话域 `github.com` / `api.github.com` 本就不在白名单里，README 的 `/owner/repo/raw/...` 第一跳是 302，天然不参与。**准入只看请求形状和 host，不看有没有凭据**——带签名或登录态的图也照切。
+- **探片**：发 `Range: bytes=0-0`，拿 `Content-Range` 总长与 `Content-Type`。≥512KB 且是 `image/*` 或 `video/*`（README 嵌的视频走同一套切片）才切；结果按 URL 记 10 分钟，上游忽略 Range 或非媒体记「不可切」不再白探。池冷时经 `gather_channels(host, 1)` 借池子的建造等一拍（≤3s），建不出退单流。
+- **段数与派发**：按总长 ≈192KB 一段，钳在 4~8 段。每段一个 `Range`，**摊到池内多条通道上**（`gather_channels(host, min(段数, 3))` 申报需求量：现成的直接给，不够先溢出补临时通道，补不出按现有的摊）——每条通道一个独立拥塞窗口，比单连接多路复用高一截；单条通道上的段失败换一条通道重试一次，再败才整体退单流。**URL 查询串与 Cookie / Authorization / Proxy-Authorization 原样保留**——签名可能在 query 里、凭据可能在 Authorization 里，剥掉只会把请求改坏（403 / 签名校验失败）；段请求只换 Range，并剥掉会改变段语义的头（原始 Range、If-Range / If-None-Match / If-Modified-Since、Accept-Encoding、逐跳头与 body 相关头）。带 `jwt` / `sig` / `X-Amz-Credential` 的 URL 一个字不动地跟着 8 个段请求发出去。
+- **合并**：只有**所有**段都回 206、且 `Content-Range` **起点等于本段 `s`、终点不越过本段末端**，才组装 200 响应（`content-length` = 总长，搬 `content-type` / `etag` 等头、剥逐跳头），body 按段序交付；补发段用同一套校验。单段 body 读到的字节超出自己那份预算会直接报错，不让多出来的尾巴吃掉全局总长；响应体总长仍按 `content-length` 截断（设计内保护）。每轮 poll 所有段，避免未读的段把 h2 连接级流控窗口占死。任一段重试后仍失败就丢弃全部段响应、交回单流，不会出现「头已发出、图却花掉」。
+- **闸**：同时在途的多段响应最多 6 个（挂在响应体生命周期上自动归还；段已摊到多通道、单连接压力被摊薄后从 3 放宽），单段用户态缓冲 2MiB、段响应头预算 8s。
 
-实测依据（人工实测，非单元测试断言）：2026-11-05 同一文件、同样字节、只走代理直连腿，1MB 单流 73.8s / 8 段 45.0s，反序热连接 512KB 单流 48.6~56.5s / 8 段 20.9s。2026-11-06 带 `jwt` / `sig` / `X-Amz-Credential` 查询串的 1,608,296B 大图：8 段 41.17s、单流 69.21s，两者 sha256 一致，日志确认无镜像、无熔断、无新拨连接。瓶颈在单条 h2 stream 那一层而非 TCP 拥塞窗口，所以段不必落在不同的 IP 上，风控暴露面也不随段数增长。注意 raw CDN 不校验签名，实测证明的是「签名形态的 query 不会被丢、8 段能切、合并字节一致」，不等于「真 jwt 被服务端接受并发 Range」；凭据头与 query 的保留由单元测试钉住。
+实测依据（人工实测，非单元测试断言）：2026-11-05 同一文件、同样字节、只走代理直连腿，1MB 单流 73.8s / 8 段 45.0s，反序热连接 512KB 单流 48.6~56.5s / 8 段 20.9s。2026-11-06 带 `jwt` / `sig` / `X-Amz-Credential` 查询串的 1,608,296B 大图：8 段 41.17s、单流 69.21s，两者 sha256 一致，日志确认无镜像、无熔断、无新拨连接。单连接多 stream 的天花板约 1.6 倍；v0.5.6 起段摊到池内多条通道（每条一个独立拥塞窗口）突破该天花板，倍率以实测为准；临时溢出通道用毕即焚，常驻风控暴露面不随段数增长。注意 raw CDN 不校验签名，实测证明的是「签名形态的 query 不会被丢、8 段能切、合并字节一致」，不等于「真 jwt 被服务端接受并发 Range」；凭据头与 query 的保留由单元测试钉住。
 
 ## 大请求体与 git push（流式直通）
 

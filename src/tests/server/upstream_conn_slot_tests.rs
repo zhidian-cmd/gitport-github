@@ -17,6 +17,7 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
+        overflow: false,
         send,
     }
 }
@@ -55,6 +56,7 @@ async fn live_conn(ip: &str) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
+        overflow: false,
         send,
     }
 }
@@ -692,6 +694,7 @@ async fn conn_end_removes_itself_from_pool() {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
+        overflow: false,
         send: send.clone(),
     };
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
@@ -773,6 +776,48 @@ async fn probe_liveness_passes_on_responsive_upstream() {
         probe_liveness(&send, "raw.githubusercontent.com").await,
         "活通道探活必须通过"
     );
+}
+
+/// 溢出临时通道语义：句柄只归触发那次溢出的调用方——pick 与通道清单都不再外发它，
+/// 驱动按"在途流归零即焚"回收（conn_probe_state 露出标记给探活拍判）。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn overflow_channel_handle_is_never_handed_out_again() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let ip = "9.9.2.1";
+    let mut normal = mk_up(ip, 1).await;
+    normal.owner = Some("raw.githubusercontent.com".to_string());
+    let normal_id = normal.id;
+    store_h2(ip, normal);
+    // 溢出通道：与正常通道同 IP，标了 overflow。
+    let mut temp = mk_up(ip, 1).await;
+    temp.owner = Some("raw.githubusercontent.com".to_string());
+    temp.overflow = true;
+    let temp_id = temp.id;
+    store_h2(ip, temp);
+
+    let ips = vec![ip.to_string()];
+    // pick 永远只给正常通道：溢出通道对后来者不存在。
+    for _ in 0..3 {
+        assert_eq!(
+            cached_h2_in(&ips, None).expect("正常通道应在池").id,
+            normal_id,
+            "pick 不得外发溢出通道句柄"
+        );
+    }
+    // 通道清单同理：只列正常的，摊段调用方拿不到溢出品。
+    let listed = channels_for(&ips);
+    assert_eq!(listed.len(), 1, "清单只含非溢出通道");
+    assert_eq!(listed[0].id, normal_id);
+    // 驱动看到的标记就位：在途流归零时探活拍会焚毁它。
+    let (_, inflight, overflow) = conn_probe_state(ip, temp_id);
+    assert!(overflow, "溢出标记应跟着句柄进池");
+    assert_eq!(inflight, 0, "无在途流 = 下一个探活拍回收");
+    // 正常通道不带标记。
+    assert!(!conn_probe_state(ip, normal_id).2);
+    let _ = lock(conn_pool()).remove(ip);
 }
 
 /// get_or_build 步骤①：池里有闲通道就直接骑（fresh=false），绝不拨号。

@@ -1344,8 +1344,11 @@ pub async fn get_or_build(
         if !saturated || session {
             return Ok((up, false));
         }
-        // 2) 溢出：全部通道顶满 → 同 IP 另开（上限内）；到顶/建不成骑现有连接排队。
-        return overflow(host, &targets, &up, want_slot, log).await;
+        // 2) 溢出：全部通道顶满 → 补一条临时通道；补不出骑现有连接排队等释放。
+        return match overflow_build(host, &targets, log).await {
+            Some(new) => Ok((new, true)),
+            None => Ok((up, false)),
+        };
     }
 
     // 3) 池空 → 建造。等在途建造最多 3s（30ms 步进重查池），超时交 Err 走兜底。
@@ -1386,56 +1389,91 @@ fn pick_channel(
     }
 }
 
-/// 全忙溢出：在饱和通道所在的 IP 上再开一条（同 IP 上限内）。持建造锁防并发溢出雷群；
-/// 锁被占说明溢出已在途，直接骑现有连接排队（新通道马上就有）。
-/// 同 IP 直接拨不走串发：溢出失败不该牵动游标/冷却，那是建造路径的记账。
-async fn overflow(
+/// 溢出补一条**临时通道**：目标挑候选里"现役通道最少且未到上限"的 IP（天然把通道往
+/// 空 IP 上摊，全部到顶才补不动）。直接拨不走串发——溢出失败不牵动游标/冷却，那是
+/// 建造路径的记账。建成的通道打 overflow 标记：pick/通道清单不再外发它的句柄（只归
+/// 触发本次溢出的调用方），驱动在它空闲后的第一个探活拍单方面掐断——用完即焚。
+/// 会话域不溢出（恒单通道）。补不出返回 None，调用方用现有通道凑合。
+async fn overflow_build(
     host: &str,
     targets: &[route::NodeIp],
-    saturated: &crate::server::upstream::H2Upstream,
-    want_slot: Option<u8>,
     log: &LogFn,
-) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
+) -> Option<crate::server::upstream::H2Upstream> {
     use crate::server::upstream as chan;
-    let ride = Ok((saturated.clone(), false));
-    if chan::conn_count_on_ip(&saturated.ip)
-        >= chan::max_conns_per_ip(chan::host_class(host))
-    {
-        return ride; // 同 IP 到顶：骑现有连接排队等释放
+    if chan::host_class(host) == chan::HostClass::Session {
+        return None;
     }
+    let cap = chan::max_conns_per_ip(chan::host_class(host));
+    let node = {
+        let mut cands: Vec<(usize, &route::NodeIp)> = targets
+            .iter()
+            .map(|t| (chan::conn_count_on_ip(&t.ip), t))
+            .filter(|(n, _)| *n < cap)
+            .collect();
+        cands.sort_by_key(|(n, _)| *n);
+        cands.first()?.1.clone()
+    };
     let gate = build_lock(host);
     let Ok(_guard) = gate.try_lock() else {
-        return ride;
-    };
-    // 拿到锁再查一次：别的请求可能刚溢出建成一条闲的。
-    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    if let Some(up) = pick_channel(host, &ips, want_slot, false) {
-        let free =
-            up.inflight.load(std::sync::atomic::Ordering::Relaxed) < up.max_streams.max(1);
-        if free {
-            return Ok((up, false));
-        }
-    }
-    let Some(node) = targets.iter().find(|t| t.ip == saturated.ip) else {
-        return ride; // 通道不在候选表里（DNS 兜底来的）：没法按表拨，骑现有连接
+        return None; // 建造/溢出在途：不排队，用现有通道凑合
     };
     let t0 = Instant::now();
-    let conn = match dial::dial_one(&node.ip, &node.sni, &node.verify, true).await {
-        Ok(c) => c,
-        Err(_) => return ride, // 该 IP 眼下建不成新通道：骑现有连接
-    };
-    match chan::h2_from_dialed(host, conn, &node.ip, saturated.slot, log).await {
-        Ok(up) => {
+    let conn = dial::dial_one(&node.ip, &node.sni, &node.verify, true).await.ok()?;
+    match chan::h2_from_dialed(host, conn, &node.ip, 1, log).await {
+        Ok(mut up) => {
             latency::note(&node.ip, t0.elapsed().as_millis() as u64);
-            let up = chan::store_h2(&node.ip, up);
-            Ok((up, true))
+            up.overflow = true;
+            Some(chan::store_h2(&node.ip, up))
         }
         Err(_) => {
             // h2 谈不成 = 这个 IP 现在建不成通道，进死亡退避，别家串发直接跳过。
             note_dead(&node.ip);
-            ride
+            None
         }
     }
+}
+
+/// 把 host 候选内最多 `want` 条通道收齐给调用方摊并发用——**申报需求量**的接口：
+/// 现成的直接给；不够先建腿（池空走 dial_upstream 双腿，长期通道），再溢出补
+/// （上限内的临时通道，用毕即焚）；补不动就交现有的。返回可能少于 want，空 = 直连暂不可用。
+pub async fn gather_channels(
+    host: &str,
+    want: usize,
+    log: &LogFn,
+) -> Vec<crate::server::upstream::H2Upstream> {
+    use crate::server::upstream as chan;
+    if want == 0 {
+        return Vec::new();
+    }
+    let Some(targets) = route::dial_targets(host) else {
+        return Vec::new();
+    };
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    let mut got = chan::channels_for(&ips);
+    if got.len() >= want {
+        got.truncate(want);
+        return got;
+    }
+    // 池空先建：双腿建造可能直接带回两条（主副分落不同 IP），一并收进来。
+    if got.is_empty() {
+        match get_or_build(host, None, log).await {
+            Ok((up, _)) => got.push(up),
+            Err(_) => return Vec::new(),
+        }
+        for c in chan::channels_for(&ips) {
+            if !got.iter().any(|g| g.id == c.id) {
+                got.push(c);
+            }
+        }
+    }
+    // 还缺就溢出补临时通道；补不出交现有的。
+    while got.len() < want {
+        match overflow_build(host, &targets, log).await {
+            Some(up) => got.push(up),
+            None => break,
+        }
+    }
+    got
 }
 
 /// 通道失败上报：摘通道 + 记账。fresh=本轮新拨（IP 真试过了，罚边冷却 + 游标前移）；

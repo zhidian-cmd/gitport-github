@@ -35,6 +35,9 @@ pub struct H2Upstream {
     pub max_streams: u32,
     /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 延迟"挑最闲且最快的。
     pub inflight: Arc<AtomicU32>,
+    /// 溢出临时通道标记：句柄只归触发那次溢出的调用方，pick/通道清单不再外发；
+    /// 驱动在它空闲（在途流归零）后的第一个探活拍单方面掐断——用完即焚。
+    pub overflow: bool,
     send: SendRequest<Bytes>,
 }
 
@@ -152,6 +155,10 @@ pub(crate) fn pick(
                     continue;
                 }
             }
+            // 溢出临时通道不外发句柄：它只归触发那次溢出的调用方用。
+            if c.up.overflow {
+                continue;
+            }
             let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
             let cap = c.up.max_streams.max(1);
             // 占用率 × 延迟：闲着又快的分最小；都忙时也自然挑"最快腾出槽位"的那条。
@@ -199,6 +206,27 @@ pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream>
 /// 一上来就蹭公共通道，等于带会话的请求骑在别人建的连接上，风控面直接漂移。
 pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
     pick(ips, want_slot, Some(host))
+}
+
+/// 候选 IP 集合内**全部**可用通道，按「占用率 × 延迟」升序；溢出临时通道不在列
+/// （即取即用的一次品，句柄不再外发）。摊段/批量取通道的调用方用这个。
+pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
+    let g = lock(conn_pool());
+    let mut cands: Vec<(f64, H2Upstream)> = Vec::new();
+    for ip in ips {
+        let Some(h) = g.get(ip.as_str()) else { continue };
+        for c in &h.conns {
+            if c.up.overflow {
+                continue;
+            }
+            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let cap = c.up.max_streams.max(1);
+            let ewma = if c.ewma > 0.0 { c.ewma } else { 1.0 };
+            cands.push(((inflight as f64 + 1.0) / cap as f64 * ewma, c.up.clone()));
+        }
+    }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cands.into_iter().map(|(_, up)| up).collect()
 }
 
 /// 每次成功发完回填耗时（α=0.3，抗单次抖动）。
@@ -276,14 +304,17 @@ pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
     lock(conn_pool()).get(ip).map(|h| h.conns.len()).unwrap_or(0)
 }
 
-/// 这条连接还在池里吗？在 → 返回它自己的空闲秒数（会话域 ping 闸按它决定要不要验活）。
-fn conn_idle_secs(ip: &str, id: u64) -> Option<u64> {
+/// 驱动探活用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
+fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     let g = lock(conn_pool());
-    g.get(ip)?
-        .conns
-        .iter()
-        .find(|c| c.up.id == id)
-        .map(|c| now_secs().saturating_sub(c.last_used))
+    match g.get(ip).and_then(|h| h.conns.iter().find(|c| c.up.id == id)) {
+        Some(c) => (
+            now_secs().saturating_sub(c.last_used),
+            c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
+            c.up.overflow,
+        ),
+        None => (0, 0, false),
+    }
 }
 
 /// 内容域/其他探活的单次实现：在现有 h2 连接上开 stream 发 GET Range:bytes=0-0，
@@ -371,8 +402,14 @@ where
             match step {
                 Step::ConnEnd => break 'keep "对端关闭",
                 Step::Probe => {
+                    // 溢出通道是临时工：在途流归零就单方面掐断出池（句柄已不再外发），
+                    // 最多滞后一个探活拍——用完即焚。
+                    let (idle, inflight, overflow) = conn_probe_state(&ip, id);
+                    if overflow && inflight == 0 {
+                        break 'keep "溢出通道用毕回收";
+                    }
                     // 刚用过的通道不必探；探的是闲置期黑洞。
-                    if conn_idle_secs(&ip, id).unwrap_or(0) < probe_every {
+                    if idle < probe_every {
                         continue;
                     }
                     let alive = if session {
@@ -470,6 +507,7 @@ pub async fn h2_from_dialed(
         owner: Some(host.to_string()),
         max_streams,
         inflight: Arc::new(AtomicU32::new(0)),
+        overflow: false,
         send,
     })
 }

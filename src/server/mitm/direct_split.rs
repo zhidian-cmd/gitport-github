@@ -1,11 +1,11 @@
-//! README 大图的纯直连多段：同一批字节拆成多个 Range，全部落在池里现成的伪装 SNI
-//! 直连连接上并发拉，按字节边界顺序合成一条 200 流交回浏览器。
+//! README 大图/视频的纯直连多段：同一批字节拆成多个 Range，摊到池里的多条伪装 SNI
+//! 直连通道上并发拉（每条通道一个独立拥塞窗口），按字节边界顺序合成一条 200 流交回浏览器。
 //!
 //! 与 mirror::split_download 是两回事：那边按「镜像源 + 直连」分配段位、走 ECT 记账和
-//! 跨源补发；这边只认池里已有的直连连接，不碰 gh-proxy、不拨新 IP、不扩 MAX_CHANNELS，
-//! 也不经过 get_direct 的熔断/兜底，因而不会把一次段失败误判成「内容域直连全灭」而转镜像。
-//! 实测同一条通道上多开 stream 也有收益（1MB 单流 73.8s，8 段 45.0s；反序热连接
-//! 512KB 单流 48.6s、8 段 20.9s），所以段不必绑定不同 IP。
+//! 跨源补发；这边只认池子给的直连通道，段不够时经池子按需溢出补临时通道（上限内、
+//! 用毕即焚），自己从不拨号，也不经过 get_direct 的兜底，因而不会把一次段失败误判成
+//! 「内容域直连全灭」而转镜像。并发是两层叠加：同通道多 stream + 多通道多窗口——
+//! 实测单连接 8 段 73.8s→45.0s（1.6 倍封顶），多通道摊段就是为了突破这个天花板。
 use super::{merge, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
@@ -31,7 +31,8 @@ const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
 /// 同时在途的「多段响应」个数。浏览器一页十几个 <img> 一起到，全切会把 h2 连接级
 /// 流控窗口（4MB）占死；闸按「响应体还在流」计数，靠 body 的生命周期自动归还。
-const MAX_ACTIVE: usize = 3;
+/// 段已摊到多条通道上（单连接压力被摊薄），闸从 3 放宽到 6。
+const MAX_ACTIVE: usize = 6;
 /// 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它。
 const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
 /// 段响应头预算。段本身是 Range 请求，头应该毫秒级；8s 只是防上游装死。
@@ -53,6 +54,12 @@ pub(super) fn is_image_split_host(host: &str) -> bool {
             | "gist.githubusercontent.com"
             | "avatars.githubusercontent.com"
     )
+}
+
+/// 探片与收口共用的媒体判定：图片之外放行视频（README 嵌的 mp4/webm 走同一套
+/// Range 切片）。只在白名单 host 内生效，会话域永远不在名单上。
+fn is_media(ct: Option<&str>) -> bool {
+    ct.is_some_and(|v| v.starts_with("image/") || v.starts_with("video/"))
 }
 
 pub(super) fn seg_count(total: u64) -> usize {
@@ -149,25 +156,14 @@ fn memo_put(key: &str, total: u64) {
     g.insert(key.to_string(), (total, Instant::now()));
 }
 
-/// 只从池里拿现成的直连连接。池冷（刚启动/刚被摘空）就老实走单流，让主路径自己拨号，
-/// 切片不负责建连，也就不会顺带把 MAX_CHANNELS 或拨号单飞语义卷进来。
-fn pick_conn(host: &str) -> Option<upstream::H2Upstream> {
-    let ips: Vec<String> = pool::route::dial_targets(host)?
-        .into_iter()
-        .map(|n| n.ip)
-        .collect();
-    upstream::cached_h2_in(&ips, None)
-}
-
 async fn fetch_segment(
-    host: &str,
+    up: &upstream::H2Upstream,
     tpl: &Tpl,
     s: u64,
     e: u64,
 ) -> Result<(BoxBody, HeaderMap), String> {
-    let up = pick_conn(host).ok_or_else(|| "池里没有现成直连通道".to_string())?;
     let req = tpl.build(s, e)?;
-    let resp = tokio::time::timeout(SEG_HEAD_BUDGET, upstream::h2_send(&up, &req, &None::<Bytes>))
+    let resp = tokio::time::timeout(SEG_HEAD_BUDGET, upstream::h2_send(up, &req, &None::<Bytes>))
         .await
         .map_err(|_| "段响应头超时".to_string())??;
     if resp.status() != StatusCode::PARTIAL_CONTENT {
@@ -208,7 +204,10 @@ pub(super) async fn try_direct_split(
         Some(t) => t,
         None => {
             let tpl = Tpl::of(out);
-            let up = pick_conn(host)?;
+            // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
+            let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
+                return None;
+            };
             *info.lock().unwrap() = up.ip.clone();
             let req = tpl.build(0, 1).ok()?;
             let resp = match tokio::time::timeout(
@@ -232,14 +231,14 @@ pub(super) async fn try_direct_split(
                 memo_put(&key, 0);
                 return None;
             };
-            let is_image = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.starts_with("image/"));
+            let media = is_media(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+            );
             drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
-            if !is_image {
-                memo_put(&key, 0); // 非图片：10 分钟内别再探、更别切
+            if !media {
+                memo_put(&key, 0); // 非媒体：10 分钟内别再探、更别切
                 return None;
             }
             memo_put(&key, t); // 记住总长；小图下次直接被 MIN_SPLIT_BYTES 挡掉
@@ -256,9 +255,30 @@ pub(super) async fn try_direct_split(
     if segs.len() < 2 {
         return None;
     }
-    let futs = segs.iter().map(|&(s, e)| {
-        let host = host.to_string();
-        async move { fetch_segment(&host, tpl_ref, s, e).await }
+    // 段摊到池内多条通道上：每条通道一个独立拥塞窗口，比单连接多路复用高一截。
+    // 一次响应最多借 3 条；通道不够（上限/建造失败）就按现有的摊，单条也能跑。
+    let chans: std::sync::Arc<[upstream::H2Upstream]> =
+        std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
+    if chans.is_empty() {
+        return None;
+    }
+    let n = chans.len();
+    let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
+        let up = chans[i % n].clone();
+        let all = chans.clone();
+        async move {
+            match fetch_segment(&up, tpl_ref, s, e).await {
+                Ok(r) => Ok(r),
+                Err(why) => {
+                    // 本通道上的段失败：换一条通道重试一次——多通道摊段后，
+                    // 单条通道半死不该拖垮整张图。
+                    match all.iter().find(|c| c.id != up.id) {
+                        Some(alt) => fetch_segment(alt, tpl_ref, s, e).await,
+                        None => Err(why),
+                    }
+                }
+            }
+        }
     });
     let results = join_all(futs).await;
     if let Some((i, why)) = results
@@ -284,11 +304,7 @@ pub(super) async fn try_direct_split(
     }
     // 总长记忆命中时没走过探片，用第一段的 content-type 补一道图片校验。
     let hs = first_headers.as_ref()?;
-    if !hs
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("image/"))
-    {
+    if !is_media(hs.get("content-type").and_then(|v| v.to_str().ok())) {
         return None;
     }
     let mut builder = hyper::Response::builder().status(StatusCode::OK);
