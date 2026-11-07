@@ -1,5 +1,6 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
-//! 通道池的记账、挑选、开流全在本文件：池只有一个口径，选和用不另设管理层。
+//! 通道的记账、挑选、探活、开流全在本文件；取用统一入口是 `pool::get_or_build`
+//! （骑池 → 建造 → 溢出，一层管完），请求路径不再各管一段。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
 use crate::util::{lock, now_ms, LogFn};
@@ -34,9 +35,6 @@ pub struct H2Upstream {
     pub max_streams: u32,
     /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 延迟"挑最闲且最快的。
     pub inflight: Arc<AtomicU32>,
-    /// 会话域按需 ping 的入口：发一个 oneshot 回执端过去，驱动任务 ping 完回 bool。
-    /// 内容域通道不做任何健康检查，恒为 None。
-    pub ping_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<bool>>>,
     send: SendRequest<Bytes>,
 }
 
@@ -47,7 +45,7 @@ pub(crate) struct ConnSlot {
     pub(crate) up: H2Upstream,
     pub(crate) ewma: f64,
     n: u32,
-    /// 这条连接自己最后一次被使用（开流刷新）；批窗与 ping 闸的空闲期按它算。
+    /// 这条连接自己最后一次被使用（开流刷新）；探活计时器的闲置期按它算。
     last_used: u64,
 }
 
@@ -58,22 +56,27 @@ pub(crate) struct IpConns {
 }
 
 
-/// 同一个 IP 永远只允许一条 h2 连接。要开第二条通道只能落在另一个 IP 上。
-/// 这是硬约束：无论多少个 host 同时拨到同一个 IP，入库时只留第一条，其余当场丢弃。
-const MAX_CONNS_PER_IP: usize = 1;
+/// 同 IP 通道上限：会话域恒 1 条（风控面不漂移，全忙骑现有连接排队）；
+/// 内容域/其他 3 条——常态 2 条（主副双腿），两条顶满才同 IP 溢出补。
+pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
+    match class {
+        HostClass::Session => crate::config::MAX_CONNS_SESSION,
+        _ => crate::config::MAX_CONNS_CONTENT,
+    }
+}
 
 /// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
 const DIAL_SLOW_MS: u64 = 1500;
 
 /// 这个错误重试没有意义：候选都被已有通道占着，
 /// 换候选、再来一轮都是同一句话。上层看到它直接交兜底，别原地刷屏。
+/// 仅会话域会产生（内容域/其他已放开多通道并存）。
 pub const ERR_NO_FREE_IP: &str = "候选均已有通道";
 
 /// host 三类：
-/// - 内容域：双通道，池里按"空闲且快"选。
+/// - 内容域：多通道并存，池里按"空闲且快"选。
 /// - 会话域：单通道单 IP，建连优先自己拨一条，不蹭公共通道（带会话，跨 IP 是风控特征）。
-/// - 其他（大文件、docs/agent）：单通道，复用现成的优先，自建只是兜底——
-///   它们不维护长期会话，没必要占一条专属通道。
+/// - 其他（大文件、docs/agent）：单通道，批窗临时通道。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HostClass {
     Content,
@@ -126,36 +129,6 @@ pub(crate) fn conn_pool() -> &'static Mutex<HashMap<String, IpConns>> {
 
 fn now_secs() -> u64 {
     now_ms() / 1000
-}
-
-/// 批窗外通道的就地除名（请求驱动，无定时器）：本 host 候选 IP 里，空闲（无在途流）
-/// 且最后使用已过批窗的连接，当场按 id 摘除。「下批重建」的批界由此落地——过窗通道
-/// 不先摘掉，`store_h2` 会把新拨的当场作废、把旧通道塞回手里，拨号订单也会被
-/// 「已有通道」驳回。会话域自己的通道不在此列（归 ping 闸验活）；睡眠唤醒也不再需要
-/// 专门机制：醒来后所有通道都过了窗，第一个请求自然清场。
-pub(crate) fn evict_stale(ips: &[String]) {
-    let stale: Vec<(String, u64)> = {
-        let g = lock(conn_pool());
-        ips.iter()
-            .filter_map(|ip| {
-                let h = g.get(ip.as_str())?;
-                h.conns
-                    .iter()
-                    .find(|c| {
-                        // 在途流 > 0 说明正在干活：长下载的 last_used 停在开流时刻，
-                        // 不能按空闲论处。会话域通道由 ping 闸负责，批窗摘除永远跳过。
-                        c.up.inflight.load(std::sync::atomic::Ordering::Relaxed) == 0
-                            && !c.up.owner.as_deref().is_some_and(prefer_own_channel)
-                            && now_secs().saturating_sub(c.last_used)
-                                > crate::config::REUSE_WINDOW_SECS
-                    })
-                    .map(|c| (ip.clone(), c.up.id))
-            })
-            .collect()
-    };
-    for (ip, id) in stale {
-        drop_h2_id(&ip, id);
-    }
 }
 
 /// 响应头预算超时：上层按它区分"真等超了"和别的失败。
@@ -222,44 +195,6 @@ pub async fn stream_on(
     }
 }
 
-/// 会话域取用闸：闲置超过阈值的通道先 ping 验活——活着直接复用（同 IP 保住会话，
-/// 风控面不漂移），死了当场摘掉返回 None，调用方走拨号（游标钉着原 IP，重拨落回原家）。
-/// ping 由连接驱动任务代答（PingPong 只有 poll conn 的人能驱动），本侧另设兜底超时：
-/// 驱动已死/卡死时通道同样判死，绝不挂住取用路径。
-pub(crate) async fn session_pick(
-    host: &str,
-    ips: &[String],
-    want_slot: Option<u8>,
-) -> Option<H2Upstream> {
-    let up = pick(ips, want_slot, Some(host))?;
-    let idle = conn_idle_secs(&up.ip, up.id).unwrap_or(u64::MAX);
-    if idle < crate::config::SESSION_PING_GATE_SECS {
-        return Some(up); // 刚用过的连接：零额外延迟，直接信
-    }
-    let Some(tx) = &up.ping_tx else {
-        return Some(up); // 无 ping 端（理论不可达）：按旧语义放行，失败由请求路径兜底
-    };
-    let (rtx, rrx) = tokio::sync::oneshot::channel();
-    let alive = if tx.send(rtx).await.is_err() {
-        false // 驱动任务已不在：通道必死
-    } else {
-        matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(crate::config::SESSION_PING_TIMEOUT_SECS + 1),
-                rrx,
-            )
-            .await,
-            Ok(Ok(true))
-        )
-    };
-    if alive {
-        Some(up)
-    } else {
-        drop_h2_id(&up.ip, up.id);
-        None
-    }
-}
-
 /// 在给定 IP 集合里取活连接：按「占用率 × 延迟」挑最闲且最快的那条（公式在 keeper 层）。
 pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
     pick(ips, want_slot, None)
@@ -284,13 +219,15 @@ pub fn note_latency(ip: &str, id: u64, ms: u64) {
     c.n = c.n.saturating_add(1);
 }
 
-/// 新连接入库的唯一入口：同一把锁里保证每个 IP 只有一条通道。
-/// 该 IP 已有连接时，新拨的这条当场作废（句柄 drop 即关掉那条 TCP），返回池里现成的那条。
-/// 调用方必须改用返回的连接发请求——继续用自己手里那条，就等于绕过约束并存两条。
+/// 新连接入库的唯一入口。会话域同 IP 去重；内容域/其他并存（赌 IP 能扛多通道）。
+/// 会话域该 IP 已有连接时，新拨的当场作废，返回池里现成的那条。
 pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
     let mut g = lock(conn_pool());
     let h = g.entry(ip.to_string()).or_default();
-    if h.conns.len() >= MAX_CONNS_PER_IP {
+    let cap = up.owner.as_deref()
+        .map(|owner| max_conns_per_ip(host_class(owner)))
+        .unwrap_or(usize::MAX);
+    if h.conns.len() >= cap {
         return h.conns[0].up.clone();
     }
     let keep = up.clone();
@@ -340,6 +277,11 @@ pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// 该 IP 当前在池里的通道条数（溢出闸按它判"同 IP 还能不能再开"）。
+pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
+    lock(conn_pool()).get(ip).map(|h| h.conns.len()).unwrap_or(0)
+}
+
 /// 这条连接还在池里吗？在 → 返回它自己的空闲秒数（会话域 ping 闸按它决定要不要验活）。
 fn conn_idle_secs(ip: &str, id: u64) -> Option<u64> {
     let g = lock(conn_pool());
@@ -350,23 +292,53 @@ fn conn_idle_secs(ip: &str, id: u64) -> Option<u64> {
         .map(|c| now_secs().saturating_sub(c.last_used))
 }
 
-/// 一条连接 = 一个任务。它只干两件事：持续 poll conn 让 h2 帧收发活着（这是 h2 协议
-/// 的硬要求，不是保活），以及连接结束时把自己从池里摘掉。
+/// 内容域/其他探活的单次实现：在现有 h2 连接上开 stream 发 GET Range:bytes=0-0，
+/// `PROBE_TIMEOUT_SECS` 内等到响应头 = 通道活着（响应体随 stream 一起丢弃，h2 自动
+/// 发 RST_STREAM 收尾）。PING 帧被 GFW 放行但数据被丢，探不了黑洞；1 字节 Range 是
+/// 正常 HTTP 请求，与真实流量无异。单独拎成函数：驱动循环里跑，单测里对本地假上游跑。
+pub(crate) async fn probe_liveness(send: &SendRequest<Bytes>, owner: &str) -> bool {
+    let probe = async {
+        let send = send.clone();
+        let mut ready = send.ready().await.ok()?;
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!("https://{owner}/"))
+            .header("range", "bytes=0-0")
+            .body(())
+            .ok()?;
+        let (resp, _stream) = ready.send_request(req, true).ok()?;
+        resp.await.ok()?;
+        Some(())
+    };
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(crate::config::PROBE_TIMEOUT_SECS),
+            probe,
+        )
+        .await,
+        Ok(Some(()))
+    )
+}
+
+/// 一条连接 = 一个任务。它只干三件事：持续 poll conn 让 h2 帧收发活着（这是 h2 协议
+/// 的硬要求，不是保活）、按类探活、连接结束时把自己从池里摘掉。
 ///
-/// 通道不再是需要续命的资产：内容域没有定时器、没有 PING——死没死由请求结果说了算，
-/// 批窗外的通道由 `evict_stale` 在取用时惰性清场，还挂在池里的由边缘 50-65s 空闲回收
-/// 收尾（对端关连接时 conn.await 返回，这里自摘）。会话域额外挂一个按需 ping 的应答
-/// 端：取用闸要验活时发一个 oneshot 过来，这里代答。所有出口都按 id 自摘出池；
-/// 不做任何补拨——通道重建是下一批请求自己的事。断开日志只给会话域：
-/// 内容域的连接断掉是家常便饭（边缘回收在预期内），记了全是噪音。
+/// 通道持续存在（无批窗），健康由探活保证——驱动自己的 select 里挂一个计时器，闲置的
+/// 通道按类验活：内容域/其他发极小请求（[`probe_liveness`]），会话域发 PING。
+/// 超时无响应 = 连接已黑洞 → 当场自摘出池，不再等下一个请求骑上去 4-8s 才发现。
+/// 所有出口都按 id 自摘出池；不做任何补拨——通道重建是下一个请求自己的事。
+/// 断开日志只给会话域：内容域的连接断掉是家常便饭（边缘回收在预期内），记了全是噪音。
 struct ConnDriver<T> {
     ip: String,
     id: u64,
     conn: h2::client::Connection<T, Bytes>,
     session: bool,
+    /// 会话域才有：PING 探活用（内容域/其他恒 None，探活走极小请求）。
     ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
-    /// 会话域才有：取用闸的 ping 请求队列；全部发送端释放后退化为纯 conn 模式。
-    ping_rx: Option<tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<bool>>>,
+    /// 内容域/其他探活用：驱动自己持有的 send clone，在现有连接上开流。
+    send: SendRequest<Bytes>,
+    /// 探活请求的 :authority（建这条连接时用的 host）。
+    owner: String,
     log: LogFn,
 }
 
@@ -380,69 +352,67 @@ where
         conn,
         session,
         ping,
-        mut ping_rx,
+        send,
+        owner,
         log,
     } = d;
     tokio::spawn(async move {
         let mut conn = Box::pin(conn);
+        let probe_every = if session {
+            crate::config::SESSION_PROBE_INTERVAL_SECS
+        } else {
+            crate::config::PROBE_INTERVAL_SECS
+        };
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(probe_every));
+        tick.tick().await; // interval 首拍立即完成，吞掉
         let why: &str = 'keep: loop {
-            // 先把 ping 端从 Option 里取出来再等：recv 到 None（全部 H2Upstream 句柄
-            // 已释放）就不再放回，下一轮退化为纯 conn 模式；代答完再原样还回去。
-            // 取出/还回都发生在 select 之外，避开「future 借着 rx 时移动 rx」的借用冲突。
-            let mut rx = match ping_rx.take() {
-                Some(rx) => rx,
-                None => {
-                    let _ = (&mut conn).await;
-                    break 'keep "对端关闭";
-                }
-            };
             enum Step {
                 ConnEnd,
-                Ping(Option<tokio::sync::oneshot::Sender<bool>>),
+                Probe,
             }
             let step = tokio::select! {
                 _ = &mut conn => Step::ConnEnd,
-                req = rx.recv() => Step::Ping(req),
+                _ = tick.tick() => Step::Probe,
             };
             match step {
                 Step::ConnEnd => break 'keep "对端关闭",
-                Step::Ping(None) => continue, // ping 端已空：下一轮走纯 conn
-                Step::Ping(Some(reply)) => {
-                    let Some(pp) = &ping else {
-                        let _ = reply.send(false);
-                        ping_rx = Some(rx);
+                Step::Probe => {
+                    // 刚用过的通道不必探；探的是闲置期黑洞。
+                    if conn_idle_secs(&ip, id).unwrap_or(0) < probe_every {
                         continue;
-                    };
-                    // PONG 靠 conn 被 poll 才收得到，所以等 PONG 时 conn 仍要在同一个
-                    // select 里跑；连接恰在此刻断开就当场收摊（reply 随 drop 关闭，
-                    // 取用闸按「通道已死」处理）。
-                    let pong = async {
-                        let mut guard = pp.lock().await;
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(
-                                crate::config::SESSION_PING_TIMEOUT_SECS,
-                            ),
-                            guard.ping(h2::Ping::opaque()),
+                    }
+                    let alive = if session {
+                        let Some(pp) = &ping else { continue };
+                        // PONG 靠 conn 被 poll 才收得到，所以等 PONG 时 conn 仍要在
+                        // 同一个 select 里跑；连接恰在此刻断开就当场收摊。
+                        let pong = async {
+                            let mut guard = pp.lock().await;
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(
+                                    crate::config::SESSION_PING_TIMEOUT_SECS,
+                                ),
+                                guard.ping(h2::Ping::opaque()),
+                            )
+                            .await
+                        };
+                        matches!(
+                            tokio::select! {
+                                _ = &mut conn => None,
+                                r = pong => Some(r),
+                            },
+                            Some(Ok(Ok(_)))
                         )
-                        .await
+                    } else {
+                        probe_liveness(&send, &owner).await
                     };
-                    let ponged = tokio::select! {
-                        _ = &mut conn => None,
-                        r = pong => Some(r),
-                    };
-                    match ponged {
-                        None => break 'keep "对端关闭",
-                        Some(r) => {
-                            let _ = reply.send(matches!(r, Ok(Ok(_))));
-                            ping_rx = Some(rx); // 还回去，下一轮继续听
-                        }
+                    if !alive {
+                        break 'keep "探活失败(黑洞)";
                     }
                 }
             }
         };
-        // 唯一出口：连接结束（对端关闭/回收/错误）。把自己从池里摘掉；
-        // 已被 evict_stale 先摘过的，这里 no-op。不做任何补拨——通道重建是
-        // 下一批请求自己的事。
+        // 唯一出口：连接结束（对端关闭/回收/错误）或探活判死。把自己从池里摘掉；
+        // 已被先摘过的，这里 no-op。不做任何补拨——通道重建是下一个请求自己的事。
         drop_h2_id(&ip, id);
         if session {
             // 只有会话域的断开值得记：长寿命资产没了，下一个会话请求会重拨落回原家。
@@ -475,7 +445,8 @@ pub async fn h2_from_dialed(
         )
     })?
     .map_err(|e| format!("h2 握手失败: {e}"))?;
-    // 会话域才有按需 ping：内容域通道不做任何健康检查，PingPong 和应答端整个省掉。
+    // 会话域才有 PING 探活（PingPong 归驱动自用）；内容域/其他探活走极小请求，
+    // 驱动自持 send clone 即可，PingPong 整个省掉。
     let session = host_class(host) == HostClass::Session;
     let ping = if session {
         conn.ping_pong()
@@ -487,20 +458,15 @@ pub async fn h2_from_dialed(
     let max_streams = conn.max_concurrent_send_streams().max(1) as u32;
     // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (ping_tx, ping_rx) = if session {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    // 从此这条连接归它自己的任务管：驱动帧收发、按需代答 ping（会话域）、断开自摘。
+    // 从此这条连接归它自己的任务管：驱动帧收发、按类探活、断开自摘。
     spawn_conn_driver(ConnDriver {
         ip: ip.to_string(),
         id,
         conn,
         session,
         ping,
-        ping_rx,
+        send: send.clone(),
+        owner: host.to_string(),
         log: log.clone(),
     });
     Ok(H2Upstream {
@@ -510,7 +476,6 @@ pub async fn h2_from_dialed(
         owner: Some(host.to_string()),
         max_streams,
         inflight: Arc::new(AtomicU32::new(0)),
-        ping_tx,
         send,
     })
 }
@@ -624,8 +589,15 @@ async fn dial_h2_race(
     let targets = pool::route::dial_targets(host).unwrap_or_default();
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let distinct = ips.len();
-    // 已有通道占掉的 IP 不再拨：主副两条腿都跳过，这是「更严格的主副通道」的底线。
-    let free = distinct.saturating_sub(occupied.len());
+    // 会话域：已有通道的 IP 不再拨（同 IP 只留一条，风控面不漂移）。
+    // 内容域/其他：不管已有通道——同 IP 并发拨出来的都保留（赌 IP 能扛多通道），
+    // store_h2 按类处置（会话域去重，内容域并存）。
+    let session = host_class(host) == HostClass::Session;
+    let free = if session {
+        distinct.saturating_sub(occupied.len())
+    } else {
+        distinct
+    };
     // 单通道判定：内容域之外都是。即使只剩一家，原因也按规则算，不误报成「候选不足」。
     let single = !dual_channel(host);
     // 副通道的「先查表」：只在这个 host 自己的候选里找现成通道；
@@ -740,10 +712,14 @@ pub async fn dial_upstream(
         return Err(format!("{host} 候选 IP 全部在边冷却中, 走 fallback"));
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 本 host 候选里已经被通道占掉的 IP：主副两条腿都跳过，绝不为这个 host 再拨一条。
-    // 同 IP 并发拨不设仲裁：两条都建，入库时 store_h2 按"每 IP 一条"去重，
-    // 输家的握手是接受的代价；别的 host 已建好的那家由 skip_ips 绕开。
-    let occupied = occupied_ips(&ips);
+    // 会话域：已有通道的 IP 不再拨（同 IP 只留一条，风控面不漂移）。
+    // 内容域/其他：不管已有通道——同 IP 并发拨出来的都保留（赌 IP 能扛多通道），
+    // skip_ips 传空让串发试全部候选。
+    let occupied = if host_class(host) == HostClass::Session {
+        occupied_ips(&ips)
+    } else {
+        Vec::new()
+    };
     let (up, reused) = dial_h2_race(host, log, &occupied, allow_reuse).await?;
     // 两腿都在这一轮处理完了（副腿可能直接复用了现成通道），调用方不必再补第二条。
     // reused 如实交代来源：池里现成的连接失败只能说明它自己死了，不能据此判 IP 不行。
@@ -833,7 +809,7 @@ pub async fn h2_open_stream(
     ),
     String,
 > {
-    // 每次开流刷新这条连接自己的空闲期：批窗与 ping 闸的空闲期按它算。
+    // 每次开流刷新这条连接自己的空闲期：探活计时器的闲置期按它算。
     {
         let mut g = lock(conn_pool());
         if let Some(h) = g.get_mut(&up.ip) {
@@ -916,18 +892,6 @@ pub fn h2_spawn_pump(
         let _ = send.send_data(Bytes::new(), true); // 干净收尾: EOS
         (log)(&format!("[上游] 请求体转发完成: {sent}B"));
     })
-}
-/// 每路由拨号单飞闸：并发未命中只放一个进串发拨号（无闸时一波 27 条全新拨号，握手风暴触发边缘限流）。
-static HOST_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    std::sync::OnceLock::new();
-pub fn host_dial_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
-    HOST_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entry(host.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 #[derive(Clone)]
 pub struct MirrorConnector {

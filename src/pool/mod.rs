@@ -1301,6 +1301,160 @@ pub async fn serial_dial_skip(
     ))
 }
 
+/* ---------- 通道池统一入口 ---------- */
+
+/// per-host 建造锁：同 host 的取通道未命中只放一个进拨号（雷群去重），
+/// 等锁的人重查池子，建造落地就骑现成的，绝不一波请求各拨一条。
+static BUILD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
+    BUILD_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(host.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// 通道获取统一入口。骑池 → 没有 → 建造（内容域主副双腿）；全部通道顶满 →
+/// 会话域骑现有连接排队（恒单通道），内容域/其他同 IP 溢出补一条。
+/// 请求路径只调这一个函数，不管通道怎么来的。
+/// 返回 (通道, 是否本轮新拨)：新拨的通道失败要罚边冷却，骑来的只摘不罚（见 report_failure）。
+pub async fn get_or_build(
+    host: &str,
+    want_slot: Option<u8>,
+    log: &LogFn,
+) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
+    use crate::server::upstream as chan;
+    let Some(targets) = route::dial_targets(host) else {
+        return Err(format!("域名不在路由表({host})"));
+    };
+    if targets.is_empty() {
+        return Err(format!("{host} 候选 IP 全部在边冷却中"));
+    }
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    let session = chan::host_class(host) == chan::HostClass::Session;
+
+    // 1) 骑池：会话域只认自己建的通道；内容域/其他谁闲用谁。
+    if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+        let saturated =
+            up.inflight.load(std::sync::atomic::Ordering::Relaxed) >= up.max_streams.max(1);
+        if !saturated || session {
+            return Ok((up, false));
+        }
+        // 2) 溢出：全部通道顶满 → 同 IP 另开（上限内）；到顶/建不成骑现有连接排队。
+        return overflow(host, &targets, &up, want_slot, log).await;
+    }
+
+    // 3) 池空 → 建造。等在途建造最多 3s（30ms 步进重查池），超时交 Err 走兜底。
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+            return Ok((up, false)); // 等锁期间别人可能刚建好
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{host} 建造在途等待超时(3s), 走兜底"));
+        }
+        let gate = build_lock(host);
+        let Ok(_guard) = gate.try_lock() else {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            continue;
+        };
+        // 双检：拿锁前一刻可能刚有人建成。
+        if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+            return Ok((up, false));
+        }
+        // 建造：内容域主副双腿、其他单通道、会话域自建单条，全在 dial_upstream 内。
+        let (up, _reused) = chan::dial_upstream(host, log, false).await?;
+        return Ok((up, true));
+    }
+}
+
+/// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
+fn pick_channel(
+    host: &str,
+    ips: &[String],
+    want_slot: Option<u8>,
+    session: bool,
+) -> Option<crate::server::upstream::H2Upstream> {
+    if session {
+        crate::server::upstream::cached_h2_own(host, ips, want_slot)
+    } else {
+        crate::server::upstream::cached_h2_in(ips, want_slot)
+    }
+}
+
+/// 全忙溢出：在饱和通道所在的 IP 上再开一条（同 IP 上限内）。持建造锁防并发溢出雷群；
+/// 锁被占说明溢出已在途，直接骑现有连接排队（新通道马上就有）。
+/// 同 IP 直接拨不走串发：溢出失败不该牵动游标/冷却，那是建造路径的记账。
+async fn overflow(
+    host: &str,
+    targets: &[route::NodeIp],
+    saturated: &crate::server::upstream::H2Upstream,
+    want_slot: Option<u8>,
+    log: &LogFn,
+) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
+    use crate::server::upstream as chan;
+    let ride = Ok((saturated.clone(), false));
+    if chan::conn_count_on_ip(&saturated.ip)
+        >= chan::max_conns_per_ip(chan::host_class(host))
+    {
+        return ride; // 同 IP 到顶：骑现有连接排队等释放
+    }
+    let gate = build_lock(host);
+    let Ok(_guard) = gate.try_lock() else {
+        return ride;
+    };
+    // 拿到锁再查一次：别的请求可能刚溢出建成一条闲的。
+    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
+    if let Some(up) = pick_channel(host, &ips, want_slot, false) {
+        let free =
+            up.inflight.load(std::sync::atomic::Ordering::Relaxed) < up.max_streams.max(1);
+        if free {
+            return Ok((up, false));
+        }
+    }
+    let Some(node) = targets.iter().find(|t| t.ip == saturated.ip) else {
+        return ride; // 通道不在候选表里（DNS 兜底来的）：没法按表拨，骑现有连接
+    };
+    let t0 = Instant::now();
+    let conn = match dial::dial_one(&node.ip, &node.sni, &node.verify, true).await {
+        Ok(c) => c,
+        Err(_) => return ride, // 该 IP 眼下建不成新通道：骑现有连接
+    };
+    match chan::h2_from_dialed(host, conn, &node.ip, saturated.slot, log).await {
+        Ok(up) => {
+            latency::note(&node.ip, t0.elapsed().as_millis() as u64);
+            let up = chan::store_h2(&node.ip, up);
+            Ok((up, true))
+        }
+        Err(_) => {
+            // h2 谈不成 = 这个 IP 现在建不成通道，进死亡退避，别家串发直接跳过。
+            note_dead(&node.ip);
+            ride
+        }
+    }
+}
+
+/// 通道失败上报：摘通道 + 记账。fresh=本轮新拨（IP 真试过了，罚边冷却 + 游标前移）；
+/// false=池里骑来的旧通道（只说明这条连接死了，IP 一点没试过，不罚——
+/// 实测复用超时后 1 秒同 IP 新建 334ms 就回 200，冤枉好 IP 会把直连逼进镜像链）。
+pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fresh: bool) {
+    use crate::server::upstream as chan;
+    chan::drop_h2_id(&up.ip, up.id);
+    if !fresh {
+        return;
+    }
+    if let Some(row) = route::route_for(host) {
+        edges::mark_stall(&up.ip, &row.key);
+    }
+    if !route::is_content(host) {
+        cursor_note(host, &up.ip, false, up.slot);
+    }
+}
+
 /// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,

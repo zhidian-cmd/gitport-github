@@ -140,18 +140,6 @@ fn stream_decision_contract() {
     assert_eq!(stream_decision(&Method::HEAD, "/x", Some(u64::MAX)), None);
 }
 
-/// 非幂等重发策略：只有"连接没接住请求"才算可重发，半路失败一律不重试。
-#[test]
-fn failed_before_send_contract() {
-    // h2 拒绝接帧：连接已死，请求头都没进连接 → 可重发。
-    assert!(failed_before_send("h2 流配额: connection closed"));
-    assert!(failed_before_send("h2 发送: stream closed"));
-    // 请求头已入队、body 或响应阶段失败 → 已发出，不能重发。
-    assert!(!failed_before_send("h2 请求体: broken pipe"));
-    assert!(!failed_before_send("h2 响应: connection reset"));
-    assert!(!failed_before_send("响应预算超时"));
-}
-
 /// 客户端掐断的文案只认断开类，真故障不能被静默吞掉。
 #[test]
 fn client_gone_text_only_matches_disconnects() {

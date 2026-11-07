@@ -27,8 +27,6 @@ use defuse::gh_defuse;
 use mirror::chain_fetch;
 
 const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
-/// 预算耗尽的统一文案：日志分叉与"能不能换连接重发"都认它，别再各写一份字面量。
-const GET_DIRECT_MAX_ATTEMPTS: usize = 24;
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
@@ -598,299 +596,79 @@ async fn mirror_or_direct(
     Ok(write_upstream(resp, route, info))
 }
 
-/// 失败发生在请求写出之前（连接已死、h2 拒绝接帧）：这条连接从没承载过该请求，
-/// 对已缓存 body 的非幂等方法也可以安全换连接重发。
-fn failed_before_send(why: &str) -> bool {
-    why.starts_with("h2 流配额") || why.starts_with("h2 发送")
-}
-
-/// 复用尝试的三种结果。第三种要带回主循环：本请求后面不再碰池，只走新拨连接，
-/// 免得把「这条旧连接死了」误判成「这批 IP 都不行」，进而熔断转镜像。
-enum CachedOutcome {
-    /// 成功，或失败且不可重发：本次请求到此收尾。
-    Done(Result<hyper::Response<BoxBody>, String>),
-    /// 池里压根没有可用通道，正常去拨号。
-    NoChannel,
-    /// 撞上一条坏复用连接，已摘掉，后面只走新拨的。
-    ReuseFailed,
-}
-
-async fn try_cached(
-    log: &LogFn,
-    out: &hyper::Request<BoxBody>,
-    host: &str,
-    ips: &[String],
-    info: &UpstreamInfo,
-    is_simple: bool,
-    body: &Option<Bytes>,
-) -> CachedOutcome {
-    // 流式请求（body 未缓存，>1MB 上传/git push）发出去就收不回，复用一条可能已死的连接
-    // 等于赌命：这类请求直接新建连接，代价一次握手，换"失败不必整页重来"。
-    if !is_simple && body.is_none() {
-        return CachedOutcome::NoChannel;
-    }
-    // path/want_slot/is_content 均可由 host/out 现场推导, 不占参数位。
-    let path = path_of(out.uri());
-    let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    let is_content = pool::route::is_content(host);
-    // 会话域（含 api）优先用自己建的通道：闲置久的先过 ping 闸验活，死了就地摘掉
-    // 走拨号（游标钉着原 IP，重拨落回原家，会话不漂移）。内容域双通道，池里谁快用谁。
-    let up = if upstream::prefer_own_channel(host) {
-        match upstream::session_pick(host, ips, want_slot).await {
-            Some(up) => up,
-            None => return CachedOutcome::NoChannel,
-        }
-    } else {
-        match upstream::cached_h2_in(ips, want_slot) {
-            Some(up) => up,
-            None => return CachedOutcome::NoChannel,
-        }
-    };
-    let budget = request_budget(is_content);
-    match stream_on(&up, out, body, budget).await {
-        Ok((resp, ms)) => {
-            *info.lock().unwrap() = up.ip.clone();
-            pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(&up.ip, up.id, ms);
-            // 复用路径同样要学 302：头像请求几乎总走这里，只挂拨号分支会漏。
-            redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-            quiet::note_reuse(log, host, ms);
-            CachedOutcome::Done(Ok(resp))
-        }
-        Err(why) => {
-            // 复用失败只说明「这条旧连接不能用了」，跟这个 IP 好不好没关系。
-            // 实测 185.199.110.215 复用超时后 1 秒，新建连接 334ms 就回了 200；
-            // 记边冷却是冤枉好 IP，会把直连赶到别的 IP 甚至逼进镜像链。
-            // 只摘这条连接，本请求后续改走新拨的连接（由 CachedOutcome 带出去）。
-            upstream::drop_h2_id(&up.ip, up.id);
-            note_reuse_failure(log, host, &up.ip, &why, budget);
-            // 请求没写出去（连接已死）时，非幂等方法也能换连接重发。
-            let replayable = is_simple || (body.is_some() && failed_before_send(&why));
-            if replayable {
-                CachedOutcome::ReuseFailed
-            } else {
-                CachedOutcome::Done(Err(
-                    "POST 等非简单方法不重发(复用连接失效)".to_string()
-                ))
-            }
-        }
-    }
-}
-
+/// 直连腿：通道获取全在 `pool::get_or_build` 一站式（骑池 → 建造 → 溢出），这里只管
+/// 在通道上发请求、成功记账与失败上报。通道失败 = 摘通道换一条重试一次——两次内有救
+/// 是通道级故障，再败就是候选全坏，交上层按 fallback 走镜像/DNS。
+/// 全部候选的死亡退避/边冷却/建造排队都在池与串发层记账，这里不再有自己的重试循环。
 pub(super) async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
     info: &UpstreamInfo,
-    is_simple: bool,
+    _is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    // copilot-proxy 后缀是 githubusercontent.com，会误命中内容域熔断，但它走 edge 白名单族。
     let is_content = pool::route::is_content(host);
-    // 查询管线②③：host → 邻接 IP（滤黑边后）。None=不在表；空=全黑走 fallback。
-    let targets = match pool::route::dial_targets(host) {
-        Some(t) => t,
-        None => return Err(format!("域名不在路由表({host})")),
-    };
-    if targets.is_empty() {
-        return Err(format!("{host} 候选 IP 全部在边冷却中"));
-    }
-    let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
-    // 批界第一步：过批窗的空闲通道就地除名。不先摘，store_h2 会把新拨的作废、
-    // 把旧通道塞回手里，拨号订单也会被「已有通道」驳回——「下批重建」就落不了地。
-    // 会话域自己的通道在这里被豁免，由 try_cached 的 ping 闸验活。
-    upstream::evict_stale(&ips);
-    // 熔断只拦「拨新通道」，不拦「骑池里现成的通道」：骑不到、拨不出，才交镜像链。
-    // 所以这里的复用尝试在熔断检查之前跑——串发全灭 ≠ 直连没了，池里的活通道照用。
-    let mut reuse_failed = false;
-    match try_cached(log, out, host, &ips, info, is_simple, body).await {
-        CachedOutcome::Done(r) => return r,
-        CachedOutcome::ReuseFailed => reuse_failed = true,
-        CachedOutcome::NoChannel => {}
-    }
-    // per-host 拨号单飞：锁只罩拨号等待不罩发送（持锁到发送曾致 129 并发串行 34s FCP）。
-    let dial_lock = upstream::host_dial_lock(host);
-    let mut guard = Some(dial_lock.lock().await);
-    // 必须重查：等锁期间别人可能刚建好连接；砍掉这步会让 18 个在途请求排队各自拨号。
-    let reusable_in_pool = !(!is_simple && body.is_none())
-        && !reuse_failed
-        && if upstream::prefer_own_channel(host) {
-            upstream::cached_h2_own(host, &ips, want_slot).is_some()
-        } else {
-            upstream::cached_h2_in(&ips, want_slot).is_some()
-        };
-    if reusable_in_pool {
-        guard.take();
-        match try_cached(log, out, host, &ips, info, is_simple, body).await {
-            CachedOutcome::Done(r) => return r,
-            CachedOutcome::ReuseFailed => reuse_failed = true,
-            CachedOutcome::NoChannel => {}
-        }
-        guard = Some(dial_lock.lock().await);
-    }
-    // 外层这把锁只负责「排队等拨号 + 等完重查池」，到这里就该放手。
-    // 发送若一直攥着它，同 host 的并发请求只能一个发完才轮到下一个
-    // （历史踩过：129 并发串行 34s FCP）。改成每轮只在「查池 + 拨号」那一小段拿锁。
-    drop(guard);
-    // 串发已全灭：不再拨新通道，只骑池里剩下的活通道；骑不到才交镜像/报错。
-    let mut serial_exhausted = false;
-    let mut last_serial_err: Option<String> = None;
-    for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。批窗过界同样先清场再选。
-        let ips: Vec<String> = match pool::route::dial_targets(host) {
-            Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
-            _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
-        };
-        upstream::evict_stale(&ips);
-        // 每轮再查一次池子：并行建连任务可能已建成，排队者直接复用。
-        // 流式请求（body 未缓存）跳过复用：发了就收不回，必须走新拨的连接。
-        // 已经撞过一次复用失败的本请求不再碰池，只走确定刚拨出来的连接。
-        let allow_reuse = !(!is_simple && body.is_none()) && !reuse_failed;
-        // 单飞只罩「查池 + 拨号」：连接一到手（新拨或池里现成）立刻放锁，
-        // 下面的 send_once 与同 host 其它请求并发跑，不再排队过闸。
-        let (up, dial_reused, pool_pick) = {
-            let _dial_guard = dial_lock.lock().await;
-            let cached = if !allow_reuse {
-                None
-            } else if upstream::prefer_own_channel(host) {
-                upstream::cached_h2_own(host, &ips, want_slot)
-            } else {
-                upstream::cached_h2_in(&ips, want_slot)
-            };
-            let pool_pick = cached.is_some();
-            match cached {
-                Some(up) => (up, false, pool_pick),
-                // 串发已全灭（或熔断拦着拨号）：池里也没有可骑的了——
-                // 直连这条路本请求走完，交镜像/报错。
-                None if serial_exhausted => {
-                    return Err(last_serial_err
-                        .clone()
-                        .unwrap_or_else(|| "直连暂不可用, 交兜底".into()));
-                }
-                None => match upstream::dial_upstream(host, log, allow_reuse).await {
-                    Ok((up, reused)) => (up, reused, pool_pick),
-                    Err(e) => {
-                        // 候选被已有通道占满：能骑现成通道的请求在上面 cached 检查
-                        // 已经接住（占满 ⇒ 池里必有）；走到这里只剩流式请求——
-                        // 它骑不了现成通道，等也没用，立即交兜底。
-                        if e.contains(upstream::ERR_NO_FREE_IP) {
-                            return Err(e);
-                        }
-                        // 串发拨不出新的（全灭/预算耗尽/全在死亡冷却/冷却中）：
-                        // 不再原地重试，也不急着熔断——池里的活通道下一轮
-                        // cached 接着骑，池也空了才熔断交镜像。
-                        let exhausted = e.contains("无可拨候选")
-                            || e.contains("慢失败预算耗尽")
-                            || e.contains("直连串发全灭")
-                            || e.contains("串发冷却中");
-                        if exhausted {
-                            serial_exhausted = true;
-                            last_serial_err = Some(e.clone());
-                            continue;
-                        }
-                        // 单候选真实拨号失败（TCP/TLS/h2 超时等，已进死亡退避）：
-                        // 内容域拨号失败交调用方按 fallback 转镜像；其余换下一个候选。
-                        if is_content {
-                            (log)(&format!(
-                                "[MITM] {host} 第 {} 次拨号失败({e}), 转镜像链",
-                                attempt + 1
-                            ));
-                            return Err(e);
-                        }
-                        (log)(&format!(
-                            "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
-                            attempt + 1
-                        ));
-                        continue;
-                    }
-                },
-            }
-        };
-        // 并行建连内部也可能直接交回池里现成的连接，一并算「复用」，别让它冒充新拨失败。
-        let from_pool = pool_pick || dial_reused;
-        let e = match stream_on(&up, out, body, request_budget(is_content)).await {
+    let budget = request_budget(is_content);
+    let (mut up, mut fresh) = pool::get_or_build(host, want_slot, log).await?;
+    let mut retried = false;
+    loop {
+        match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
                 let id = up.id;
-                let up_slot = up.slot;
-                let up_ip = up.ip.clone();
+                let slot = up.slot;
+                let ip = up.ip.clone();
                 // 服务端回 421 = 这个 IP 服务不了这个 host：边级长冷却，换下一条。
+                // 边状态按路由键记（子域请求的 host ≠ 路由键，按 host 记永远对不上）。
                 if resp.status() == StatusCode::MISDIRECTED_REQUEST {
-                    // 边状态按路由键记账（子域请求的 host ≠ 路由键，按 host 记会永远对不上）。
                     if let Some(row) = pool::route::route_for(host) {
-                        pool::edges::mark_reject(&up_ip, &row.key);
+                        pool::edges::mark_reject(&ip, &row.key);
                     }
-                    upstream::drop_h2_id(&up_ip, id);
+                    upstream::drop_h2_id(&ip, id);
                     (log)(&format!(
-                        "[MITM] {host} <- {up_ip} 被拒(421), 该 IP 冷却 4 小时, 换下一个"
+                        "[MITM] {host} <- {ip} 被拒(421), 该 IP 冷却 4 小时, 换下一个"
                     ));
-                    // 421 = 服务器声明未处理该请求；body 已缓存才能重发（流式已随旧连接消费掉）。
-                    if !is_simple && body.is_none() {
-                        return Err("421 边缘拒绝(流式请求不可重发)".to_string());
+                    if retried {
+                        return Err("421 边缘连续拒绝".to_string());
                     }
+                    retried = true;
+                    (up, fresh) = pool::get_or_build(host, want_slot, log).await?;
                     continue;
                 }
-                *info.lock().unwrap() = up_ip.clone();
+                *info.lock().unwrap() = ip.clone();
                 // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
-                pool::cursor_note(host, &up_ip, true, up_slot);
-                // 第二条腿由 dial_h2_race 自己收尾补建，这里不重复补（会与并行建连抢跑）。
-                upstream::note_latency(&up_ip, id, ms); // 新连接也要记账，否则择优池没有它的样本
+                pool::cursor_note(host, &ip, true, slot);
+                upstream::note_latency(&ip, id, ms);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-                (log)(&format!("[上游] {host}{path} 新连接 {up_ip}, {ms}ms"));
+                if fresh {
+                    (log)(&format!("[上游] {host}{path} 新连接 {ip}, {ms}ms"));
+                } else {
+                    quiet::note_reuse(log, host, ms);
+                }
                 return Ok(resp);
             }
-            Err(e) => e,
-        };
-        // 发送失败这条连接一律先摘掉，别留在池里给下一个请求继续撞。
-        upstream::drop_h2_id(&up.ip, up.id);
-        // 只有"连接没接住请求 + body 还在手里"才允许非幂等方法重发；半路断的不重试。
-        if !is_simple && !(body.is_some() && failed_before_send(&e)) {
-            return Err(format!("POST 等非简单方法不重发({e})"));
-        }
-        // 池里现成的旧连接失败：只说明这条连接死了，IP 一点没试过。
-        // 摘掉它，本请求后面只走新拨的连接；不许记边冷却，更不许据此判「直连全灭」转镜像。
-        // 19:01:56 那段日志就是这么来的：四条复用超时烧满预算 → 熔断 → 头像走镜像，
-        // 而 1 秒后同一个 IP 新建连接 334ms 就回了 200。
-        if from_pool {
-            reuse_failed = true;
-            // 通道不可复用 ≠ IP 不行，但「下一个请求别从这家开始」还是要记的：
-            // 挪游标不罚 IP（不记边冷却），批内自愈回到 v1 的速度。
-            if is_simple && !is_content {
-                pool::cursor_note(host, &up.ip, false, up.slot);
+            Err(e) => {
+                // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
+                pool::report_failure(&up, host, fresh);
+                if fresh {
+                    (log)(&format!(
+                        "[MITM] {host} 新连接 {} 失败({e}), 换一条重试",
+                        up.ip
+                    ));
+                } else {
+                    note_reuse_failure(log, host, &up.ip, &e, budget);
+                }
+                if retried {
+                    return Err(e);
+                }
+                retried = true;
+                (up, fresh) = pool::get_or_build(host, want_slot, log).await?;
             }
-            (log)(&format!(
-                "[MITM] {host} 复用通道失效({e}), 丢掉这条换新连接"
-            ));
-            continue;
         }
-        // 到这里才是「新拨出来的连接也不行」，这时罚 IP / 熔断才有依据。
-        // 数据层失败才垫底 IP，且只认幂等、无镜像兜底的失败；POST/内容域失败不代表 IP 死。
-        if is_simple && !is_content {
-            pool::cursor_note(host, &up.ip, false, up.slot);
-        }
-        // 边级记账：超时/断连短冷却，这个 IP 对这个 host 稍后再说。
-        // 键必须按路由键记（子域请求的 host ≠ 路由键，按 host 记 dial_targets 永远滤不到——同 421 路径）。
-        if let Some(row) = pool::route::route_for(host) {
-            pool::edges::mark_stall(&up.ip, &row.key);
-        }
-        // 内容域新拨失败交调用方按 fallback 转镜像（不做 host 级熔断——
-        // 死亡退避已逐 IP 记账，全试完之前不判定「直连没救」）。
-        if is_content {
-            (log)(&format!(
-                "[MITM] {host} 第 {} 次新拨连接失败({e}), 转镜像链",
-                attempt + 1
-            ));
-            return Err(format!("内容域直连全灭({e})"));
-        }
-        (log)(&format!(
-            "[MITM] {host} 上游第 {} 次失败({e}), 换下一个 IP",
-            attempt + 1
-        ));
-        continue; // GET/HEAD: 换下一个候选重发完整请求
     }
-    Err("直连串发全灭(完整请求逐个试完)".to_string())
 }
 
 fn write_upstream(

@@ -17,7 +17,6 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
-        ping_tx: None,
         send,
     }
 }
@@ -56,13 +55,12 @@ async fn live_conn(ip: &str) -> H2Upstream {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
-        ping_tx: None,
         send,
     }
 }
 
-/// 硬约束：同一个 IP 永远只有一条通道。后到的连接当场作废、返回池里已有的那条。
-/// 顺带验证槽位过滤：主通道被摘后不回落到别的槽位，且登记随之撤销允许重拨。
+/// 会话域硬约束：同一 IP 只留一条通道。后到的当场作废、返回池里已有的那条。
+/// 顺带验证槽位过滤：主通道被摘后不回落到别的槽位。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn one_ip_one_channel_and_slot_filter() {
@@ -70,18 +68,20 @@ async fn one_ip_one_channel_and_slot_filter() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let ip = "9.9.9.1";
-    let first = mk_up(ip, 1).await;
+    let mut first = mk_up(ip, 1).await;
+    first.owner = Some("github.com".to_string()); // 会话域 → cap 1
     let first_id = first.id;
     assert_eq!(store_h2(ip, first).id, first_id, "第一条应入库");
 
-    let second = mk_up(ip, 2).await;
+    let mut second = mk_up(ip, 2).await;
+    second.owner = Some("github.com".to_string());
     let second_id = second.id;
     let kept = store_h2(ip, second);
-    assert_eq!(kept.id, first_id, "同 IP 的第二条必须作废, 返回已有连接");
+    assert_eq!(kept.id, first_id, "会话域同 IP 的第二条必须作废, 返回已有连接");
     assert_ne!(kept.id, second_id);
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "池里该 IP 只能有一条");
+        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "会话域池里该 IP 只能有一条");
     }
 
     for _ in 0..4 {
@@ -97,6 +97,43 @@ async fn one_ip_one_channel_and_slot_filter() {
         cached_h2_in(&[ip.to_string()], None).is_none(),
         "同 IP 不该还留着第二条通道"
     );
+    let _ = lock(conn_pool()).remove(ip);
+}
+
+/// 内容域：同 IP 并发拨出的通道并存（不再去重）——赌 IP 能扛多通道。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn content_ip_allows_multiple_channels() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let ip = "9.9.9.2";
+    let mut a = mk_up(ip, 1).await;
+    a.owner = Some("raw.githubusercontent.com".to_string());
+    let a_id = a.id;
+    assert_eq!(store_h2(ip, a).id, a_id, "第一条应入库");
+
+    let mut b = mk_up(ip, 2).await;
+    b.owner = Some("raw.githubusercontent.com".to_string());
+    let b_id = b.id;
+    let kept = store_h2(ip, b);
+    assert_eq!(kept.id, b_id, "内容域同 IP 第二条应并存, 不作废");
+    // 上限 3：第 3 条并存，第 4 条作废返回已有的（溢出补通道的地板/天花板就钉在这里）。
+    let mut c = mk_up(ip, 1).await;
+    c.owner = Some("raw.githubusercontent.com".to_string());
+    let c_id = c.id;
+    let kept3 = store_h2(ip, c);
+    assert_eq!(kept3.id, c_id, "内容域同 IP 第 3 条应并存");
+    let mut d = mk_up(ip, 1).await;
+    d.owner = Some("raw.githubusercontent.com".to_string());
+    let d_id = d.id;
+    let kept4 = store_h2(ip, d);
+    assert_ne!(kept4.id, d_id, "内容域同 IP 第 4 条必须作废");
+    assert_eq!(kept4.id, a_id, "作废时返回池里现成的那条");
+    {
+        let g = lock(conn_pool());
+        assert_eq!(g.get(ip).unwrap().conns.len(), 3, "内容域同 IP 上限 3 条");
+    }
     let _ = lock(conn_pool()).remove(ip);
 }
 
@@ -213,10 +250,11 @@ async fn inflight_count_follows_response_body_lifecycle() {
     assert_eq!(up.inflight.load(order), 0, "body 丢弃后必须归还槽位");
 }
 
-/// 两个 host 同时把新连接交上来，池里也只能留下一条；两条通道只能分落在两个不同 IP。
+/// 两个 host 并发入库同一 IP（内容域）：两条通道并存，不互斥。
+/// 会话域仍然恒单通道（见 one_ip_one_channel_and_slot_filter）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn concurrent_hosts_never_share_two_channels_on_one_ip() {
+async fn concurrent_content_hosts_coexist_on_one_ip() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -229,10 +267,11 @@ async fn concurrent_hosts_never_share_two_channels_on_one_ip() {
         async move { store_h2(same, a) },
         async move { store_h2(same, b) },
     );
-    assert_eq!(ra.id, rb.id, "两边最终必须用同一条连接");
+    // 内容域/其他（owner 无 session 标志）：两条并存
+    assert_ne!(ra.id, rb.id, "内容域同 IP 两条通道并存");
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(same).unwrap().conns.len(), 1);
+        assert_eq!(g.get(same).unwrap().conns.len(), 2, "内容域同 IP 两条并存");
     }
     // 第二条通道落在另一个 IP：仍然允许， EWMA 轮转也照旧。
     store_h2(other, mk_up(other, 2).await);
@@ -243,8 +282,8 @@ async fn concurrent_hosts_never_share_two_channels_on_one_ip() {
             .filter(|(k, _)| ips.contains(k))
             .map(|(_, h)| h.conns.len())
             .sum::<usize>(),
-        2,
-        "两条通道 = 两个不同 IP 各一条"
+        3,
+        "同 IP 两条 + 另一 IP 一条 = 三条"
     );
     assert!(cached_h2_in(&ips, None).is_some());
     let _ = lock(conn_pool()).remove(same);
@@ -653,8 +692,7 @@ async fn conn_end_removes_itself_from_pool() {
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
-        send,
-        ping_tx: None,
+        send: send.clone(),
     };
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
 
@@ -664,7 +702,8 @@ async fn conn_end_removes_itself_from_pool() {
         conn,
         session: false,
         ping: None,
-        ping_rx: None,
+        send,
+        owner: "test.example".to_string(),
         log: Arc::new(|_| {}),
     });
     // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
@@ -689,102 +728,79 @@ async fn conn_end_removes_itself_from_pool() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 批窗外通道的就地除名：过窗且空闲的摘掉（跨批重建/睡眠唤醒共用这一条路），
-/// 刚用过的留着；挂着在途流的（长下载 last_used 停在开流时刻）不按空闲论处；
-/// 会话域通道归 ping 闸管，批窗摘除永远跳过。摘除连带撤销「已有通道」登记。
+/// 内容域探活：装死的上游（握手成功但对请求永不回响应头）必须被判死——
+/// 这是黑洞通道出池的依据。PING 帧探不了这种黑洞，只有真实小请求探得出。
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn evict_stale_removes_only_expired_idle_conns() {
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-
-    let fresh_ip = "9.9.9.20";
-    let stale_ip = "9.9.9.21";
-    let busy_ip = "9.9.9.22";
-    let session_ip = "9.9.9.23";
-    store_h2(fresh_ip, mk_up(fresh_ip, 1).await);
-    store_h2(stale_ip, mk_up(stale_ip, 1).await);
-    store_h2(busy_ip, mk_up(busy_ip, 1).await);
-    let mut session_up = mk_up(session_ip, 1).await;
-    session_up.owner = Some("github.com".to_string());
-    store_h2(session_ip, session_up);
-    // 除批内那条外全部回拨过窗，模拟跨批/睡眠唤醒。
-    {
-        let mut g = lock(conn_pool());
-        for ip in [stale_ip, busy_ip, session_ip] {
-            if let Some(h) = g.get_mut(ip) {
-                for c in h.conns.iter_mut() {
-                    c.last_used = now_secs() - crate::config::REUSE_WINDOW_SECS - 1;
-                }
-            }
+async fn probe_liveness_detects_silent_upstream() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let Ok(mut conn) = h2::server::handshake(server_io).await else {
+            return;
+        };
+        while let Some(Ok((req, _respond))) = conn.accept().await {
+            let _ = req; // 故意不响应：模拟黑洞（TCP 活着但对请求装死）
         }
-    }
-    // busy 那条挂一个在途流：guard drop 时归还，断言前一直算「忙」。
-    let inflight_arc = {
-        let g = lock(conn_pool());
-        g.get(busy_ip).unwrap().conns[0].up.inflight.clone()
-    };
-    let _busy = StreamGuard::new(inflight_arc);
-
-    evict_stale(&[
-        fresh_ip.to_string(),
-        stale_ip.to_string(),
-        busy_ip.to_string(),
-        session_ip.to_string(),
-    ]);
-
-    assert!(lock(conn_pool()).get(fresh_ip).is_some(), "批内通道不摘");
+    });
+    let (send, conn) = h2::client::handshake(client_io).await.expect("client 握手");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     assert!(
-        lock(conn_pool()).get(stale_ip).is_none(),
-        "过窗且空闲的摘掉，该 IP 立刻可重拨"
+        !probe_liveness(&send, "raw.githubusercontent.com").await,
+        "黑洞连接探活必须判死"
     );
-    assert!(
-        lock(conn_pool()).get(busy_ip).is_some(),
-        "挂着在途流的不按空闲论处"
-    );
-    assert!(
-        lock(conn_pool()).get(session_ip).is_some(),
-        "会话域归 ping 闸管，批窗摘除跳过"
-    );
-    let _ = lock(conn_pool()).remove(fresh_ip);
-    let _ = lock(conn_pool()).remove(busy_ip);
-    let _ = lock(conn_pool()).remove(session_ip);
-
 }
 
-/// 会话域取用闸：ping 端已死（驱动不在/全部句柄释放）= 通道必死，就地摘除返回 None；
-/// 刚用过的通道跳过 ping 直接信——哪怕 ping 端也是死的，取用路径零额外延迟。
+/// 探活不得误报：正常回 200 的通道必须判活，否则活通道会被白白摘掉重拨。
+#[tokio::test]
+async fn probe_liveness_passes_on_responsive_upstream() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let Ok(mut conn) = h2::server::handshake(server_io).await else {
+            return;
+        };
+        while let Some(Ok((req, mut respond))) = conn.accept().await {
+            let _ = req;
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            let _ = respond.send_response(resp, true);
+        }
+    });
+    let (send, conn) = h2::client::handshake(client_io).await.expect("client 握手");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert!(
+        probe_liveness(&send, "raw.githubusercontent.com").await,
+        "活通道探活必须通过"
+    );
+}
+
+/// get_or_build 步骤①：池里有闲通道就直接骑（fresh=false），绝不拨号。
+/// 建造路径要真网，单测不碰；这里的断言是"取到池里那条且来源不是新拨"。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn session_pick_gates_on_ping_end_health() {
+async fn get_or_build_rides_pool_channel_without_dialing() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-
-    let ip = "9.9.9.24";
-    let mut up = mk_up(ip, 1).await;
+    crate::pool::install_seed_routes();
+    // 必须落在路由表候选里，pick 才看得见；表外 IP 会被当成池空去真拨号。
+    let ip = crate::pool::route::dial_targets("github.com")
+        .expect("种子表必有 github.com 行")[0]
+        .ip
+        .clone();
+    let mut up = mk_up(&ip, 1).await;
     up.owner = Some("github.com".to_string());
-    let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<bool>>(1);
-    drop(dead_rx); // 接收端没了 = 驱动任务不在，任何 ping 都发不进去
-    up.ping_tx = Some(dead_tx);
-    store_h2(ip, up);
-    // 刚入库（last_used = 现在）：跳过 ping 直接信，死 ping 端轮不到出场。
-    let fresh = session_pick("github.com", &[ip.to_string()], None).await;
-    assert!(fresh.is_some(), "刚用过的会话通道不该被 ping 闸拦下");
-    // 回拨过闸限：这次必须验活，ping 端已死 → 通道判死摘除。
-    {
-        let mut g = lock(conn_pool());
-        if let Some(h) = g.get_mut(ip) {
-            for c in h.conns.iter_mut() {
-                c.last_used = now_secs() - crate::config::SESSION_PING_GATE_SECS - 1;
-            }
-        }
-    }
-    let gated = session_pick("github.com", &[ip.to_string()], None).await;
-    assert!(gated.is_none(), "ping 端已死 = 通道必死");
-    assert!(lock(conn_pool()).get(ip).is_none(), "池里不该留死通道");
+    let id = up.id;
+    store_h2(&ip, up);
+    let log: LogFn = Arc::new(|_| {});
+    let (got, fresh) = crate::pool::get_or_build("github.com", None, &log)
+        .await
+        .expect("池里有通道应直接返回");
+    assert_eq!(got.id, id, "应骑池里现成的那条");
+    assert!(!fresh, "骑池不算新拨，失败记账走不罚分支");
+    let _ = lock(conn_pool()).remove(&ip);
 }
 
-// 看护任务不再做保活与补拨（批窗 + ping 闸取代），旧的隧道打点与补拨节流测试随之退役：
-// 连接死亡一律由请求结果或批窗发现，通道重建是下一批请求自己的事。
+// 看护任务不再做保活与补拨（探活计时器 + 死亡退避取代），旧的隧道打点与补拨节流
+// 测试随之退役：连接死亡由探活或请求结果发现，通道重建是下一个请求自己的事。

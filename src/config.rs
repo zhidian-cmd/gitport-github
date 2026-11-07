@@ -35,14 +35,20 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 /// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。2s/IP 上限下 ≈ 走完 6 个候选就交镜像链。
 pub const SERIAL_DIAL_BUDGET_SECS: u64 = 12;
 
-/// 批窗：30s 内用过 = 还在本批，可复用；过窗视同不存在，取用时惰性摘除重拨。
-/// 取值 ≈ 边缘空闲回收窗（实测 50-65s）的一半，能被复用的通道最多这么老，
-/// 陈旧复用（撞死连接）被构造性消灭。通道不做任何主动保活。
-pub const REUSE_WINDOW_SECS: u64 = 30;
-/// 会话域通道闲置超过此秒数，取用前先 ping 验活；刚用过的直接信。
-pub const SESSION_PING_GATE_SECS: u64 = 10;
+/// 通道持续存在（无批窗）：健康由驱动探活保证，死了立即出池。
+/// 内容域/其他探活间隔：闲置超此秒数的通道，驱动在现有连接上开 stream 发
+/// GET Range:bytes=0-0（1 字节 Range 是正常 HTTP 请求，与真实流量无异）。
+pub const PROBE_INTERVAL_SECS: u64 = 10;
+/// 探活响应头等待上限：超时 = 连接已黑洞，当场自摘出池。
+pub const PROBE_TIMEOUT_SECS: u64 = 2;
+/// 会话域 PING 探活间隔（闲置超此秒数才探，驱动计时器驱动）。
+pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
 /// 会话域按需 ping 的 PONG 等待上限（驱动任务侧计时）。
 pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
+/// 内容域/其他同 IP 通道上限：常态 2 条（主副双腿），两条顶满才同 IP 溢出补。
+pub const MAX_CONNS_CONTENT: usize = 3;
+/// 会话域同 IP 通道上限：恒 1 条（风控面不漂移，全忙骑现有连接排队）。
+pub const MAX_CONNS_SESSION: usize = 1;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 
