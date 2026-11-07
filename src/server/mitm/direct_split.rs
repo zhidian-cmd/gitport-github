@@ -544,7 +544,8 @@ pub(super) struct SegmentedBody {
 }
 
 impl SegmentedBody {
-    /// 无救援的拼装（单测/不可救援场景）：5s 界整个关掉。
+    /// 无救援的拼装（仅测试用）：5s 界整个关掉，生产路径一律走 build。
+    #[cfg(test)]
     fn new(entries: Vec<(BoxBody, usize)>, total: u64) -> Self {
         let entries = entries
             .into_iter()
