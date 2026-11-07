@@ -743,11 +743,9 @@ pub(super) async fn get_direct(
     // 发送若一直攥着它，同 host 的并发请求只能一个发完才轮到下一个
     // （历史踩过：129 并发串行 34s FCP）。改成每轮只在「查池 + 拨号」那一小段拿锁。
     drop(guard);
-    // 自愈时代"候选全在建"的等待总量上限：等补拨建成直接复用，超时才交兜底。
-    let no_free_wait_deadline = Instant::now() + Duration::from_secs(3);
     for attempt in 0..GET_DIRECT_MAX_ATTEMPTS {
-        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。等锁、等待补拨的
-        // 3s 里通道也可能过批窗——同样先清场再选。
+        // 每轮重推一次 targets：黑边/候选可能已被别的请求更新。等锁的 3s 里
+        // 通道也可能过批窗——同样先清场再选。
         let ips: Vec<String> = match pool::route::dial_targets(host) {
             Some(t) if !t.is_empty() => t.into_iter().map(|t| t.ip).collect(),
             _ => return Err(format!("{host} 候选 IP 全部在边冷却中")),
@@ -774,24 +772,11 @@ pub(super) async fn get_direct(
                 None => match upstream::dial_upstream(host, log, allow_reuse).await {
                     Ok((up, reused)) => (up, reused, pool_pick),
                     Err(e) => {
-                        // 候选被已有通道占满：自愈时代多半是"补拨正在建"——原地等它
-                        // 入库（总量 ≤3s，50ms 步进），池里出现现成通道就重走本轮取用，
-                        // 比交兜底/502 强。流式请求骑不了现成通道，照旧立即交兜底。
-                        // 总量上限同时兜住老问题（24 行相同失败日志）。
+                        // 候选被已有通道占满：能骑现成通道的请求在上面 cached 检查
+                        // 已经接住（占满 ⇒ 池里必有）；走到这里只剩流式请求——
+                        // 它骑不了现成通道，等也没用，立即交兜底。
                         if e.contains(upstream::ERR_NO_FREE_IP) {
-                            if !allow_reuse || Instant::now() >= no_free_wait_deadline {
-                                return Err(e);
-                            }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            let picked = if upstream::prefer_own_channel(host) {
-                                upstream::cached_h2_own(host, &ips, want_slot)
-                            } else {
-                                upstream::cached_h2_in(&ips, want_slot)
-                            };
-                            if picked.is_some() {
-                                continue; // 补拨已建成：下一轮 cached 检查直接接住
-                            }
-                            continue; // 未建成：继续在总量上限内等
+                            return Err(e);
                         }
                         // 串发冷却中：重试只是空转（30s 内必再败），立即交兜底（镜像/DNS）。
                         if pool::dial_cool_open(host) {
