@@ -6,7 +6,7 @@
 //! 用毕即焚），自己从不拨号，也不经过 get_direct 的兜底，因而不会把一次段失败误判成
 //! 「内容域直连全灭」而转镜像。并发是两层叠加：同通道多 stream + 多通道多窗口——
 //! 实测单连接 8 段 73.8s→45.0s（1.6 倍封顶），多通道摊段就是为了突破这个天花板。
-use super::{merge, path_of, UpstreamInfo};
+use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use hyper::body::Frame;
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -59,7 +60,7 @@ pub(super) fn is_image_split_host(host: &str) -> bool {
 /// 探片与收口共用的媒体判定：图片之外放行视频（README 嵌的 mp4/webm 走同一套
 /// Range 切片）。只在白名单 host 内生效，会话域永远不在名单上。
 fn is_media(ct: Option<&str>) -> bool {
-    ct.is_some_and(|v| v.starts_with("image/") || v.starts_with("video/"))
+    MediaKind::of_content_type(ct).is_some()
 }
 
 pub(super) fn seg_count(total: u64) -> usize {
@@ -67,6 +68,7 @@ pub(super) fn seg_count(total: u64) -> usize {
 }
 
 /// 段请求的模板：原请求的 method/uri/headers，每次重建一份干净的 GET。
+#[derive(Clone)]
 struct Tpl {
     method: Method,
     uri: http::Uri,
@@ -137,24 +139,55 @@ fn skip_response_header(k: &str) -> bool {
 // Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
 // 与镜像链的 206 校验用同一套标准，别再各写一份。
 
-/// 探片/总长记忆：命中省一次真实往返；记 0 表示这个 URL 不支持 Range，10 分钟内别再探。
-static MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> = LazyLock::new(Default::default);
+/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum MediaKind {
+    Image,
+    Video,
+}
 
-fn memo_get(key: &str) -> Option<u64> {
+impl MediaKind {
+    fn chain(self) -> &'static str {
+        match self {
+            MediaKind::Image => pool::MEDIA_IMAGE_CHAIN,
+            MediaKind::Video => pool::MEDIA_VIDEO_CHAIN,
+        }
+    }
+    fn of_content_type(ct: Option<&str>) -> Option<Self> {
+        let ct = ct?;
+        if ct.starts_with("image/") {
+            Some(MediaKind::Image)
+        } else if ct.starts_with("video/") {
+            Some(MediaKind::Video)
+        } else {
+            None
+        }
+    }
+}
+
+/// 探片记忆：总长 + 媒体类别（救援链按类别分流）。总长 0 = 这个 URL 探明不可切
+/// （上游忽略 Range / 非媒体），10 分钟内别再探。
+static MEMO: LazyLock<Mutex<HashMap<String, (u64, MediaKind, Instant)>>> =
+    LazyLock::new(Default::default);
+
+fn memo_get(key: &str) -> Option<(u64, MediaKind)> {
     MEMO.lock()
         .unwrap()
         .get(key)
-        .filter(|(_, at)| at.elapsed() < MEMO_TTL)
-        .map(|(t, _)| *t)
+        .filter(|(_, _, at)| at.elapsed() < MEMO_TTL)
+        .map(|(t, k, _)| (*t, *k))
 }
 
-fn memo_put(key: &str, total: u64) {
+fn memo_put(key: &str, total: u64, kind: MediaKind) {
     let mut g = MEMO.lock().unwrap();
     if g.len() >= 512 {
-        g.retain(|_, (_, at)| at.elapsed() < MEMO_TTL);
+        g.retain(|_, (_, _, at)| at.elapsed() < MEMO_TTL);
     }
-    g.insert(key.to_string(), (total, Instant::now()));
+    g.insert(key.to_string(), (total, kind, Instant::now()));
 }
+
+/// 媒体救援链全灭熔断 60s：链死透时别让每个大图的每段都白付一遍链序尝试。
+static MEDIA_RESCUE_BREAKER: pool::Breaker = pool::Breaker::new(60);
 
 async fn fetch_segment(
     up: &upstream::H2Upstream,
@@ -169,19 +202,88 @@ async fn fetch_segment(
     if resp.status() != StatusCode::PARTIAL_CONTENT {
         return Err(format!("段回 {}", resp.status()));
     }
-    let cr = resp
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok());
-    if merge::content_range_start(cr) != Some(s) {
-        return Err(format!("段边界不符: 要 {s}, 拿到 {cr:?}"));
+    check_segment_bounds(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        s,
+        e,
+    )?;
+    let (parts, body) = resp.into_parts();
+    Ok((body, parts.headers))
+}
+
+/// 206 段边界校验（直连与镜像救援共用一套标准）：Content-Range 起点必须等于本段请求
+/// 起点、终点不越过本段末端——拼错边界的字节会吃掉总长预算，尾段就发不完了。
+fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), String> {
+    match merge::content_range_start(cr) {
+        Some(got) if got == start => {}
+        Some(_) => return Err(format!("段边界不符: 要 {start}, 拿到 {cr:?}")),
+        None => return Err("段缺 Content-Range".to_string()),
     }
-    // 起点对但终点越界也不能收：多出来的字节会吃掉总长预算，尾段就发不完了。
     if merge::content_range_end(cr).is_some_and(|end| end >= e) {
         return Err(format!("段终点越界: 要 <= {}, 拿到 {cr:?}", e - 1));
     }
-    let (parts, body) = resp.into_parts();
-    Ok((body, parts.headers))
+    Ok(())
+}
+
+/// 段的镜像救援（"先直连后镜像"的镜像半场）：Range 从 `start` 续到 `e`——直连已交付
+/// 的字节不重拉，镜像只补剩下的。按链序逐个试；全灭记 60s 熔断并返回 None。
+/// 整段单流取回、不分段——镜像永远一枪一个 Range。
+async fn rescue_segment(
+    tpl: &Tpl,
+    kind: MediaKind,
+    start: u64,
+    e: u64,
+    log: &LogFn,
+) -> Option<(BoxBody, HeaderMap)> {
+    let chain_key = kind.chain();
+    if MEDIA_RESCUE_BREAKER.open(chain_key) {
+        return None;
+    }
+    let chain = pool::mirror_chain(chain_key);
+    if chain.is_empty() {
+        return None;
+    }
+    let orig = tpl.uri.to_string();
+    for m in &chain {
+        let Ok(seg_req) = tpl.build(start, e) else { return None };
+        let Ok(req) = mirror::mirror_request(&seg_req, m, &orig) else { continue };
+        match mirror::mirror_do(req, m, log).await {
+            Ok(resp) => {
+                if resp.status() != StatusCode::PARTIAL_CONTENT {
+                    continue;
+                }
+                if check_segment_bounds(
+                    resp.headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    start,
+                    e,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                let (parts, body) = resp.into_parts();
+                (log)(&format!(
+                    "[直连切片] 段 {start}-{} 由镜像 {} 接手{}",
+                    e - 1,
+                    m.trim_start_matches("https://"),
+                    if start > 0 {
+                        format!("(续传自 {start})")
+                    } else {
+                        String::new()
+                    }
+                ));
+                return Some((body, parts.headers));
+            }
+            Err(_) => continue,
+        }
+    }
+    MEDIA_RESCUE_BREAKER.set(chain_key);
+    (log)(&format!("[直连切片] {chain_key} 链全灭, 60s 内段救援直接放弃"));
+    None
 }
 
 /// 主入口：不满足条件、或任一段没拿到 206，一律返回 None 让 mitm_http 走原来的单流。
@@ -199,9 +301,9 @@ pub(super) async fn try_direct_split(
         return None;
     }
     let key = format!("{host}{}", path_of(out.uri()));
-    let total = match memo_get(&key) {
-        Some(0) => return None,
-        Some(t) => t,
+    let (total, kind) = match memo_get(&key) {
+        Some((0, _)) => return None,
+        Some(hit) => hit,
         None => {
             let tpl = Tpl::of(out);
             // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
@@ -220,7 +322,7 @@ pub(super) async fn try_direct_split(
                 _ => return None,
             };
             if resp.status() != StatusCode::PARTIAL_CONTENT {
-                memo_put(&key, 0); // 上游忽略 Range：10 分钟内别再白探
+                memo_put(&key, 0, MediaKind::Image); // 上游忽略 Range：10 分钟内别再白探
                 return None;
             }
             let Some(t) = merge::content_range_total(
@@ -228,21 +330,21 @@ pub(super) async fn try_direct_split(
                     .get("content-range")
                     .and_then(|v| v.to_str().ok()),
             ) else {
-                memo_put(&key, 0);
+                memo_put(&key, 0, MediaKind::Image);
                 return None;
             };
-            let media = is_media(
+            let Some(kind) = MediaKind::of_content_type(
                 resp.headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok()),
-            );
-            drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
-            if !media {
-                memo_put(&key, 0); // 非媒体：10 分钟内别再探、更别切
+            ) else {
+                drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
+                memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内别再探、更别切
                 return None;
-            }
-            memo_put(&key, t); // 记住总长；小图下次直接被 MIN_SPLIT_BYTES 挡掉
-            t
+            };
+            drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
+            memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
+            (t, kind)
         }
     };
     if total < MIN_SPLIT_BYTES {
@@ -262,21 +364,41 @@ pub(super) async fn try_direct_split(
     if chans.is_empty() {
         return None;
     }
+    // 先直连后镜像：每段一个 5s 界——响应头拿不到/段失败，立刻换镜像重取该段 Range；
+    // 5s 内拿到头的，体在 SegmentedBody 里继续受 5s 界约束（没拉完的部分由镜像续传）。
+    let t0 = Instant::now();
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let up = chans[i % n].clone();
-        let all = chans.clone();
+        let log2 = log.clone();
         async move {
-            match fetch_segment(&up, tpl_ref, s, e).await {
-                Ok(r) => Ok(r),
-                Err(why) => {
-                    // 本通道上的段失败：换一条通道重试一次——多通道摊段后，
-                    // 单条通道半死不该拖垮整张图。
-                    match all.iter().find(|c| c.id != up.id) {
-                        Some(alt) => fetch_segment(alt, tpl_ref, s, e).await,
-                        None => Err(why),
-                    }
-                }
+            match tokio::time::timeout(
+                Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+                fetch_segment(&up, tpl_ref, s, e),
+            )
+            .await
+            {
+                Ok(Ok((body, hs))) => Ok(SegFetch {
+                    body,
+                    hs,
+                    rescued: false,
+                }),
+                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, s, e, &log2).await {
+                    Some((body, hs)) => Ok(SegFetch {
+                        body,
+                        hs,
+                        rescued: true,
+                    }),
+                    None => Err("段失败且镜像救援不可用".to_string()),
+                },
+                Err(_) => match rescue_segment(tpl_ref, kind, s, e, &log2).await {
+                    Some((body, hs)) => Ok(SegFetch {
+                        body,
+                        hs,
+                        rescued: true,
+                    }),
+                    None => Err("段直连 5s 无响应头, 镜像救援也不可用".to_string()),
+                },
             }
         }
     });
@@ -293,16 +415,16 @@ pub(super) async fn try_direct_split(
         ));
         return None;
     }
-    let mut bodies: Vec<(BoxBody, usize)> = Vec::with_capacity(segs.len());
+    let mut entries: Vec<(BoxBody, usize, u64, bool)> = Vec::with_capacity(segs.len());
     let mut first_headers: Option<HeaderMap> = None;
     for (i, r) in results.into_iter().enumerate() {
-        let (body, hs) = r.ok()?;
+        let f = r.ok()?;
         if first_headers.is_none() {
-            first_headers = Some(hs);
+            first_headers = Some(f.hs);
         }
-        bodies.push((body, (segs[i].1 - segs[i].0) as usize));
+        entries.push((f.body, (segs[i].1 - segs[i].0) as usize, segs[i].0, f.rescued));
     }
-    // 总长记忆命中时没走过探片，用第一段的 content-type 补一道图片校验。
+    // 总长记忆命中时没走过探片，用第一段的 content-type 补一道媒体校验。
     let hs = first_headers.as_ref()?;
     if !is_media(hs.get("content-type").and_then(|v| v.to_str().ok())) {
         return None;
@@ -317,7 +439,20 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
-    let body = BoxBody::new(SegmentedBody::new(bodies, total).hold(guard));
+    let body = BoxBody::new(
+        SegmentedBody::build(
+            entries,
+            total,
+            Some(RescueCtx {
+                tpl: tpl.clone(),
+                kind,
+                log: log.clone(),
+            }),
+            t0,
+            Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+        )
+        .hold(guard),
+    );
     (log)(&format!(
         "[直连切片] {host}{} {total}B 切 {} 段, 池内直连并发",
         path_of(out.uri()),
@@ -357,6 +492,21 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// 段的镜像救援上下文：模板（按偏移重建 Range 请求）、媒体类别（选链）、日志。
+#[derive(Clone)]
+struct RescueCtx {
+    tpl: Tpl,
+    kind: MediaKind,
+    log: LogFn,
+}
+
+/// 段future 的产出：体 + 头 + 是否已来自镜像救援（救援过的体不再做体级 5s 换镜）。
+struct SegFetch {
+    body: BoxBody,
+    hs: HeaderMap,
+    rescued: bool,
+}
+
 struct Seg {
     body: BoxBody,
     buf: VecDeque<Bytes>,
@@ -364,10 +514,23 @@ struct Seg {
     expected: usize,
     got: usize,
     done: bool,
+    /// 本段请求起点（Range 头），救援续传按它算偏移。
+    s: u64,
+    /// 本段终点（Range 尾 +1），换体时期望字节按它重算。
+    e: u64,
+    /// 5s 界触发：冻结本段（不再 poll 直连体），buf 榨干后起镜像救援续传剩余 Range。
+    rescue_due: bool,
+    /// 在途的镜像救援任务；就绪即换体。
+    handle: Option<tokio::task::JoinHandle<Option<(BoxBody, u64)>>>,
+    /// 体已来自镜像（或不可救援）：不再触发体级 5s 换镜。
+    no_rescue: bool,
+    /// 段起点计时：5s 界从开流算起，不是从拼装算起。
+    started: Instant,
 }
 
 /// 按段序交付，但每轮把所有段都 poll 一次：h2 的连接级流控窗口是所有 stream 共享的，
 /// 只盯着队首那一段读，后面几段的数据会把窗口占满、反过来把队首也卡死。
+/// 每段另挂 5s 界（先直连后镜像）：没拉完的段冻结直连侧，由镜像按已交付偏移续传。
 pub(super) struct SegmentedBody {
     segs: Vec<Seg>,
     idx: usize,
@@ -375,20 +538,43 @@ pub(super) struct SegmentedBody {
     sent: u64,
     guard: Option<ActiveGuard>,
     finished: bool,
+    rescue: Option<RescueCtx>,
+    rescue_after: Duration,
 }
 
 impl SegmentedBody {
+    /// 无救援的拼装（单测/不可救援场景）：5s 界整个关掉。
     fn new(entries: Vec<(BoxBody, usize)>, total: u64) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|(body, expected)| (body, expected, 0, true))
+            .collect();
+        Self::build(entries, total, None, Instant::now(), Duration::MAX)
+    }
+
+    fn build(
+        entries: Vec<(BoxBody, usize, u64, bool)>,
+        total: u64,
+        rescue: Option<RescueCtx>,
+        started: Instant,
+        rescue_after: Duration,
+    ) -> Self {
         SegmentedBody {
             segs: entries
                 .into_iter()
-                .map(|(body, expected)| Seg {
+                .map(|(body, expected, s, rescued)| Seg {
                     body,
                     buf: VecDeque::new(),
                     buffered: 0,
                     expected,
                     got: 0,
                     done: false,
+                    s,
+                    e: s + expected as u64,
+                    rescue_due: false,
+                    handle: None,
+                    no_rescue: rescued,
+                    started,
                 })
                 .collect(),
             idx: 0,
@@ -396,6 +582,8 @@ impl SegmentedBody {
             sent: 0,
             guard: None,
             finished: false,
+            rescue,
+            rescue_after,
         }
     }
 
@@ -418,7 +606,59 @@ impl hyper::body::Body for SegmentedBody {
             return Poll::Ready(None);
         }
         for seg in me.segs.iter_mut() {
-            if seg.done || seg.buffered >= SEG_BUFFER_MAX {
+            if seg.done {
+                continue;
+            }
+            // 5s 界：直连还没拉完就冻结本段——不再 poll 直连体（got 定格）；
+            // buf 榨干后起镜像救援，从已交付偏移续传剩余 Range，成功的段一字节不重拉。
+            if !seg.no_rescue
+                && !seg.rescue_due
+                && me.rescue.is_some()
+                && seg.got < seg.expected
+                && seg.started.elapsed() >= me.rescue_after
+            {
+                seg.rescue_due = true;
+            }
+            if seg.rescue_due {
+                if let Some(ctx) = &me.rescue {
+                    if seg.handle.is_none() && seg.buf.is_empty() && seg.got < seg.expected {
+                        let c = ctx.clone();
+                        let (s, e, got) = (seg.s, seg.e, seg.got as u64);
+                        seg.handle = Some(tokio::spawn(async move {
+                            rescue_segment(&c.tpl, c.kind, s + got, e, &c.log)
+                                .await
+                                .map(|(body, _hs)| (body, s + got))
+                        }));
+                    }
+                }
+                if let Some(handle) = &mut seg.handle {
+                    match Pin::new(handle).poll(cx) {
+                        Poll::Ready(Ok(Some((body, start)))) => {
+                            // 换体：直连残体与缓冲一并丢弃，期望字节从续传点重算。
+                            // 已交付的字节都是直连的连续前缀，镜像从同一偏移接着发。
+                            seg.buf.clear();
+                            seg.buffered = 0;
+                            seg.got = 0;
+                            seg.expected = (seg.e - start) as usize;
+                            seg.body = body;
+                            seg.handle = None;
+                            seg.no_rescue = true; // 换上来的就是镜像体，不再二次救援
+                            seg.rescue_due = false;
+                        }
+                        Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
+                            me.finished = true;
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                "直连段 5s 未完且镜像救援失败",
+                            ))));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                if seg.handle.is_some() {
+                    continue; // 救援在途：本段冻结，等其他段的数据把窗口腾出来
+                }
+            }
+            if seg.buffered >= SEG_BUFFER_MAX {
                 continue;
             }
             match Pin::new(&mut seg.body).poll_frame(cx) {

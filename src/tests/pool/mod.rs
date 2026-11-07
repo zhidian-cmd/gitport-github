@@ -1049,3 +1049,78 @@ fn dial_order_partitions_exclusive_and_shared() {
     let o = ips(dial_order(&circle, None, None));
     assert_eq!(o.len(), 3, "不分档 = 全体一个序");
 }
+
+/// 媒体救援链（图片/视频）是保留键：解析进表、落盘回写、注册表对齐三处都不能弄丢。
+/// 全程不碰磁盘与真网——parse/encode/align 都是纯函数，装种子表只为 encode 取节点快照。
+#[test]
+fn media_rescue_chains_roundtrip_and_align_skip() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let raw = r#"{
+  "ips": [],
+  "hosts": {},
+  "mirrors_small": {
+    "raw.githubusercontent.com": ["https://a.example.com"],
+    "图片": ["https://img.example.com"],
+    "视频": ["https://vid.example.com", "https://vid2.example.com"]
+  }
+}"#;
+    let (doc, salvaged) = parse_routes_tolerant(raw, None).expect("媒体链必须能解析");
+    assert!(!salvaged);
+    assert_eq!(
+        doc.chains.get(crate::pool::MEDIA_IMAGE_CHAIN).map(|c| c.len()),
+        Some(1),
+        "图片链必须进表"
+    );
+    assert_eq!(
+        doc.chains.get(crate::pool::MEDIA_VIDEO_CHAIN).map(|c| c.len()),
+        Some(2),
+        "视频链必须进表"
+    );
+
+    // 落盘回写：手改的媒体链不能因 encode 丢掉。
+    install_seed_routes();
+    latency::install(HashMap::new());
+    let mut mirrors = HashMap::new();
+    mirrors.insert(
+        crate::pool::MEDIA_IMAGE_CHAIN.to_string(),
+        vec!["https://img.example.com".to_string()],
+    );
+    mirrors.insert(
+        crate::pool::MEDIA_VIDEO_CHAIN.to_string(),
+        vec!["https://vid.example.com".to_string()],
+    );
+    mirrors.insert(
+        "raw.githubusercontent.com".to_string(),
+        vec!["https://a.example.com".to_string()],
+    );
+    let encoded = encode_routes(&mirrors);
+    assert!(encoded.contains("\"图片\""), "图片链必须回写落盘");
+    assert!(encoded.contains("\"视频\""), "视频链必须回写落盘");
+    let (doc2, _) = parse_routes_tolerant(&encoded, None).expect("回写后必须还能解析");
+    assert_eq!(
+        doc2.chains.get(crate::pool::MEDIA_IMAGE_CHAIN).map(|c| c.len()),
+        Some(1)
+    );
+
+    // 注册表对齐绕开保留键：工作台增删镜像不动手改的图片/视频链。
+    let before = mirrors.get(crate::pool::MEDIA_IMAGE_CHAIN).cloned().unwrap();
+    align_custom_mirrors(
+        &mut mirrors,
+        &["https://new.example.com".to_string()],
+        &[],
+        &["https://new.example.com".to_string()],
+        &[],
+    );
+    assert_eq!(
+        mirrors.get(crate::pool::MEDIA_IMAGE_CHAIN),
+        Some(&before),
+        "注册表对齐不许碰媒体救援链"
+    );
+    // 小文件链照常对齐（对照组证明对齐逻辑本身还在跑）。
+    assert!(
+        mirrors["raw.githubusercontent.com"]
+            .iter()
+            .any(|m| m == "https://new.example.com"),
+        "普通链的注册表对齐不受影响"
+    );
+}

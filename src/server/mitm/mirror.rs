@@ -1555,7 +1555,9 @@ fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(stream))
 }
 
-fn mirror_request(
+/// 镜像请求模板：URL = {镜像}/{原始URL}（前缀拼接惯例），剥凭据头、统一注入镜像 UA。
+/// 直连切片的镜像救援（direct_split）也走这里，与链条镜像同一套凭据/UA 语义。
+pub(super) fn mirror_request(
     out: &hyper::Request<BoxBody>,
     mirror: &str,
     orig_url: &str,
@@ -1588,7 +1590,8 @@ fn mirror_request(
         .body(protocol::empty_body())
         .map_err(|e| e.to_string())
 }
-async fn mirror_do(
+/// 单镜像取响应（响应头预算 5s，体流式）。直连切片的镜像救援也走这里。
+pub(super) async fn mirror_do(
     req: hyper::Request<BoxBody>,
     mirror: &str,
     log: &LogFn,

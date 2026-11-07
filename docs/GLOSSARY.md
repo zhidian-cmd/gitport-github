@@ -37,7 +37,7 @@
 | 流式直通 | 大请求体不进内存，边收边泵给上游；响应头一到立即交付客户端，不等请求体泵完。不进镜像链、不进页面缓存 |
 | 镜像链 | 每种资源的"复印店优先级名单"。全新安装双字典为空，一个镜像也没有，要自己在工作台填；名单来自 routes.json，可加自部署镜像（支持拼接即可） |
 | 分段竞速 | 大文件按字节切段：镜像一家一份；**整包（无 Range）请求里直连入列两次**，对应主/副两条 h2 通道各领一段；下载器带 Range 时按「在途区间总字节 ÷（镜像数 + 1）」算段大小，大区间先占位、小区间保底一段，不设最小切片尺寸；慢段尾巴让给最快者；仅适用于支持 Range 的域（objects / release-assets） |
-| 直连多段（README 大图/视频） | 与镜像链正交的另一条切片路径：只认 raw / user-images / private-user-images / media / camo / gist / avatars 七个内容 CDN，先发 1 字节 Range 探总长和 `content-type`，≥512KB 且为 `image/*` 或 `video/*` 才按约 192KB 切 4~8 段，**摊到池内多条伪装 SNI 直连通道上并发拉**（`gather_channels` 申报需求量：现成的直接给，不够先溢出补临时通道，池冷借建造等 ≤3s），按字节边界合成一条 200 流。不进镜像链、自己从不拨号、不经过直连兜底。**URL 查询串与 Cookie / Authorization 原样保留**，段请求只换 Range、剥掉会改变段语义的头（条件头 / Accept-Encoding / 逐跳头）；带签名 query 的图也照切，能不能切交给上游的 206 回答。`github.com` / `api.github.com` 会话域与 README 的 `/raw/` 302 第一跳不在白名单内；任一段换通道重试后仍失败、起点/终点不对，整请求退回单流。并发两层叠加：同通道多 stream（实测 1MB 单流 73.8s、8 段 45.0s，约 1.6 倍封顶）+ 多通道多窗口（突破天花板的那一级） |
+| 直连多段（README 大图/视频） | 与镜像链正交的另一条切片路径：只认 raw / user-images / private-user-images / media / camo / gist / avatars 七个内容 CDN，先发 1 字节 Range 探总长和 `content-type`，≥512KB 且为 `image/*` 或 `video/*` 才按约 192KB 切 4~8 段，**摊到池内多条伪装 SNI 直连通道上并发拉**（`gather_channels` 申报需求量），按字节边界合成一条 200 流。**先直连后镜像**：每段挂 5s 界——成功的段一字节不重拉；段失败立即、或 5s 没拉完的部分由 mirrors_small 里的保留键链（图片段走"图片"链、视频段走"视频"链，纯手改 routes.json，注册表对齐不碰）按已交付偏移续传剩余 Range，链全灭记 60s 熔断，救援也失败才整请求退回单流；镜像整段单流续取、不分段，自己从不拨号。**URL 查询串与 Cookie / Authorization 原样保留**，段请求只换 Range、剥掉会改变段语义的头；`github.com` / `api.github.com` 会话域与 `/raw/` 302 第一跳不在白名单内。并发三层叠加：同通道多 stream（实测 1MB 单流 73.8s、8 段 45.0s，约 1.6 倍封顶）+ 多通道多窗口 + 5s 镜像兜尾 |
 | 206 段边界校验 | 主切片与补发收 206 时都要 `Content-Range` 起点等于本段 `s`、终点不越过本段末端；缺头或不符就当段失败走补发，绝不把错段字节拼进合并流。单段 body 超出自己那份字节预算也要报错 |
 | 让位 | 慢段的尾巴按「接手划算才抢」的算术切给最快的源，缓冲里的字节一个不丢，交付线零缺口 |
 | ECT 时间槽 | 大文件派发打分：手里的字节 ÷ 上一窗(500ms)实收 = 还需几个槽跑完，最少者胜；零历史垫底，有债零收（卡死）立即避开。每面镜像 5 个原子量记账 + 1 个并列轮转计数 |
@@ -80,7 +80,7 @@
 | 会话域 PING 间隔 / PONG 超时 | 30s / 2s | `config.rs::SESSION_PROBE_INTERVAL_SECS`·`SESSION_PING_TIMEOUT_SECS` |
 | 同 IP 通道上限（内容域/会话域） | 3 条 / 1 条 | `config.rs::MAX_CONNS_CONTENT`·`MAX_CONNS_SESSION` |
 | 建造在途等待 | 3s（30ms 步进） | `pool/mod.rs::get_or_build` |
-| 直连切片 准入 / 目标段 / 段数 / 在途上限 | ≥512KB / ≈192KB / 4~8 段 / 6 个 | `direct_split.rs` |
+| 直连切片 准入 / 目标段 / 段数 / 在途上限 / 救援等待 | ≥512KB / ≈192KB / 4~8 段 / 6 个 / 5s | `direct_split.rs`·`config.rs::MEDIA_RESCUE_WAIT_SECS` |
 | 单段缓冲 / 段头预算 / 探片记忆 | 2MiB / 8s / 10min | `direct_split.rs` |
 | 镜像 ECT 窗口 / 让位冷却 | 500ms / 1.5s、2.5s | `mirror.rs::ECT_WINDOW_MS`、`merge.rs::CUT_COOLDOWN` / `CUT_ANY_COOLDOWN` |
 | 镜像连接池空闲 / 回收 | 4 条 / 60s | `upstream.rs::MIRROR_POOL_MAX_IDLE` / `MIRROR_POOL_IDLE` |

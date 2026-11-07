@@ -9,6 +9,9 @@ use crate::server::protocol::{self, BoxBody};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use http_body_util::BodyExt;
+use hyper::body::{Body as _, Frame};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 fn tpl() -> Tpl {
     let mut headers = HeaderMap::new();
@@ -210,6 +213,89 @@ async fn segmented_body_stops_at_declared_total() {
         .to_bytes();
     assert_eq!(got.len(), 40);
     assert!(got.iter().all(|b| *b == 3));
+}
+
+/// 先吐 prefix 字节然后永远 Pending 的体：模拟直连段拉了一半卡死。
+struct StallBody {
+    prefix: Bytes,
+    sent: bool,
+}
+
+impl hyper::body::Body for StallBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.sent {
+            return Poll::Pending;
+        }
+        self.sent = true;
+        Poll::Ready(Some(Ok(Frame::data(self.prefix.clone()))))
+    }
+}
+
+/// 5s 界拨到 0、救援链为空（SERIAL 未装表 = 空"图片"链）：直连段当场冻结，
+/// 救援返回不可用 → 整流报错。冻结先行意味着一个字节都不许先交付——
+/// 这个不变量钉住"冻结点之后绝不数据错位"。
+#[tokio::test]
+async fn stalled_segment_freezes_before_rescue_fails() {
+    use super::{RescueCtx, MediaKind};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entries = vec![(BoxBody::new(StallBody {
+        prefix: Bytes::from_static(b"abcdef"),
+        sent: false,
+    }), 30usize, 0u64, false)];
+    let mut body = SegmentedBody::build(
+        entries,
+        30,
+        Some(RescueCtx {
+            tpl: tpl(),
+            kind: MediaKind::Image,
+            log: Arc::new(|_| {}),
+        }),
+        Instant::now(),
+        Duration::ZERO,
+    );
+    // 串行手动 poll：不许有数据帧出来，第一拍就该在冻结/救援里走到报错。
+    let mut delivered = 0usize;
+    let mut err = false;
+    for _ in 0..10 {
+        match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+            Some(Ok(frame)) => delivered += frame.into_data().unwrap().len(),
+            Some(Err(_)) => {
+                err = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    assert!(err, "救援不可用时必须以错误收场");
+    assert_eq!(delivered, 0, "冻结先行：救援判定之前一个字节都不许交付");
+}
+
+#[test]
+fn media_kind_routes_to_its_chain() {
+    use super::MediaKind;
+    assert_eq!(MediaKind::Image.chain(), crate::pool::MEDIA_IMAGE_CHAIN);
+    assert_eq!(MediaKind::Video.chain(), crate::pool::MEDIA_VIDEO_CHAIN);
+    assert_eq!(
+        MediaKind::of_content_type(Some("video/mp4")),
+        Some(MediaKind::Video)
+    );
+    assert_eq!(
+        MediaKind::of_content_type(Some("image/png")),
+        Some(MediaKind::Image)
+    );
+    assert_eq!(MediaKind::of_content_type(Some("text/html")), None);
+    assert_eq!(MediaKind::of_content_type(None), None);
 }
 
 #[tokio::test]

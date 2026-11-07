@@ -38,6 +38,17 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
+/// 媒体救援链（直连切片 5s 未完成的段换镜像续传）：保留键，纯手改 routes.json——
+/// 注册表对齐不参与，落盘必须回写。图片段走"图片"链、视频段走"视频"链。
+pub const MEDIA_IMAGE_CHAIN: &str = "图片";
+pub const MEDIA_VIDEO_CHAIN: &str = "视频";
+pub const MEDIA_CHAINS: &[&str] = &[MEDIA_IMAGE_CHAIN, MEDIA_VIDEO_CHAIN];
+
+/// routes.json 镜像链键的白名单口径：内容域 host + 媒体救援保留键。
+fn is_chain_key(key: &str) -> bool {
+    CONTENT_HOSTS.contains(&key) || MEDIA_CHAINS.contains(&key)
+}
+
 /// 种子只剩两个用途：全新安装引导、给已有表补节点/边（不新建 hosts 行）。
 fn seed_db() -> TopoDoc {
     let Some((doc, _)) = parse_routes_tolerant(SEEDS_JSON, None) else {
@@ -605,6 +616,12 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             small_rows.push(row);
         }
     }
+    // 媒体救援链是保留键：原样回写进 mirrors_small，手改的内容不因落盘丢失。
+    for h in MEDIA_CHAINS {
+        let Some(c) = mirrors.get(*h) else { continue };
+        let items: Vec<String> = c.iter().map(json_of).collect();
+        small_rows.push(format!("    {}: [{}]", json_of(h), items.join(", ")));
+    }
     if !big_rows.is_empty() {
         parts.push(format!(
             "  \"mirrors_big\": {{\n{}\n  }}",
@@ -766,7 +783,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     for (host, chain) in doc.chains {
-        if !CONTENT_HOSTS.contains(&host.as_str()) {
+        if !is_chain_key(&host) {
             if let Some(l) = log.as_ref() {
                 l(&format!(
                     "[串发] routes.json 镜像链 {host} 不在支持列表, 已丢弃(其余链保留)"
@@ -1503,6 +1520,10 @@ pub fn align_custom_mirrors(
 ) -> bool {
     let mut changed = false;
     for (h, chain) in mirrors.iter_mut() {
+        // 媒体救援链是保留键：注册表对齐不碰它们，工作台增删镜像不影响手改的链。
+        if MEDIA_CHAINS.contains(&h.as_str()) {
+            continue;
+        }
         let (en, dis) = if route::is_big_file_host(h) {
             (enabled, disabled)
         } else {

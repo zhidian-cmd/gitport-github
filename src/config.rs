@@ -49,6 +49,9 @@ pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
 pub const MAX_CONNS_CONTENT: usize = 3;
 /// 会话域同 IP 通道上限：恒 1 条（风控面不漂移，全忙骑现有连接排队）。
 pub const MAX_CONNS_SESSION: usize = 1;
+/// 直连切片的等待上限：开流后 5s 还没拉完的段，剩余 Range 由镜像链续传
+/// （成功的段一字节不重拉；段失败则立即换镜像不等 5s）。
+pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 
