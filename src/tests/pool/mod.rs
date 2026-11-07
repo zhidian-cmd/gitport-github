@@ -1102,19 +1102,31 @@ fn media_rescue_chains_roundtrip_and_align_skip() {
         Some(1)
     );
 
-    // 注册表对齐绕开保留键：工作台增删镜像不动手改的图片/视频链。
-    let before = mirrors.get(crate::pool::MEDIA_IMAGE_CHAIN).cloned().unwrap();
+    // 注册表对齐与小文件链同一套：工作台启用的镜像自动进图片/视频链（按小文件档）。
     align_custom_mirrors(
         &mut mirrors,
         &["https://new.example.com".to_string()],
-        &[],
+        &["https://a.example.com".to_string()],
         &["https://new.example.com".to_string()],
-        &[],
+        &["https://a.example.com".to_string()],
     );
-    assert_eq!(
-        mirrors.get(crate::pool::MEDIA_IMAGE_CHAIN),
-        Some(&before),
-        "注册表对齐不许碰媒体救援链"
+    for key in [crate::pool::MEDIA_IMAGE_CHAIN, crate::pool::MEDIA_VIDEO_CHAIN] {
+        assert!(
+            mirrors[key].iter().any(|m| m == "https://new.example.com"),
+            "{key} 链应自动获得工作台启用的镜像"
+        );
+    }
+    assert!(
+        mirrors[crate::pool::MEDIA_IMAGE_CHAIN]
+            .iter()
+            .any(|m| m == "https://img.example.com"),
+        "手改成员不在注册表移除清单里：位置与成员原样保留"
+    );
+    assert!(
+        !mirrors["raw.githubusercontent.com"]
+            .iter()
+            .any(|m| m == "https://a.example.com"),
+        "注册表移除的镜像从普通链摘除（对照组）"
     );
     // 小文件链照常对齐（对照组证明对齐逻辑本身还在跑）。
     assert!(

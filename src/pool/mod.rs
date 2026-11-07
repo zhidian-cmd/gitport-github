@@ -38,8 +38,9 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 媒体救援链（直连切片 5s 未完成的段换镜像续传）：保留键，纯手改 routes.json——
-/// 注册表对齐不参与，落盘必须回写。图片段走"图片"链、视频段走"视频"链。
+/// 媒体救援链（直连切片 5s 未完成的段换镜像续传）：保留键——不是 host，加载/落盘
+/// 需要专门伺候，但对齐与小文件链同一套：工作台"我的镜像"启用的镜像自动进这两条链，
+/// 手改成员位置照旧不动。图片段走"图片"链、视频段走"视频"链。
 pub const MEDIA_IMAGE_CHAIN: &str = "图片";
 pub const MEDIA_VIDEO_CHAIN: &str = "视频";
 pub const MEDIA_CHAINS: &[&str] = &[MEDIA_IMAGE_CHAIN, MEDIA_VIDEO_CHAIN];
@@ -1520,10 +1521,7 @@ pub fn align_custom_mirrors(
 ) -> bool {
     let mut changed = false;
     for (h, chain) in mirrors.iter_mut() {
-        // 媒体救援链是保留键：注册表对齐不碰它们，工作台增删镜像不影响手改的链。
-        if MEDIA_CHAINS.contains(&h.as_str()) {
-            continue;
-        }
+        // 媒体救援链按小文件档参与对齐（is_big_file_host 对保留键恒 false → 走 small 档）。
         let (en, dis) = if route::is_big_file_host(h) {
             (enabled, disabled)
         } else {
@@ -1573,9 +1571,9 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
         Some(t) => t,
         None => return,
     };
-    // 链全空时先按 CONTENT_HOSTS 建键，否则镜像永远落不进链。
+    // 链全空时先建键，否则镜像永远落不进链——内容域 host 与媒体救援保留键一视同仁。
     if !all.is_empty() {
-        for h in CONTENT_HOSTS {
+        for h in CONTENT_HOSTS.iter().copied().chain(MEDIA_CHAINS.iter().copied()) {
             tab.mirrors.entry(h.to_string()).or_default();
         }
     }
