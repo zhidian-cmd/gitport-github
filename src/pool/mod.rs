@@ -1066,6 +1066,12 @@ pub fn note_dead(ip: &str) {
     }
 }
 
+/// 节点级死亡退避（键 = `ip|sni`）：TLS 握手超时。ClientHello 的 SNI 由节点配置决定，
+/// 与触发请求的 host 无关——同节点（同 IP 同 SNI）对所有 host 一并跳过，不冤枉任何 host。
+pub fn note_dead_node(ip: &str, sni: &str) {
+    note_dead(&format!("{ip}|{sni}"));
+}
+
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
 /// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
@@ -1127,10 +1133,14 @@ pub async fn serial_dial_skip(
     let mut slow_n = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
+        // 死亡退避双键：TCP/h2 失败记 IP 粒度（TCP 在 SNI 之前、h2 在 TLS 之后，与 SNI 无关）；
+        // TLS 握手超时记节点粒度 ip|sni（ClientHello 由节点配置决定，与触发请求的 host 无关）。
+        let node_dead_key = format!("{}|{}", p.ip, p.sni);
         {
-            let g = lock(&SERIAL);
-            if let Some((until, _)) = g.as_ref().unwrap().dead.get(&p.ip) {
-                if Instant::now() < *until {
+            let mut g = lock(&SERIAL);
+            if let Some(t) = g.as_mut() {
+                let cooling = |k: &str| t.dead.get(k).is_some_and(|(until, _)| Instant::now() < *until);
+                if cooling(&p.ip) || cooling(&node_dead_key) {
                     dead_skipped += 1;
                     continue;
                 }
@@ -1176,7 +1186,8 @@ pub async fn serial_dial_skip(
                 // TCP 失败 = IP 对谁都死，进死亡退避；TLS 失败是按域干扰，只前移。
                 let msg = e.to_string();
                 // 证书校验失败 = 锚点没印在这张证书上，不是 IP 坏：留一行能照做的提示。
-                if msg.contains("TLS") && cert_miss(&msg) {
+                let cert_bad = msg.contains("TLS") && cert_miss(&msg);
+                if cert_bad {
                     log_cert_miss(&p.ip, &p.sni, &p.verify, host, log);
                 }
                 let tcp_level = msg.starts_with("TCP")
@@ -1189,11 +1200,16 @@ pub async fn serial_dial_skip(
                 if tcp_level {
                     note_dead(&p.ip);
                 }
-                // 慢失败烧预算；快速失败不烧——连续拒连也拦不住把圈走完。
-                if e.kind() == std::io::ErrorKind::TimedOut
+                // TLS 握手超时（TCP 过了、对端对 ClientHello 装死）= 节点级死亡退避：
+                // ClientHello 的 SNI 由节点配置决定，与触发请求的 host 无关，全局共享不冤枉。
+                let timed_out = e.kind() == std::io::ErrorKind::TimedOut
                     || msg.contains("超时")
-                    || msg.to_lowercase().contains("timed out")
-                {
+                    || msg.to_lowercase().contains("timed out");
+                if tls_handshake && !tcp_level && !cert_bad && timed_out {
+                    note_dead_node(&p.ip, &p.sni);
+                }
+                // 慢失败烧预算；快速失败不烧——连续拒连也拦不住把圈走完。
+                if timed_out {
                     budget_used += dt;
                     slow_n += 1;
                     if budget_used >= budget_cap {
