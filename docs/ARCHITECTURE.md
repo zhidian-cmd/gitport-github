@@ -216,3 +216,30 @@ GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能�
 | GET / HEAD / 小体 | 缓冲路径（可重放重试） |
 
 关键语义：响应头一到立即交付客户端（上游拒了也要让客户端拿到真实响应）；客户端断开时泵弃流不补 EOS（git pack 尾带校验和，截断包必须被服务端拒）；单次尝试不重发；流式响应头预算 1800 秒。
+
+## MITM 与纯隧道：能力边界
+
+`handle_connect`（`server/mod.rs:126`）只有两条路，且 **MITM 优先**：
+
+```rust
+if port == 443 && mitm_scope(...) {
+    handle_connect_mitm(...).await;
+    return;                      // 命中即结束，隧道分支不执行
+}
+connect_upstream(...);           // 纯隧道
+```
+
+所以「clone 走隧道」只在 MITM 关闭、未装 CA、或域名不在路由表时成立。**MITM 开着时，clone 与网页走同一条 MITM 路径**——此时 `stream_decision` 能识别 `git-upload-pack` / `git-receive-pack`，走流式直通。
+
+| 能力 | MITM | 纯隧道 |
+|---|---|---|
+| 看到 method/path（`stream_decision` 识别 git 智能协议） | ✅ | ❌ |
+| 流式直通（1800s 预算） | ✅ | 字节直转，无预算概念 |
+| SNI 伪装（代理自己发 ClientHello，用节点配置的假 SNI） | ✅ | ❌ ClientHello 由客户端发出，SNI 即真实域名 |
+| 首包分片（`hello_split_ranges`，全仓仅 `server/mod.rs:459` 一处调用） | ❌ | ✅ |
+| 镜像链 / 页面缓存 / 直连切片 | ✅ | ❌ |
+| 客户端需信任本地 CA | 需要 | 不需要 |
+
+**SNI 伪装与首包分片互斥，不是互补**：ClientHello 只能由一方发出，代理发了就没有可拆的包，客户端发了代理就改不了里面的 SNI。伪装是强解（内容层面就是假域名，DPI 做流重组也还原不出真名），分片是弱解（流重组即可还原）。因此 MITM 路径不做分片，也不需要做。
+
+MITM 的解密开销可忽略：BoringSSL 的 AES-GCM 走 AES-NI，单核 GB/s 级，而跨境链路只有 10~100 Mbps，差三个数量级。真正的成本是**客户端要信任本地 CA**（如 `git config --global http.sslCAInfo <ca.crt>`），不是 CPU。
