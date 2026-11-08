@@ -395,13 +395,19 @@ where
                     if overflow && inflight == 0 {
                         break 'keep "溢出通道用毕回收";
                     }
-                    // 内容域/其他闲置超限放手：在途流不为零不算闲置（长下载的
-                    // last_used 停在开流时刻）。会话域不限，长期资产。
+                    // 内容域/其他闲置超限主动放手：在途流不为零不算闲置（长下载的
+                    // last_used 停在开流时刻）。会话域不主动断——保住同 IP 的会话连续性，
+                    // 但闲置超限后也不再保活（见下面的探活跳过）。
                     if !session && inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
                         break 'keep "闲置超限放手";
                     }
                     // 刚用过的通道不必探；探的是闲置期黑洞。
                     if idle < probe_every {
+                        continue;
+                    }
+                    // 闲置超限不再保活：会话域长期空闲连接到此为止，不再发 PING，
+                    // 让它按对端空闲回收窗（50~65s）自然过期，由 ConnEnd 分支出池。
+                    if idle >= crate::config::CONN_IDLE_RETIRE_SECS {
                         continue;
                     }
                     let alive = if session {
