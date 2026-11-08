@@ -15,8 +15,8 @@ fn rotated() -> &'static Mutex<HashMap<String, String>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 单 host 的复用窗口：(次数, 累计毫秒, 窗口起点)。
-type ReuseStat = (u64, u64, Instant);
+/// 单 host 的复用窗口：(次数, 累计毫秒, 窗口起点, 最近一次 IP)。
+type ReuseStat = (u64, u64, Instant, String);
 
 fn reuse() -> &'static Mutex<HashMap<String, ReuseStat>> {
     static R: OnceLock<Mutex<HashMap<String, ReuseStat>>> = OnceLock::new();
@@ -47,21 +47,25 @@ pub(super) fn mirror_rotated(chain_host: &str, mirror: &str) -> bool {
     }
 }
 
-/// 复用连接记账：每个 host 满一分钟落一行汇总，免得每请求一条。
-pub(super) fn note_reuse(log: &LogFn, host: &str, ms: u64) {
+/// 复用连接记账：每个 host 满一分钟落一行汇总（含最近一次复用到的 IP），免得每请求一条。
+pub(super) fn note_reuse(log: &LogFn, host: &str, ip: &str, ms: u64) {
     let mut g = reuse().lock().unwrap();
     if g.len() >= 128 {
         g.clear();
     }
-    let e = g.entry(host.to_string()).or_insert((0, 0, Instant::now()));
+    let e = g
+        .entry(host.to_string())
+        .or_insert((0, 0, Instant::now(), String::new()));
     e.0 += 1;
     e.1 += ms;
+    e.3 = ip.to_string();
     if e.2.elapsed() >= Duration::from_secs(60) {
+        let last = e.3.clone();
         (log)(&format!(
-            "[上游] {host} 复用连接 {} 次, 均 {}ms",
+            "[上游] {host} 复用连接 {} 次, 均 {}ms, 最近 {last}",
             e.0,
             e.1 / e.0
         ));
-        *e = (0, 0, Instant::now());
+        *e = (0, 0, Instant::now(), last);
     }
 }

@@ -26,14 +26,13 @@ pub fn set_webui_port(p: u16) {
 }
 
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
-/// 单阶段拨号上限（TCP 连接与 TLS 握手各自独立计时，各 2s）：黑洞型死 IP 不许拖住整轮串发。
-/// 健康全流程实测 ~334ms，2s 是 5-10 倍余量；须 > DIAL_SLOW_MS(1500) 保住"慢成功"检测窗。
-pub const CONNECT_TIMEOUT_SECS: u64 = 2;
+/// 拨号单阶段上限，TCP 与 TLS 各自独立计时：TCP 1.15s、TLS 1.35s。
+/// 健康全流程实测 ~334ms，两项合计 2.5s 是 7 倍余量；合计仍 > DIAL_SLOW_MS(1500)，慢成功检测窗不变。
+/// 不设整轮总预算：候选逐个试完为止，慢总比失败好。
+pub const TCP_CONNECT_TIMEOUT_MS: u64 = 1150;
+pub const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 1350;
 /// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
-
-/// 串发每请求总耗时预算，到期即停并按 host 冷却 30s。2s/IP 上限下 ≈ 走完 6 个候选就交镜像链。
-pub const SERIAL_DIAL_BUDGET_SECS: u64 = 12;
 
 /// 内容域/其他探活间隔：闲置超此秒数发 1 字节 Range 请求验活（PING 探不了黑洞）。
 /// 须卡在边缘 50~65s 空闲回收窗内，保活才有效。

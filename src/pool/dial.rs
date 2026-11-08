@@ -1,6 +1,6 @@
 //! 握手执行器：SNI 与校验名解耦（SNI 骗墙，证书按组锚点校验）；BoringSSL 造 Chrome 指纹。
 
-use crate::config::CONNECT_TIMEOUT_SECS;
+use crate::config::{TCP_CONNECT_TIMEOUT_MS, TLS_HANDSHAKE_TIMEOUT_MS};
 use boring::ssl::{NameType, Ssl, SslContextBuilder, SslMethod, SslSession, SslVerifyMode};
 use boring::x509::verify::X509CheckFlags;
 use boring::x509::X509;
@@ -207,7 +207,7 @@ fn client_ssl(verify: &str, sni: &str, ca_pem: Option<&str>) -> std::io::Result<
 /// 限时 TLS 握手共用尾：label 进错误文案（镜像腿与池腿归因可分）。
 async fn tls_handshake(ssl: Ssl, tcp: TcpStream, label: &str) -> std::io::Result<BoringTls> {
     tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        Duration::from_millis(TLS_HANDSHAKE_TIMEOUT_MS),
         tokio_boring::SslStreamBuilder::new(ssl, tcp).connect(),
     )
     .await
@@ -274,7 +274,7 @@ pub async fn dial_one(
     let _permit = gate_acquire().await;
     let addr = format!("{ip}:{}", dial_port());
     let tcp = tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        Duration::from_millis(TCP_CONNECT_TIMEOUT_MS),
         TcpStream::connect(&addr),
     )
     .await
@@ -293,7 +293,7 @@ pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     let mut ssl = client_ssl(host, host, None)?;
     apply_cached_session(&mut ssl, host);
     let tcp = tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        Duration::from_millis(TCP_CONNECT_TIMEOUT_MS),
         TcpStream::connect((host, 443)),
     )
     .await

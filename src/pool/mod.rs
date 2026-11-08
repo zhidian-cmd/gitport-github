@@ -1124,6 +1124,37 @@ pub fn note_dead_node(ip: &str, sni: &str) {
     note_dead(&format!("{ip}|{sni}"));
 }
 
+/// 串发尝试日志的限速器：每 host 每 60 秒最多 12 行——留证又不刷屏。
+/// 旧行为是这个过程一行都不打，事后完全无法归因。
+fn serial_try_allowed(host: &str) -> bool {
+    static Q: Mutex<Option<HashMap<String, (u32, Instant)>>> = Mutex::new(None);
+    let mut g = lock(&Q);
+    let map = g.get_or_insert_with(HashMap::new);
+    if map.len() >= 256 {
+        map.clear();
+    }
+    let now = Instant::now();
+    let e = map.entry(host.to_string()).or_insert((0, now));
+    if e.1.elapsed() >= Duration::from_secs(60) {
+        *e = (0, now);
+    }
+    if e.0 >= 12 {
+        return false;
+    }
+    e.0 += 1;
+    true
+}
+
+/// 错误文案截断：串发日志一行一个，长错误会把整行撑爆。
+fn brief_err(msg: &str) -> String {
+    let s = msg.trim();
+    if s.chars().count() <= 60 {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(60).collect::<String>())
+    }
+}
+
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
 /// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
@@ -1178,11 +1209,6 @@ pub async fn serial_dial_skip(
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
     let mut crew_skipped = 0usize;
-    // 预算只由"慢失败"（超时/黑洞，真在等）消耗；拒连/RST 毫秒级，不占——保证快速候选永远试得完。
-    let budget_cap = Duration::from_secs(crate::config::SERIAL_DIAL_BUDGET_SECS);
-    let mut budget_used = Duration::ZERO;
-    let mut budget_hit = false;
-    let mut slow_n = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
         // 死亡退避双键：TCP/h2 失败记 IP 粒度（TCP 在 SNI 之前、h2 在 TLS 之后，与 SNI 无关）；
@@ -1209,6 +1235,22 @@ pub async fn serial_dial_skip(
         let t0 = Instant::now();
         let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
         let dt = t0.elapsed();
+        // 每次尝试都留一行（限速）：换 IP 的全过程以前完全无日志，出问题查不到。
+        if let Some(log) = log {
+            if serial_try_allowed(host) {
+                let verdict = match &result {
+                    Ok(_) => "成功".to_string(),
+                    Err(e) => format!("失败({})", brief_err(&e.to_string())),
+                };
+                log(&format!(
+                    "[串发] {host} 试 {}({}) {verdict} {}ms [{tried}/{}]",
+                    p.ip,
+                    p.sni,
+                    dt.as_millis(),
+                    order.len()
+                ));
+            }
+        }
         match result {
             Ok(conn) => {
                 // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
@@ -1260,36 +1302,11 @@ pub async fn serial_dial_skip(
                 if tls_handshake && !tcp_level && !cert_bad && timed_out {
                     note_dead_node(&p.ip, &p.sni);
                 }
-                // 慢失败烧预算；快速失败不烧——连续拒连也拦不住把圈走完。
-                if timed_out {
-                    budget_used += dt;
-                    slow_n += 1;
-                    if budget_used >= budget_cap {
-                        budget_hit = true;
-                        break;
-                    }
-                }
                 continue;
             }
         }
     }
 
-    if budget_hit {
-        // 慢失败预算烧满 = 同等退避，防重试每次再烧一遍；有镜像兜底的 host 豁免。
-        if mirror_chain(host).is_empty() {
-            SERIAL_COOL.set(host);
-        }
-        if let Some(log) = log {
-            log(&format!(
-                "[串发] {host} [{key}] 慢失败预算({}s)耗尽(试 {tried} 个, 其中慢 {slow_n} 个), 冷却退避, 剩余候选稍后复测",
-                crate::config::SERIAL_DIAL_BUDGET_SECS
-            ));
-        }
-        return Err(format!(
-            "串发慢失败预算耗尽({}s)",
-            crate::config::SERIAL_DIAL_BUDGET_SECS
-        ));
-    }
     if tried == 0 {
         return Err(format!(
             "[{key}] {host} 无可拨候选: 共 {total_candidates} 个, {occupied_n} 个已有通道被跳过, \

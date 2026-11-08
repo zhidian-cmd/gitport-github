@@ -515,17 +515,56 @@ fn reuse_failure_text(why: &str, budget: Duration) -> String {
 }
 
 /// 复用失败出声一次就够：一次页面加载会连着撞几条同 host 的连接，别拿同样的行刷屏。
+/// 复用失败记账：首条立刻留痕，之后每 60 秒汇总一行（次数 + 超时/断开分项 + 最近 IP）。
+/// 旧行为是每 host 每种失败只打第一条——反复发生的证据反而被抹掉了，排查时看不到。
 fn note_reuse_failure(log: &LogFn, host: &str, ip: &str, why: &str, budget: Duration) {
-    let tag = if why == ERR_BUDGET_TIMEOUT {
-        "reuse-timeout"
-    } else {
-        "reuse-broken"
-    };
-    if quiet::first_time(tag, host) {
+    struct Acc {
+        n: u32,
+        timeouts: u32,
+        last_ip: String,
+        last_text: String,
+        since: std::time::Instant,
+    }
+    static ACC: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Acc>>> =
+        std::sync::OnceLock::new();
+
+    let timeout = why == ERR_BUDGET_TIMEOUT;
+    let text = reuse_failure_text(why, budget);
+    let mut g = ACC
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if g.len() >= 128 {
+        g.clear();
+    }
+    let e = g.entry(host.to_string()).or_insert_with(|| Acc {
+        n: 0,
+        timeouts: 0,
+        last_ip: String::new(),
+        last_text: String::new(),
+        since: std::time::Instant::now(),
+    });
+    e.n += 1;
+    if timeout {
+        e.timeouts += 1;
+    }
+    e.last_ip = ip.to_string();
+    e.last_text = text.clone();
+
+    if e.n == 1 {
+        // 窗口内首条：立刻留痕，单次失败也查得到。
+        (log)(&format!("[MITM] {host} 复用失败({text}), IP {ip}, 重新建连"));
+        return;
+    }
+    if e.since.elapsed() >= Duration::from_secs(60) {
+        let (n, t, last_ip, last_text) = (e.n, e.timeouts, e.last_ip.clone(), e.last_text.clone());
         (log)(&format!(
-            "[MITM] {host} {}({ip}), 重新建连",
-            reuse_failure_text(why, budget)
+            "[MITM] {host} 60s 内复用失败 {n} 次(超时 {t} / 断开 {}), 最近: {last_text}, IP {last_ip}",
+            n - t
         ));
+        e.n = 0;
+        e.timeouts = 0;
+        e.since = std::time::Instant::now();
     }
 }
 
@@ -644,7 +683,7 @@ pub(super) async fn get_direct(
                 if fresh {
                     (log)(&format!("[上游] {host}{path} 新连接 {ip}, {ms}ms"));
                 } else {
-                    quiet::note_reuse(log, host, ms);
+                    quiet::note_reuse(log, host, &ip, ms);
                 }
                 return Ok(resp);
             }
