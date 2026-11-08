@@ -15,4 +15,5 @@ pub fn full_body(b: Bytes) -> BoxBody {
     BoxBody::new(http_body_util::Full::new(b).map_err(std::io::Error::other))
 }
 
-pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// 其他域（文档站/静态 CDN/杂项子域）响应头预算：静态内容 2s 无头基本可判该 IP 有问题。
+pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);

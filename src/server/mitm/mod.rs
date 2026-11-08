@@ -26,7 +26,8 @@ pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
 
-const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 内容域 .133 直连腿响应头预算
+const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(2); // 内容域（CDN 静态）响应头预算
+const SESSION_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 会话域（动态页面/API）响应头预算
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
         return false;
@@ -489,12 +490,13 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// 内容域 4s（vs 8s）：黑洞必烧满预算，罩更久纯浪费。
-fn request_budget(is_content: bool) -> Duration {
-    if is_content {
-        CONTENT_REQUEST_BUDGET
-    } else {
-        REQUEST_BUDGET
+/// 响应头预算按 host 三类分开：黑洞必烧满预算，罩更久纯浪费。
+/// CDN 静态资源 2s 足够；会话域（动态页面/API）留 4s——GitHub 现场拼页面偶有 2~3s。
+fn request_budget(host: &str) -> Duration {
+    match upstream::host_class(host) {
+        upstream::HostClass::Content => CONTENT_REQUEST_BUDGET,
+        upstream::HostClass::Session => SESSION_REQUEST_BUDGET,
+        upstream::HostClass::Other => REQUEST_BUDGET,
     }
 }
 
@@ -647,8 +649,7 @@ pub(super) async fn get_direct(
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
-    let is_content = pool::route::is_content(host);
-    let budget = request_budget(is_content);
+    let budget = request_budget(host);
     let (mut up, mut fresh) = pool::get_or_build(host, want_slot, log).await?;
     let mut retried = false;
     loop {
@@ -792,8 +793,8 @@ async fn dns_direct_fetch(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",
         addrs.len()
     ));
-    // 与 get_direct 口径一致：白名单域名不算内容域；预算与候选地址无关，循环外算一次。
-    let budget_content = pool::route::is_content(host);
+    // 与 get_direct 口径一致：预算按 host 三类算，与候选地址无关，循环外算一次。
+    let budget = request_budget(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
         // 这个 IP 已经有通道就直接用：兜底路径也绝不为了再发一次请求而并存两条。
@@ -817,7 +818,7 @@ async fn dns_direct_fetch(
             // 拨完立刻入库：晚一秒都可能让别的 host 对同一 IP 又拨一条。
             upstream::store_h2(&ip, up)
         };
-        match stream_on(&up, out, body, request_budget(budget_content)).await {
+        match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
                 let id = up.id;
                 *info.lock().unwrap() = ip.clone();
