@@ -1,6 +1,6 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
 //! 通道的记账、挑选、探活、开流全在本文件；取用统一入口是 `pool::get_or_build`
-//! （骑池 → 建造 → 溢出，一层管完），请求路径不再各管一段。
+//! （取 → 溢出 → 建，一层管完），请求路径不再各管一段。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
 use crate::util::{lock, now_ms, LogFn};
@@ -572,7 +572,7 @@ pub(crate) async fn h2_dial_slot(
 fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> String {
     match class {
         HostClass::Session => "会话域固定同一 IP, 不开第二条(防风控)".to_string(),
-        HostClass::Other => "大文件/文档站: 单通道, 复用优先".to_string(),
+        HostClass::Other => "大文件/文档站: 单通道".to_string(),
         HostClass::Content => format!("可用候选仅 {free} 家, 不够开第二条"),
     }
 }
@@ -595,7 +595,7 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
 }
 
 /// 双腿建连：主副各拨各的新连接，crew 互斥保证同一个 IP 只由一条腿试。
-/// 只拨新不骑池——骑池归 get_or_build。
+/// 只建新的、不查池——查池归 get_or_build。
 async fn dial_h2_race(
     host: &str,
     log: &LogFn,

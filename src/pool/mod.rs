@@ -1351,8 +1351,8 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// 通道获取统一入口：骑池 → 建造 → 溢出，请求路径只调这一个。
-/// 返回 (通道, 是否本轮新拨)：新拨的失败要罚边冷却，骑来的只摘不罚（见 report_failure）。
+/// 通道获取统一入口：从池取一条可用通道（选 → 溢出 → 建），请求路径只调这一个。
+/// 来源对调用方不可见；返回的 fresh 只用于失败归因——本轮新拨的罚边冷却，沿用的只摘不罚（见 report_failure）。
 pub async fn get_or_build(
     host: &str,
     want_slot: Option<u8>,
@@ -1368,7 +1368,7 @@ pub async fn get_or_build(
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let session = chan::host_class(host) == chan::HostClass::Session;
 
-    // 1) 骑池：会话域只认自己建的通道；内容域/其他谁闲用谁。
+    // 1) 选：会话域只认自己建的通道；内容域/其他谁闲用谁。
     if let Some(up) = pick_channel(host, &ips, want_slot, session) {
         let saturated =
             up.inflight.load(std::sync::atomic::Ordering::Relaxed) >= up.max_streams.max(1);
