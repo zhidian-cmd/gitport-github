@@ -34,7 +34,7 @@ fn bench_until_reaches_target() {
     // 同一条后来跑出 150KB/s：EWMA 平滑，9→65.4 一次就过 60 的够用线
     record("1.1.1.1", 307_200, 2_000);
     release("1.1.1.1");
-    assert!(!is_benched("1.1.1.1"), "单次好样本足以越过 60KB/s 够用线");
+    assert!(!is_benched("1.1.1.1"), "单次好样本足以越过 50KB/s 够用线");
     assert_eq!(usable(&ips), ips);
 }
 

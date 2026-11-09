@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 /// 样本下限：小于这个字节数的响应不参与判定（小文件测不准，别让它们投票）。
 pub const MIN_SAMPLE_BYTES: u64 = 64 * 1024;
 /// 够用线：达到就认定够快，不再为它折腾。
-pub const TARGET_KBPS: f64 = 60.0;
+pub const TARGET_KBPS: f64 = 50.0;
 /// 暂缓时长：不够够用线的通道先放着不发，下一轮触发时复测，不重拨。
 const BENCH_SECS: u64 = 60;
 /// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报慢也只触发一轮。
