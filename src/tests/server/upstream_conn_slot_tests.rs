@@ -114,6 +114,7 @@ async fn race_ranks_by_measured_throughput_then_dial() {
             ip: "d".into(),
             dial_ms: 50,
             kbps: None,
+            fail: Some(ProbeFail::HeadTimeout),
             up: mk_up("9.9.9.34", 1).await,
         },
         // 吞吐第二
@@ -121,6 +122,7 @@ async fn race_ranks_by_measured_throughput_then_dial() {
             ip: "b".into(),
             dial_ms: 900,
             kbps: Some(105),
+            fail: None,
             up: mk_up("9.9.9.32", 1).await,
         },
         // 吞吐第一
@@ -128,6 +130,7 @@ async fn race_ranks_by_measured_throughput_then_dial() {
             ip: "c".into(),
             dial_ms: 500,
             kbps: Some(321),
+            fail: None,
             up: mk_up("9.9.9.33", 1).await,
         },
         // 探针失败，拨号慢
@@ -135,6 +138,7 @@ async fn race_ranks_by_measured_throughput_then_dial() {
             ip: "a".into(),
             dial_ms: 100,
             kbps: None,
+            fail: Some(ProbeFail::HeadTimeout),
             up: mk_up("9.9.9.31", 1).await,
         },
     ];
