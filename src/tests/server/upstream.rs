@@ -118,6 +118,20 @@ fn forced_gzip_gated_on_client_accept() {
     );
 }
 
+/// 纯 CDN 域剥凭据：githubassets/github.io 全剥；githubusercontent 家族不剥
+/// ——私有仓库的 raw/头像/codeload 压缩包靠 Cookie 鉴权，剥了掐死私有内容。
+#[test]
+fn credentials_stripped_only_on_pure_cdn_hosts() {
+    assert!(strip_credentials("github.githubassets.com"));
+    assert!(strip_credentials("githubassets.com"));
+    assert!(strip_credentials("foo.github.io"));
+    assert!(strip_credentials("github.io"));
+    assert!(!strip_credentials("raw.githubusercontent.com"), "私有 raw 靠 Cookie");
+    assert!(!strip_credentials("avatars.githubusercontent.com"));
+    assert!(!strip_credentials("codeload.github.com"), "私有压缩包靠 Cookie");
+    assert!(!strip_credentials("github.com"), "会话域更不能剥");
+}
+
 /// 单通道日志必须说清是「会话域规则」还是「候选真的不够」，别再混成一行。
 #[test]
 fn single_channel_reason_separates_rule_from_shortage() {

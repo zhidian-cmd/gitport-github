@@ -412,7 +412,7 @@ async fn stream_passthrough(
             }
         }
         // 流式请求不许捡现成连接：body 没有副本，发出去就收不回。
-        match upstream::dial_upstream(host, log).await {
+        match upstream::dial_upstream(host, &path, log).await {
             Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
@@ -437,7 +437,6 @@ async fn stream_passthrough(
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
             pool::cursor_note(host, &up.ip, true, up.slot);
-            upstream::note_latency(&up.ip, up.id, t0.elapsed().as_millis() as u64);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
@@ -650,7 +649,7 @@ pub(super) async fn get_direct(
     let path = path_of(out.uri());
     let want_slot = if is_search_path(&path) { Some(1) } else { None };
     let budget = request_budget(host);
-    let (mut up, mut fresh) = pool::get_or_build(host, want_slot, log).await?;
+    let (mut up, mut fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
     let mut retried = false;
     loop {
         match stream_on(&up, out, body, budget).await {
@@ -672,13 +671,12 @@ pub(super) async fn get_direct(
                         return Err("421 边缘连续拒绝".to_string());
                     }
                     retried = true;
-                    (up, fresh) = pool::get_or_build(host, want_slot, log).await?;
+                    (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
                     continue;
                 }
                 *info.lock().unwrap() = ip.clone();
                 // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
                 pool::cursor_note(host, &ip, true, slot);
-                upstream::note_latency(&ip, id, ms);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
                 if fresh {
@@ -686,7 +684,7 @@ pub(super) async fn get_direct(
                 } else {
                     quiet::note_reuse(log, host, &ip, ms);
                 }
-                return Ok(resp);
+                return Ok(meter_body(log, host, &path, &ip, resp));
             }
             Err(e) => {
                 // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
@@ -703,10 +701,64 @@ pub(super) async fn get_direct(
                     return Err(e);
                 }
                 retried = true;
-                (up, fresh) = pool::get_or_build(host, want_slot, log).await?;
+                (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
             }
         }
     }
+}
+
+/// 响应体计量：流结束时按「实收字节 ÷ 响应头到末字节耗时」给 IP 记账。
+/// 低于够用线 → 交池子暂缓并通知建连机器人补齐其余 IP；达标 → 立刻解暂缓。
+/// 样本不足 64KB 不计（小文件测不准）。
+fn meter_body(
+    log: &LogFn,
+    host: &str,
+    path: &str,
+    ip: &str,
+    resp: hyper::Response<BoxBody>,
+) -> hyper::Response<BoxBody> {
+    struct Watch {
+        log: LogFn,
+        host: String,
+        path: String,
+        ip: String,
+        started: std::time::Instant,
+        bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let ms = self.started.elapsed().as_millis() as u64;
+            let Some(s) = pool::speed::record(&self.ip, bytes, ms) else {
+                return;
+            };
+            if s.kbps >= pool::speed::TARGET_KBPS {
+                pool::speed::release(&self.ip);
+            } else {
+                pool::on_channel_slow(&self.host, &self.ip, &self.path, &self.log);
+            }
+        }
+    }
+    let (parts, body) = resp.into_parts();
+    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = bytes.clone();
+    let watch = Watch {
+        log: log.clone(),
+        host: host.to_string(),
+        path: path.to_string(),
+        ip: ip.to_string(),
+        started: std::time::Instant::now(),
+        bytes,
+    };
+    // 闭包持有 watch：body 活多久它活多久——读完、客户端断开、连接出错都只结算一次。
+    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+        if let Some(d) = frame.data_ref() {
+            counter.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = &watch;
+        frame
+    });
+    hyper::Response::from_parts(parts, BoxBody::new(body))
 }
 
 fn write_upstream(
@@ -820,9 +872,7 @@ async fn dns_direct_fetch(
         };
         match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
-                let id = up.id;
                 *info.lock().unwrap() = ip.clone();
-                upstream::note_latency(&ip, id, ms);
                 (log)(&format!(
                     "[DNS直连] {host}{} 新连接 {ip}, 成功({ms}ms)",
                     path_of(out.uri())

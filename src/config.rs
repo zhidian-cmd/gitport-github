@@ -45,8 +45,9 @@ pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
 pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
 /// 内容域/其他闲置（无真实流量）超此秒数主动放手，稳态不多养连接；会话域不限。
 pub const CONN_IDLE_RETIRE_SECS: u64 = 600;
-/// 内容域/其他同 IP 通道上限（常态 2，全忙溢出补）。
-pub const MAX_CONNS_CONTENT: usize = 3;
+/// 内容域/其他同 IP 通道上限：恒 1 条。同 IP 多通道实测是灾难（互相抢带宽、连接级窗口
+/// 被几条流摊薄），要多通道就换 IP 另起一条——竞速建连取前二即按此展开。
+pub const MAX_CONNS_CONTENT: usize = 1;
 /// 会话域同 IP 通道上限：恒 1 条。
 pub const MAX_CONNS_SESSION: usize = 1;
 /// 直连切片 5s 界：没拉完的段由镜像链续传，段失败立即换镜像。

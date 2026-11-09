@@ -18,6 +18,7 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
+        close: std::sync::Arc::new(tokio::sync::Notify::new()),
         send,
     }
 }
@@ -57,6 +58,7 @@ async fn live_conn(ip: &str) -> H2Upstream {
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
+        close: std::sync::Arc::new(tokio::sync::Notify::new()),
         send,
     }
 }
@@ -102,10 +104,50 @@ async fn one_ip_one_channel_and_slot_filter() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 内容域：同 IP 并发拨出的通道并存（不再去重）——赌 IP 能扛多通道。
+/// 竞速排名：量到吞吐的在前（降序）；探针失败/超时的排后面，按拨号耗时升序。
+/// 探针只是判据不判死——全探不动时仍按握手快慢给顺序，建连不因此失败。
+#[tokio::test]
+async fn race_ranks_by_measured_throughput_then_dial() {
+    let legs = vec![
+        // 探针失败，但拨号最快
+        RaceLeg {
+            ip: "d".into(),
+            dial_ms: 50,
+            kbps: None,
+            up: mk_up("9.9.9.34", 1).await,
+        },
+        // 吞吐第二
+        RaceLeg {
+            ip: "b".into(),
+            dial_ms: 900,
+            kbps: Some(105),
+            up: mk_up("9.9.9.32", 1).await,
+        },
+        // 吞吐第一
+        RaceLeg {
+            ip: "c".into(),
+            dial_ms: 500,
+            kbps: Some(321),
+            up: mk_up("9.9.9.33", 1).await,
+        },
+        // 探针失败，拨号慢
+        RaceLeg {
+            ip: "a".into(),
+            dial_ms: 100,
+            kbps: None,
+            up: mk_up("9.9.9.31", 1).await,
+        },
+    ];
+    let ranked = rank_legs(legs);
+    let order: Vec<&str> = ranked.iter().map(|l| l.ip.as_str()).collect();
+    assert_eq!(order, vec!["c", "b", "d", "a"], "先按实测吞吐降序, 探针失败按拨号升序");
+}
+
+/// 内容域：同 IP 只准一条通道——第二条拨出来当场作废，返回池里现成那条。
+/// 要多通道就换 IP 另起（竞速建连按这个前提展开）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn content_ip_allows_multiple_channels() {
+async fn content_ip_keeps_single_channel() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -119,22 +161,11 @@ async fn content_ip_allows_multiple_channels() {
     b.owner = Some("raw.githubusercontent.com".to_string());
     let b_id = b.id;
     let kept = store_h2(ip, b);
-    assert_eq!(kept.id, b_id, "内容域同 IP 第二条应并存, 不作废");
-    // 上限 3：第 3 条并存，第 4 条作废返回已有的（溢出补通道的地板/天花板就钉在这里）。
-    let mut c = mk_up(ip, 1).await;
-    c.owner = Some("raw.githubusercontent.com".to_string());
-    let c_id = c.id;
-    let kept3 = store_h2(ip, c);
-    assert_eq!(kept3.id, c_id, "内容域同 IP 第 3 条应并存");
-    let mut d = mk_up(ip, 1).await;
-    d.owner = Some("raw.githubusercontent.com".to_string());
-    let d_id = d.id;
-    let kept4 = store_h2(ip, d);
-    assert_ne!(kept4.id, d_id, "内容域同 IP 第 4 条必须作废");
-    assert_eq!(kept4.id, a_id, "作废时返回池里现成的那条");
+    assert_ne!(kept.id, b_id, "同 IP 第二条必须作废");
+    assert_eq!(kept.id, a_id, "作废时返回池里现成的那条");
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(ip).unwrap().conns.len(), 3, "内容域同 IP 上限 3 条");
+        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "同 IP 上限 1 条");
     }
     let _ = lock(conn_pool()).remove(ip);
 }
@@ -215,17 +246,16 @@ async fn pool_prefers_idle_channel_over_full_one() {
     full.max_streams = 4;
     full.inflight
         .store(4, std::sync::atomic::Ordering::Relaxed);
-    let full_id = full.id;
+    let _full_id = full.id;
     store_h2(full_ip, full);
     let mut idle = mk_up(idle_ip, 1).await;
     idle.max_streams = 4;
     let idle_id = idle.id;
     store_h2(idle_ip, idle);
-    // 把"满的那条"灌成明显更快：只看 EWMA 会选它，看空闲就该让给另一条。
-    for _ in 0..4 {
-        note_latency(full_ip, full_id, 10);
-        note_latency(idle_ip, idle_id, 300);
-    }
+    // 把"满的那条"灌成明显更快：只看速度会选它，看空闲就该让给另一条。
+    crate::pool::speed::clear();
+    crate::pool::speed::record(full_ip, 262_144, 400); // ≈640KB/s
+    crate::pool::speed::record(idle_ip, 262_144, 6_000); // ≈43KB/s
     let ips = vec![full_ip.to_string(), idle_ip.to_string()];
     let up = cached_h2_in(&ips, None).expect("应有一条可用");
     assert_eq!(up.id, idle_id, "满了的通道不该再接新流");
@@ -339,17 +369,16 @@ async fn pool_prefers_fastest_across_ips() {
     let fast_ip = "9.9.8.2";
     let slow = mk_up(slow_ip, 1).await;
     let fast = mk_up(fast_ip, 1).await;
-    let (sid, fid) = (slow.id, fast.id);
+    let _fid = fast.id;
     store_h2(slow_ip, slow);
     store_h2(fast_ip, fast);
-    // 灌 EWMA 样本(>=3 次才参与择优):慢的 300ms,快的 50ms
-    for _ in 0..4 {
-        note_latency(slow_ip, sid, 300);
-        note_latency(fast_ip, fid, 50);
-    }
+    // 灌实测吞吐样本：慢的 ≈43KB/s，快的 ≈640KB/s
+    crate::pool::speed::clear();
+    crate::pool::speed::record(slow_ip, 262_144, 6_000);
+    crate::pool::speed::record(fast_ip, 262_144, 400);
     let ips = vec![slow_ip.to_string(), fast_ip.to_string()];
     let up = cached_h2_in(&ips, Some(1)).expect("主通道应在池");
-    assert_eq!(up.id, fid, "应在候选集合内取 EWMA 最快者");
+    assert_eq!(up.id, _fid, "应在候选集合内取实测吞吐最快者");
     let _ = lock(conn_pool()).remove(slow_ip);
     let _ = lock(conn_pool()).remove(fast_ip);
 }
@@ -365,23 +394,22 @@ async fn pool_no_samples_takes_first_candidate() {
     let fast_ip = "9.9.5.2";
     let slow = mk_up(slow_ip, 1).await;
     let fast = mk_up(fast_ip, 1).await;
-    let (sid, fid) = (slow.id, fast.id);
+    let _ = (slow.id, fast.id);
     store_h2(slow_ip, slow);
     store_h2(fast_ip, fast);
     let ips = vec![slow_ip.to_string(), fast_ip.to_string()];
+    crate::pool::speed::clear();
     // 全零样本：取首条（确定性）
     for _ in 0..3 {
         let up = cached_h2_in(&ips, None).expect("应有连接");
         assert_eq!(up.ip, slow_ip, "全零样本时恒取首条");
     }
-    // 灌样本：快的恒赢
-    for _ in 0..4 {
-        note_latency(slow_ip, sid, 300);
-        note_latency(fast_ip, fid, 50);
-    }
+    // 灌实测吞吐：快的恒赢
+    crate::pool::speed::record(slow_ip, 262_144, 6_000);
+    crate::pool::speed::record(fast_ip, 262_144, 400);
     for _ in 0..3 {
         let up = cached_h2_in(&ips, None).expect("应有连接");
-        assert_eq!(up.ip, fast_ip, "有样本后 EWMA 快者恒胜");
+        assert_eq!(up.ip, fast_ip, "有样本后实测吞吐快者恒胜");
     }
     let _ = lock(conn_pool()).remove(slow_ip);
     let _ = lock(conn_pool()).remove(fast_ip);
@@ -695,6 +723,7 @@ async fn conn_end_removes_itself_from_pool() {
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
+        close: std::sync::Arc::new(tokio::sync::Notify::new()),
         send: send.clone(),
     };
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");
@@ -707,6 +736,7 @@ async fn conn_end_removes_itself_from_pool() {
         ping: None,
         send,
         owner: "test.example".to_string(),
+        close: std::sync::Arc::new(tokio::sync::Notify::new()),
         log: Arc::new(|_| {}),
     });
     // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
@@ -786,19 +816,20 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let ip = "9.9.2.1";
-    let mut normal = mk_up(ip, 1).await;
+    let ip_normal = "9.9.2.1";
+    let mut normal = mk_up(ip_normal, 1).await;
     normal.owner = Some("raw.githubusercontent.com".to_string());
     let normal_id = normal.id;
-    store_h2(ip, normal);
-    // 溢出通道：与正常通道同 IP，标了 overflow。
-    let mut temp = mk_up(ip, 1).await;
+    store_h2(ip_normal, normal);
+    // 溢出通道：一 IP 一条，必然落在另一个没有通道的 IP 上，标了 overflow。
+    let ip_temp = "9.9.2.2";
+    let mut temp = mk_up(ip_temp, 1).await;
     temp.owner = Some("raw.githubusercontent.com".to_string());
     temp.overflow = true;
     let temp_id = temp.id;
-    store_h2(ip, temp);
+    store_h2(ip_temp, temp);
 
-    let ips = vec![ip.to_string()];
+    let ips = vec![ip_normal.to_string(), ip_temp.to_string()];
     // pick 永远只给正常通道：溢出通道对后来者不存在。
     for _ in 0..3 {
         assert_eq!(
@@ -812,12 +843,13 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     assert_eq!(listed.len(), 1, "清单只含非溢出通道");
     assert_eq!(listed[0].id, normal_id);
     // 驱动看到的标记就位：在途流归零时探活拍会焚毁它。
-    let (_, inflight, overflow) = conn_probe_state(ip, temp_id);
+    let (_, inflight, overflow) = conn_probe_state(ip_temp, temp_id);
     assert!(overflow, "溢出标记应跟着句柄进池");
     assert_eq!(inflight, 0, "无在途流 = 下一个探活拍回收");
     // 正常通道不带标记。
-    assert!(!conn_probe_state(ip, normal_id).2);
-    let _ = lock(conn_pool()).remove(ip);
+    assert!(!conn_probe_state(ip_normal, normal_id).2);
+    let _ = lock(conn_pool()).remove(ip_normal);
+    let _ = lock(conn_pool()).remove(ip_temp);
 }
 
 /// get_or_build 步骤①：池里有闲通道就直接骑（fresh=false），绝不拨号。
@@ -839,7 +871,7 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let id = up.id;
     store_h2(&ip, up);
     let log: LogFn = Arc::new(|_| {});
-    let (got, fresh) = crate::pool::get_or_build("github.com", None, &log)
+    let (got, fresh) = crate::pool::get_or_build("github.com", None, "", &log)
         .await
         .expect("池里有通道应直接返回");
     assert_eq!(got.id, id, "应骑池里现成的那条");

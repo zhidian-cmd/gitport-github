@@ -3,6 +3,7 @@ pub mod dial;
 pub mod edges;
 pub mod latency;
 pub mod route;
+pub mod speed;
 
 use crate::util::{lock, LogFn};
 use serde::{Deserialize, Serialize};
@@ -1130,6 +1131,15 @@ pub fn note_dead_node(ip: &str, sni: &str) {
     note_dead(&format!("{ip}|{sni}"));
 }
 
+/// 该 IP 或该节点（ip|sni）是否在死亡冷却中：竞速取候选与外部预检共用这一个口径。
+pub fn dial_cooling(ip: &str, sni: &str) -> bool {
+    let g = lock(&SERIAL);
+    let Some(t) = g.as_ref() else { return false };
+    let now = Instant::now();
+    let cooling = |k: &str| t.dead.get(k).is_some_and(|(until, _)| now < *until);
+    cooling(ip) || cooling(&format!("{ip}|{sni}"))
+}
+
 /// 串发尝试日志的限速器：每 host 每 60 秒最多 12 行——留证又不刷屏。
 /// 旧行为是这个过程一行都不打，事后完全无法归因。
 fn serial_try_allowed(host: &str) -> bool {
@@ -1199,6 +1209,16 @@ pub async fn serial_dial_skip(
     }
     // 已有通道被 skip 掉的数量（过滤全部滤空时保留原表走入库去重，不计）。
     let occupied_n = total_candidates - circle.len();
+    // 慢 IP 软排除：全慢时 usable 原样返回，一圈候选不会打空。会话域固定单 IP，不参与。
+    let mut slow_skipped = 0usize;
+    if crate::server::upstream::host_class(host) != crate::server::upstream::HostClass::Session {
+        let ips: Vec<String> = circle.iter().map(|p| p.ip.clone()).collect();
+        let keep = speed::usable(&ips);
+        if keep.len() < ips.len() {
+            slow_skipped = ips.len() - keep.len();
+            circle.retain(|p| keep.iter().any(|k| k == &p.ip));
+        }
+    }
     if circle.is_empty() {
         return Err(format!("路由 [{key}] 没有可用候选 IP({host})"));
     }
@@ -1316,7 +1336,7 @@ pub async fn serial_dial_skip(
     if tried == 0 {
         return Err(format!(
             "[{key}] {host} 无可拨候选: 共 {total_candidates} 个, {occupied_n} 个已有通道被跳过, \
-             {dead_skipped} 个死亡冷却, {crew_skipped} 个同组在建"
+             {dead_skipped} 个死亡冷却, {slow_skipped} 个慢冷却, {crew_skipped} 个同组在建"
         ));
     }
     // 绕表全灭：无镜像兜底才冷却（camo 无链，豁免会让每张徽章重烧整表）。
@@ -1362,6 +1382,7 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
 pub async fn get_or_build(
     host: &str,
     want_slot: Option<u8>,
+    probe_path: &str,
     log: &LogFn,
 ) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
     use crate::server::upstream as chan;
@@ -1373,6 +1394,8 @@ pub async fn get_or_build(
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let session = chan::host_class(host) == chan::HostClass::Session;
+    // 慢 IP 软排除：usable 在全慢时原样返回，候选不会被打空。会话域固定单 IP，换 IP 是风控特征，不参与。
+    let ips = if session { ips } else { speed::usable(&ips) };
 
     // 1) 选：会话域只认自己建的通道；内容域/其他谁闲用谁。
     if let Some(up) = pick_channel(host, &ips, want_slot, session) {
@@ -1407,9 +1430,121 @@ pub async fn get_or_build(
             return Ok((up, false));
         }
         // 建造：内容域双腿、其他/会话域单条，全在 dial_upstream 内。
-        let up = chan::dial_upstream(host, log).await?;
+        let up = chan::dial_upstream(host, probe_path, log).await?;
         return Ok((up, true));
     }
+}
+
+/* ---------- 慢通道触发链：池子摘出 → 通知建连机器人补齐 ---------- */
+
+/// 内容域某条通道实测低于够用线：先暂缓（不再发给请求），再按每 host 的节奏
+/// 通知建连机器人把该域其余 IP 的通道都建出来。冷却/熔断由池子把关，
+/// 一页几百个请求同时报慢也只触发一轮。
+pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
+    use crate::server::upstream as chan;
+    if chan::host_class(host) != chan::HostClass::Content {
+        return;
+    }
+    speed::bench(ip);
+    if speed::breaker_open(host) || !speed::may_rebuild(host) {
+        return;
+    }
+    speed::begin_rebuild(host);
+    log(&format!(
+        "[池] {ip} {:.0}KB/s 低于够用线 {:.0}KB/s, 暂缓该通道; 通知机器人补齐 {host} 其余 IP",
+        speed::kbps_of(ip).unwrap_or(0.0),
+        speed::TARGET_KBPS
+    ));
+    ensure_coverage(host, path, log.clone());
+}
+
+/// 建连机器人：把 host 的其余 IP 通道都建出来（一 IP 一条）。
+/// 现成通道就地复测、不重拨；建成/复测的都交给池子，由池子按实测吞吐筛。
+fn ensure_coverage(host: &str, path: &str, log: LogFn) {
+    let host = host.to_string();
+    let path = path.to_string();
+    tokio::spawn(async move {
+        use crate::server::upstream as chan;
+        let targets = route::dial_targets(&host).unwrap_or_default();
+        let mut best: Option<f64> = None;
+        let mut ok = 0usize;
+        let mut built = 0usize;
+
+        // ① 现成通道复测：暂缓的留在池里，直接量，不重拨。
+        let mut probes = Vec::new();
+        for t in targets.iter() {
+            if chan::conn_count_on_ip(&t.ip) == 0 {
+                continue;
+            }
+            let Some(up) = chan::cached_h2_in(std::slice::from_ref(&t.ip), None) else {
+                continue;
+            };
+            let ip = t.ip.clone();
+            let p = path.clone();
+            probes.push(async move {
+                let st = chan::probe_channel(&up, &p).await?;
+                speed::record(&ip, st.bytes, st.ms);
+                Some((ip, st.kbps as f64))
+            });
+        }
+        for (ip, k) in futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if k >= speed::TARGET_KBPS {
+                speed::release(&ip);
+                ok += 1;
+            }
+            best = Some(best.map_or(k, |b: f64| b.max(k)));
+        }
+
+        // ② 缺的 IP 并发拨：一 IP 一条，失败记死，超时的不等（各自的探针有自己的时限）。
+        let mut dials = Vec::new();
+        for t in targets.into_iter() {
+            if chan::conn_count_on_ip(&t.ip) > 0 || dial_cooling(&t.ip, &t.sni) {
+                continue;
+            }
+            let host2 = host.clone();
+            let p = path.clone();
+            let log2 = log.clone();
+            dials.push(async move {
+                let conn = dial::dial_one(&t.ip, &t.sni, &t.verify, true).await.ok()?;
+                let up = chan::h2_from_dialed(&host2, conn, &t.ip, 1, &log2)
+                    .await
+                    .ok()?;
+                let up = chan::store_h2(&t.ip, up);
+                let st = chan::probe_channel(&up, &p).await?;
+                speed::record(&t.ip, st.bytes, st.ms);
+                Some((t.ip.clone(), st.kbps as f64))
+            });
+            built += 1;
+        }
+        for (ip, k) in futures_util::future::join_all(dials)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if k >= speed::TARGET_KBPS {
+                speed::release(&ip);
+                ok += 1;
+            }
+            best = Some(best.map_or(k, |b: f64| b.max(k)));
+        }
+
+        if speed::finish_rebuild(&host, best) {
+            (log)(&format!(
+                "[池] {host} 熔断 10 分钟: 连续 3 轮仍不足 {:.0}KB/s, 改用现有最快的通道",
+                speed::TARGET_KBPS
+            ));
+        } else {
+            (log)(&format!(
+                "[池] {host} 补齐完成: 新拨 {built} 条, 达标 {ok} 条, 本轮最快 {}",
+                best.map(|b| format!("{b:.0}KB/s"))
+                    .unwrap_or_else(|| "无".to_string())
+            ));
+        }
+    });
 }
 
 /// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
@@ -1490,7 +1625,7 @@ pub async fn gather_channels(
     }
     // 池空先建（双腿可能直接带回两条），一并收进来。
     if got.is_empty() {
-        match get_or_build(host, None, log).await {
+        match get_or_build(host, None, "", log).await {
             Ok((up, _)) => got.push(up),
             Err(_) => return Vec::new(),
         }
