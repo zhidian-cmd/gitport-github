@@ -739,7 +739,9 @@ fn meter_body(
             };
             if s.kbps >= pool::speed::TARGET_KBPS {
                 pool::speed::release(&self.ip);
-            } else {
+            } else if s.kbps < pool::speed::TRIGGER_KBPS {
+                // 够用线以下、触发线以上：将就用，不动。只有跌穿触发线才交给池子
+                // 判断「主副全低」——低一条不值得折腾。
                 pool::on_channel_slow(&self.host, &self.ip, &self.path, &self.log);
             }
         }

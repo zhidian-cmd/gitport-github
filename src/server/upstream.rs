@@ -395,9 +395,8 @@ struct ConnDriver<T> {
     id: u64,
     conn: h2::client::Connection<T, Bytes>,
     session: bool,
-    /// 会话域才有：PING 探活用（内容域/其他恒 None，探活走极小请求）。
-    ping: Option<Arc<tokio::sync::Mutex<h2::PingPong>>>,
-    /// 内容域/其他探活用：驱动自己持有的 send clone，在现有连接上开流。
+    /// 探活用：驱动自己持有的 send clone，在现有连接上开流（全类统一极小真实请求
+    /// ——PING 帧被 GFW 放行但数据照丢，探不出黑洞）。
     send: SendRequest<Bytes>,
     /// 探活请求的 :authority（建这条连接时用的 host）。
     owner: String,
@@ -415,7 +414,6 @@ where
         id,
         conn,
         session,
-        ping,
         send,
         owner,
         close,
@@ -450,44 +448,20 @@ where
                     if overflow && inflight == 0 {
                         break 'keep "溢出通道用毕回收";
                     }
-                    // 内容域/其他闲置超限主动放手：在途流不为零不算闲置（长下载的
-                    // last_used 停在开流时刻）。会话域不主动断——保住同 IP 的会话连续性，
-                    // 但闲置超限后也不再保活（见下面的探活跳过）。
-                    if !session && inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
+                    // 闲置超限主动放手（会话域/内容域一律）：在途流不为零不算闲置
+                    // （长下载的 last_used 停在开流时刻）。重拨有游标兜底，同 IP 驻留。
+                    if inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
                         break 'keep "闲置超限放手";
                     }
                     // 刚用过的通道不必探；探的是闲置期黑洞。
                     if idle < probe_every {
                         continue;
                     }
-                    // 闲置超限不再保活：会话域长期空闲连接到此为止，不再发 PING，
-                    // 让它按对端空闲回收窗（50~65s）自然过期，由 ConnEnd 分支出池。
-                    if idle >= crate::config::CONN_IDLE_RETIRE_SECS {
+                    // 在途流还挂着的长下载不探：探活请求混进去只会添乱。
+                    if inflight > 0 {
                         continue;
                     }
-                    let alive = if session {
-                        let Some(pp) = &ping else { continue };
-                        // PONG 靠 conn 被 poll 才收得到，等 PONG 时 conn 留在同一个 select 里跑。
-                        let pong = async {
-                            let mut guard = pp.lock().await;
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(
-                                    crate::config::SESSION_PING_TIMEOUT_SECS,
-                                ),
-                                guard.ping(h2::Ping::opaque()),
-                            )
-                            .await
-                        };
-                        matches!(
-                            tokio::select! {
-                                _ = &mut conn => None,
-                                r = pong => Some(r),
-                            },
-                            Some(Ok(Ok(_)))
-                        )
-                    } else {
-                        probe_liveness(&send, &owner).await
-                    };
+                    let alive = probe_liveness(&send, &owner).await;
                     if !alive {
                         break 'keep "探活失败(黑洞)";
                     }
@@ -515,7 +489,7 @@ pub async fn h2_from_dialed(
     cb.initial_window_size(1024 * 1024) // 流级 1MB
         .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
                                                           // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
-    let (send, mut conn) = tokio::time::timeout(
+    let (send, conn) = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
         cb.handshake(conn_io),
     )
@@ -527,15 +501,8 @@ pub async fn h2_from_dialed(
         )
     })?
     .map_err(|e| format!("h2 握手失败: {e}"))?;
-    // 会话域才有 PING 探活（PingPong 归驱动自用）；内容域/其他探活走极小请求，
-    // 驱动自持 send clone 即可，PingPong 整个省掉。
+    // 探活全类统一走极小真实请求（PING 探不出黑洞），驱动自持 send clone 即可。
     let session = host_class(host) == HostClass::Session;
-    let ping = if session {
-        conn.ping_pong()
-            .map(|p| Arc::new(tokio::sync::Mutex::new(p)))
-    } else {
-        None
-    };
     // 服务端在 SETTINGS 里说了它一条连接能接多少流，照着用，不替它猜数字。
     let max_streams = conn.max_concurrent_send_streams().max(1) as u32;
     // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
@@ -547,7 +514,6 @@ pub async fn h2_from_dialed(
         id,
         conn,
         session,
-        ping,
         send: send.clone(),
         owner: host.to_string(),
         close: close.clone(),

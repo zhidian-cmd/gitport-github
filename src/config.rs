@@ -39,12 +39,11 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 pub const PROBE_INTERVAL_SECS: u64 = 30;
 /// 探活响应头等待上限：超时 = 连接已黑洞，当场自摘出池。
 pub const PROBE_TIMEOUT_SECS: u64 = 2;
-/// 会话域 PING 探活间隔（闲置超此秒数才探）。
+/// 会话域探活间隔（闲置超此秒数才探）。
 pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
-/// 会话域 PING 的 PONG 等待上限。
-pub const SESSION_PING_TIMEOUT_SECS: u64 = 2;
-/// 内容域/其他闲置（无真实流量）超此秒数主动放手，稳态不多养连接；会话域不限。
-pub const CONN_IDLE_RETIRE_SECS: u64 = 600;
+/// 闲置（无真实流量）超此秒数主动放手，会话域/内容域一律适用——5 分钟没人用的
+/// 连接没有留的价值，重拨有游标兜底（同 IP 驻留）；在途流不为零不算闲置。
+pub const CONN_IDLE_RETIRE_SECS: u64 = 300;
 /// 内容域/其他同 IP 通道上限：恒 1 条。同 IP 多通道实测是灾难（互相抢带宽、连接级窗口
 /// 被几条流摊薄），要多通道就换 IP 另起一条——竞速建连取前二即按此展开。
 pub const MAX_CONNS_CONTENT: usize = 1;

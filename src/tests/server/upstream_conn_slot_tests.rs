@@ -733,7 +733,6 @@ async fn conn_end_removes_itself_from_pool() {
         id,
         conn,
         session: false,
-        ping: None,
         send,
         owner: "test.example".to_string(),
         close: std::sync::Arc::new(tokio::sync::Notify::new()),

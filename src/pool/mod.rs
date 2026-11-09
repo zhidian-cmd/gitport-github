@@ -1437,12 +1437,20 @@ pub async fn get_or_build(
 
 /* ---------- 慢通道触发链：池子摘出 → 通知建连机器人补齐 ---------- */
 
-/// 内容域某条通道实测低于够用线：先暂缓（不再发给请求），再按每 host 的节奏
-/// 通知建连机器人把该域其余 IP 的通道都建出来。冷却/熔断由池子把关，
-/// 一页几百个请求同时报慢也只触发一轮。
+/// 内容域某条通道实测低于触发线：先查候选里还有没有已测达标的通道——有就把请求
+/// 让给它，将就用不折腾；全部已测通道都低于触发线（主副全低）才暂缓慢通道并通知
+/// 建连机器人补齐该域其余 IP。冷却/熔断由池子把关，一页几百个请求同时报慢也只触发一轮。
 pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
     use crate::server::upstream as chan;
     if chan::host_class(host) != chan::HostClass::Content {
+        return;
+    }
+    let ips: Vec<String> = route::dial_targets(host)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.ip)
+        .collect();
+    if speed::any_at_or_above(&ips, speed::TRIGGER_KBPS) {
         return;
     }
     speed::bench(ip);
@@ -1451,9 +1459,9 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
     }
     speed::begin_rebuild(host);
     log(&format!(
-        "[池] {ip} {:.0}KB/s 低于够用线 {:.0}KB/s, 暂缓该通道; 通知机器人补齐 {host} 其余 IP",
+        "[池] {host} 全部已测通道低于触发线 {:.0}KB/s: {ip} {:.0}KB/s 暂缓; 通知机器人补齐其余 IP",
+        speed::TRIGGER_KBPS,
         speed::kbps_of(ip).unwrap_or(0.0),
-        speed::TARGET_KBPS
     ));
     ensure_coverage(host, path, log.clone());
 }

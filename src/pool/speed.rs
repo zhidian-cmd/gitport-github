@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 pub const MIN_SAMPLE_BYTES: u64 = 64 * 1024;
 /// 够用线：达到就认定够快，不再为它折腾。
 pub const TARGET_KBPS: f64 = 50.0;
+/// 触发线：比够用线再降一档。只有候选里所有已测通道都低于它（主副全低）才值得
+/// 催建连机器人补齐；还有一条在它之上就把请求让给它，将就用不折腾。
+pub const TRIGGER_KBPS: f64 = 45.0;
 /// 暂缓时长：不够够用线的通道先放着不发，下一轮触发时复测，不重拨。
 const BENCH_SECS: u64 = 60;
 /// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报慢也只触发一轮。
@@ -71,6 +74,13 @@ pub fn kbps_of(ip: &str) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// 候选里是否还有已测吞吐达到 line 的通道——有 = 慢的那条只是个别现象，
+/// 请求让给快的就行（将就用），不值得为它触发一轮重建。
+pub fn any_at_or_above(ips: &[String], line: f64) -> bool {
+    ips.iter()
+        .any(|ip| kbps_of(ip).is_some_and(|k| k >= line))
 }
 
 /// 暂缓：不够够用线的通道先不发（60 秒），下一轮触发时复测，不重拨。

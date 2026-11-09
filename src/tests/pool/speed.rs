@@ -61,6 +61,27 @@ fn rebuild_is_cooldown_limited() {
     assert!(may_rebuild("h2"), "不同 host 各算各的");
 }
 
+/// 触发线判定：候选里还有一条已测 ≥45KB/s 就不该折腾（将就用），全低才返回 true。
+#[test]
+fn any_at_or_above_gates_rebuild_trigger() {
+    let _g = guard();
+    clear();
+    let ips = s(&["1.1.1.1", "2.2.2.2"]);
+    // 一条 ≈46KB/s（≥触发线）、一条 ≈30KB/s：有人能用，不触发
+    record("1.1.1.1", 262_144, 5_500);
+    record("2.2.2.2", 262_144, 8_500);
+    assert!(any_at_or_above(&ips, TRIGGER_KBPS), "有一条达标就不该触发");
+    // 达标的那条掉了：全低 → 触发
+    record("1.1.1.1", 262_144, 60_000);
+    assert!(
+        !any_at_or_above(&ips, TRIGGER_KBPS),
+        "全部低于触发线才允许触发重建"
+    );
+    // 从没测过的候选不算数：空表 = 全低
+    clear();
+    assert!(!any_at_or_above(&ips, TRIGGER_KBPS));
+}
+
 /// 连续 3 轮都达不到够用线 → 熔断 10 分钟；有一轮达标就从零计数。
 #[test]
 fn three_fruitless_rounds_open_breaker() {

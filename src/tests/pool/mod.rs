@@ -1024,8 +1024,10 @@ fn shared_ip_marks_come_from_topology() {
 
 /// dial_order 档位排序：指定 prefer_shared 时独占/共享分档，优先档整档在前、
 /// 档内游标优先 + 延迟升序；None 保持纯游标+延迟序。
+/// 断言依赖「延迟表为空」——必须持 TEST_LOCK 与 seed 延迟的用例串行，否则撞表。
 #[test]
 fn dial_order_partitions_exclusive_and_shared() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mk = |ip: &str, shared: bool| route::NodeIp {
         ip: ip.to_string(),
         sni: String::new(),
