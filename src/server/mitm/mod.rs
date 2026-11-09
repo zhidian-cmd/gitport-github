@@ -727,13 +727,29 @@ fn meter_body(
         host: String,
         path: String,
         ip: String,
-        started: std::time::Instant,
+        /// 数据窗起点 = **第一个数据字节**到达的时刻。池子只认数据传输速度：
+        /// 响应头到首字节之间的等待是延迟不是吞吐，混进来就是把机器人侧的账
+        /// 算进池子——与探针的头部预算同一条纪律。
+        started: std::sync::Mutex<Option<std::time::Instant>>,
         bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Watch {
+        fn on_frame(&self, n: usize) {
+            self.bytes
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            let mut g = self.started.lock().unwrap();
+            if g.is_none() {
+                *g = Some(std::time::Instant::now());
+            }
+        }
     }
     impl Drop for Watch {
         fn drop(&mut self) {
             let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
-            let ms = self.started.elapsed().as_millis() as u64;
+            let Some(t0) = *self.started.lock().unwrap() else {
+                return; // 一个数据帧都没有（纯头响应）：无从量速度，不记账
+            };
+            let ms = t0.elapsed().as_millis() as u64;
             let Some(s) = pool::speed::record(&self.ip, bytes, ms) else {
                 return;
             };
@@ -748,21 +764,19 @@ fn meter_body(
     }
     let (parts, body) = resp.into_parts();
     let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = bytes.clone();
     let watch = Watch {
         log: log.clone(),
         host: host.to_string(),
         path: path.to_string(),
         ip: ip.to_string(),
-        started: std::time::Instant::now(),
+        started: std::sync::Mutex::new(None),
         bytes,
     };
     // 闭包持有 watch：body 活多久它活多久——读完、客户端断开、连接出错都只结算一次。
     let body = http_body_util::BodyExt::map_frame(body, move |frame| {
         if let Some(d) = frame.data_ref() {
-            counter.fetch_add(d.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            watch.on_frame(d.len());
         }
-        let _ = &watch;
         frame
     });
     hyper::Response::from_parts(parts, BoxBody::new(body))
