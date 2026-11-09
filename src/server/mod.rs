@@ -338,10 +338,12 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 }
 
 /// 上游唯一入口：串发池按 routes.json 串发，其余交系统 DNS 直连；这是真名透传腿。
+/// 池串发全灭也必须给出通道（git clone 走这里，不能一上来就 502）：落系统 DNS
+/// 真名透传——与直连同款成功率，是兜底不是加速。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::route::is_managed(host) {
-        let (conn, ip, _shape) = pool::serial_dial_skip(
+        if let Ok((conn, ip, _shape)) = pool::serial_dial_skip(
             pool::DialSkip {
                 host,
                 tls_handshake: false,
@@ -352,8 +354,10 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
             },
             None,
         )
-        .await?;
-        return Ok((conn, ip));
+        .await
+        {
+            return Ok((conn, ip));
+        }
     }
     let addr = format!("{host}:{port}");
     let tcp = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))

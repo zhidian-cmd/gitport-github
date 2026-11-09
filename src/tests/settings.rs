@@ -16,6 +16,29 @@ fn should_backup_foreign_pac_shapes() {
     assert!(!should_backup_foreign("", pac, ""));
 }
 
+/// git 键的三态动作：我们写的才清/还原，别家或空一律不动。
+#[test]
+fn git_key_action_only_touches_ours() {
+    let ours = "http://127.0.0.1:7810";
+    // 我们写的 + 没备份 → 清除
+    assert!(matches!(
+        git_key_action(Some(ours), ours, ""),
+        GitKeyAction::Unset
+    ));
+    // 我们写的 + 有备份 → 还原原值
+    assert!(matches!(
+        git_key_action(Some(ours), ours, "http://127.0.0.1:9999"),
+        GitKeyAction::Restore(v) if v == "http://127.0.0.1:9999"
+    ));
+    // 别家的 → 不动
+    assert!(matches!(
+        git_key_action(Some("http://127.0.0.1:9999"), ours, ""),
+        GitKeyAction::Keep
+    ));
+    // 没设 → 不动
+    assert!(matches!(git_key_action(None, ours, ""), GitKeyAction::Keep));
+}
+
 /// 清场只认 last_pac：运行期间别家接管了 PAC（同形态），不许当自己的删掉。
 #[test]
 fn clear_only_exact_last_pac() {
@@ -166,6 +189,7 @@ fn save_emits_full_schema_in_canonical_order() {
         win_rect: [1, 2, 3, 4],
         github_pac: false,
         proxy_backup: String::new(),
+        git_proxy_backup: String::new(),
         last_pac: String::new(),
         last_ip: LastIpTable::from_marks(vec![(first.clone(), "140.82.114.6".to_string())]),
         worker_mirrors: vec![WorkerMirror {

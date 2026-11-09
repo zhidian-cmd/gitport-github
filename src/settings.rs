@@ -25,6 +25,9 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 我们最后一次成功写进系统的 PAC URL：接管时区分"自己的残留"与别家同形态
     last_pac: Mutex<String>,
+    // git 全局代理的原值备份（http\u{1}https 两段，\u{1} 分隔；空段 = 原本没设）：
+    // 覆盖前抓一把，关开关/退出/自愈时按原样还回去，别家配置不动。
+    git_proxy_backup: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
     // 自定义镜像注册表：settings.json 永久记录；启停只改镜像链成员，不动注册表。
@@ -57,6 +60,7 @@ fn state() -> &'static SettingsState {
         win_rect: Mutex::new([0; 4]),
         proxy_backup: Mutex::new(String::new()),
         last_pac: Mutex::new(String::new()),
+        git_proxy_backup: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
         worker_mirrors: Mutex::new(Vec::new()),
     })
@@ -289,20 +293,25 @@ pub fn ensure_system_proxy() -> Result<String, String> {
         mirror_auto_config_url(Some(&pac));
         *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
         refresh_wininet();
+        let git_note = ensure_git_proxy();
         let _ = save();
-        return Ok(note);
+        return Ok(format!("{note}; {git_note}"));
     }
     clear_if_ours(&key, &cur);
-    Ok("未开启分流, 已还原".to_string())
+    let git_note = remove_git_proxy();
+    Ok(format!("未开启分流, 已还原; {git_note}"))
 }
 
 /// 还原系统代理：只动我们上次写进去的那条 PAC（last_pac 精确比较），别家的不碰。
-pub fn remove_system_proxy() {
+/// git 全局代理同款待遇：优雅退出/开关关闭时随这里一起还原。
+pub fn remove_system_proxy() -> String {
+    let git_note = remove_git_proxy();
     let Ok(key) = internet_settings_key() else {
-        return;
+        return git_note;
     };
     let cur = get_auto_config_url(&key);
     clear_if_ours(&key, &cur);
+    git_note
 }
 
 fn restore_or_clear(key: &RegKey) {
@@ -524,6 +533,9 @@ struct SettingsFile {
     github_pac: bool,
     #[serde(deserialize_with = "lenient")]
     proxy_backup: String,
+    /// git 全局代理的原值备份（http\u{1}https 两段）：覆盖前抓的，恢复后清空。
+    #[serde(deserialize_with = "lenient")]
+    git_proxy_backup: String,
     #[serde(deserialize_with = "lenient")]
     last_pac: String, // 我们最后一次写进系统的 PAC URL——识别自己的残留
     #[serde(deserialize_with = "lenient")]
@@ -551,6 +563,11 @@ pub fn load() {
         Err(_) => {}
     }
     heal_stale_proxy();
+    // git 残留自愈：故障退出留下的代理/CA 键在下次启动清掉（开关开着时
+    // ensure_system_proxy 马上会重新接管，这里先清是幂等的一来一回）。
+    if !github_pac() {
+        remove_git_proxy();
+    }
 }
 
 fn parse(raw: &str) -> SettingsFile {
@@ -568,6 +585,7 @@ fn apply(v: SettingsFile) {
         .store(v.mitm, std::sync::atomic::Ordering::Relaxed);
     *state().win_rect.lock().unwrap() = v.win_rect;
     *state().proxy_backup.lock().unwrap() = v.proxy_backup;
+    *state().git_proxy_backup.lock().unwrap() = v.git_proxy_backup;
     *state().last_pac.lock().unwrap() = v.last_pac;
     *state().last_ip.lock().unwrap() = v.last_ip;
     state()
@@ -588,6 +606,7 @@ fn save() -> Result<(), String> {
         win_rect: *s.win_rect.lock().unwrap(),
         github_pac: s.github_pac.load(std::sync::atomic::Ordering::Relaxed),
         proxy_backup: s.proxy_backup.lock().unwrap().clone(),
+        git_proxy_backup: s.git_proxy_backup.lock().unwrap().clone(),
         last_pac: s.last_pac.lock().unwrap().clone(),
         last_ip: s.last_ip.lock().unwrap().clone(),
         worker_mirrors: s.worker_mirrors.lock().unwrap().clone(),
@@ -619,6 +638,159 @@ fn heal_stale_proxy() {
         return;
     }
     restore_or_clear(&key);
+}
+
+/* ---------- git 全局代理：与 PAC 同款生命周期 ---------- */
+
+/// 我们写进 git 的代理地址：本地 HTTP CONNECT 入口，git 流量经此进通道池。
+fn git_proxy_url() -> String {
+    format!("http://127.0.0.1:{}", crate::config::proxy_port())
+}
+
+/// CA 信任键：按 URL 作用域只对 GitHub 系生效，不动全局 sslBackend、不碰别的域。
+/// git 默认不信任代理的自签证书，这组键让 clone/push 过 MITM 进通道池。
+const GIT_CA_KEYS: &[&str] = &[
+    "http.https://github.com/.sslCAInfo",
+    "http.https://codeload.github.com/.sslCAInfo",
+    "http.https://raw.githubusercontent.com/.sslCAInfo",
+    "http.https://objects.githubusercontent.com/.sslCAInfo",
+    "http.https://release-assets.githubusercontent.com/.sslCAInfo",
+    "http.https://media.githubusercontent.com/.sslCAInfo",
+];
+const GIT_PROXY_KEYS: &[&str] = &["http.proxy", "https.proxy"];
+/// 备份两段的分隔符（URL 里不可能出现）。
+const GIT_BACKUP_SEP: char = '\u{1}';
+
+/// 隐藏窗口跑 git：GUI 进程 spawn 控制台程序会弹黑框，必须压掉。
+fn git_run(args: &[&str]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("git")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("git 未安装或不在 PATH({e})"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 读单个 git 键；未设置时 None。
+fn git_get(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    map.get(key).cloned().filter(|v| !v.is_empty())
+}
+
+/// 一次 `--list` 拿全全局键值（多值键取最后一行，与 --get 同语义）。
+fn git_map() -> Result<HashMap<String, String>, String> {
+    let out = git_run(&["config", "--global", "--list"])?;
+    let mut m = HashMap::new();
+    for line in out.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            m.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(m)
+}
+
+/// 纯判定：键该还原备份、清掉还是不动。当前值是别人写的 → 永远不动。
+fn git_key_action(current: Option<&str>, ours: &str, backup: &str) -> GitKeyAction {
+    match current {
+        Some(v) if v == ours => {
+            if backup.is_empty() {
+                GitKeyAction::Unset
+            } else {
+                GitKeyAction::Restore(backup.to_string())
+            }
+        }
+        _ => GitKeyAction::Keep,
+    }
+}
+
+enum GitKeyAction {
+    Restore(String),
+    Unset,
+    Keep,
+}
+
+/// 开关开：备份用户原值 → 写入代理与 CA 信任。git 不可用只留一句说明，不影响开关。
+fn ensure_git_proxy() -> String {
+    let Ok(map) = git_map() else {
+        return "git 不可用, 跳过代理注入".to_string();
+    };
+    let ours = git_proxy_url();
+    let mut backups: Vec<String> = Vec::new();
+    for key in GIT_PROXY_KEYS {
+        let cur = git_get(&map, key).unwrap_or_default();
+        backups.push(if cur == ours { String::new() } else { cur });
+    }
+    if backups.iter().any(|b| !b.is_empty()) {
+        *state().git_proxy_backup.lock().unwrap() = backups.join(&GIT_BACKUP_SEP.to_string());
+    }
+    for key in GIT_PROXY_KEYS {
+        let _ = git_run(&["config", "--global", key, &ours]);
+    }
+    let ca = exe_dir().join("ca.crt");
+    if ca.exists() {
+        let ca_str = ca.to_string_lossy().to_string();
+        for key in GIT_CA_KEYS {
+            // 用户自己的 CA 信任不动：我们的写入对它毫无意义，覆盖了反而坏别人的事
+            let cur = git_get(&map, key).unwrap_or_default();
+            if cur.is_empty() || cur == ca_str {
+                let _ = git_run(&["config", "--global", key, &ca_str]);
+            }
+        }
+    }
+    let had_backup = backups.iter().any(|b| !b.is_empty());
+    if had_backup {
+        "git 代理已接管(原配置已备份)".to_string()
+    } else {
+        "git 代理已接管".to_string()
+    }
+}
+
+/// 开关关/退出/自愈：只清我们写的值；有备份还原备份，别家配置原样不动。
+fn remove_git_proxy() -> String {
+    let Ok(map) = git_map() else {
+        return "git 不可用, 跳过清理".to_string();
+    };
+    let ours = git_proxy_url();
+    let backups: Vec<String> = state()
+        .git_proxy_backup
+        .lock()
+        .unwrap()
+        .split(GIT_BACKUP_SEP)
+        .map(|s| s.to_string())
+        .collect();
+    let mut touched = false;
+    for (i, key) in GIT_PROXY_KEYS.iter().enumerate() {
+        let backup = backups.get(i).map(|s| s.as_str()).unwrap_or("");
+        match git_key_action(git_get(&map, key).as_deref(), &ours, backup) {
+            GitKeyAction::Restore(v) => {
+                let _ = git_run(&["config", "--global", key, &v]);
+                touched = true;
+            }
+            GitKeyAction::Unset => {
+                let _ = git_run(&["config", "--global", "--unset", key]);
+                touched = true;
+            }
+            GitKeyAction::Keep => {}
+        }
+    }
+    let ca_str = exe_dir().join("ca.crt").to_string_lossy().to_string();
+    for key in GIT_CA_KEYS {
+        if git_get(&map, key).as_deref() == Some(ca_str.as_str()) {
+            let _ = git_run(&["config", "--global", "--unset", key]);
+            touched = true;
+        }
+    }
+    *state().git_proxy_backup.lock().unwrap() = String::new();
+    let _ = save();
+    if touched {
+        "git 代理已还原".to_string()
+    } else {
+        "git 代理无残留".to_string()
+    }
 }
 
 pub fn last_ips() -> Vec<(String, String)> {
