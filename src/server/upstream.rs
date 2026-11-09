@@ -667,8 +667,43 @@ async fn dial_h2_race(
     Ok(won)
 }
 
+/// 会话域建造闸：候选 IP 上已有活着的自家通道，就直接返回它，不建第二条。
+/// 判据是「池里有没有活的」，不是「有没有死过的」——冷启动和首条刚被摘时池都是空的，必须放行。
+/// cap 只管每个 IP 一条，管不住「A 一条、B 又一条」；这道闸查的是该 host 的全部候选 IP。
+fn live_session_channel(host: &str) -> Option<H2Upstream> {
+    let ips: Vec<String> = pool::route::dial_targets(host)?
+        .into_iter()
+        .map(|t| t.ip)
+        .collect();
+    let found = {
+        let g = lock(conn_pool());
+        let mut hit = None;
+        for ip in &ips {
+            if let Some(h) = g.get(ip) {
+                if let Some(c) = h.conns.iter().find(|c| c.up.owner.as_deref() == Some(host)) {
+                    hit = Some(c.up.clone());
+                    break;
+                }
+            }
+        }
+        hit
+    };
+    found
+}
+
 /// 建连统一入口：双腿各拨各的新连接；串发全灭冷却中快速失败，调用方走兜底。
 pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
+    // 会话域建造闸：候选 IP 上已有活通道 → 直接给那条，绝不建第二条。
+    // 放在冷却判断之前：有活通道时冷却状态无关紧要。
+    if host_class(host) == HostClass::Session {
+        if let Some(up) = live_session_channel(host) {
+            (log)(&format!(
+                "[建连] {host} 已有活通道 {}#{}, 拒绝建第二条",
+                up.ip, up.id
+            ));
+            return Ok(up);
+        }
+    }
     if pool::dial_cool_open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
