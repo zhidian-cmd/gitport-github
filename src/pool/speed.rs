@@ -42,11 +42,29 @@ struct Stat {
 
 static TABLE: Mutex<Option<HashMap<String, Stat>>> = Mutex::new(None);
 
+/// 状态行的样本窗：自上次取走以来各 IP 的（样本数, 吞吐和）。
+static SAMPLES: Mutex<Option<HashMap<String, (u32, f64)>>> = Mutex::new(None);
+
 /// 记一次真实传输的吞吐（只记账，不判死活）。样本不足 64KB 返回 None。
 pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
     if bytes < MIN_SAMPLE_BYTES || ms == 0 {
         return None;
     }
+    note_sample(ip, bytes, ms)
+}
+
+/// 记一次探针/复测样本：那是刻意发起的测量，门槛放低——完整响应 ≥16KB，
+/// 预算到点的部分样本无论多小都算（它就是真实的停滞速度）。
+/// 只入账（EWMA/样本窗/解锁暂缓），不触发暂缓与重建——那是真实请求慢时触发链的事。
+pub fn record_probe(ip: &str, bytes: u64, ms: u64, complete: bool) -> Option<Sample> {
+    let gate = if complete { 16 * 1024 } else { 1 };
+    if bytes < gate || ms == 0 {
+        return None;
+    }
+    note_sample(ip, bytes, ms)
+}
+
+fn note_sample(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
     let kbps = bytes as f64 / 1024.0 / (ms as f64 / 1000.0);
     let mut g = lock(&TABLE);
     let t = g.get_or_insert_with(HashMap::new);
@@ -59,6 +77,13 @@ pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
     } else {
         st.ewma * (1.0 - ALPHA) + kbps * ALPHA
     };
+    let mut g = lock(&SAMPLES);
+    let e = g
+        .get_or_insert_with(HashMap::new)
+        .entry(ip.to_string())
+        .or_insert((0, 0.0));
+    e.0 += 1;
+    e.1 += kbps;
     Some(Sample {
         kbps: st.ewma,
         target: TARGET_KBPS,
@@ -134,11 +159,37 @@ pub fn usable(ips: &[String]) -> Vec<String> {
 /// 单 IP 是否暂缓中（测试用；运行期筛选走 usable）。
 #[cfg(test)]
 pub fn is_benched(ip: &str) -> bool {
+    bench_remaining_secs(ip).is_some()
+}
+
+/// 暂缓剩余秒数（状态行用）；未暂缓/已到期 = None。
+pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
     let g = lock(&TABLE);
-    g.as_ref()
-        .and_then(|t| t.get(ip))
-        .and_then(|s| s.until)
-        .is_some_and(|u| Instant::now() < u)
+    let st = g.as_ref()?.get(ip)?;
+    st.until
+        .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
+        .filter(|s| *s > 0)
+}
+
+/// 熔断剩余秒数（状态行用）；未熔断/已到期 = None。
+pub fn breaker_remaining_secs(host: &str) -> Option<u64> {
+    let g = lock(&HOSTS);
+    let st = g.as_ref()?.get(host)?;
+    st.open_until
+        .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
+        .filter(|s| *s > 0)
+}
+
+/// 取走自上次取走以来累计的（IP, 样本数, 均值 KB/s）——状态行 30s 一取，取走即清。
+pub fn drain_samples() -> Vec<(String, u32, f64)> {
+    let mut g = lock(&SAMPLES);
+    let Some(m) = g.take() else { return Vec::new() };
+    m.into_iter()
+        .map(|(ip, (c, sum))| {
+            let mean = if c > 0 { sum / c as f64 } else { 0.0 };
+            (ip, c, mean)
+        })
+        .collect()
 }
 
 /// 单 host 的重建节奏：60s 一轮，连续 3 轮不达标熔断 10 分钟。
@@ -208,6 +259,7 @@ pub fn breaker_open(host: &str) -> bool {
 pub(crate) fn clear() {
     *lock(&TABLE) = Some(HashMap::new());
     *lock(&HOSTS) = Some(HashMap::new());
+    *lock(&SAMPLES) = None;
 }
 
 #[cfg(test)]

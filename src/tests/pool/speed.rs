@@ -101,3 +101,32 @@ fn three_fruitless_rounds_open_breaker() {
     assert!(!breaker_open(host));
     assert!(!finish_rebuild(host, Some(20.0)), "清零后重新从 1 数");
 }
+
+/// 状态行数据源：样本窗按取走即清，剩余时长查询与账本一致。
+#[test]
+fn drain_samples_and_remaining_queries() {
+    let _g = guard();
+    clear();
+    record("1.1.1.1", 262_144, 4_000); // ≈64KB/s
+    record("1.1.1.1", 262_144, 2_000); // ≈128KB/s，EWMA ≈85KB/s
+    record("2.2.2.2", 262_144, 10_000); // ≈26KB/s
+    let drained = drain_samples();
+    assert_eq!(drained.len(), 2, "两个 IP 各一组");
+    let (ip1, n1, mean1) = drained.iter().find(|(ip, _, _)| ip == "1.1.1.1").unwrap();
+    assert_eq!(*ip1, "1.1.1.1");
+    assert_eq!(*n1, 2);
+    assert!((95.0..=97.0).contains(mean1), "原始样本均值应 ≈96KB/s: {}", mean1);
+    // 取走即清
+    assert!(drain_samples().is_empty());
+    // 暂缓/熔断剩余：未发生 = None
+    assert_eq!(bench_remaining_secs("1.1.1.1"), None);
+    assert_eq!(breaker_remaining_secs("h9"), None);
+    bench("1.1.1.1");
+    assert!(bench_remaining_secs("1.1.1.1").is_some(), "暂缓中有剩余时长");
+    begin_rebuild("h9");
+    assert!(!breaker_remaining_secs("h9").is_some(), "冷却不是熔断");
+    finish_rebuild("h9", Some(10.0));
+    finish_rebuild("h9", Some(10.0));
+    finish_rebuild("h9", Some(10.0));
+    assert!(breaker_remaining_secs("h9").is_some(), "熔断后有剩余时长");
+}

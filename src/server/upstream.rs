@@ -14,7 +14,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -274,6 +274,30 @@ pub fn drop_h2(ip: &str) {
     }
 }
 
+/// 状态行快照：池内全部通道按 owner（建连时的 host）归组。
+/// 返回 (host, [(ip, 在途流, 流上限, 空闲秒)])，host 键稳定排序。
+pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)> {
+    let mut groups: std::collections::HashMap<String, Vec<(String, u32, u32, u64)>> =
+        std::collections::HashMap::new();
+    {
+        let g = lock(conn_pool());
+        for (ip, h) in g.iter() {
+            for c in &h.conns {
+                let host = c.up.owner.clone().unwrap_or_else(|| ip.clone());
+                let idle = now_secs().saturating_sub(c.last_used);
+                let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
+                groups
+                    .entry(host)
+                    .or_default()
+                    .push((ip.clone(), inflight, c.up.max_streams.max(1), idle));
+            }
+        }
+    }
+    let mut out: Vec<(String, Vec<(String, u32, u32, u64)>)> = groups.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// 池中该组 IP 里**已经有活连接**的地址(供拨号 skip:同一个 IP 不再拨第二次)。
 /// 全仓"这个 IP 有没有通道"的唯一口径：拨号预检与双通道 skip 都从这里取。
 pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
@@ -334,20 +358,30 @@ pub(crate) struct ProbeStat {
     pub kbps: u64,
     pub bytes: u64,
     pub ms: u64,
+    /// true = 响应体收完了；false = 预算到点，按已收字节折算的保守吞吐。
+    /// 部分样本不是「探针失败」——收了 8KB/3s = 2.7KB/s 就是真实的停滞速度。
+    pub complete: bool,
 }
 
-/// 内容域竞速探针：在刚建好的通道上拉 64KB 段，量「实收字节 ÷ 传输耗时」。
+/// 内容域竞速探针：在刚建好的通道上拉 16KB 段，量「实收字节 ÷ 传输耗时」。
 /// 首包时间判不出快慢（实测首包相差几十毫秒的 IP，吞吐能差 60 倍），只能拿真实字节量。
-/// 时限单独给 6 秒：2 秒是 1 字节探活的预算，拿来量 64KB 会把快线也误判成超时。
-pub(crate) async fn probe_speed(send: &SendRequest<Bytes>, owner: &str, path: &str) -> Option<ProbeStat> {
+/// 预算 3 秒：到点不弃赛，拿已收字节折算保守吞吐——快线 16KB 一秒内跑完，
+/// 烂线也能量出「每秒几 KB」，竞速永远有数据可排名。
+pub(crate) async fn probe_speed(
+    send: &SendRequest<Bytes>,
+    owner: &str,
+    path: &str,
+) -> Option<ProbeStat> {
     const BUDGET_SECS: u64 = 3;
     let uri = if path.is_empty() {
         format!("https://{owner}/")
     } else {
         format!("https://{owner}{path}")
     };
-    let probe = async {
-        let t0 = Instant::now();
+    let t0 = Instant::now();
+    let got = Arc::new(AtomicU64::new(0));
+    let counter = got.clone();
+    let pull = async move {
         let mut ready = send.clone().ready().await.ok()?;
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
@@ -357,28 +391,30 @@ pub(crate) async fn probe_speed(send: &SendRequest<Bytes>, owner: &str, path: &s
             .ok()?;
         let (resp, _stream) = ready.send_request(req, true).ok()?;
         let (_parts, mut body) = resp.await.ok()?.into_parts();
-        let mut got: u64 = 0;
         while let Some(chunk) = body.data().await {
-            got += chunk.ok()?.len() as u64;
+            let n = chunk.ok()?.len() as u64;
+            let now = counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
             // 服务端不认 Range 时可能回整包：够 24KB 就停，体丢弃即 RST，不替它下完。
-            if got >= 24 * 1024 {
+            if now >= 24 * 1024 {
                 break;
             }
         }
-        let ms = t0.elapsed().as_millis() as u64;
-        if got == 0 || ms == 0 {
-            return None;
-        }
-        Some(ProbeStat {
-            kbps: (got as f64 / 1024.0 / (ms as f64 / 1000.0)) as u64,
-            bytes: got,
-            ms,
-        })
+        Some(())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(BUDGET_SECS), probe)
+    let complete = tokio::time::timeout(std::time::Duration::from_secs(BUDGET_SECS), pull)
         .await
-        .ok()
-        .flatten()
+        == Ok(Some(()));
+    let bytes = got.load(std::sync::atomic::Ordering::Relaxed);
+    let ms = t0.elapsed().as_millis() as u64;
+    if bytes == 0 || ms == 0 {
+        return None;
+    }
+    Some(ProbeStat {
+        kbps: (bytes as f64 / 1024.0 / (ms as f64 / 1000.0)) as u64,
+        bytes,
+        ms,
+        complete,
+    })
 }
 
 /// 池内通道复测：不重拨，直接在这条现成通道上量。
@@ -504,7 +540,9 @@ pub async fn h2_from_dialed(
     // 探活全类统一走极小真实请求（PING 探不出黑洞），驱动自持 send clone 即可。
     let session = host_class(host) == HostClass::Session;
     // 服务端在 SETTINGS 里说了它一条连接能接多少流，照着用，不替它猜数字。
-    let max_streams = conn.max_concurrent_send_streams().max(1) as u32;
+    // 服务端不设上限时 h2 回 u32::MAX——评分按 (在途+1)/上限 算，(MAX) 会让它
+    // 永远显得最闲；钳到 100 与 Fastly 实际下发值同量级。
+    let max_streams = conn.max_concurrent_send_streams().max(1).min(100) as u32;
     // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let close = Arc::new(tokio::sync::Notify::new());
@@ -623,7 +661,7 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
 pub(crate) struct RaceLeg {
     pub ip: String,
     pub dial_ms: u64,
-    /// 探针实测吞吐（KB/s）；None = 探针失败或超时。
+    /// 探针实测吞吐（KB/s）；None = 三秒零字节（通道全哑）或完整小响应（延迟主导不参与排名）。
     pub kbps: Option<u64>,
     up: H2Upstream,
 }
@@ -696,7 +734,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
             // 全都不达标时通道要全部留用摊带宽（暂缓是触发链在真实请求慢时才做的事）。
             // 响应体太小的探针（头像类 3~5KB）被延迟主导，量出来的不是吞吐，不进排名。
             if let Some(st) = &stat {
-                pool::speed::record(&node.ip, st.bytes, st.ms);
+                pool::speed::record_probe(&node.ip, st.bytes, st.ms, st.complete);
                 if (st.kbps as f64) >= pool::speed::TARGET_KBPS {
                     pool::speed::release(&node.ip);
                 }
@@ -705,8 +743,10 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
                 .send(Ok(RaceLeg {
                     ip: node.ip.clone(),
                     dial_ms,
+                    // 完整小响应（头像类 3~5KB）被延迟主导，不进排名；
+                    // 部分样本（预算到点）无论多小都进——它就是真实的停滞速度。
                     kbps: stat
-                        .filter(|s| s.bytes >= RACE_PROBE_MIN_BYTES)
+                        .filter(|s| s.bytes >= RACE_PROBE_MIN_BYTES || !s.complete)
                         .map(|s| s.kbps),
                     up,
                 }))
@@ -762,7 +802,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
             let t = l
                 .kbps
                 .map(|k| format!("{k}KB/s"))
-                .unwrap_or_else(|| format!("探针失败/拨号{}ms", l.dial_ms));
+                .unwrap_or_else(|| format!("零字节/拨号{}ms", l.dial_ms));
             format!("{}({t})", l.ip)
         })
         .collect();

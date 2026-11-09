@@ -2,6 +2,7 @@
 
 pub mod mitm;
 pub mod protocol;
+pub mod status;
 pub mod upstream;
 
 use crate::certgen::Authority;
