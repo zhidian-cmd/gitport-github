@@ -83,6 +83,11 @@ pub async fn handle_connect_mitm(
     });
     let result = if alpn == b"h2" {
         hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            // 与上游侧同款（upstream.rs 4MB 连接窗）：h2 默认 64KB 连接窗会把整页
+            // 上百个流压成按 RTT 串行——当年只修了上游那一半，浏览器侧漏了，
+            // 页面资产再多通道也灌不进浏览器。
+            .initial_stream_window_size(1024 * 1024) // 流级 1MB
+            .initial_connection_window_size(4 * 1024 * 1024) // 连接级聚合 4MB
             .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
             .await
     } else {

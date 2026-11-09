@@ -677,6 +677,8 @@ pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
 /// 内容域竞速建连：该 host 的**全部**候选 IP 一 IP 一条腿并发拨（数量随域的 IP 组走），
 /// 各自实测吞吐，取最快的两条入池，其余当场关闭。建连机器人返回最快那条。
 const RACE_WINDOW_SECS: u64 = 8;
+/// 探针排名的最小响应体：小于它的「速度」是延迟不是吞吐（小头像 3KB/0.5s 也叫 6KB/s）。
+const RACE_PROBE_MIN_BYTES: u64 = 16 * 1024;
 
 async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let targets = pool::route::dial_targets(host).unwrap_or_default();
@@ -726,7 +728,8 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
             let stat = probe_speed(&up.send, &host2, &probe).await;
             // 赛道上就完成一次真实测速。达标的确保可用；不够的先不动——
             // 全都不达标时通道要全部留用摊带宽（暂缓是触发链在真实请求慢时才做的事）。
-            if let Some(st) = stat {
+            // 响应体太小的探针（头像类 3~5KB）被延迟主导，量出来的不是吞吐，不进排名。
+            if let Some(st) = &stat {
                 pool::speed::record(&node.ip, st.bytes, st.ms);
                 if (st.kbps as f64) >= pool::speed::TARGET_KBPS {
                     pool::speed::release(&node.ip);
@@ -736,7 +739,9 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
                 .send(Ok(RaceLeg {
                     ip: node.ip.clone(),
                     dial_ms,
-                    kbps: stat.map(|s| s.kbps),
+                    kbps: stat
+                        .filter(|s| s.bytes >= RACE_PROBE_MIN_BYTES)
+                        .map(|s| s.kbps),
                     up,
                 }))
                 .await;
