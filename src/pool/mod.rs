@@ -1491,7 +1491,7 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
             let p = path.clone();
             probes.push(async move {
                 let st = chan::probe_channel(&up, &p).await?;
-                speed::record_probe(&ip, st.bytes, st.ms, st.complete);
+                speed::record_probe(&ip, st.bytes, st.ms);
                 Some((ip, st.kbps as f64))
             });
         }
@@ -1523,7 +1523,7 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
                     .ok()?;
                 let up = chan::store_h2(&t.ip, up);
                 let st = chan::probe_channel(&up, &p).await?;
-                speed::record_probe(&t.ip, st.bytes, st.ms, st.complete);
+                speed::record_probe(&t.ip, st.bytes, st.ms);
                 Some((t.ip.clone(), st.kbps as f64))
             });
             built += 1;

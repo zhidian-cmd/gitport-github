@@ -53,12 +53,11 @@ pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
     note_sample(ip, bytes, ms)
 }
 
-/// 记一次探针/复测样本：那是刻意发起的测量，门槛放低——完整响应 ≥16KB，
-/// 预算到点的部分样本无论多小都算（它就是真实的停滞速度）。
+/// 记一次探针/复测样本：时间窗 500ms 的刻意测量，任何字节量都入账——
+/// 快线慢线都有数，「无样本」只属于从没被探过的通道。
 /// 只入账（EWMA/样本窗/解锁暂缓），不触发暂缓与重建——那是真实请求慢时触发链的事。
-pub fn record_probe(ip: &str, bytes: u64, ms: u64, complete: bool) -> Option<Sample> {
-    let gate = if complete { 16 * 1024 } else { 1 };
-    if bytes < gate || ms == 0 {
+pub fn record_probe(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
+    if bytes == 0 || ms == 0 {
         return None;
     }
     note_sample(ip, bytes, ms)
