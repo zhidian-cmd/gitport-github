@@ -568,6 +568,8 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
     parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
 
     // hosts：有节点服务且全默认的键不落盘（域名由节点一行声明），只留特殊属性/无节点的。
+    // "全默认"必须把 session/big 也算进去——它们由下面 map 写出，若在 filter 里漏判，
+    // 会话域/大文件域的标志会在第一次存盘时被静默丢掉，下次启动 github.com 就降级成 Other。
     let served: std::collections::HashSet<&str> = snapshot
         .iter()
         .flat_map(|n| n.hosts.iter().map(|s| s.as_str()))
@@ -575,7 +577,11 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
     let rows: Vec<String> = route::hosts_snapshot()
         .iter()
         .filter(|r| {
-            let plain = !r.flags.direct && !r.flags.content && r.fallback == route::Fallback::Dns;
+            let plain = !r.flags.direct
+                && !r.flags.content
+                && !r.flags.session
+                && !r.flags.big
+                && r.fallback == route::Fallback::Dns;
             !(plain && served.contains(r.key.as_str()))
         })
         .map(|r| {
