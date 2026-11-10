@@ -741,8 +741,6 @@ async fn conn_end_removes_itself_from_pool() {
         id,
         conn,
         session: false,
-        send,
-        owner: "test.example".to_string(),
         close: std::sync::Arc::new(tokio::sync::Notify::new()),
         log: Arc::new(|_| {}),
     });
@@ -766,53 +764,6 @@ async fn conn_end_removes_itself_from_pool() {
     );
     assert!(lock(conn_pool()).get(ip).is_none(), "池里不该留这条僵尸");
     let _ = lock(conn_pool()).remove(ip);
-}
-
-/// 内容域探活：装死的上游（握手成功但对请求永不回响应头）必须被判死——
-/// 这是黑洞通道出池的依据。PING 帧探不了这种黑洞，只有真实小请求探得出。
-#[tokio::test]
-async fn probe_liveness_detects_silent_upstream() {
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        let Ok(mut conn) = h2::server::handshake(server_io).await else {
-            return;
-        };
-        while let Some(Ok((req, _respond))) = conn.accept().await {
-            let _ = req; // 故意不响应：模拟黑洞（TCP 活着但对请求装死）
-        }
-    });
-    let (send, conn) = h2::client::handshake(client_io).await.expect("client 握手");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    assert!(
-        !probe_liveness(&send, "raw.githubusercontent.com").await,
-        "黑洞连接探活必须判死"
-    );
-}
-
-/// 探活不得误报：正常回 200 的通道必须判活，否则活通道会被白白摘掉重拨。
-#[tokio::test]
-async fn probe_liveness_passes_on_responsive_upstream() {
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        let Ok(mut conn) = h2::server::handshake(server_io).await else {
-            return;
-        };
-        while let Some(Ok((req, mut respond))) = conn.accept().await {
-            let _ = req;
-            let resp = http::Response::builder().status(200).body(()).unwrap();
-            let _ = respond.send_response(resp, true);
-        }
-    });
-    let (send, conn) = h2::client::handshake(client_io).await.expect("client 握手");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    assert!(
-        probe_liveness(&send, "raw.githubusercontent.com").await,
-        "活通道探活必须通过"
-    );
 }
 
 /// 溢出临时通道语义：同 IP 溢出是拥挤时的临时加班——正编 + 一条溢出并存，

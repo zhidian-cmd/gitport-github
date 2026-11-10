@@ -34,16 +34,10 @@ pub const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 1350;
 /// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// 内容域/其他探活间隔：闲置超此秒数发 1 字节 Range 请求验活（PING 探不了黑洞）。
-/// 须卡在边缘 50~65s 空闲回收窗内，保活才有效。
-pub const PROBE_INTERVAL_SECS: u64 = 30;
-/// 探活响应头等待上限：超时 = 连接已黑洞，当场自摘出池。
-pub const PROBE_TIMEOUT_SECS: u64 = 2;
-/// 会话域探活间隔（闲置超此秒数才探）。
-pub const SESSION_PROBE_INTERVAL_SECS: u64 = 30;
-/// 闲置（无真实流量）超此秒数主动放手，会话域/内容域一律适用——5 分钟没人用的
-/// 连接没有留的价值，重拨有游标兜底（同 IP 驻留）；在途流不为零不算闲置。
-pub const CONN_IDLE_RETIRE_SECS: u64 = 300;
+/// 即用即建、用完就丢：闲置（无在途流）超此秒数即焚毁通道。10s 远短于对端/中间
+/// 设备的静默掐死窗口（60~90s），「领到僵尸通道」在结构上不可能发生——探活机制
+/// 因此整体移除（探活只能验尸不能续命，且总有漏检窗口）。在途流不为零不算闲置。
+pub const CONN_IDLE_RETIRE_SECS: u64 = 10;
 /// 内容域/其他同 IP 通道上限：恒 1 条。同 IP 多通道实测是灾难（互相抢带宽、连接级窗口
 /// 被几条流摊薄），要多通道就换 IP 另起一条——竞速建连取前二即按此展开。
 pub const MAX_CONNS_CONTENT: usize = 1;

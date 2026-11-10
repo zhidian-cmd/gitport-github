@@ -355,7 +355,7 @@ pub(crate) fn cull_channel(ip: &str) {
     }
 }
 
-/// 驱动探活用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
+/// 驱动清扫用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
 fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     let g = lock(conn_pool());
     match g.get(ip).and_then(|h| h.conns.iter().find(|c| c.up.id == id)) {
@@ -366,32 +366,6 @@ fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
         ),
         None => (0, 0, false),
     }
-}
-
-/// 内容域探活单次实现：现有连接上开 stream 发 1 字节 Range 请求，超时无响应头 = 黑洞。
-/// PING 帧探不了黑洞（放行帧、丢数据），故用真请求；体随 stream 丢弃。
-pub(crate) async fn probe_liveness(send: &SendRequest<Bytes>, owner: &str) -> bool {
-    let probe = async {
-        let send = send.clone();
-        let mut ready = send.ready().await.ok()?;
-        let req = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(format!("https://{owner}/"))
-            .header("range", "bytes=0-0")
-            .body(())
-            .ok()?;
-        let (resp, _stream) = ready.send_request(req, true).ok()?;
-        resp.await.ok()?;
-        Some(())
-    };
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(crate::config::PROBE_TIMEOUT_SECS),
-            probe,
-        )
-        .await,
-        Ok(Some(()))
-    )
 }
 
 /// 竞速探针的实测结果：500ms 时间窗内的（字节数 ÷ 实际耗时）。
@@ -501,19 +475,15 @@ pub async fn probe_channel(up: &H2Upstream, path: &str) -> Option<ProbeStat> {
     probe_speed(&up.send, &owner, path).await.ok()
 }
 
-/// 一条连接 = 一个任务：持续 poll conn（协议硬要求）、按类探活闲置通道、结束自摘出池。
-/// 死通道最迟一个探活拍出池，不等请求撞；不做补拨，重建是下一个请求自己的事。
+/// 一条连接 = 一个任务：持续 poll conn（协议硬要求）、收到关闭信号或闲置超限即焚。
+/// 即用即建、用完就丢：通道不再长期持有——闲置寿命（10s）远短于对端/中间设备的
+/// 静默掐死窗口（60~90s），「领到僵尸通道」在结构上不可能发生。
 /// 断开日志只给会话域——内容域断连是家常便饭，记了全是噪音。
 struct ConnDriver<T> {
     ip: String,
     id: u64,
     conn: h2::client::Connection<T, Bytes>,
     session: bool,
-    /// 探活用：驱动自己持有的 send clone，在现有连接上开流（全类统一极小真实请求
-    /// ——PING 帧被 GFW 放行但数据照丢，探不出黑洞）。
-    send: SendRequest<Bytes>,
-    /// 探活请求的 :authority（建这条连接时用的 host）。
-    owner: String,
     /// 竞速落败的腿：收到即断开，不必等闲置超时。
     close: Arc<tokio::sync::Notify>,
     log: LogFn,
@@ -528,61 +498,42 @@ where
         id,
         conn,
         session,
-        send,
-        owner,
         close,
         log,
     } = d;
     tokio::spawn(async move {
         let mut conn = Box::pin(conn);
-        let probe_every = if session {
-            crate::config::SESSION_PROBE_INTERVAL_SECS
-        } else {
-            crate::config::PROBE_INTERVAL_SECS
-        };
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(probe_every));
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.tick().await; // interval 首拍立即完成，吞掉
         let why: &str = 'keep: loop {
             enum Step {
                 ConnEnd,
                 Close,
-                Probe,
+                Sweep,
             }
             let step = tokio::select! {
                 _ = &mut conn => Step::ConnEnd,
                 _ = close.notified() => Step::Close,
-                _ = tick.tick() => Step::Probe,
+                _ = tick.tick() => Step::Sweep,
             };
             match step {
                 Step::ConnEnd => break 'keep "对端关闭",
-                Step::Close => break 'keep "竞速落败主动关闭",
-                Step::Probe => {
-                    // 溢出通道用毕即焚：空闲（在途归零）即出池。
+                Step::Close => break 'keep "主动关闭",
+                Step::Sweep => {
+                    // 用完就丢：溢出通道在途归零即刻焚；普通通道闲置超限（在途流
+                    // 不为零不算闲置——长下载的 last_used 停在开流时刻）即焚。
+                    // 重拨是下一个请求自己的事（即用即建）。
                     let (idle, inflight, overflow) = conn_probe_state(&ip, id);
                     if overflow && inflight == 0 {
                         break 'keep "溢出通道用毕回收";
                     }
-                    // 闲置超限主动放手（会话域/内容域一律）：在途流不为零不算闲置
-                    // （长下载的 last_used 停在开流时刻）。重拨有游标兜底，同 IP 驻留。
                     if inflight == 0 && idle >= crate::config::CONN_IDLE_RETIRE_SECS {
-                        break 'keep "闲置超限放手";
-                    }
-                    // 刚用过的通道不必探；探的是闲置期黑洞。
-                    if idle < probe_every {
-                        continue;
-                    }
-                    // 在途流还挂着的长下载不探：探活请求混进去只会添乱。
-                    if inflight > 0 {
-                        continue;
-                    }
-                    let alive = probe_liveness(&send, &owner).await;
-                    if !alive {
-                        break 'keep "探活失败(黑洞)";
+                        break 'keep "闲置用毕丢弃";
                     }
                 }
             }
         };
-        // 唯一出口：断开或探活判死，按 id 自摘（已被摘过则 no-op）。
+        // 唯一出口：断开/判焚/主动关闭，按 id 自摘（已被摘过则 no-op）。
         drop_h2_id(&ip, id);
         if session {
             // 会话域的断开值得记一行，内容域是噪音。
@@ -615,7 +566,6 @@ pub async fn h2_from_dialed(
         )
     })?
     .map_err(|e| format!("h2 握手失败: {e}"))?;
-    // 探活全类统一走极小真实请求（PING 探不出黑洞），驱动自持 send clone 即可。
     let session = host_class(host) == HostClass::Session;
     // 服务端在 SETTINGS 里说了它一条连接能接多少流，照着用，不替它猜数字。
     // 服务端不设上限时 h2 回 u32::MAX——评分按 (在途+1)/上限 算，(MAX) 会让它
@@ -624,14 +574,12 @@ pub async fn h2_from_dialed(
     // id 建连时就定下：驱动任务带着它，连接一断就能精确摘自己那一条。
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let close = Arc::new(tokio::sync::Notify::new());
-    // 从此这条连接归它自己的任务管：驱动帧收发、按类探活、断开自摘。
+    // 从此这条连接归它自己的任务管：驱动帧收发、闲置焚毁、断开自摘。
     spawn_conn_driver(ConnDriver {
         ip: ip.to_string(),
         id,
         conn,
         session,
-        send: send.clone(),
-        owner: host.to_string(),
         close: close.clone(),
         log: log.clone(),
     });
