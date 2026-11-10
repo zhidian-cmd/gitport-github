@@ -31,6 +31,19 @@ pub fn note(ip: &str, ms: u64) {
     m.insert(ip.to_string(), merged);
 }
 
+/// 黑洞降权：实测值翻倍上探（下限 3s、封顶 10s），连续黑洞会把该 IP 沉到
+/// 已测候选的队尾——游标挪动只管下一次重拨，降权管排序不该再偏爱它。
+/// 不会沉过未测候选（未测恒垫底），一次误判 60s 内随正常样本稀释恢复。
+pub fn sink(ip: &str) {
+    let mut g = lock(&TABLE);
+    let m = g.get_or_insert_with(HashMap::new);
+    let merged = match m.get(ip) {
+        Some(old) => (*old * 2).max(3000).min(10000),
+        None => 3000,
+    };
+    m.insert(ip.to_string(), merged);
+}
+
 /// 落盘用全量快照（编码 routes.json 时写入 `latency` 键）。
 pub fn snapshot_all() -> HashMap<String, u64> {
     lock(&TABLE).clone().unwrap_or_default()

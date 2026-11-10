@@ -1468,7 +1468,7 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
     ensure_coverage(host, path, log.clone());
 }
 
-/// 通道黑洞（真实请求响应头后 500ms 数据窗零字节）：按域分流处置。
+/// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS 数据窗零字节）：按域分流处置。
 /// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
 /// - 内容域：暂缓黑通道 + 全量换血（健康复测 / 暂缓摘旧换新 / 缺的补建），
@@ -1480,6 +1480,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
         chan::HostClass::Session => {
             chan::cull_channel(ip);
             cursor_note(host, ip, false, 1); // 游标挪到下一候选，别死磕黑 IP
+            latency::sink(ip); // 拨号排序同步降权，不然游标挪了排序还把它排第一
             (log)(&format!(
                 "[黑洞] {host} 会话通道 {ip} 弃用, 游标挪动并预建替代通道"
             ));
@@ -1494,7 +1495,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
         chan::HostClass::Content => {
             speed::bench(ip);
             (log)(&format!(
-                "[黑洞] {host} {ip} 暂缓(500ms 数据窗零字节), 触发全量换血"
+                "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
             ));
             if !speed::breaker_open(host) && speed::may_rebuild(host) {
                 speed::begin_rebuild(host);

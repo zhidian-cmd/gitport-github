@@ -6,7 +6,7 @@ use crate::server::upstream;
 use crate::util::LogFn;
 use std::time::Duration;
 
-/// 状态行节奏：30s 一拍，与探活拍错开（探活 30s 起算时间不同，互不挤占）。
+/// 状态行节奏：30s 一拍。
 const STATUS_INTERVAL_SECS: u64 = 30;
 /// 最近有活动才打：通道空闲或样本窗内出现过，避免给闲置 host 刷屏。
 const ACTIVE_WINDOW_SECS: u64 = 90;

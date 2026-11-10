@@ -1,5 +1,5 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
-//! 通道的记账、挑选、探活、开流全在本文件；取用统一入口是 `pool::get_or_build`
+//! 通道的记账、挑选、开流全在本文件；取用统一入口是 `pool::get_or_build`
 //! （取 → 溢出 → 建，一层管完），请求路径不再各管一段。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
@@ -33,7 +33,7 @@ pub struct H2Upstream {
     pub owner: Option<String>,
     /// 服务端在 SETTINGS 里下发的并发上限（`MAX_CONCURRENT_STREAMS`）。
     pub max_streams: u32,
-    /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 延迟"挑最闲且最快的。
+    /// 当前在途流数：发请求 +1、流收尾 -1。选路按"占用率 × 吞吐倒数"挑最闲且最快的。
     pub inflight: Arc<AtomicU32>,
     /// 溢出临时通道：句柄不再外发，空闲（在途归零）即被驱动掐断出池。
     pub overflow: bool,
@@ -47,7 +47,7 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// 一条连接 + 最近使用时刻。
 pub(crate) struct ConnSlot {
     pub(crate) up: H2Upstream,
-    /// 这条连接自己最后一次被使用（开流刷新）；探活计时器的闲置期按它算。
+    /// 这条连接自己最后一次被使用（开流刷新）；闲置焚毁计时按它算。
     last_used: u64,
 }
 
@@ -58,7 +58,7 @@ pub(crate) struct IpConns {
 }
 
 
-/// 同 IP 通道上限：会话域恒 1；内容域/其他 3（常态 2，全忙溢出补）。
+/// 同 IP 通道上限：会话域/内容域/其他恒 1——多通道一律换 IP 另起（同 IP 溢出例外）。
 pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
     match class {
         HostClass::Session => crate::config::MAX_CONNS_SESSION,
@@ -83,7 +83,7 @@ pub(crate) enum HostClass {
 /// host 三类全部由 routes.json/seeds.json 的 hosts 标志决定（数据，改类别不用重编译）：
 /// - content 标记：内容域（双通道，池里按"空闲且快"选）。
 /// - big 标记：大文件域（单通道——一条长流占满槽位，两条互相抢带宽；大镜像链）。
-/// - session 标记：会话域（单通道单 IP 长期资产 + ping 闸，只标实测出拦截页的主站族）。
+/// - session 标记：会话域（单通道单 IP 单通道单 IP，只标实测出拦截页的主站族）。
 /// - 三个都不标：「其他」——单通道、批窗临时通道，不值得养专属资产。
 pub(crate) fn host_class(host: &str) -> HostClass {
     if pool::route::is_big_file_host(host) {
@@ -92,7 +92,7 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     if pool::route::is_content(host) {
         return HostClass::Content;
     }
-    // 会话域按风控面划界：拦截页(Whoa)实测只出现在主站族，只有它们配长期通道 + ping 闸。
+    // 会话域按风控面划界：拦截页(Whoa)实测只出现在主站族，只有它们配专属通道。
     // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译。
     // 内容型的子域不做通配排除——写进 ips 节点的 hosts（写完整即豁免，具体键最长匹配
     // 天然压过通配）。githubassets/github.io/githubapp/codeload 等不标 session——
@@ -130,7 +130,7 @@ fn now_secs() -> u64 {
 /// 响应头预算超时：上层按它区分"真等超了"和别的失败。
 pub const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
 
-/// 门房公式：在给定 IP 集合里挑活连接——占用率 × 延迟，最闲且最快的胜出。
+/// 门房公式：在给定 IP 集合里挑活连接——占用率 × 吞吐倒数，最闲且最快的胜出。
 /// only_owner = 会话域只认自己建的通道；want_slot = 搜索路径固定骑主通道。
 pub(crate) fn pick(
     ips: &[String],
@@ -197,7 +197,7 @@ pub async fn stream_on(
     }
 }
 
-/// 在给定 IP 集合里取活连接：按「占用率 × 延迟」挑最闲且最快的那条（公式在 keeper 层）。
+/// 在给定 IP 集合里取活连接：按「占用率 × 吞吐倒数」挑最闲且最快的那条。
 pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
     pick(ips, want_slot, None)
 }
@@ -1076,7 +1076,7 @@ pub async fn h2_open_stream(
     ),
     String,
 > {
-    // 每次开流刷新这条连接自己的空闲期：探活计时器的闲置期按它算。
+    // 每次开流刷新这条连接自己的空闲期：闲置焚毁计时按它算。
     {
         let mut g = lock(conn_pool());
         if let Some(h) = g.get_mut(&up.ip) {

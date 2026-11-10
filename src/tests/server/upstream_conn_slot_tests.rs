@@ -768,7 +768,7 @@ async fn conn_end_removes_itself_from_pool() {
 
 /// 溢出临时通道语义：同 IP 溢出是拥挤时的临时加班——正编 + 一条溢出并存，
 /// pick 与通道清单都不外发溢出句柄，第二条溢出拒收（递回正编），
-/// 驱动按"在途流归零即焚"回收（conn_probe_state 露出标记给探活拍判）。
+/// 驱动按"在途流归零即焚"回收（conn_probe_state 露出标记给清扫拍判）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn overflow_channel_handle_is_never_handed_out_again() {
@@ -808,10 +808,10 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     let listed = channels_for(&ips);
     assert_eq!(listed.len(), 1, "清单只含非溢出通道");
     assert_eq!(listed[0].id, normal_id);
-    // 驱动看到的标记就位：在途流归零时探活拍会焚毁它。
+    // 驱动看到的标记就位：在途流归零时清扫拍会焚毁它。
     let (_, inflight, overflow) = conn_probe_state(ip_normal, temp_id);
     assert!(overflow, "溢出标记应跟着句柄进池");
-    assert_eq!(inflight, 0, "无在途流 = 下一个探活拍回收");
+    assert_eq!(inflight, 0, "无在途流 = 下一个清扫拍回收");
     // 正常通道不带标记。
     assert!(!conn_probe_state(ip_normal, normal_id).2);
     let _ = lock(conn_pool()).remove(ip_normal);
@@ -844,5 +844,5 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let _ = lock(conn_pool()).remove(&ip);
 }
 
-// 看护任务不再做保活与补拨（探活计时器 + 死亡退避取代），旧的隧道打点与补拨节流
-// 测试随之退役：连接死亡由探活或请求结果发现，通道重建是下一个请求自己的事。
+// 看护任务不再做保活与补拨（即用即建取代），旧的隧道打点与补拨节流
+// 测试随之退役：连接死亡由请求结果发现，通道重建是下一个请求自己的事。

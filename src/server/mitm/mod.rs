@@ -703,9 +703,11 @@ pub(super) async fn get_direct(
                         ));
                     } else {
                         (log)(&format!(
-                            "[流停滞] {host}{path} 响应头后 {}ms 无首字节, 换通道重发",
+                            "[流停滞] {host}{path} 响应头后 {}ms 无首字节, 摘除停滞通道并重发",
                             config::FIRST_FRAME_WAIT_MS
                         ));
+                        // 不摘僵尸通道，重发的 get_or_build 还会领回同一条（17 连停滞实证）
+                        upstream::cull_channel(&ip);
                         retried = true;
                         (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
                         continue;

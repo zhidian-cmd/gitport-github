@@ -22,7 +22,7 @@ pub struct Flags {
     pub direct: bool,
     /// 内容域：走熔断与短响应预算。
     pub content: bool,
-    /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
+    /// 会话域：带用户会话、跨 IP 是风控特征——own 过滤（只认自建通道）。
     /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
     /// 内容型的子域不做通配排除——直接写进 ips 节点的 hosts（写完整即豁免，
     /// 具体键最长匹配天然压过通配）。
@@ -48,7 +48,7 @@ pub struct HostSpec {
     pub action: Option<String>,
     #[serde(default)]
     pub content: bool,
-    /// 会话域：带用户会话、跨 IP 是风控特征——长期通道 + ping 闸 + own 过滤。
+    /// 会话域：带用户会话、跨 IP 是风控特征——own 过滤（只认自建通道）。
     #[serde(default)]
     pub session: bool,
     /// 大文件域：单通道 + 大镜像链。
