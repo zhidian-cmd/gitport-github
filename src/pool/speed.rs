@@ -25,11 +25,10 @@ const BREAKER_SECS: u64 = 600;
 /// EWMA 新样本权重。
 const ALPHA: f64 = 0.4;
 
-/// 一次实测样本。
+/// 一次实测样本（EWMA 后的吞吐）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     pub kbps: f64,
-    pub target: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -85,10 +84,7 @@ fn note_sample(ip: &str, kbps: f64) -> Option<Sample> {
         .or_insert((0, 0.0));
     e.0 += 1;
     e.1 += kbps;
-    Some(Sample {
-        kbps: st.ewma,
-        target: TARGET_KBPS,
-    })
+    Some(Sample { kbps: st.ewma })
 }
 
 /// 该 IP 的实测吞吐（KB/s）；没测过 = None。
