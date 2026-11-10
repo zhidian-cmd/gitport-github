@@ -341,6 +341,20 @@ pub(crate) fn channel_load(ip: &str) -> Option<(u32, u32)> {
     ))
 }
 
+/// 摘除并关闭该 IP 的正编通道（cap=1 时即唯一一条）——替换黑通道/会话换血用。
+/// 只 notify：驱动走 close 分支退出并自摘出池，连接随任务收尾关闭。
+pub(crate) fn cull_channel(ip: &str) {
+    let close = {
+        let g = lock(conn_pool());
+        g.get(ip)
+            .and_then(|h| h.conns.first())
+            .map(|c| c.up.close.clone())
+    };
+    if let Some(c) = close {
+        c.notify_one();
+    }
+}
+
 /// 驱动探活用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
 fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     let g = lock(conn_pool());
@@ -847,6 +861,13 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
         }
     });
     let mut ranked = rank_legs(got);
+    // 探针失败（头部超时/零数据）的腿 = 黑洞嫌疑：暂缓 60s，pick 不再选中它们——
+    // 竞速天然排除黑洞。µs 精度后 NoData 是真实的 500ms 零数据，不是毫秒截断误伤。
+    for leg in &ranked {
+        if leg.kbps.is_none() {
+            pool::speed::bench(&leg.ip);
+        }
+    }
     // 有达标通道 → 留最快的两条，落败腿关闭；
     // 全都不达标 → 一条不关全留用：N 条通道摊并发就是 N 份聚合带宽，
     // 单通道的 h2 流排队才是瓶颈（DNS 兜底"更快"的真因就是它一个人独占一条新连接）。

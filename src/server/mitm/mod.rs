@@ -712,9 +712,11 @@ pub(super) async fn get_direct(
     }
 }
 
-/// 响应体计量：流结束时按「实收字节 ÷ 响应头到末字节耗时」给 IP 记账。
-/// 低于够用线 → 交池子暂缓并通知建连机器人补齐其余 IP；达标 → 立刻解暂缓。
-/// 样本不足 64KB 不计（小文件测不准）。
+/// 响应体计量 + 黑洞看门狗。池子只认数据段吞吐（首数据字节起算）：低于够用线
+/// 交给触发链，达标解暂缓。**黑洞**：响应头到了但 BLACKHOLE_FIRST_BYTE_MS 内
+/// 第一个数据字节没来——看门狗只标记不杀在途请求（也许回源后能完成），
+/// 通道暂缓 + 触发换血；会话域则当场弃旧通道并预建替代（浏览器对未收到响应的
+/// 重置连接会自动重试，重试落在预建的新通道上）。
 fn meter_body(
     log: &LogFn,
     host: &str,
@@ -722,32 +724,31 @@ fn meter_body(
     ip: &str,
     resp: hyper::Response<BoxBody>,
 ) -> hyper::Response<BoxBody> {
-    struct Watch {
+    struct WatchInner {
         log: LogFn,
         host: String,
         path: String,
         ip: String,
+        bytes: std::sync::atomic::AtomicU64,
         /// 数据窗起点 = **第一个数据字节**到达的时刻。池子只认数据传输速度：
         /// 响应头到首字节之间的等待是延迟不是吞吐，混进来就是把机器人侧的账
         /// 算进池子——与探针的头部预算同一条纪律。
-        started: std::sync::Mutex<Option<std::time::Instant>>,
-        bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        first_frame: std::sync::Mutex<Option<std::time::Instant>>,
     }
-    impl Watch {
+    impl WatchInner {
         fn on_frame(&self, n: usize) {
             self.bytes
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut g = self.started.lock().unwrap();
+            let mut g = self.first_frame.lock().unwrap();
             if g.is_none() {
                 *g = Some(std::time::Instant::now());
             }
         }
-    }
-    impl Drop for Watch {
-        fn drop(&mut self) {
+        /// body 结束（正常/中断）时结算：数据段吞吐入账并分流。
+        fn settle(&self) {
             let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
-            let Some(t0) = *self.started.lock().unwrap() else {
-                return; // 一个数据帧都没有（纯头响应）：无从量速度，不记账
+            let Some(t0) = *self.first_frame.lock().unwrap() else {
+                return; // 一个数据帧都没有：速度无从谈起（黑洞由看门狗处置）
             };
             let ms = t0.elapsed().as_millis() as u64;
             let Some(s) = pool::speed::record(&self.ip, bytes, ms) else {
@@ -762,20 +763,55 @@ fn meter_body(
             }
         }
     }
+    impl Drop for WatchInner {
+        fn drop(&mut self) {
+            self.settle();
+        }
+    }
+    // 纯头响应（204/304/Content-Length: 0）没有数据阶段，不参与黑洞判定。
+    let no_body_expected = matches!(
+        resp.status(),
+        http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
+    ) || resp
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        == Some("0");
     let (parts, body) = resp.into_parts();
-    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let watch = Watch {
+    let inner = Arc::new(WatchInner {
         log: log.clone(),
         host: host.to_string(),
         path: path.to_string(),
         ip: ip.to_string(),
-        started: std::sync::Mutex::new(None),
-        bytes,
-    };
-    // 闭包持有 watch：body 活多久它活多久——读完、客户端断开、连接出错都只结算一次。
+        bytes: std::sync::atomic::AtomicU64::new(0),
+        first_frame: std::sync::Mutex::new(None),
+    });
+    // 黑洞看门狗：头部预算内第一个数据字节没到 = 黑洞。标记（暂缓）+ 触发换血，
+    // 不杀在途请求——它也许回源后能完成；杀连接只会把部分数据变成断流。
+    if !no_body_expected {
+        let w = inner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::config::BLACKHOLE_FIRST_BYTE_MS,
+            ))
+            .await;
+            if w.first_frame.lock().unwrap().is_some() {
+                return; // 数据来了：不是黑洞，结算交给 body 结束时的 settle
+            }
+            let bytes = w.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            (w.log)(&format!(
+                "[黑洞] {} {} 响应头后 {}ms 零数据({bytes}B)",
+                w.host,
+                w.ip,
+                crate::config::BLACKHOLE_FIRST_BYTE_MS
+            ));
+            pool::on_channel_blackhole(&w.host, &w.ip, &w.path, &w.log);
+        });
+    }
+    // 闭包持有 inner：body 活多久它活多久——读完、客户端断开、连接出错都只结算一次。
     let body = http_body_util::BodyExt::map_frame(body, move |frame| {
         if let Some(d) = frame.data_ref() {
-            watch.on_frame(d.len());
+            inner.on_frame(d.len());
         }
         frame
     });

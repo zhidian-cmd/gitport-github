@@ -1437,7 +1437,7 @@ pub async fn get_or_build(
     }
 }
 
-/* ---------- 慢通道触发链：池子摘出 → 通知建连机器人补齐 ---------- */
+/* ---------- 慢通道/黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
 
 /// 内容域某条通道实测低于触发线：先查候选里还有没有已测达标的通道——有就把请求
 /// 让给它，将就用不折腾；全部已测通道都低于触发线（主副全低）才暂缓慢通道并通知
@@ -1466,6 +1466,45 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
         speed::kbps_of(ip).unwrap_or(0.0),
     ));
     ensure_coverage(host, path, log.clone());
+}
+
+/// 通道黑洞（真实请求响应头后 500ms 数据窗零字节）：按域分流处置。
+/// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
+///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
+/// - 内容域：暂缓黑通道 + 全量换血（健康复测 / 暂缓摘旧换新 / 缺的补建），
+///   竞速天然排除黑洞（暂缓 = 不进 pick）。
+/// - 其他（低频单通道）：暂缓即可，不折腾。
+pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
+    use crate::server::upstream as chan;
+    match chan::host_class(host) {
+        chan::HostClass::Session => {
+            chan::cull_channel(ip);
+            cursor_note(host, ip, false, 1); // 游标挪到下一候选，别死磕黑 IP
+            (log)(&format!(
+                "[黑洞] {host} 会话通道 {ip} 弃用, 游标挪动并预建替代通道"
+            ));
+            let host = host.to_string();
+            let path = path.to_string();
+            let log = log.clone();
+            tokio::spawn(async move {
+                // 预建：池空即拨，游标已指向下一候选 IP
+                let _ = get_or_build(&host, None, &path, &log).await;
+            });
+        }
+        chan::HostClass::Content => {
+            speed::bench(ip);
+            (log)(&format!(
+                "[黑洞] {host} {ip} 暂缓(500ms 数据窗零字节), 触发全量换血"
+            ));
+            if !speed::breaker_open(host) && speed::may_rebuild(host) {
+                speed::begin_rebuild(host);
+                ensure_coverage(host, path, log.clone());
+            }
+        }
+        _ => {
+            speed::bench(ip);
+        }
+    }
 }
 
 /// 建连机器人：把 host 的其余 IP 通道都建出来（一 IP 一条）。
@@ -1509,10 +1548,17 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
             best = Some(best.map_or(k, |b: f64| b.max(k)));
         }
 
-        // ② 缺的 IP 并发拨：一 IP 一条，失败记死，超时的不等（各自的探针有自己的时限）。
+        // ② 缺的 IP 与被暂缓的黑通道并发处置：缺的直拨；暂缓的摘旧换新（同 IP 重拨
+        // 实测能复活——黑的多为连接级而非 IP 级）；健康的不动。失败记死，超时不等。
         let mut dials = Vec::new();
         for t in targets.into_iter() {
-            if chan::conn_count_on_ip(&t.ip) > 0 || dial_cooling(&t.ip, &t.sni) {
+            if chan::conn_count_on_ip(&t.ip) > 0 {
+                if speed::bench_remaining_secs(&t.ip).is_none() {
+                    continue; // 健康通道：复测已覆盖，不动
+                }
+                // 暂缓中的黑通道：摘旧（close 分支断开 + 出池），同 IP 换一条新的
+                chan::cull_channel(&t.ip);
+            } else if dial_cooling(&t.ip, &t.sni) {
                 continue;
             }
             let host2 = host.clone();
