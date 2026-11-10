@@ -811,7 +811,8 @@ async fn probe_liveness_passes_on_responsive_upstream() {
     );
 }
 
-/// 溢出临时通道语义：句柄只归触发那次溢出的调用方——pick 与通道清单都不再外发它，
+/// 溢出临时通道语义：同 IP 溢出是拥挤时的临时加班——正编 + 一条溢出并存，
+/// pick 与通道清单都不外发溢出句柄，第二条溢出拒收（递回正编），
 /// 驱动按"在途流归零即焚"回收（conn_probe_state 露出标记给探活拍判）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
@@ -824,15 +825,22 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     normal.owner = Some("raw.githubusercontent.com".to_string());
     let normal_id = normal.id;
     store_h2(ip_normal, normal);
-    // 溢出通道：一 IP 一条，必然落在另一个没有通道的 IP 上，标了 overflow。
-    let ip_temp = "9.9.2.2";
-    let mut temp = mk_up(ip_temp, 1).await;
+    // 溢出通道：与正编同 IP（同 IP 溢出例外），标了 overflow。
+    let mut temp = mk_up(ip_normal, 1).await;
     temp.owner = Some("raw.githubusercontent.com".to_string());
     temp.overflow = true;
     let temp_id = temp.id;
-    store_h2(ip_temp, temp);
+    store_h2(ip_normal, temp);
+    // 第二条溢出拒收：每 IP 至多一条溢出，关掉新的、递回正编。
+    let mut temp2 = mk_up(ip_normal, 1).await;
+    temp2.owner = Some("raw.githubusercontent.com".to_string());
+    temp2.overflow = true;
+    let temp2_id = temp2.id;
+    let back = store_h2(ip_normal, temp2);
+    assert_ne!(back.id, temp2_id, "第二条溢出必须拒收");
+    assert_eq!(back.id, normal_id, "拒收时递回正编通道");
 
-    let ips = vec![ip_normal.to_string(), ip_temp.to_string()];
+    let ips = vec![ip_normal.to_string()];
     // pick 永远只给正常通道：溢出通道对后来者不存在。
     for _ in 0..3 {
         assert_eq!(
@@ -846,13 +854,12 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     assert_eq!(listed.len(), 1, "清单只含非溢出通道");
     assert_eq!(listed[0].id, normal_id);
     // 驱动看到的标记就位：在途流归零时探活拍会焚毁它。
-    let (_, inflight, overflow) = conn_probe_state(ip_temp, temp_id);
+    let (_, inflight, overflow) = conn_probe_state(ip_normal, temp_id);
     assert!(overflow, "溢出标记应跟着句柄进池");
     assert_eq!(inflight, 0, "无在途流 = 下一个探活拍回收");
     // 正常通道不带标记。
     assert!(!conn_probe_state(ip_normal, normal_id).2);
     let _ = lock(conn_pool()).remove(ip_normal);
-    let _ = lock(conn_pool()).remove(ip_temp);
 }
 
 /// get_or_build 步骤①：池里有闲通道就直接骑（fresh=false），绝不拨号。

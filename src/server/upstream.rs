@@ -236,11 +236,24 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
     let cap = up.owner.as_deref()
         .map(|owner| max_conns_per_ip(host_class(owner)))
         .unwrap_or(usize::MAX);
-    if h.conns.len() >= cap {
-        // 同 IP 满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
+    // 常驻名额按非溢出通道算：溢出是拥挤时的临时工，不占"一 IP 一通道"的名额。
+    let normal_cnt = h.conns.iter().filter(|c| !c.up.overflow).count();
+    if !up.overflow && normal_cnt >= cap {
+        // 常编满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
         // 若只是丢弃，驱动任务会在池外养到对端回收（泄漏）。Notify 无等待者也存许可，必达。
         up.close.notify_one();
         return h.conns[0].up.clone();
+    }
+    if up.overflow && h.conns.iter().any(|c| c.up.overflow) {
+        // 每 IP 至多一条溢出：再来的关掉，把正编（若有）递回去——溢出通道本身
+        // 还在驮上一个请求时，后来的拥挤请求骑它排队，总好过再拨。
+        up.close.notify_one();
+        return h
+            .conns
+            .iter()
+            .find(|c| !c.up.overflow)
+            .map(|c| c.up.clone())
+            .unwrap_or_else(|| h.conns[0].up.clone());
     }
     let keep = up.clone();
     h.conns.push(ConnSlot {
@@ -314,6 +327,18 @@ pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
 /// 该 IP 当前在池里的通道条数（溢出闸按它判"同 IP 还能不能再开"）。
 pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
     lock(conn_pool()).get(ip).map(|h| h.conns.len()).unwrap_or(0)
+}
+
+/// 该 IP 上正编通道的（在途流, 流上限）；无正编 = None。溢出临时通道不算。
+/// 拥挤判定用：溢出的前提是"正编满载且速度不慢"，不是"随便加一条"。
+pub(crate) fn channel_load(ip: &str) -> Option<(u32, u32)> {
+    let g = lock(conn_pool());
+    let h = g.get(ip)?;
+    let c = h.conns.iter().find(|c| !c.up.overflow)?;
+    Some((
+        c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
+        c.up.max_streams.max(1),
+    ))
 }
 
 /// 驱动探活用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。

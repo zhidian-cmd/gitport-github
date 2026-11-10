@@ -1571,9 +1571,11 @@ fn pick_channel(
     }
 }
 
-/// 溢出补一条临时通道：目标 = 现役通道最少且未到上限的候选 IP，直接拨不走串发
-/// （失败不牵动游标/冷却）。建成即打 overflow 标记——句柄不再外发，驱动在它空闲后
-/// 的探活拍掐断出池。会话域不溢出；补不出返回 None。
+/// 溢出补一条临时通道。首选 = 还没有通道的候选 IP（"一 IP 一通道"的领地）；
+/// 候选 IP 全占时走**同 IP 溢出**例外——条件是正编"不慢"（实测吞吐 ≥ 触发线）：
+/// 速度没问题只是流挤满了，多一条连接就是多一份公平份额。
+/// 溢出打 overflow 标记：pick 永不外发、空闲即焚，速来速走不算破常驻规矩。
+/// 直接拨不走串发（失败不牵动游标/冷却）。会话域不溢出；补不出返回 None。
 async fn overflow_build(
     host: &str,
     targets: &[route::NodeIp],
@@ -1583,15 +1585,23 @@ async fn overflow_build(
     if chan::host_class(host) == chan::HostClass::Session {
         return None;
     }
-    let cap = chan::max_conns_per_ip(chan::host_class(host));
-    let node = {
-        let mut cands: Vec<(usize, &route::NodeIp)> = targets
-            .iter()
-            .map(|t| (chan::conn_count_on_ip(&t.ip), t))
-            .filter(|(n, _)| *n < cap)
-            .collect();
-        cands.sort_by_key(|(n, _)| *n);
-        cands.first()?.1.clone()
+    // ① 首选：零通道 IP。
+    let fresh = targets
+        .iter()
+        .filter(|t| chan::conn_count_on_ip(&t.ip) == 0 && !dial_cooling(&t.ip, &t.sni))
+        .next();
+    // ② 全占 → 同 IP 溢出：正编不慢（≥触发线）才配，挑最闲的一条；慢的交给触发链。
+    let congested = targets.iter().filter_map(|t| {
+        let (inflight, cap) = chan::channel_load(&t.ip)?;
+        let kbps = speed::kbps_of(&t.ip)?;
+        if (kbps as f64) < speed::TRIGGER_KBPS {
+            return None; // 慢：溢出也快不了，触发链去换 IP
+        }
+        Some(((inflight as f64) / cap as f64, t))
+    });
+    let node = match fresh {
+        Some(t) => t.clone(),
+        None => congested.min_by(|a, b| a.0.total_cmp(&b.0))?.1.clone(),
     };
     let gate = build_lock(host);
     let Ok(_guard) = gate.try_lock() else {
@@ -1603,6 +1613,11 @@ async fn overflow_build(
         Ok(mut up) => {
             latency::note(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
+            (log)(&format!(
+                "[溢出] {host} 同 IP 临时加班通道 {}(正编满载, 实测 {:.0}KB/s ≥ 触发线)",
+                node.ip,
+                speed::kbps_of(&node.ip).unwrap_or(0.0)
+            ));
             Some(chan::store_h2(&node.ip, up))
         }
         Err(_) => {
