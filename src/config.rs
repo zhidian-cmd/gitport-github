@@ -59,6 +59,10 @@ pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 /// 掐断，正在途中的 commit XHR 被误杀——每次页面加载都误伤同一个地方。
 /// 误判由「暂缓 60s 自动过期 + 换血给出全部通道」兜底，不会永久冤枉一条通道。
 pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 8000;
+/// 首字节守门：响应头转发给浏览器**之前**等第一个数据字节的上限。超时 = 上游流
+/// 停滞，此时浏览器还没收到任何字节——幂等请求换通道重发一次，浏览器零感知。
+/// 5s：正常首字节 0.2~1.1s，抖动 2~3s，5s 之外的几乎必然是停滞流。
+pub const FIRST_FRAME_WAIT_MS: u64 = 5000;
 
 /// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。
 pub const HELLO_SPLIT_ENABLED: bool = true;

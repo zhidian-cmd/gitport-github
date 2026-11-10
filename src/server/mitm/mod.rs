@@ -684,6 +684,33 @@ pub(super) async fn get_direct(
                 pool::cursor_note(host, &ip, true, slot);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
+                // 首字节守门：头到了但数据流停滞 → 此刻浏览器还没收到任何字节，
+                // 幂等请求（GET/HEAD）整体丢弃换通道重发一次，浏览器零感知；
+                // 非幂等或重发后仍停滞 → 原样交还，浏览器自决。
+                let (resp, stalled) = if !retried
+                    && matches!(*out.method(), http::Method::GET | http::Method::HEAD)
+                    && !no_body_expected(&resp)
+                {
+                    first_frame_wait(resp, Duration::from_millis(config::FIRST_FRAME_WAIT_MS))
+                        .await
+                } else {
+                    (resp, false)
+                };
+                if stalled {
+                    if retried {
+                        (log)(&format!(
+                            "[流停滞] {host}{path} 重发后仍无首字节, 原样交还浏览器"
+                        ));
+                    } else {
+                        (log)(&format!(
+                            "[流停滞] {host}{path} 响应头后 {}ms 无首字节, 换通道重发",
+                            config::FIRST_FRAME_WAIT_MS
+                        ));
+                        retried = true;
+                        (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
+                        continue;
+                    }
+                }
                 if fresh {
                     (log)(&format!("[上游] {host}{path} 新连接 {ip}, {ms}ms"));
                 } else {
@@ -708,6 +735,55 @@ pub(super) async fn get_direct(
                 retried = true;
                 (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
             }
+        }
+    }
+}
+
+/// 纯头响应判定：204/304/Content-Length: 0 没有数据阶段，不参与首字节等待与黑洞判定。
+fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
+    matches!(
+        resp.status(),
+        http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
+    ) || resp
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        == Some("0")
+}
+
+/// 首字节守门：响应头已到手但**还没转发给浏览器**——此刻发现数据流停滞，
+/// 整体丢弃换通道重发是完全安全的（幂等请求、浏览器零感知，看不到半截响应）。
+/// 返回 (响应[停滞时原样、正常时首帧已拼回], 是否停滞)。
+async fn first_frame_wait(
+    resp: hyper::Response<BoxBody>,
+    wait: Duration,
+) -> (hyper::Response<BoxBody>, bool) {
+    let (parts, mut body) = resp.into_parts();
+    let first = match tokio::time::timeout(wait, http_body_util::BodyExt::frame(&mut body)).await {
+        Err(_) => {
+            return (hyper::Response::from_parts(parts, body), true); // 数据流停滞
+        }
+        Ok(r) => r,
+    };
+    match first {
+        // 体错误/空体（204 等）：不算停滞，原样交还，上层按语义处理
+        None | Some(Err(_)) => (hyper::Response::from_parts(parts, body), false),
+        Some(Ok(f)) => {
+            // 已截获的首帧拼回流首，其余帧照常泵送
+            let mut first = Some(f);
+            let stream = futures_util::stream::poll_fn(move |cx| {
+                if let Some(f) = first.take() {
+                    return std::task::Poll::Ready(Some(Ok(f)));
+                }
+                hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
+            });
+            (
+                hyper::Response::from_parts(
+                    parts,
+                    BoxBody::new(http_body_util::StreamBody::new(stream)),
+                ),
+                false,
+            )
         }
     }
 }
@@ -769,14 +845,7 @@ fn meter_body(
         }
     }
     // 纯头响应（204/304/Content-Length: 0）没有数据阶段，不参与黑洞判定。
-    let no_body_expected = matches!(
-        resp.status(),
-        http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
-    ) || resp
-        .headers()
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        == Some("0");
+    let no_body = no_body_expected(&resp);
     let (parts, body) = resp.into_parts();
     let inner = Arc::new(WatchInner {
         log: log.clone(),
@@ -786,15 +855,22 @@ fn meter_body(
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
     });
-    // 黑洞看门狗：头部预算内第一个数据字节没到 = 黑洞。标记（暂缓）+ 触发换血，
-    // 不杀在途请求——它也许回源后能完成；杀连接只会把部分数据变成断流。
-    if !no_body_expected {
-        let w = inner.clone();
+    // 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS 内第一个数据字节没来 = 黑洞。
+    // 看门狗持 **Weak** 引用：body 结束（重定向/空体/快速完成）即静默退出——
+    // 之前强引用会在 8s 后给已完成的响应「鞭尸」判黑，把活通道 cull 掉，
+    // 连坐通道上全部在途 XHR（commit 区连环误伤的元凶）。
+    // 判黑只标记不杀在途请求——它也许回源后能完成；杀连接只会把部分数据变成断流。
+    if !no_body {
+        let w = Arc::downgrade(&inner);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(
                 crate::config::BLACKHOLE_FIRST_BYTE_MS,
             ))
             .await;
+            // Weak 升级失败 = body 已正常结束：不是黑洞，什么都不用做
+            let Some(w) = w.upgrade() else {
+                return;
+            };
             if w.first_frame.lock().unwrap().is_some() {
                 return; // 数据来了：不是黑洞，结算交给 body 结束时的 settle
             }
