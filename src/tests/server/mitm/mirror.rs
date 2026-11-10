@@ -181,12 +181,14 @@ fn cred_authorized_trusted_mirrors_only() {
             on: true,
             trusted: true,
             template: String::new(),
+            invalid: false,
         },
         WorkerMirror {
             url: "https://public-proxy.example.org".into(),
             on: true,
             trusted: false,
             template: String::new(),
+            invalid: false,
         },
     ];
     let trusted: std::collections::HashSet<String> = mirrors

@@ -47,6 +47,9 @@ pub struct WorkerMirror {
     pub trusted: bool,
     #[serde(default)]
     pub template: String,
+    /// 用法试探没过：标红给用户看，且不进镜像链（试探是 best-effort，不删条目）。
+    #[serde(default)]
+    pub invalid: bool,
 }
 
 fn on_by_default() -> bool {
@@ -507,6 +510,7 @@ where
                     on: true,
                     trusted: false,
                     template: String::new(),
+                    invalid: false,
                 },
                 One::Full(m) => m,
             };
@@ -520,6 +524,7 @@ where
                 on: m.on,
                 trusted: m.trusted,
                 template: m.template,
+                invalid: m.invalid,
             })
         })
         .collect())
@@ -896,21 +901,19 @@ pub fn set_worker_mirrors(
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
-        // 同 URL 的旧条目已探测过用法：编辑 on/trusted 不许把它弄丢。
-        let old_tpl = worker_mirrors()
-            .iter()
-            .find(|x| x.url == u)
-            .map(|x| x.template.clone())
+        // 同 URL 的旧条目已探测过：编辑 on/trusted 不许把模板与探测结论弄丢。
+        let old = worker_mirrors()
+            .into_iter()
+            .find(|x| x.url == u);
+        let (old_tpl, old_bad) = old
+            .map(|x| (x.template, x.invalid))
             .unwrap_or_default();
         norm.push(WorkerMirror {
             url: u,
             on: w.on,
             trusted: w.trusted,
-            template: if w.template.is_empty() {
-                old_tpl
-            } else {
-                w.template
-            },
+            template: if w.template.is_empty() { old_tpl } else { w.template },
+            invalid: w.invalid || old_bad,
         });
     }
     let old = worker_mirrors();
@@ -949,10 +952,22 @@ pub fn mirror_template(url: &str) -> String {
 
 /// 写入单条镜像的用法模板（后台探测命中时调用），并落盘。
 pub fn set_mirror_template(url: &str, template: String) {
+    update_mirror(url, |w| {
+        w.template = template;
+        w.invalid = false;
+    });
+}
+
+/// 探测失败：标红（不改模板），UI 据此显示红框，且该条不进镜像链。
+pub fn set_mirror_invalid(url: &str, bad: bool) {
+    update_mirror(url, |w| w.invalid = bad);
+}
+
+fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {
     let u = url.trim().trim_end_matches('/');
     let mut list = worker_mirrors();
     if let Some(w) = list.iter_mut().find(|w| w.url == u) {
-        w.template = template;
+        f(w);
         *state().worker_mirrors.lock().unwrap() = list;
         let _ = save();
     }

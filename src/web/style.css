@@ -158,6 +158,8 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
             border-radius:8px;padding:8px 11px;font:12.5px var(--mono);color:var(--txt);outline:none;
             transition:border-color .15s}
 .text-input:focus{border-color:var(--green-line)}
+/* 用法试探没过：标红不进链，留着让用户改或删 */
+.text-input.invalid{border-color:var(--red-line);color:var(--red)}
 .text-input::placeholder{color:var(--faint)}
 /* Worker 代码块：mono、可滚动、深一层底 */
 .code{margin-top:9px;background:var(--panel-2);border:1px solid var(--line-strong);border-radius:9px;

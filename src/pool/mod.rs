@@ -828,6 +828,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                     on: true,
                     trusted: false,
                     template: String::new(),
+                    invalid: false,
                 });
                 adopted = true;
             }
@@ -1713,9 +1714,10 @@ fn builtin_mirror_urls() -> std::collections::HashSet<String> {
 /// persist=false：只对齐内存，不落盘（启动路径用，避免把手改的 routes.json 规范化重写）。
 pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     let registry = crate::settings::worker_mirrors();
+    // 探测标红的条目不进链：用法没验证过的镜像放进去只会白占链位。
     let enabled: Vec<String> = registry
         .iter()
-        .filter(|w| w.on)
+        .filter(|w| w.on && !w.invalid)
         .map(|w| w.url.clone())
         .collect();
     let mut disabled: Vec<String> = registry

@@ -567,12 +567,14 @@ fn toggle_gates_big_file_chains_only() {
             on: true,
             trusted: false,
             template: String::new(),
+            invalid: false,
         },
         crate::settings::WorkerMirror {
             url: "https://off.example".into(),
             on: false,
             trusted: false,
             template: String::new(),
+            invalid: false,
         },
     ]);
     serial_load(&dir, Vec::new(), None);
@@ -667,6 +669,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
         on: true,
         trusted: false,
         template: String::new(),
+        invalid: false,
     }])
     .unwrap();
     for h in CONTENT_HOSTS {

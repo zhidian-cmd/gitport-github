@@ -154,7 +154,7 @@ function applySettings(s) {
   $('swGh').checked = s.githubPAC !== false; // 旧版无此键时维持缺省(开)
 }
 function applyMirrors(s) {
-  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
+  MIRRORS = (s.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted, invalid: !!w.invalid}));
   renderMirrors();
 }
 /* 一次 /api/settings 喂两边：开关回显 + 镜像列表（启动与切页都不再拉两次） */
@@ -192,8 +192,11 @@ function mirrorRow(m, i) {
   const cls = m.on ? 'btn sm' : 'btn sm primary';
   const trust = '<label class="trust-label" title="信任此镜像：带签名(github 302 落点)的下载地址也放行给它。签名等效 1 小时提货凭证，仅对你完全信任的自建/无日志镜像开启。">' +
     '<input type="checkbox" data-act="trust" data-idx="' + i + '"' + (m.trusted ? ' checked' : '') + '>信任</label>';
+  // 用法试探没过：标红且不进链。地址本身可能没问题（镜像挂了/用法不在已知家族里），
+  // 所以留着让用户改或删，不替他清掉。
   return '<div class="mirror-row">' +
-    '<input type="text" class="text-input" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off">' +
+    '<input type="text" class="text-input' + (m.invalid ? ' invalid' : '') + '" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off"' +
+    (m.invalid ? ' title="用法试探未通过：该镜像暂不参与下载"' : '') + '>' +
     trust +
     '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
     '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +
@@ -217,7 +220,7 @@ async function commitMirrors(opts = {}) {
   try { r = await postJSON('/api/settings/workerMirrors', {mirrors}); }
   catch (e) { alert('保存失败: ' + e); return; }
   if (!r.ok) { alert('保存失败: ' + (r.error || '')); }
-  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted}));
+  MIRRORS = (r.workerMirrors || []).map(w => ({url: w.url, on: !!w.on, trusted: !!w.trusted, invalid: !!w.invalid}));
   renderMirrors();
 }
 

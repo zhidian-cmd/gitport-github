@@ -379,15 +379,12 @@ async fn api_worker_mirrors(
                             (log)(&format!("[镜像] {url} 用法已保存, 后续按模板使用"));
                         }
                         Err(e) => {
-                            (log)(&format!("[镜像] {url} {e}, 已从注册表移除"));
-                            let list: Vec<crate::settings::WorkerMirror> = settings
-                                ::worker_mirrors()
-                                .into_iter()
-                                .filter(|w| w.url != url)
-                                .collect();
-                            if let Ok((_, rem, _)) = settings::set_worker_mirrors(list) {
-                                pool::sync_custom_mirrors(&rem, true);
-                            }
+                            // 试探是 best-effort：不删条目，标红留给用户在界面上改或删。
+                            (log)(&format!(
+                                "[镜像] {url} {e}, 已标红(不进镜像链, 界面可改或删)"
+                            ));
+                            settings::set_mirror_invalid(&url, true);
+                            pool::sync_custom_mirrors(&[], true);
                         }
                     }
                 });
