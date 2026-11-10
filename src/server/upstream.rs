@@ -464,14 +464,16 @@ pub(crate) async fn probe_speed(
             break;
         }
     }
-    let ms = data_t0.elapsed().as_millis() as u64;
-    if got == 0 || ms == 0 {
+    // 微秒折算：小响应（头像 3KB）的头体常在同一个包里到达，毫秒精度会截成
+    // ms==0 而误判成零数据——最快的通道恰恰在这里被冤枉。
+    let us = data_t0.elapsed().as_micros() as u64;
+    if got == 0 || us == 0 {
         return Err(ProbeFail::NoData);
     }
     Ok(ProbeStat {
-        kbps: (got as f64 / 1024.0 / (ms as f64 / 1000.0)) as u64,
+        kbps: (got as f64 * 1_000_000.0 / 1024.0 / us as f64) as u64,
         bytes: got,
-        ms,
+        ms: (us / 1000) as u64,
     })
 }
 
