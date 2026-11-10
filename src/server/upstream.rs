@@ -385,7 +385,8 @@ pub(crate) async fn probe_liveness(send: &SendRequest<Bytes>, owner: &str) -> bo
 pub(crate) struct ProbeStat {
     pub kbps: u64,
     pub bytes: u64,
-    pub ms: u64,
+    /// 数据窗耗时（µs）：小响应的头体同包到达时毫秒会截成 0，摘要要能显示亚毫秒。
+    pub us: u64,
 }
 
 /// 探针失败原因：两回事分开打日志，否则「头部超时」和「数据黑洞」混成一行没法归因。
@@ -476,7 +477,7 @@ pub(crate) async fn probe_speed(
     Ok(ProbeStat {
         kbps: ((got as f64 * 1_000_000.0 / 1024.0 / us as f64).min(KBPS_CAP)) as u64,
         bytes: got,
-        ms: (us / 1000) as u64,
+        us,
     })
 }
 
@@ -804,7 +805,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
             // 赛道上就完成一次真实测速。达标的确保可用；不够的先不动——
             // 全都不达标时通道要全部留用摊带宽（暂缓是触发链在真实请求慢时才做的事）。
             if let Some(st) = &stat {
-                pool::speed::record_probe(&node.ip, st.bytes, st.ms);
+                pool::speed::record_probe(&node.ip, st.kbps, st.bytes);
                 if (st.kbps as f64) >= pool::speed::TARGET_KBPS {
                     pool::speed::release(&node.ip);
                 }
@@ -814,7 +815,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
                     ip: node.ip.clone(),
                     dial_ms,
                     kbps: stat.map(|s| s.kbps),
-                    sample: stat.map(|s| (s.bytes, s.ms)),
+                    sample: stat.map(|s| (s.bytes, s.us)),
                     fail,
                     up,
                 }))
@@ -870,7 +871,9 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
             let t = l
                 .kbps
                 .map(|k| match l.sample {
-                    Some((bytes, ms)) => format!("{k}KB/s({bytes}B/{ms}ms)"),
+                    // 亚毫秒数据窗显示 µs：0ms 会引来下一个疑问
+                    Some((bytes, us)) if us < 1000 => format!("{k}KB/s({bytes}B/{us}µs)"),
+                    Some((bytes, us)) => format!("{k}KB/s({bytes}B/{}ms)", us / 1000),
                     None => format!("{k}KB/s"),
                 })
                 .unwrap_or_else(|| {
@@ -1325,3 +1328,4 @@ mod conn_slot_tests;
 #[cfg(test)]
 #[path = "../tests/server/upstream.rs"]
 mod tests;
+ 

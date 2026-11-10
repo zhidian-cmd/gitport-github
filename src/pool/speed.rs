@@ -50,21 +50,23 @@ pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
     if bytes < MIN_SAMPLE_BYTES || ms == 0 {
         return None;
     }
-    note_sample(ip, bytes, ms)
+    let kbps = bytes as f64 / 1024.0 / (ms as f64 / 1000.0);
+    note_sample(ip, kbps)
 }
 
 /// 记一次探针/复测样本：时间窗 500ms 的刻意测量，任何字节量都入账——
 /// 快线慢线都有数，「无样本」只属于从没被探过的通道。
+/// 速度由调用方按 µs 精度算好传入——这里再收 bytes/ms 重算会撞毫秒截断，
+/// 头体同包的小响应（数据窗 0.8ms）会被 ms==0 误丢，「无样本」怪圈死灰复燃。
 /// 只入账（EWMA/样本窗/解锁暂缓），不触发暂缓与重建——那是真实请求慢时触发链的事。
-pub fn record_probe(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
-    if bytes == 0 || ms == 0 {
+pub fn record_probe(ip: &str, kbps: u64, bytes: u64) -> Option<Sample> {
+    if kbps == 0 || bytes == 0 {
         return None;
     }
-    note_sample(ip, bytes, ms)
+    note_sample(ip, kbps as f64)
 }
 
-fn note_sample(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
-    let kbps = bytes as f64 / 1024.0 / (ms as f64 / 1000.0);
+fn note_sample(ip: &str, kbps: f64) -> Option<Sample> {
     let mut g = lock(&TABLE);
     let t = g.get_or_insert_with(HashMap::new);
     let st = t.entry(ip.to_string()).or_insert(Stat {
