@@ -53,10 +53,12 @@ pub const MAX_CONNS_SESSION: usize = 1;
 pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
-/// MITM 响应体黑洞判定：响应头到了但这个毫秒数内第一个数据字节没来 = 黑洞。
-/// 500ms：小响应的头体同包到达（<1ms），回源/排队的正常等待也在这个量级之下；
+/// MITM 响应体黑洞判定：响应头到了但这个秒数内第一个数据字节没来 = 黑洞。
+/// 8s 与隧道首字节看门狗统一（实战值）。500ms 实测是灾难：tree-commit-info 这类
+/// git 数据端点总耗时可达 1.1s，线路抖一下头体间隔就过 500ms，看门狗把会话通道
+/// 掐断，正在途中的 commit XHR 被误杀——每次页面加载都误伤同一个地方。
 /// 误判由「暂缓 60s 自动过期 + 换血给出全部通道」兜底，不会永久冤枉一条通道。
-pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 500;
+pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 8000;
 
 /// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。
 pub const HELLO_SPLIT_ENABLED: bool = true;
