@@ -237,6 +237,9 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         .map(|owner| max_conns_per_ip(host_class(owner)))
         .unwrap_or(usize::MAX);
     if h.conns.len() >= cap {
+        // 同 IP 满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
+        // 若只是丢弃，驱动任务会在池外养到对端回收（泄漏）。Notify 无等待者也存许可，必达。
+        up.close.notify_one();
         return h.conns[0].up.clone();
     }
     let keep = up.clone();
