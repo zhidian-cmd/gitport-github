@@ -35,6 +35,8 @@ struct SettingsState {
 }
 
 /// 一条自定义镜像：url 为反代地址，on 为是否进链，trusted 表示用户授权把签名 URL 交给它。
+/// template = 该镜像的用法模板（占位符 {mirror}/{url}/{url_enc}/{owner}/{repo}/{ref}/{path}），
+/// 添加时由后台探测自动试出并保存；空 = 未探测，按老拼法（前缀拼接）用。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
@@ -43,6 +45,8 @@ pub struct WorkerMirror {
     #[serde(default = "on_by_default")]
     pub on: bool,
     pub trusted: bool,
+    #[serde(default)]
+    pub template: String,
 }
 
 fn on_by_default() -> bool {
@@ -502,6 +506,7 @@ where
                     url,
                     on: true,
                     trusted: false,
+                    template: String::new(),
                 },
                 One::Full(m) => m,
             };
@@ -514,6 +519,7 @@ where
                 url: url.to_string(),
                 on: m.on,
                 trusted: m.trusted,
+                template: m.template,
             })
         })
         .collect())
@@ -874,7 +880,10 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
 }
 
 /// 整表保存：规范化校验并与旧表求差集；删除即彻底消失，前端须先 GET 合并，链对齐由调用方用 removed 触发。
-pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<String>), String> {
+/// 返回 (enabled, removed, added)——added 是新出现的镜像，调用方据此触发用法探测。
+pub fn set_worker_mirrors(
+    list: Vec<WorkerMirror>,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {
         let u = w.url.trim().trim_end_matches('/').to_string();
@@ -887,10 +896,21 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
+        // 同 URL 的旧条目已探测过用法：编辑 on/trusted 不许把它弄丢。
+        let old_tpl = worker_mirrors()
+            .iter()
+            .find(|x| x.url == u)
+            .map(|x| x.template.clone())
+            .unwrap_or_default();
         norm.push(WorkerMirror {
             url: u,
             on: w.on,
             trusted: w.trusted,
+            template: if w.template.is_empty() {
+                old_tpl
+            } else {
+                w.template
+            },
         });
     }
     let old = worker_mirrors();
@@ -899,6 +919,11 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         .map(|w| w.url.clone())
         .filter(|u| !norm.iter().any(|n| n.url == *u))
         .collect();
+    let added: Vec<String> = norm
+        .iter()
+        .map(|w| w.url.clone())
+        .filter(|u| !old.iter().any(|o| o.url == *u))
+        .collect();
     let enabled: Vec<String> = norm
         .iter()
         .filter(|w| w.on)
@@ -906,7 +931,31 @@ pub fn set_worker_mirrors(list: Vec<WorkerMirror>) -> Result<(Vec<String>, Vec<S
         .collect();
     *state().worker_mirrors.lock().unwrap() = norm;
     save()?;
-    Ok((enabled, removed))
+    Ok((enabled, removed, added))
+}
+
+/// 镜像用法模板：注册表里查该 URL；查不到/未探测 = 空（按老拼法前缀拼接用）。
+pub fn mirror_template(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
+    state()
+        .worker_mirrors
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.url == u)
+        .map(|w| w.template.clone())
+        .unwrap_or_default()
+}
+
+/// 写入单条镜像的用法模板（后台探测命中时调用），并落盘。
+pub fn set_mirror_template(url: &str, template: String) {
+    let u = url.trim().trim_end_matches('/');
+    let mut list = worker_mirrors();
+    if let Some(w) = list.iter_mut().find(|w| w.url == u) {
+        w.template = template;
+        *state().worker_mirrors.lock().unwrap() = list;
+        let _ = save();
+    }
 }
 
 /// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。

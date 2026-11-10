@@ -358,11 +358,40 @@ struct WorkerMirrorsBody {
 }
 
 /// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
-async fn api_worker_mirrors(axum::Json(body): axum::Json<WorkerMirrorsBody>) -> Response {
+/// 新增的镜像在后台做用法试探：命中存模板（此后照模板用），全不中则摘出注册表。
+async fn api_worker_mirrors(
+    State(st): State<Arc<App>>,
+    axum::Json(body): axum::Json<WorkerMirrorsBody>,
+) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
-        Ok((_, removed)) => {
+        Ok((_, removed, added)) => {
             // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
             pool::sync_custom_mirrors(&removed, true);
+            for url in added {
+                let log: crate::util::LogFn = {
+                    let l = st.logs.clone();
+                    Arc::new(move |msg: &str| l.log(msg))
+                };
+                tokio::spawn(async move {
+                    match crate::server::mitm::mirror::discover_template(&url, &log).await {
+                        Ok(tpl) => {
+                            settings::set_mirror_template(&url, tpl);
+                            (log)(&format!("[镜像] {url} 用法已保存, 后续按模板使用"));
+                        }
+                        Err(e) => {
+                            (log)(&format!("[镜像] {url} {e}, 已从注册表移除"));
+                            let list: Vec<crate::settings::WorkerMirror> = settings
+                                ::worker_mirrors()
+                                .into_iter()
+                                .filter(|w| w.url != url)
+                                .collect();
+                            if let Ok((_, rem, _)) = settings::set_worker_mirrors(list) {
+                                pool::sync_custom_mirrors(&rem, true);
+                            }
+                        }
+                    }
+                });
+            }
             write_json(
                 &serde_json::json!({"ok": true, "workerMirrors": settings::worker_mirrors()}),
             )

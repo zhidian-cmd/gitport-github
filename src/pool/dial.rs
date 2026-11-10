@@ -291,6 +291,11 @@ pub async fn dial_one(
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     let mut ssl = client_ssl(host, host, None)?;
+    // 镜像腿只谈 HTTP/1.1：Cloudflare 系（gh-proxy.org 实测）的 h2 响应体在本客户端
+    // 读不出——头正常、体流立即 0B EOF，而同一 URL 走 h1.1 一切正常。镜像只拉文件，
+    // h2 多路复用没有收益，直接不开，这一类兼容问题连根拔掉。
+    ssl.set_alpn_protos(b"\x08http/1.1")
+        .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
     apply_cached_session(&mut ssl, host);
     let tcp = tokio::time::timeout(
         Duration::from_millis(TCP_CONNECT_TIMEOUT_MS),

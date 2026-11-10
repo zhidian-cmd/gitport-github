@@ -22,7 +22,7 @@ fn tmpdir() -> PathBuf {
 
 /// 生产路径：settings 只存注册表，存完由调用方用 removed 触发链对齐。
 fn apply_worker_mirrors(list: Vec<crate::settings::WorkerMirror>) -> Result<(), String> {
-    let (_, removed) = crate::settings::set_worker_mirrors(list)?;
+    let (_, removed, _) = crate::settings::set_worker_mirrors(list)?;
     sync_custom_mirrors(&removed, true);
     Ok(())
 }
@@ -566,11 +566,13 @@ fn toggle_gates_big_file_chains_only() {
             url: "https://on.example".into(),
             on: true,
             trusted: false,
+            template: String::new(),
         },
         crate::settings::WorkerMirror {
             url: "https://off.example".into(),
             on: false,
             trusted: false,
+            template: String::new(),
         },
     ]);
     serial_load(&dir, Vec::new(), None);
@@ -664,6 +666,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
         url: "https://my-worker.example.com".to_string(),
         on: true,
         trusted: false,
+        template: String::new(),
     }])
     .unwrap();
     for h in CONTENT_HOSTS {

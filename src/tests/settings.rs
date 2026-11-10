@@ -196,6 +196,7 @@ fn save_emits_full_schema_in_canonical_order() {
             url: "https://my.worker".to_string(),
             on: true,
             trusted: false,
+            template: String::new(),
         }],
     };
     let json = serde_json::to_string_pretty(&f).unwrap();

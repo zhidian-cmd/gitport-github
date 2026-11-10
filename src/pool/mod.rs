@@ -827,6 +827,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                     url: u.clone(),
                     on: true,
                     trusted: false,
+                    template: String::new(),
                 });
                 adopted = true;
             }
