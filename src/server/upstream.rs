@@ -470,8 +470,11 @@ pub(crate) async fn probe_speed(
     if got == 0 || us == 0 {
         return Err(ProbeFail::NoData);
     }
+    // 钳顶：小响应的头体同包到达时 µs 折算会算出 GB/s 级的缓冲速度——
+    // 是"快得测不出"的下界不是线速，钳到 100MB/s 保排序单调、不印天文数字。
+    const KBPS_CAP: f64 = 100_000.0;
     Ok(ProbeStat {
-        kbps: (got as f64 * 1_000_000.0 / 1024.0 / us as f64) as u64,
+        kbps: ((got as f64 * 1_000_000.0 / 1024.0 / us as f64).min(KBPS_CAP)) as u64,
         bytes: got,
         ms: (us / 1000) as u64,
     })
@@ -716,13 +719,15 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     }
 }
 
-/// 竞速腿的结果：拨号耗时（TCP+TLS+h2）与实测吞吐（64KB 探针）。
+/// 竞速腿的结果：拨号耗时（TCP+TLS+h2）与实测吞吐（500ms 探针）。
 #[derive(Clone)]
 pub(crate) struct RaceLeg {
     pub ip: String,
     pub dial_ms: u64,
     /// 探针实测吞吐（KB/s）；None = 探针失败，原因在 fail。
     pub kbps: Option<u64>,
+    /// 样本可信度：探针的字节数与数据窗耗时，太小/太快的读数一眼可辨。
+    pub sample: Option<(u64, u64)>,
     /// 探针失败原因：头部超时 / 零数据——两回事分开打，否则没法归因。
     pub fail: Option<ProbeFail>,
     up: H2Upstream,
@@ -809,6 +814,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
                     ip: node.ip.clone(),
                     dial_ms,
                     kbps: stat.map(|s| s.kbps),
+                    sample: stat.map(|s| (s.bytes, s.ms)),
                     fail,
                     up,
                 }))
@@ -857,13 +863,16 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
     for leg in ranked {
         leg.up.close.notify_one();
     }
-    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快。
+    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快、样本可信度如何。
     let summary: Vec<String> = winners
         .iter()
         .map(|l| {
             let t = l
                 .kbps
-                .map(|k| format!("{k}KB/s"))
+                .map(|k| match l.sample {
+                    Some((bytes, ms)) => format!("{k}KB/s({bytes}B/{ms}ms)"),
+                    None => format!("{k}KB/s"),
+                })
                 .unwrap_or_else(|| {
                     format!(
                         "{}/拨号{}ms",

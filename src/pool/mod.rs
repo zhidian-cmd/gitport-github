@@ -1599,9 +1599,21 @@ async fn overflow_build(
         }
         Some(((inflight as f64) / cap as f64, t))
     });
-    let node = match fresh {
-        Some(t) => t.clone(),
-        None => congested.min_by(|a, b| a.0.total_cmp(&b.0))?.1.clone(),
+    // 分支与挑选时刻的速度一起定死：拨号要花一秒，账本在这段时间会被改写，
+    // 日志再回头查账本就会印出与决策时无关的数（「0KB/s ≥ 触发线」的自相矛盾行）。
+    let (node, why) = match fresh {
+        Some(t) => (t.clone(), "零通道 IP 补建".to_string()),
+        None => {
+            let (ratio, t) = congested.min_by(|a, b| a.0.total_cmp(&b.0))?;
+            let kbps = speed::kbps_of(&t.ip).unwrap_or(0.0);
+            (
+                t.clone(),
+                format!(
+                    "同 IP 临时加班(正编满载 {:.0}%, 挑选时实测 {kbps:.0}KB/s ≥ 触发线)",
+                    ratio * 100.0
+                ),
+            )
+        }
     };
     let gate = build_lock(host);
     let Ok(_guard) = gate.try_lock() else {
@@ -1613,11 +1625,7 @@ async fn overflow_build(
         Ok(mut up) => {
             latency::note(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
-            (log)(&format!(
-                "[溢出] {host} 同 IP 临时加班通道 {}(正编满载, 实测 {:.0}KB/s ≥ 触发线)",
-                node.ip,
-                speed::kbps_of(&node.ip).unwrap_or(0.0)
-            ));
+            (log)(&format!("[溢出] {host} {why}: {}", node.ip));
             Some(chan::store_h2(&node.ip, up))
         }
         Err(_) => {
