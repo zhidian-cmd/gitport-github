@@ -452,8 +452,13 @@ pub(crate) async fn probe_speed(
     if got == 0 || us == 0 {
         return Err(ProbeFail::NoData);
     }
-    // 钳顶：小响应的头体同包到达时 µs 折算会算出 GB/s 级的缓冲速度——
-    // 是"快得测不出"的下界不是线速，钳到 100MB/s 保排序单调、不印天文数字。
+    // 样本下限：头体同包的小响应（41B/1µs 型）会算出 GB/s 级"缓冲速度"，
+    // 是测不出而不是线速——不到 16KB（等效 <32KB/s，够用线一半以下）与零数据
+    // 同归无样本，别让假满速通道达标入账被 pick 优先选中。
+    if got < 16 * 1024 {
+        return Err(ProbeFail::NoData);
+    }
+    // 钳顶：大样本的 µs 折算仍可能算出高于线速的读数，钳到 100MB/s 保排序单调。
     const KBPS_CAP: f64 = 100_000.0;
     Ok(ProbeStat {
         kbps: ((got as f64 * 1_000_000.0 / 1024.0 / us as f64).min(KBPS_CAP)) as u64,
