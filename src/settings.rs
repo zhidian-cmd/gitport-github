@@ -56,6 +56,18 @@ fn on_by_default() -> bool {
     true
 }
 
+/// 初次使用（无 settings.json）时内置的镜像注册表：公共前缀型镜像，拨测
+/// 逐字节一致才入选。用户删掉后落盘即不再出现——默认值只在首启生效。
+fn default_worker_mirrors() -> Vec<WorkerMirror> {
+    vec![WorkerMirror {
+        url: "https://gh-proxy.com".to_string(),
+        on: true,
+        trusted: false,
+        template: String::new(), // 前缀型用法不需要模板
+        invalid: false,
+    }]
+}
+
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();
 static EXE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -69,7 +81,7 @@ fn state() -> &'static SettingsState {
         last_pac: Mutex::new(String::new()),
         git_proxy_backup: Mutex::new(String::new()),
         last_ip: Mutex::new(LastIpTable::default()),
-        worker_mirrors: Mutex::new(Vec::new()),
+        worker_mirrors: Mutex::new(default_worker_mirrors()),
     })
 }
 
