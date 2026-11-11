@@ -52,7 +52,9 @@ pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
 /// git 数据端点总耗时可达 1.1s，线路抖一下头体间隔就过 500ms，看门狗把会话通道
 /// 掐断，正在途中的 commit XHR 被误杀——每次页面加载都误伤同一个地方。
 /// 误判由「暂缓 60s 自动过期 + 换血给出全部通道」兜底，不会永久冤枉一条通道。
-pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 8000;
+/// 30s：8s 实测把"服务端慢渲染/单连接排队"误判成黑洞（overview-files 等接口
+/// 20~80s 才回是常态，数据最终都到）——零字节满 30s 仍无数据才按黑洞处置。
+pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 30_000;
 
 /// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。
 pub const HELLO_SPLIT_ENABLED: bool = true;

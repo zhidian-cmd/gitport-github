@@ -779,10 +779,10 @@ fn meter_body(
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
     });
-    // 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS 内第一个数据字节没来 = 黑洞。
-    // 看门狗持 **Weak** 引用：body 结束（重定向/空体/快速完成）即静默退出——
-    // 之前强引用会在 8s 后给已完成的响应「鞭尸」判黑，把活通道 cull 掉，
-    // 连坐通道上全部在途 XHR（commit 区连环误伤的元凶）。
+    // 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节没来 = 黑洞。
+    // 30s 而不是更短：8s 实测会把"服务端慢渲染/单连接排队"误判成黑洞——
+    // overview-files 等接口 20~80s 才回是常态，数据最终都到（纯慢，不是黑）。
+    // 看门狗持 **Weak** 引用：body 结束（重定向/空体/快速完成）即静默退出。
     // 判黑只标记不杀在途请求——它也许回源后能完成；杀连接只会把部分数据变成断流。
     if !no_body {
         let w = Arc::downgrade(&inner);

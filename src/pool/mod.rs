@@ -1439,7 +1439,8 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
     ensure_coverage(host, path, log.clone());
 }
 
-/// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS 数据窗零字节）：按域分流处置。
+/// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS=30s 数据窗零字节）：按域分流处置。
+/// 30s 才判黑：更短的窗把"服务端慢渲染/排队"误判成黑（数据最终都到，纯慢）。
 /// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
 /// - 内容域：**软禁黑 IP 60s**（不进 pick，在途流不杀）+ 全量换血补缺；
