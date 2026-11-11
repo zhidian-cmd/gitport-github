@@ -624,7 +624,9 @@ pub(crate) async fn h2_dial_slot(
     if dial_ms as u64 >= DIAL_SLOW_MS {
         pool::cursor_note(host, &ip, false, slot);
     }
-    let form = if sni.is_empty() || sni == host {
+    let form = if sni.is_empty() {
+        "无"
+    } else if sni == host {
         "真名"
     } else {
         "伪装"
