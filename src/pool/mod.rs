@@ -1472,8 +1472,8 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
 /// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS 数据窗零字节）：按域分流处置。
 /// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
-/// - 内容域：暂缓黑通道 + 全量换血（健康复测 / 暂缓摘旧换新 / 缺的补建），
-///   竞速天然排除黑洞（暂缓 = 不进 pick）。
+/// - 内容域：**摘除黑通道**（连接级故障，重拨同 IP 能复活）+ 全量换血；
+///   慢通道不走这里（on_channel_slow 只 bench 复测，不摘不重建）。
 /// - 其他（低频单通道）：暂缓即可，不折腾。
 pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     use crate::server::upstream as chan;
@@ -1495,8 +1495,12 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
         }
         chan::HostClass::Content => {
             speed::bench(ip);
+            // 黑通道当场摘除：零数据是连接级故障（重拨同 IP 实测能复活），
+            // 摘掉后它变成"缺的 IP"，由 ensure_coverage 的补建路径重拨+探针。
+            // 慢通道不走这里（on_channel_slow 只 bench 复测，不摘不重建）。
+            chan::cull_channel(ip);
             (log)(&format!(
-                "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
+                "[黑洞] {host} {ip} 摘除重建(数据窗零字节), 触发全量换血"
             ));
             if !speed::breaker_open(host) && speed::may_rebuild(host) {
                 speed::begin_rebuild(host);
@@ -1550,17 +1554,12 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
             best = Some(best.map_or(k, |b: f64| b.max(k)));
         }
 
-        // ② 缺的 IP 与被暂缓的黑通道并发处置：缺的直拨；暂缓的摘旧换新（同 IP 重拨
-        // 实测能复活——黑的多为连接级而非 IP 级）；健康的不动。失败记死，超时不等。
+        // ② 黑通道重建 + 缺的补建，慢通道不重建只复测：黑洞触发时肇事黑通道已当场
+        // 摘除（on_channel_blackhole），此处只对没通道的 IP（含刚摘的黑通道、本来
+        // 就缺的）直拨补建；有通道的（健康或暂缓中的慢通道）① 复测已覆盖，不动。
         let mut dials = Vec::new();
         for t in targets.into_iter() {
-            if chan::conn_count_on_ip(&t.ip) > 0 {
-                if speed::bench_remaining_secs(&t.ip).is_none() {
-                    continue; // 健康通道：复测已覆盖，不动
-                }
-                // 暂缓中的黑通道：摘旧（close 分支断开 + 出池），同 IP 换一条新的
-                chan::cull_channel(&t.ip);
-            } else if dial_cooling(&t.ip, &t.sni) {
+            if chan::conn_count_on_ip(&t.ip) > 0 || dial_cooling(&t.ip, &t.sni) {
                 continue;
             }
             let host2 = host.clone();
@@ -1572,7 +1571,11 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
                     .await
                     .ok()?;
                 let up = chan::store_h2(&t.ip, up);
-                let st = chan::probe_channel(&up, &p).await?;
+                let Some(st) = chan::probe_channel(&up, &p).await else {
+                    // 补建后探针仍零数据：黑通道复活失败，继续暂缓别让它被 pick 选中
+                    speed::bench(&t.ip);
+                    return None;
+                };
                 speed::record_probe(&t.ip, st.kbps, st.bytes);
                 Some((t.ip.clone(), st.kbps as f64))
             });
