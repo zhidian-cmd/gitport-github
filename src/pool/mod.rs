@@ -609,7 +609,8 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             }
         })
         .collect();
-    parts.push(format!("  \"hosts\": {{\n{}\n  }}", rows.join(",\n")));
+    // hosts 表压成一行：纯路由声明，逐行展开徒增文件高度。
+    parts.push(format!("  \"hosts\": {{{}}}", rows.join(", ")));
 
     let mut big_rows: Vec<String> = Vec::new();
     let mut small_rows: Vec<String> = Vec::new();
