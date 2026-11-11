@@ -1442,8 +1442,8 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
 /// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS 数据窗零字节）：按域分流处置。
 /// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
-/// - 内容域：**摘除黑通道**（连接级故障，重拨同 IP 能复活）+ 全量换血；
-///   慢通道不走这里（on_channel_slow 只 bench 复测，不摘不重建）。
+/// - 内容域：**软禁黑 IP 60s**（不进 pick，在途流不杀）+ 全量换血补缺；
+///   慢通道不走这里（on_channel_slow 只 bench 复测，同样不摘不重建）。
 /// - 其他（低频单通道）：暂缓即可，不折腾。
 pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     use crate::server::upstream as chan;
@@ -1464,13 +1464,12 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
             });
         }
         chan::HostClass::Content => {
+            // 软禁 60s（不进 pick），**不杀在途连接**：一条 h2 驮着几十条复用流，
+            // 个别流黑洞 ≠ 连接死；cull 会连坐全部在途流（commit 延迟 XHR 全灭=骨架屏）。
+            // 旧连接随在途流结束 + 闲置焚毁自然退役；bench 过期后由真实流量重新验证。
             speed::bench(ip);
-            // 黑通道当场摘除：零数据是连接级故障（重拨同 IP 实测能复活），
-            // 摘掉后它变成"缺的 IP"，由 ensure_coverage 的补建路径重拨+探针。
-            // 慢通道不走这里（on_channel_slow 只 bench 复测，不摘不重建）。
-            chan::cull_channel(ip);
             (log)(&format!(
-                "[黑洞] {host} {ip} 摘除重建(数据窗零字节), 触发全量换血"
+                "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
             ));
             if !speed::breaker_open(host) && speed::may_rebuild(host) {
                 speed::begin_rebuild(host);
