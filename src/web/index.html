@@ -88,7 +88,7 @@
           <div class="addr-row" onclick="copyText(document.getElementById('addr').textContent)" title="点击复制">
             <code class="addr" id="addr">127.0.0.1:7810</code>
           </div>
-          <span class="hint">浏览器扩展(SwitchyOmega 等)/ git / 命令行把代理指向这里</span>
+          <span class="hint">浏览器扩展（SwitchyOmega 等）、git、命令行把代理指向这里</span>
         </div>
 
         <div class="grid3">
@@ -171,9 +171,9 @@
           </div>
           <p class="hint" style="margin-top:6px;line-height:1.9">
             ① Cloudflare 控制台 → Workers & Pages → Create → 选「Hello World」模板 → 起名并 Deploy；<br>
-            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置 CF 边缘缓存 + 凭据防护，git clone / git fetch 可直用；2026-10-29 前部署的老代码请重新粘贴覆盖一次）；<br>
+            ② Edit Code → 全选删除，粘贴上面「复制 Worker 代码」的内容 → Deploy（已内置边缘缓存与凭据防护，git clone / fetch 可直用；早前部署的老代码请重贴一次）；<br>
             ③ 回到概览页，你的 Worker 地址 = <code>https://名字.你的子域.workers.dev</code>；<br>
-            ④ 把地址粘贴到上方「我的镜像」→ 点「启动」。之后「启动/关闭」只增删 routes.json 链成员，地址注册表原位保留；<br>
+            ④ 把地址粘贴到上方「我的镜像」→ 点「启动」，已存的镜像地址不会因启动/关闭丢失；<br>
             ⑤ 建议绑定自有域名（Worker 设置 → 域和路由），抗 workers.dev 域名干扰；GitHub 看到的将全是 Cloudflare 的 IP。
           </p>
         </div>
@@ -210,18 +210,18 @@
         <div class="feature-card">
           <div class="feature-info">
             <h2>MITM 模式</h2>
-            <p class="hint" style="margin-top:5px">启用伪装 SNI、拦截页化解与流式直通；首次开启需安装本地证书</p>
+            <p class="hint" style="margin-top:5px">无 SNI 直连、拦截页化解、大文件分流直通；首次开启需安装本地证书</p>
           </div>
           <button class="btn primary" id="mitmBtn">开启</button>
         </div>
         <div class="feature-card">
           <div class="feature-info">
             <h2>镜像链校准</h2>
-            <p class="hint" style="margin-top:5px">按实测响应头耗时重排图片链顺序，后台任务（关窗进托盘也会跑完，结果见「运行日志」）。<br>• <strong>图片链</strong>：响应头测速，约 1 分钟<br>• <strong>大文件链</strong>：无需校准，代理按实时下载速度自动分流到最快镜像</p>
+            <p class="hint" style="margin-top:5px">逐个测各镜像的响应头耗时，最快的排到图片链前头；后台约 1 分钟，关窗进托盘也照常，结果看「运行日志」。<br>• <strong>大文件链</strong>无需校准：代理按实时下载速度自动挑最快镜像</p>
             <pre id="calResult"></pre>
           </div>
           <div class="cal-actions">
-            <button class="btn primary" id="calImgBtn">校准图片链（响应头）</button>
+            <button class="btn primary" id="calImgBtn">校准图片链</button>
           </div>
         </div>
 
