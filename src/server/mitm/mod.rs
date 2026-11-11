@@ -65,17 +65,6 @@ pub async fn handle_connect_mitm(
         .selected_alpn_protocol()
         .map(|p| p.to_vec())
         .unwrap_or_default();
-    // ALPN 必记：connection closed 类错误只可能来自 h1 服务端，凭 ALPN 归因。
-    let alpn_name = match alpn.as_slice() {
-        b"h2" => "h2",
-        b"http/1.1" => "http/1.1",
-        _ => "none",
-    };
-    if quiet::first_time("tunnel", host) {
-        (srv.log)(&format!(
-            "[MITM] {host} 隧道已解密(alpn={alpn_name}), 按域名路由转发"
-        ));
-    }
     let log = srv.log.clone();
     let svc = hyper::service::service_fn(move |req| {
         let log = log.clone();
