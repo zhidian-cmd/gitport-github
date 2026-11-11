@@ -684,35 +684,6 @@ pub(super) async fn get_direct(
                 pool::cursor_note(host, &ip, true, slot);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
-                // 首字节守门：头到了但数据流停滞 → 此刻浏览器还没收到任何字节，
-                // 幂等请求（GET/HEAD）整体丢弃换通道重发一次，浏览器零感知；
-                // 非幂等或重发后仍停滞 → 原样交还，浏览器自决。
-                let (resp, stalled) = if !retried
-                    && matches!(*out.method(), http::Method::GET | http::Method::HEAD)
-                    && !no_body_expected(&resp)
-                {
-                    first_frame_wait(resp, Duration::from_millis(config::FIRST_FRAME_WAIT_MS))
-                        .await
-                } else {
-                    (resp, false)
-                };
-                if stalled {
-                    if retried {
-                        (log)(&format!(
-                            "[流停滞] {host}{path} 重发后仍无首字节, 原样交还浏览器"
-                        ));
-                    } else {
-                        (log)(&format!(
-                            "[流停滞] {host}{path} 响应头后 {}ms 无首字节, 摘除停滞通道并重发",
-                            config::FIRST_FRAME_WAIT_MS
-                        ));
-                        // 不摘僵尸通道，重发的 get_or_build 还会领回同一条（17 连停滞实证）
-                        upstream::cull_channel(&ip);
-                        retried = true;
-                        (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
-                        continue;
-                    }
-                }
                 if fresh {
                     (log)(&format!("[上游] {host}{path} 新连接 {ip}, {ms}ms"));
                 } else {
@@ -751,43 +722,6 @@ fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         == Some("0")
-}
-
-/// 首字节守门：响应头已到手但**还没转发给浏览器**——此刻发现数据流停滞，
-/// 整体丢弃换通道重发是完全安全的（幂等请求、浏览器零感知，看不到半截响应）。
-/// 返回 (响应[停滞时原样、正常时首帧已拼回], 是否停滞)。
-async fn first_frame_wait(
-    resp: hyper::Response<BoxBody>,
-    wait: Duration,
-) -> (hyper::Response<BoxBody>, bool) {
-    let (parts, mut body) = resp.into_parts();
-    let first = match tokio::time::timeout(wait, http_body_util::BodyExt::frame(&mut body)).await {
-        Err(_) => {
-            return (hyper::Response::from_parts(parts, body), true); // 数据流停滞
-        }
-        Ok(r) => r,
-    };
-    match first {
-        // 体错误/空体（204 等）：不算停滞，原样交还，上层按语义处理
-        None | Some(Err(_)) => (hyper::Response::from_parts(parts, body), false),
-        Some(Ok(f)) => {
-            // 已截获的首帧拼回流首，其余帧照常泵送
-            let mut first = Some(f);
-            let stream = futures_util::stream::poll_fn(move |cx| {
-                if let Some(f) = first.take() {
-                    return std::task::Poll::Ready(Some(Ok(f)));
-                }
-                hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
-            });
-            (
-                hyper::Response::from_parts(
-                    parts,
-                    BoxBody::new(http_body_util::StreamBody::new(stream)),
-                ),
-                false,
-            )
-        }
-    }
 }
 
 /// 响应体计量 + 黑洞看门狗。池子只认数据段吞吐（首数据字节起算）：低于够用线
