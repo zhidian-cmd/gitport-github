@@ -205,7 +205,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 #logsBox .lg.err{color:#c9837c}   /* 柔化红：低饱和，长行不刺眼 */
 #logsBox .lg.warn{color:#c2a35e}  /* 柔化黄：降级/冷却类 */
 #logsBox .lg.ok{color:#7fbf98}    /* 柔化绿：成功路径（主线：用通道） */
-#logsBox .lg.bg{color:#5f6d7d}    /* 压暗：后台建造/换 IP/通道生命周期，不与主线争注意力 */
+#logsBox .lg.bg{color:#9f8dc2}    /* 柔化紫：后台建造/换 IP/通道生命周期，低饱和不刺眼 */
 #view-logs #logsBox{flex:1;min-height:0}
 .check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);cursor:pointer}
 .check input{accent-color:var(--green)}
