@@ -25,12 +25,6 @@ const BREAKER_SECS: u64 = 600;
 /// EWMA 新样本权重。
 const ALPHA: f64 = 0.4;
 
-/// 一次实测样本（EWMA 后的吞吐）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sample {
-    pub kbps: f64,
-}
-
 #[derive(Clone, Copy)]
 struct Stat {
     /// 吞吐 EWMA（KB/s）；0 = 还没测过。
@@ -45,7 +39,7 @@ static TABLE: Mutex<Option<HashMap<String, Stat>>> = Mutex::new(None);
 static SAMPLES: Mutex<Option<HashMap<String, (u32, f64)>>> = Mutex::new(None);
 
 /// 记一次真实传输的吞吐（只记账，不判死活）。样本不足 64KB 返回 None。
-pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
+pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<f64> {
     if bytes < MIN_SAMPLE_BYTES || ms == 0 {
         return None;
     }
@@ -58,14 +52,14 @@ pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<Sample> {
 /// 速度由调用方按 µs 精度算好传入——这里再收 bytes/ms 重算会撞毫秒截断，
 /// 头体同包的小响应（数据窗 0.8ms）会被 ms==0 误丢，「无样本」怪圈死灰复燃。
 /// 只入账（EWMA/样本窗/解锁暂缓），不触发暂缓与重建——那是真实请求慢时触发链的事。
-pub fn record_probe(ip: &str, kbps: u64, bytes: u64) -> Option<Sample> {
+pub fn record_probe(ip: &str, kbps: u64, bytes: u64) -> Option<f64> {
     if kbps == 0 || bytes == 0 {
         return None;
     }
     note_sample(ip, kbps as f64)
 }
 
-fn note_sample(ip: &str, kbps: f64) -> Option<Sample> {
+fn note_sample(ip: &str, kbps: f64) -> Option<f64> {
     let mut g = lock(&TABLE);
     let t = g.get_or_insert_with(HashMap::new);
     let st = t.entry(ip.to_string()).or_insert(Stat {
@@ -84,7 +78,7 @@ fn note_sample(ip: &str, kbps: f64) -> Option<Sample> {
         .or_insert((0, 0.0));
     e.0 += 1;
     e.1 += kbps;
-    Some(Sample { kbps: st.ewma })
+    Some(st.ewma)
 }
 
 /// 该 IP 的实测吞吐（KB/s）；没测过 = None。
@@ -151,12 +145,6 @@ pub fn usable(ips: &[String]) -> Vec<String> {
     } else {
         live
     }
-}
-
-/// 单 IP 是否暂缓中（测试用；运行期筛选走 usable）。
-#[cfg(test)]
-pub fn is_benched(ip: &str) -> bool {
-    bench_remaining_secs(ip).is_some()
 }
 
 /// 暂缓剩余秒数（状态行用）；未暂缓/已到期 = None。

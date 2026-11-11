@@ -223,10 +223,10 @@ pub fn expand_ip(spec: &str) -> Result<Vec<String>, String> {
     Ok(prefixes)
 }
 
-/// 表 + 反向索引一体：Arc 持有，脱离锁安全读。
-pub struct Topology {
-    pub rows: Vec<RouteRow>,
-    pub nodes: Vec<IpNode>,
+/// 表 + 反向索引一体：Arc 持有，脱离锁安全读（不出本模块，pub 字段供同模块方法用）。
+struct Topology {
+    rows: Vec<RouteRow>,
+    nodes: Vec<IpNode>,
     /// 路由键 → 节点下标。
     host_index: HashMap<String, Vec<usize>>,
     /// 装表时算好的共享 IP：挂了 2 个以上路由键，或含 `*.` 通配键（一个键背后几十个 host）。
@@ -283,12 +283,6 @@ pub struct Hit {
     idx: usize,
 }
 
-impl Hit {
-    pub fn row_idx(&self) -> usize {
-        self.idx
-    }
-}
-
 impl std::ops::Deref for Hit {
     type Target = RouteRow;
     fn deref(&self) -> &RouteRow {
@@ -337,18 +331,17 @@ pub fn route_for(host: &str) -> Option<Hit> {
 /// 返回 None = host 不在表（走 Tunnel）；Some(空) = 全黑（走 fallback）。
 pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
     let topo = lock(&TABLE).as_ref()?.clone();
-    let row_idx = route_for(host)?.row_idx();
+    let row_idx = route_for(host)?.idx;
     let key = &topo.rows[row_idx].key;
     let host_lower = host.to_ascii_lowercase();
     let mut out: Vec<NodeIp> = Vec::new();
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for &ni in topo.host_index.get(key).into_iter().flatten() {
         let node = &topo.nodes[ni];
         for ip in &node.ips {
-            if seen.contains(&ip.as_str()) || edges::is_bad(ip, key) {
+            if !seen.insert(ip.as_str()) || edges::is_bad(ip, key) {
                 continue;
             }
-            seen.push(ip);
             out.push(NodeIp {
                 ip: ip.clone(),
                 sni: node.sni.clone(),
@@ -406,12 +399,9 @@ pub fn pac_lists() -> (Vec<String>, Vec<String>) {
     let mut proxy = Vec::new();
     let mut direct = Vec::new();
     for r in t.rows.iter() {
-        if r.flags.direct {
-            if !direct.contains(&r.bare) {
-                direct.push(r.bare.clone());
-            }
-        } else if !proxy.contains(&r.bare) {
-            proxy.push(r.bare.clone());
+        let slot = if r.flags.direct { &mut direct } else { &mut proxy };
+        if !slot.contains(&r.bare) {
+            slot.push(r.bare.clone());
         }
     }
     (proxy, direct)
@@ -454,19 +444,13 @@ pub fn route_count() -> usize {
 
 /// 概览数字：节点展开后的具体 IP 总数（去重）。
 pub fn ip_count() -> usize {
-    let g = lock(&TABLE);
-    let Some(t) = g.as_ref() else {
-        return 0;
-    };
-    let mut seen: Vec<&str> = Vec::new();
-    for n in &t.nodes {
-        for ip in &n.ips {
-            if !seen.contains(&ip.as_str()) {
-                seen.push(ip);
-            }
-        }
-    }
-    seen.len()
+    lock(&TABLE).as_ref().map_or(0, |t| {
+        t.nodes
+            .iter()
+            .flat_map(|n| n.ips.iter().map(String::as_str))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    })
 }
 
 // ---- 镜像链归属（与拨号路由正交，仍按 host 形状判定）----
@@ -477,25 +461,17 @@ pub fn is_big_file_host(host: &str) -> bool {
     route_for(host).is_some_and(|r| r.flags.big)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssetKind {
-    Release,
-}
-
-fn release_asset_kind(host: &str, path: &str) -> Option<AssetKind> {
+/// github.com 仓库附件下载路径（/releases/download/...）：镜像链归属 release-assets。
+fn is_release_asset_path(host: &str, path: &str) -> bool {
     if host != "github.com" {
-        return None;
+        return false;
     }
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match (segs.get(2), segs.get(3), segs.get(4)) {
-        (Some(&"releases"), Some(&"download"), _) => Some(AssetKind::Release),
-        (Some(&"releases"), Some(&"latest"), Some(&"download")) => Some(AssetKind::Release),
-        _ => None,
-    }
-}
-
-fn is_release_asset_path(host: &str, path: &str) -> bool {
-    release_asset_kind(host, path).is_some()
+    matches!(
+        (segs.get(2), segs.get(3), segs.get(4)),
+        (Some(&"releases"), Some(&"download"), _)
+            | (Some(&"releases"), Some(&"latest"), Some(&"download"))
+    )
 }
 
 /// 镜像链归属：请求 host → 实际内容 host 的专属链。（codeload 已迁池，Archive 路径不再走镜像。）
@@ -503,9 +479,10 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     if is_big_file_host(host) {
         return host;
     }
-    match release_asset_kind(host, path) {
-        Some(AssetKind::Release) => "release-assets.githubusercontent.com",
-        None => host,
+    if is_release_asset_path(host, path) {
+        "release-assets.githubusercontent.com"
+    } else {
+        host
     }
 }
 

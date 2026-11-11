@@ -85,7 +85,7 @@ async fn one_ip_one_channel_and_slot_filter() {
     assert_ne!(kept.id, second_id);
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "会话域池里该 IP 只能有一条");
+        assert_eq!(g.get(ip).unwrap().len(), 1, "会话域池里该 IP 只能有一条");
     }
 
     for _ in 0..4 {
@@ -173,7 +173,7 @@ async fn content_ip_keeps_single_channel() {
     assert_eq!(kept.id, a_id, "作废时返回池里现成的那条");
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(ip).unwrap().conns.len(), 1, "同 IP 上限 1 条");
+        assert_eq!(g.get(ip).unwrap().len(), 1, "同 IP 上限 1 条");
     }
     let _ = lock(conn_pool()).remove(ip);
 }
@@ -311,7 +311,7 @@ async fn concurrent_content_hosts_coexist_on_one_ip() {
     assert_ne!(ra.id, rb.id, "内容域同 IP 两条通道并存");
     {
         let g = lock(conn_pool());
-        assert_eq!(g.get(same).unwrap().conns.len(), 2, "内容域同 IP 两条并存");
+        assert_eq!(g.get(same).unwrap().len(), 2, "内容域同 IP 两条并存");
     }
     // 第二条通道落在另一个 IP：仍然允许， EWMA 轮转也照旧。
     store_h2(other, mk_up(other, 2).await);
@@ -320,7 +320,7 @@ async fn concurrent_content_hosts_coexist_on_one_ip() {
         lock(conn_pool())
             .iter()
             .filter(|(k, _)| ips.contains(k))
-            .map(|(_, h)| h.conns.len())
+            .map(|(_, h)| h.len())
             .sum::<usize>(),
         3,
         "同 IP 两条 + 另一 IP 一条 = 三条"

@@ -1,6 +1,7 @@
 //! 镜像链：内容域回落 + 图片链 TTFB 校准 + 凭据防护。
 //! 大文件竞速：按候选数均分切段（测速只来自代理自己分的段）、慢段让位、补发按 ECT 挑家直到不再改善，故障/变慢无缝衔接。
 use super::merge::{self, MergeBody};
+use super::direct_split::Tpl;
 use super::path_of;
 use super::quiet;
 use crate::pool;
@@ -70,19 +71,15 @@ fn is_timeout_err(e: &str) -> bool {
         || e.to_lowercase().contains("timed out")
 }
 
-fn mirror_load(mirror: &str) -> Arc<MirrorLoad> {
+/// 供直连腿(mod.rs)记账：直连候选与镜像共用同一张负载表。
+pub(super) fn mirror_load(mirror: &str) -> Arc<MirrorLoad> {
     let mut g = MIRROR_LOAD.lock().unwrap_or_else(|p| p.into_inner());
     g.entry(mirror.to_string())
         .or_insert_with(|| Arc::new(MirrorLoad::default()))
         .clone()
 }
 
-/// 供直连腿(mod.rs)记账：直连候选与镜像共用同一张负载表。
-pub(super) fn mirror_load_for(mirror: &str) -> Arc<MirrorLoad> {
-    mirror_load(mirror)
-}
-
-/// 直连候选的记账键(mod.rs 组装 DirectLeg 前后共用)。
+/// 直连候选的记账键(mod.rs 组装直连腿前后共用)。
 pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
@@ -116,8 +113,6 @@ pub(super) struct LoadGuard {
     charged: u64,
     delivered: u64,
     raw_delivered: u64,
-    /// head_at 时的 raw_delivered 基准(全片均速的字节分母起点)。
-    head_bytes: u64,
     /// 体流起点(响应头到达)：建连耗时打点与段速率分母都从这里起算。
     head_at: Instant,
     /// 切片段传输起点（收到 206 的时刻，不含建连）：段结束时据此打实测吞吐。
@@ -140,7 +135,6 @@ impl LoadGuard {
             charged,
             delivered: 0,
             raw_delivered: 0,
-            head_bytes: 0,
             head_at: Instant::now(),
             seg_start: None,
             seg_first: None,
@@ -176,7 +170,6 @@ impl LoadGuard {
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
     pub(super) fn restart_mark(&mut self) {
         self.head_at = Instant::now();
-        self.head_bytes = self.raw_delivered;
     }
 }
 
@@ -378,11 +371,9 @@ fn mirror_chain_cap(host: &str) -> Option<usize> {
 }
 
 /// 直连腿的注入接口：拨号与记账由 mod.rs 组装，这里只管 ECT 派发与失败降权。
-pub(super) struct DirectLeg<'a> {
-    pub fetch: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<hyper::Response<BoxBody>, String>> + Send + 'a>,
-    >,
-}
+pub(super) type DirectLeg<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<hyper::Response<BoxBody>, String>> + Send + 'a>,
+>;
 
 pub(super) async fn chain_fetch(
     log: &LogFn,
@@ -444,7 +435,7 @@ pub(super) async fn chain_fetch(
         pool::mirror_chain(chain_host)
     };
     // 直连同台：直连以 direct/{host} 的身份参与 ECT；502 只在镜像与直连全灭时发生。
-    let direct_key = format!("direct/{chain_host}");
+        let direct_key = direct_load_key(chain_host);
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
     // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
@@ -487,7 +478,7 @@ pub(super) async fn chain_fetch(
         // 直连候选：拨号/游标/连接池/记账包装全在 fetch future 内(mod.rs 组装)。
         if m == direct_key {
             let t0 = Instant::now();
-            match direct.fetch.as_mut().await {
+            match direct.as_mut().await {
                 Ok(mut resp) => {
                     resp.extensions_mut().insert("direct");
                     if big {
@@ -591,13 +582,6 @@ pub(super) async fn chain_fetch(
     };
     Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
 }
-/// 直连段请求模板：与直连切片共用同一个 Tpl（direct_split.rs），不再各养一份双胞胎。
-use super::direct_split::Tpl;
-
-fn direct_tpl(out: &hyper::Request<BoxBody>) -> Tpl {
-    Tpl::of(out)
-}
-
 /// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 下一条无 Range 请求不必再白跑探测；只存 206 Content-Range 的权威总长。
 static TOTAL_MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
     LazyLock::new(Default::default);
@@ -683,7 +667,8 @@ async fn probe_total_one(
             http::header::RANGE,
             http::HeaderValue::from_static("bytes=0-0"),
         );
-        mirror_do_probe(req, mirror, log).await?
+        // 探测专用：允许上游忽略 Range 回 200，把整份 body 交还调用方当单流用。
+        mirror_do_inner(req, mirror, log, true).await?
     };
     if let Some(t) = merge::content_range_total(
         resp.headers()
@@ -744,10 +729,10 @@ async fn segment_direct(
     }
     strip_body_headers(&mut req);
     let mut resp = match hop_budget {
-        Some(b) => tokio::time::timeout(b, super::get_direct(log, &req, host, info, true, replay))
+        Some(b) => tokio::time::timeout(b, super::get_direct(log, &req, host, info, replay))
             .await
             .map_err(|_| format!("直连首包超时({}ms)", b.as_millis()))??,
-        None => super::get_direct(log, &req, host, info, true, replay).await?,
+        None => super::get_direct(log, &req, host, info, replay).await?,
     };
 
     // 3xx：内容在别处。最多跟两跳（release 实测一跳到位），每跳各付各的预算。
@@ -787,11 +772,11 @@ async fn segment_direct(
         resp = match hop_budget {
             Some(b) => tokio::time::timeout(
                 b,
-                super::get_direct(log, &req2, &next_host, &fresh, true, replay),
+                super::get_direct(log, &req2, &next_host, &fresh, replay),
             )
             .await
             .map_err(|_| format!("直连跳转首包超时({}ms)", b.as_millis()))??,
-            None => super::get_direct(log, &req2, &next_host, &fresh, true, replay).await?,
+            None => super::get_direct(log, &req2, &next_host, &fresh, replay).await?,
         };
         (log)(&format!("[切片] 直连 {next_host} 回 {}", resp.status()));
     }
@@ -964,8 +949,8 @@ async fn split_download(
             idle.push(*m);
         }
     }
-    // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用。
-    let tpl = direct_tpl(out);
+    // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用；与直连切片共用同一个 Tpl（direct_split.rs）。
+    let tpl = Tpl::of(out);
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
     let (base, len, known_total) = match range {
         // 开区间/多区间/畸形：长度未知或语义不同，不切
@@ -1043,30 +1028,15 @@ async fn split_download(
         let host = host.to_string();
         let tpl = tpl.clone();
         async move {
-            let guard = LoadGuard::charge(mirror_load(m), e - s, true);
             let is_direct = m.starts_with("direct/");
-            let got = if is_direct {
+            // 直连腿公共体在 fetch_segment_direct（与补发同路：预算按跳记、失败降权）；
+            // 镜像腿 charge 后直接打镜像请求。两腿统一回 (guard, resp) 再做 206 校验。
+            let got: Result<(LoadGuard, hyper::Response<BoxBody>), String> = if is_direct {
                 // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
-                let range = segment_range(s, e - 1)?;
-                let attempt = segment_direct(
-                    log,
-                    &tpl,
-                    &host,
-                    info,
-                    replay,
-                    Some(range),
-                    has_mirror.then_some(DIRECT_HOP_HEAD),
-                );
-                if has_mirror {
-                    match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
-                        Ok(r) => r,
-                        Err(_) => Err("直连整段预算耗尽(含 302 跳)".to_string()),
-                    }
-                } else {
-                    attempt.await
-                }
+                fetch_segment_direct(log, &tpl, &host, info, replay, m, s, e, has_mirror).await
             } else {
-                match mirror_request(out, m, orig_url) {
+                let guard = LoadGuard::charge(mirror_load(m), e - s, true);
+                let resp = match mirror_request(out, m, orig_url) {
                     Ok(mut req) => {
                         let hv = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
                             .map_err(|err| err.to_string())?;
@@ -1075,17 +1045,11 @@ async fn split_download(
                         mirror_do(req, m, log).await
                     }
                     Err(err) => Err(err),
-                }
+                }?;
+                Ok((guard, resp))
             };
-            // 直连没打出 206（超时/4xx/连不上）记一次失败，ECT 下次绕开；超时(慢)与硬错误(死)分开降权，别把慢腿踢太久。
-            if is_direct
-                && !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT)
-            {
-                let timeout_only = matches!(got.as_ref(), Err(e) if is_timeout_err(e));
-                mark_fail(&mirror_load(m), timeout_only);
-            }
             match got {
-                Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+                Ok((guard, resp)) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
                     merge::check_segment_start(
                     resp.headers()
                         .get("content-range")
@@ -1095,7 +1059,7 @@ async fn split_download(
                     let at = Instant::now();
                     Ok((guard.segment_from(at), at, resp))
                 }
-                Ok(resp) => {
+                Ok((_, resp)) => {
                     // 4xx 时把正文前 200 字节带上：GitHub/Azure 会把原因写在正文里。
                     let status = resp.status();
                     let mut hint = String::new();
@@ -1136,18 +1100,12 @@ async fn split_download(
         match r {
             Ok((guard, at, resp)) => {
                 if extra.is_none() {
+                    // 与直连切片同一张跳过清单（direct_split::skip_response_header）
                     extra = Some(
                         resp.headers()
                             .iter()
                             .filter(|(k, _)| {
-                                !matches!(
-                                    k.as_str(),
-                                    "content-range"
-                                        | "content-length"
-                                        | "transfer-encoding"
-                                        | "connection"
-                                        | "content-encoding"
-                                )
+                                !super::direct_split::skip_response_header(k.as_str())
                             })
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
@@ -1271,58 +1229,12 @@ async fn split_fetch(
     let m = cands[pick_mirror(&cands, to - from)].clone();
     let (s, e) = (base + from, base + to - 1);
     if m.starts_with("direct/") {
-        let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
         let has_mirror = cands.len() > 1;
-        // e 已经是闭区间末端（base+to-1）：补发直接用它，别再减 1。
+        // e 已经是闭区间末端（base+to-1）：fetch 收开区间末 base+to，别再减 1。
         // 少一字节会让合并层为末字节反复补发，而 1 字节补发的 Range 会变成起点>终点。
-        let range = segment_range(s, e)?;
-        let attempt = segment_direct(
-            log,
-            tpl,
-            host,
-            info,
-            replay,
-            Some(range),
-            has_mirror.then_some(DIRECT_HOP_HEAD),
-        );
-        let got = if has_mirror {
-            match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
-                Ok(r) => r,
-                Err(_) => Err("直连整段预算耗尽(含 302 跳)".to_string()),
-            }
-        } else {
-            attempt.await
-        };
-        if !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT) {
-            mark_fail(
-                &mirror_load(&m),
-                matches!(got.as_ref(), Err(err) if is_timeout_err(err)),
-            );
-        }
-        match got {
-            Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                merge::check_segment_start(
-                    resp.headers()
-                        .get("content-range")
-                        .and_then(|v| v.to_str().ok()),
-                    s,
-                )?;
-                let at = Instant::now();
-                let guard = guard.segment_from(at);
-                Ok(account_seg(
-                    resp.into_body(),
-                    guard,
-                    format!("{host} 补发"),
-                    m,
-                    log.clone(),
-                ))
-            }
-            Ok(resp) => Err(format!(
-                "{m} 补发回 {} 而非 206 (host {host})",
-                resp.status()
-            )),
-            Err(err) => Err(err),
-        }
+        let got = fetch_segment_direct(log, tpl, host, info, replay, &m, s, base + to, has_mirror)
+            .await;
+        finish_fill(got, &m, host, s, log).await
     } else {
         let guard = LoadGuard::charge(mirror_load(&m), to - from, true);
         // 只有 GET 会走到切片（split_download 早退挡掉其它方法），补发一律 GET。
@@ -1330,33 +1242,86 @@ async fn split_fetch(
             .method(http::Method::GET)
             .uri(mirror_url(m.as_str(), orig_url))
             .header(http::header::USER_AGENT, MIRROR_UA)
-            .header(http::header::RANGE, segment_range(s, base + to - 1)?)
+            .header(http::header::RANGE, segment_range(s, e)?)
             .body(protocol::empty_body())
             .map_err(|e| e.to_string())?;
-        match mirror_do(req, &m, log).await {
-            Ok(resp) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
-                merge::check_segment_start(
-                    resp.headers()
-                        .get("content-range")
-                        .and_then(|v| v.to_str().ok()),
-                    s,
-                )?;
-                let at = Instant::now();
-                let guard = guard.segment_from(at);
-                Ok(account_seg(
-                    resp.into_body(),
-                    guard,
-                    format!("{host} 补发"),
-                    m,
-                    log.clone(),
-                ))
-            }
-            Ok(resp) => Err(format!(
-                "{m} 补发回 {} 而非 206 (host {host})",
-                resp.status()
-            )),
-            Err(err) => Err(err),
+        let got = mirror_do(req, &m, log).await.map(|resp| (guard, resp));
+        finish_fill(got, &m, host, s, log).await
+    }
+}
+
+/// 直连段获取（首切与补发共用）：charge → Range → 直拨 → 有镜像时设跳预算 → 失败降权。
+/// 返回 (guard, resp)——guard 随响应交还调用方接记账；mark_fail 只对直连腿
+/// （超时(慢)与硬错误(死)分开降权，慢腿别踢太久）。
+#[allow(clippy::too_many_arguments)]
+async fn fetch_segment_direct(
+    log: &LogFn,
+    tpl: &Tpl,
+    host: &str,
+    info: &super::UpstreamInfo,
+    replay: &Option<Bytes>,
+    m: &str,
+    s: u64,
+    e: u64, // 开区间末端；Range 取 [s, e-1]
+    has_mirror: bool,
+) -> Result<(LoadGuard, hyper::Response<BoxBody>), String> {
+    let guard = LoadGuard::charge(mirror_load(m), e - s, true);
+    let range = segment_range(s, e - 1)?;
+    let attempt = segment_direct(
+        log,
+        tpl,
+        host,
+        info,
+        replay,
+        Some(range),
+        has_mirror.then_some(DIRECT_HOP_HEAD),
+    );
+    let got = if has_mirror {
+        match tokio::time::timeout(DIRECT_SEG_TOTAL, attempt).await {
+            Ok(r) => r,
+            Err(_) => Err("直连整段预算耗尽(含 302 跳)".to_string()),
         }
+    } else {
+        attempt.await
+    };
+    if !matches!(got.as_ref(), Ok(r) if r.status() == http::StatusCode::PARTIAL_CONTENT) {
+        mark_fail(&mirror_load(m), matches!(got.as_ref(), Err(err) if is_timeout_err(err)));
+    }
+    got.map(|resp| (guard, resp))
+}
+
+/// 补发响应收尾（直连/镜像两腿共用）：206 校验段起点并把 guard 接上记账流；
+/// 非 206 带状态码报错——两腿原先是逐字拷贝，改一处漏一处的隐患收掉。
+async fn finish_fill(
+    got: Result<(LoadGuard, hyper::Response<BoxBody>), String>,
+    m: &str,
+    host: &str,
+    s: u64,
+    log: &LogFn,
+) -> Result<BoxBody, String> {
+    match got {
+        Ok((guard, resp)) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
+            merge::check_segment_start(
+                resp.headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok()),
+                s,
+            )?;
+            let at = Instant::now();
+            let guard = guard.segment_from(at);
+            Ok(account_seg(
+                resp.into_body(),
+                guard,
+                format!("{host} 补发"),
+                m.to_string(),
+                log.clone(),
+            ))
+        }
+        Ok((_, resp)) => Err(format!(
+            "{m} 补发回 {} 而非 206 (host {host})",
+            resp.status()
+        )),
+        Err(err) => Err(err),
     }
 }
 
@@ -1736,15 +1701,6 @@ pub(super) async fn mirror_do(
     log: &LogFn,
 ) -> Result<hyper::Response<BoxBody>, String> {
     mirror_do_inner(req, mirror, log, false).await
-}
-
-/// 探测专用：允许上游忽略 Range 回 200，把整份 body 交还调用方当单流用。
-async fn mirror_do_probe(
-    req: hyper::Request<BoxBody>,
-    mirror: &str,
-    log: &LogFn,
-) -> Result<hyper::Response<BoxBody>, String> {
-    mirror_do_inner(req, mirror, log, true).await
 }
 
 async fn mirror_do_inner(

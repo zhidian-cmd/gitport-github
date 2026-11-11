@@ -29,12 +29,15 @@ fn bench_until_reaches_target() {
     // 9KB/s：低于够用线，暂缓
     record("1.1.1.1", 273_758, 30_000);
     bench("1.1.1.1");
-    assert!(is_benched("1.1.1.1"));
+    assert!(bench_remaining_secs("1.1.1.1").is_some());
     assert_eq!(usable(&ips), s(&["2.2.2.2"]), "暂缓的通道先不发");
     // 同一条后来跑出 150KB/s：EWMA 平滑，9→65.4 一次就过 60 的够用线
     record("1.1.1.1", 307_200, 2_000);
     release("1.1.1.1");
-    assert!(!is_benched("1.1.1.1"), "单次好样本足以越过 50KB/s 够用线");
+    assert!(
+        !bench_remaining_secs("1.1.1.1").is_some(),
+        "单次好样本足以越过 50KB/s 够用线"
+    );
     assert_eq!(usable(&ips), ips);
 }
 
@@ -46,7 +49,9 @@ fn all_benched_falls_back_to_full_list() {
     let ips = s(&["1.1.1.1", "2.2.2.2"]);
     bench("1.1.1.1");
     bench("2.2.2.2");
-    assert!(is_benched("1.1.1.1") && is_benched("2.2.2.2"));
+    assert!(
+        bench_remaining_secs("1.1.1.1").is_some() && bench_remaining_secs("2.2.2.2").is_some()
+    );
     assert_eq!(usable(&ips), ips, "全暂缓必须原样返回，否则无处可拨");
 }
 

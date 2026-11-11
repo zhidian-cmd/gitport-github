@@ -51,13 +51,6 @@ pub(crate) struct ConnSlot {
     last_used: u64,
 }
 
-/// 单 IP 的连接组。
-#[derive(Default)]
-pub(crate) struct IpConns {
-    pub(crate) conns: Vec<ConnSlot>,
-}
-
-
 /// 同 IP 通道上限：会话域/内容域/其他恒 1——多通道一律换 IP 另起（同 IP 溢出例外）。
 pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
     match class {
@@ -112,14 +105,13 @@ pub(crate) fn host_class(host: &str) -> HostClass {
 fn dual_channel(host: &str) -> bool {
     host_class(host) == HostClass::Content
 }
-
 /// 会话域：建连时自建优先，连上了再复用自己那条。
 pub(crate) fn prefer_own_channel(host: &str) -> bool {
     host_class(host) == HostClass::Session
 }
 
-static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, IpConns>>> = std::sync::OnceLock::new();
-pub(crate) fn conn_pool() -> &'static Mutex<HashMap<String, IpConns>> {
+static CONN_POOL: std::sync::OnceLock<Mutex<HashMap<String, Vec<ConnSlot>>>> = std::sync::OnceLock::new();
+pub(crate) fn conn_pool() -> &'static Mutex<HashMap<String, Vec<ConnSlot>>> {
     CONN_POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -144,7 +136,7 @@ pub(crate) fn pick(
     let mut cands: Vec<(f64, bool, H2Upstream)> = Vec::new();
     for ip in &usable {
         let Some(h) = g.get_mut(ip) else { continue };
-        for c in &h.conns {
+        for c in h.iter() {
             if let Some(want) = want_slot {
                 if c.up.slot != want {
                     continue;
@@ -161,10 +153,7 @@ pub(crate) fn pick(
             }
             let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
             let cap = c.up.max_streams.max(1);
-            // 占用率 × 吞吐倒数：闲着又快的分最小。快慢只认池子那张实测吞吐表，
-            // 握手耗时留在建造机器人自己的拨号排序里，不进选路。
-            let kbps = pool::speed::kbps_of(ip).unwrap_or(pool::speed::TARGET_KBPS);
-            let score = (inflight as f64 + 1.0) / cap as f64 * (pool::speed::TARGET_KBPS / kbps.max(1.0));
+            let score = channel_score(ip, inflight, cap);
             cands.push((score, inflight >= cap, c.up.clone()));
         }
     }
@@ -207,6 +196,13 @@ pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Optio
     pick(ips, want_slot, Some(host))
 }
 
+/// 通道选路打分（pick 与 channels_for 共用）：占用率 × 吞吐倒数，闲着又快的分最小。
+/// 快慢只认池子那张实测吞吐表，握手耗时留在建造机器人自己的拨号排序里，不进选路。
+fn channel_score(ip: &str, inflight: u32, cap: u32) -> f64 {
+    let kbps = pool::speed::kbps_of(ip).unwrap_or(pool::speed::TARGET_KBPS);
+    (inflight as f64 + 1.0) / cap as f64 * (pool::speed::TARGET_KBPS / kbps.max(1.0))
+}
+
 /// 候选内全部可用通道（不含溢出临时通道），按「占用率 × 吞吐倒数」升序。
 pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
     let g = lock(conn_pool());
@@ -214,15 +210,13 @@ pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
     let mut cands: Vec<(f64, H2Upstream)> = Vec::new();
     for ip in &usable {
         let Some(h) = g.get(ip.as_str()) else { continue };
-        for c in &h.conns {
+        for c in h.iter() {
             if c.up.overflow {
                 continue;
             }
             let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
             let cap = c.up.max_streams.max(1);
-            let kbps = pool::speed::kbps_of(ip).unwrap_or(pool::speed::TARGET_KBPS);
-            let score = (inflight as f64 + 1.0) / cap as f64 * (pool::speed::TARGET_KBPS / kbps.max(1.0));
-            cands.push((score, c.up.clone()));
+            cands.push((channel_score(ip, inflight, cap), c.up.clone()));
         }
     }
     cands.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -237,26 +231,25 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         .map(|owner| max_conns_per_ip(host_class(owner)))
         .unwrap_or(usize::MAX);
     // 常驻名额按非溢出通道算：溢出是拥挤时的临时工，不占"一 IP 一通道"的名额。
-    let normal_cnt = h.conns.iter().filter(|c| !c.up.overflow).count();
+    let normal_cnt = h.iter().filter(|c| !c.up.overflow).count();
     if !up.overflow && normal_cnt >= cap {
         // 常编满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
         // 若只是丢弃，驱动任务会在池外养到对端回收（泄漏）。Notify 无等待者也存许可，必达。
         up.close.notify_one();
-        return h.conns[0].up.clone();
+        return h[0].up.clone();
     }
-    if up.overflow && h.conns.iter().any(|c| c.up.overflow) {
+    if up.overflow && h.iter().any(|c| c.up.overflow) {
         // 每 IP 至多一条溢出：再来的关掉，把正编（若有）递回去——溢出通道本身
         // 还在驮上一个请求时，后来的拥挤请求骑它排队，总好过再拨。
         up.close.notify_one();
         return h
-            .conns
             .iter()
             .find(|c| !c.up.overflow)
             .map(|c| c.up.clone())
-            .unwrap_or_else(|| h.conns[0].up.clone());
+            .unwrap_or_else(|| h[0].up.clone());
     }
     let keep = up.clone();
-    h.conns.push(ConnSlot {
+    h.push(ConnSlot {
         up,
         last_used: now_secs(),
     });
@@ -268,10 +261,10 @@ pub fn drop_h2_id(ip: &str, id: u64) {
     let mut g = lock(conn_pool());
     match g.get_mut(ip) {
         Some(h) => {
-            if let Some(pos) = h.conns.iter().position(|c| c.up.id == id) {
-                h.conns.remove(pos);
+            if let Some(pos) = h.iter().position(|c| c.up.id == id) {
+                h.remove(pos);
             }
-            if h.conns.is_empty() {
+            if h.is_empty() {
                 g.remove(ip);
             }
         }
@@ -283,7 +276,7 @@ pub fn drop_h2_id(ip: &str, id: u64) {
 pub fn drop_h2(ip: &str) {
     let id = {
         let g = lock(conn_pool());
-        g.get(ip).and_then(|h| h.conns.first()).map(|c| c.up.id)
+        g.get(ip).and_then(|h| h.first()).map(|c| c.up.id)
     };
     if let Some(id) = id {
         drop_h2_id(ip, id);
@@ -298,7 +291,7 @@ pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)>
     {
         let g = lock(conn_pool());
         for (ip, h) in g.iter() {
-            for c in &h.conns {
+            for c in h.iter() {
                 let host = c.up.owner.clone().unwrap_or_else(|| ip.clone());
                 let idle = now_secs().saturating_sub(c.last_used);
                 let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
@@ -319,14 +312,14 @@ pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)>
 pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
     let g = lock(conn_pool());
     ips.iter()
-        .filter(|ip| g.get(ip.as_str()).is_some_and(|h| !h.conns.is_empty()))
+        .filter(|ip| g.get(ip.as_str()).is_some_and(|h| !h.is_empty()))
         .cloned()
         .collect()
 }
 
 /// 该 IP 当前在池里的通道条数（溢出闸按它判"同 IP 还能不能再开"）。
 pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
-    lock(conn_pool()).get(ip).map(|h| h.conns.len()).unwrap_or(0)
+    lock(conn_pool()).get(ip).map(|h| h.len()).unwrap_or(0)
 }
 
 /// 该 IP 上正编通道的（在途流, 流上限）；无正编 = None。溢出临时通道不算。
@@ -334,7 +327,7 @@ pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
 pub(crate) fn channel_load(ip: &str) -> Option<(u32, u32)> {
     let g = lock(conn_pool());
     let h = g.get(ip)?;
-    let c = h.conns.iter().find(|c| !c.up.overflow)?;
+    let c = h.iter().find(|c| !c.up.overflow)?;
     Some((
         c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
         c.up.max_streams.max(1),
@@ -347,7 +340,7 @@ pub(crate) fn cull_channel(ip: &str) {
     let close = {
         let g = lock(conn_pool());
         g.get(ip)
-            .and_then(|h| h.conns.first())
+            .and_then(|h| h.first())
             .map(|c| c.up.close.clone())
     };
     if let Some(c) = close {
@@ -358,7 +351,7 @@ pub(crate) fn cull_channel(ip: &str) {
 /// 驱动清扫用：这条连接的 (闲置秒数, 在途流数, 是否溢出临时通道)。不在池里 = (0, 0, false)。
 fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     let g = lock(conn_pool());
-    match g.get(ip).and_then(|h| h.conns.iter().find(|c| c.up.id == id)) {
+    match g.get(ip).and_then(|h| h.iter().find(|c| c.up.id == id)) {
         Some(c) => (
             now_secs().saturating_sub(c.last_used),
             c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
@@ -950,7 +943,7 @@ async fn dial_h2_race(
 
 /// 建连统一入口：双腿各拨各的新连接；串发全灭冷却中快速失败，调用方走兜底。
 pub async fn dial_upstream(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
-    if pool::dial_cool_open(host) {
+    if pool::SERIAL_COOL.open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
     let targets =
@@ -1080,7 +1073,7 @@ pub async fn h2_open_stream(
     {
         let mut g = lock(conn_pool());
         if let Some(h) = g.get_mut(&up.ip) {
-            if let Some(c) = h.conns.iter_mut().find(|c| c.up.id == up.id) {
+            if let Some(c) = h.iter_mut().find(|c| c.up.id == up.id) {
                 c.last_used = now_secs();
             }
         }

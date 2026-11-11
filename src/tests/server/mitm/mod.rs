@@ -2,7 +2,7 @@
 #[test]
 fn direct_leg_unpolled_leaves_zero_debt() {
     let key = mirror::direct_load_key("debt.test");
-    let load = mirror::mirror_load_for(&key);
+    let load = mirror::mirror_load(&key);
     load.in_flight_bytes
         .store(0, std::sync::atomic::Ordering::Relaxed);
     load.in_flight_streams

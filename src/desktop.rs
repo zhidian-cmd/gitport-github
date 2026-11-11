@@ -429,18 +429,8 @@ fn spawn_tray(
     rx
 }
 
-/// 托盘失败是静默的（GUI 版没有 stdout），留一行到 .cache/tray.log 备查。
-fn tray_log(line: &str) {
-    use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(".cache/tray.log")
-    else {
-        return;
-    };
-    let _ = writeln!(f, "{line}");
-}
+// 托盘/窗口失败落盘统一走 logger::tray_log（GUI 版没有 stdout，留一行到 .cache/tray.log 备查）。
+use crate::logger::tray_log;
 
 /// 单实例守卫：已有实例在跑则弹提示并返回 true；mutex 句柄须活到进程退出，用 static 锚住。
 struct SingleMutexHandle {

@@ -439,7 +439,7 @@ fn dead_fill_counter_resets_on_progress() {
     let now = Instant::now();
     let mut m = MergeBody::new(vec![(0, 4, now, seg(b"AAAA"))], 4);
     for _ in 0..MAX_DEAD_FILLS {
-        m.fail_fill();
+        m.dead_fills += 1;
     }
     assert!(m.exhausted());
     let mut out = Vec::new();

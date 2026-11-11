@@ -97,15 +97,12 @@ pub fn github_pac() -> bool {
 }
 
 pub fn set_github_pac(on: bool) -> Result<(), String> {
-    state()
-        .github_pac
-        .store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    set_flag(&state().github_pac, on)
 }
 
 // 只动 WinINET 的 AutoConfigURL：接管前备份，还原时恢复；ProxyServer/ProxyEnable 永不触碰。
 
-pub fn pac_url() -> String {
+fn pac_url() -> String {
     format!("http://127.0.0.1:{}/proxy.pac", crate::config::webui_port())
 }
 
@@ -139,28 +136,21 @@ fn get_auto_config_url(key: &RegKey) -> String {
 }
 
 /// 是否本程序设置的 PAC：任何 `127.0.0.1:端口/proxy.pac` 形态都算，端口无关。
-pub fn is_our_pac(cur: &str) -> bool {
-    let cur = cur.trim();
-    let Some(rest) = cur
+fn is_our_pac(cur: &str) -> bool {
+    let rest = cur
+        .trim()
         .strip_prefix("http://")
-        .or_else(|| cur.strip_prefix("https://"))
-    else {
+        .or_else(|| cur.trim().strip_prefix("https://"));
+    let Some((hostport, path)) = rest.and_then(|r| r.split_once('/')) else {
         return false;
     };
-    let Some(idx) = rest.find('/') else {
-        return false;
-    };
-    let hostport = &rest[..idx];
     let Some((host, port)) = hostport.rsplit_once(':') else {
         return false; // 必须带端口
     };
-    if host != "127.0.0.1" {
-        return false;
-    }
-    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    &rest[idx..] == "/proxy.pac"
+    host == "127.0.0.1"
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+        && path == "proxy.pac"
 }
 
 /// 接管时该备份的：非空、不是正要写的、也不是上次自己写的，其余都算用户配置。
@@ -169,22 +159,14 @@ fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
     !cur.is_empty() && cur != pac.trim() && cur != last_pac.trim()
 }
 
-/// 系统里的 PAC 是不是自己写的：last_pac 非空按确切字符串比，为空（升级前）退回形状判定一次。
-fn is_our_current_pac(cur: &str, last_pac: &str) -> bool {
+/// 系统 PAC 是不是自家写入（当前值/备份值共用同一判据）：
+/// last_pac 非空按确切字符串比，为空（升级前）退回形状判定一次。
+fn pac_is_ours(x: &str, last_pac: &str) -> bool {
     let last = last_pac.trim();
     if last.is_empty() {
-        return is_our_pac(cur);
+        return is_our_pac(x);
     }
-    cur.trim() == last
-}
-
-/// 备份值是不是自己写过的残留；是则不还原，免得把死 PAC 写回系统。
-fn backup_is_ours(backup: &str, last_pac: &str) -> bool {
-    let last = last_pac.trim();
-    if last.is_empty() {
-        return is_our_pac(backup);
-    }
-    backup.trim() == last
+    x.trim() == last
 }
 
 /// 广播代理设置变更（WinINET 已装即链上 wininet.dll，无需动态解析）。
@@ -326,7 +308,7 @@ fn restore_or_clear(key: &RegKey) {
     let last = state().last_pac.lock().unwrap().clone();
     let keep_manual = manual_proxy_active(key);
     // 只排除 last_pac（自己写过），其余备份一律还原；按形状丢等于备份白做。
-    if !backup.is_empty() && !backup_is_ours(&backup, &last) {
+    if !backup.is_empty() && !pac_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
         let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
         mirror_auto_config_url(Some(&backup));
@@ -358,7 +340,7 @@ fn manual_proxy_active(key: &RegKey) -> bool {
 /// 确实是上次我们写进去的那条 PAC 才还原（别的工具中途接管了就不碰）。
 fn clear_if_ours(key: &RegKey, cur: &str) {
     let last = state().last_pac.lock().unwrap().clone();
-    if !is_our_current_pac(cur, &last) {
+    if !pac_is_ours(cur, &last) {
         return;
     }
     restore_or_clear(key);
@@ -387,16 +369,18 @@ pub fn set_window_rect(l: i32, t: i32, w: i32, h: i32) -> Result<(), String> {
     save()
 }
 
-pub fn set_close_to_tray(on: bool) -> Result<(), String> {
-    state()
-        .close_to_tray
-        .store(on, std::sync::atomic::Ordering::Relaxed);
+/// 布尔开关统一写法：存一次（Relaxed）+ 落盘（set_github_pac/set_close_to_tray/set_mitm 共用）。
+fn set_flag(flag: &std::sync::atomic::AtomicBool, on: bool) -> Result<(), String> {
+    flag.store(on, std::sync::atomic::Ordering::Relaxed);
     save()
 }
 
+pub fn set_close_to_tray(on: bool) -> Result<(), String> {
+    set_flag(&state().close_to_tray, on)
+}
+
 pub fn set_mitm(on: bool) -> Result<(), String> {
-    state().mitm.store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    set_flag(&state().mitm, on)
 }
 
 /// 串发游标表：键位与顺序恒为路由表全量，空值=未驻留；读兼容数组/对象，写只写对象。
@@ -407,7 +391,7 @@ impl LastIpTable {
     /// 按规范键序成表；路由表未装载时原样保留，否则会丢光上次游标。
     /// 旧键 `~2` 迁移为 `_vice`（v2 改名），其余键位原样。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
-        let keys = crate::pool::circle_keys();
+        let keys = crate::pool::route::cursor_keys();
         if keys.is_empty() {
             return LastIpTable(marks.into_iter().collect());
         }
@@ -482,6 +466,7 @@ where
 
 /// 镜像注册表容错：`["https://x"]`、`[{"url":"https://x"}]`、单个对象都认，
 /// 只写 URL 的默认启用。整段写坏只丢这一段，不连坐其他开关。
+/// 单值/数组两形态用一个 untagged 枚举收下（OneOrMany），不再手写形状分派。
 fn lenient_mirrors<'de, D>(d: D) -> Result<Vec<WorkerMirror>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -492,14 +477,16 @@ where
         Url(String),
         Full(WorkerMirror),
     }
-    let raw = serde_json::Value::deserialize(d)?;
-    let list: Vec<One> = if raw.is_array() {
-        serde_json::from_value(raw).unwrap_or_default()
-    } else if raw.is_string() || raw.is_object() {
-        // 手写时常见"只写一条、忘了数组括号"，一并收下。
-        serde_json::from_value(raw).map_or_else(|_| Vec::new(), |one| vec![one])
-    } else {
-        Vec::new()
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<One>),
+        One(One),
+    }
+    let list: Vec<One> = match OneOrMany::deserialize(d) {
+        Ok(OneOrMany::Many(l)) => l,
+        Ok(OneOrMany::One(one)) => vec![one],
+        Err(_) => Vec::new(),
     };
     Ok(list
         .into_iter()
@@ -644,7 +631,7 @@ fn heal_stale_proxy() {
     };
     let cur = get_auto_config_url(&key);
     let last = state().last_pac.lock().unwrap().clone();
-    if cur.is_empty() || !is_our_current_pac(&cur, &last) {
+    if cur.is_empty() || !pac_is_ours(&cur, &last) {
         // 本来就干净，或已是别人的 PAC：不碰，留给 ensure_system_proxy 走先备份后接管。
         return;
     }

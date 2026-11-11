@@ -2,10 +2,13 @@ use super::*;
 
 #[test]
 fn local_host_and_origin_gate() {
-    assert!(local_host("127.0.0.1:7811"));
-    assert!(local_host("LOCALHOST:7811"));
-    assert!(!local_host("evil.com"));
-    assert!(!local_host("127.0.0.2:7811"));
+    let is_local_host = |h: &str| {
+        matches!(crate::server::host_only(&h.to_lowercase()), "127.0.0.1" | "localhost")
+    };
+    assert!(is_local_host("127.0.0.1:7811"));
+    assert!(is_local_host("LOCALHOST:7811"));
+    assert!(!is_local_host("evil.com"));
+    assert!(!is_local_host("127.0.0.2:7811"));
     let port = config::webui_port();
     assert!(local_origin(&format!("http://127.0.0.1:{port}")));
     assert!(local_origin(&format!("http://localhost:{port}/")));

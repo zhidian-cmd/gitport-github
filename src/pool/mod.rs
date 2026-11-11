@@ -17,16 +17,6 @@ const ROUTES_FILE: &str = "routes.json";
 /// 0.5.3 及以前的文件名，首启一次性迁走（迁完原表留 .bak）。
 const LEGACY_ROUTES_FILE: &str = "plans.json";
 
-/// 游标键：每条路由两把（主键 / `_vice` 副键），双通道各记各的。
-pub fn circle_keys() -> Vec<String> {
-    route::cursor_keys()
-}
-
-/// 串发全灭冷却是否生效中（30s 快速失败窗）。调用方应直接走兜底，不再空转重试。
-pub fn dial_cool_open(host: &str) -> bool {
-    SERIAL_COOL.open(host)
-}
-
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
 pub const CONTENT_HOSTS: &[&str] = &[
@@ -68,7 +58,8 @@ struct SerialTab {
     cursor: HashMap<String, String>,
 }
 
-static SERIAL_COOL: Breaker = Breaker::new(30);
+/// 串发全灭冷却（30s 快速失败窗）：全灭后调用方直接走兜底，不再空转重试。
+pub static SERIAL_COOL: Breaker = Breaker::new(30);
 
 /// 测试专用：路由表/串发表都是进程级全局态，跨模块的用例靠它串行。
 #[cfg(test)]
@@ -161,51 +152,45 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
     let has_v2 = doc.ips.len() + doc.hosts.len() > 0;
     if !has_v2 {
         if let Some(routes) = obj.get("routes") {
-            match routes {
+            // 两种旧格式折成 (是否v1字典行, 标签, 行值) 序列走同一循环——
+            // 行值两格式都是对象，只能按外层容器区分，不能按形状猜。
+            let rows: Vec<(bool, String, &serde_json::Value)> = match routes {
                 serde_json::Value::Object(map) => {
-                    for (key, body) in map {
-                        match v1_route_spec(key, body) {
-                            Ok(Some(spec)) => {
-                                doc.hosts.push(spec.0);
-                                doc.ips.extend(spec.1);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                salvaged = true;
-                                if let Some(l) = log {
-                                    l(&format!(
-                                        "[串发] routes.json routes[{key}] 写坏({e}), 该行丢弃"
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                    map.iter().map(|(k, v)| (true, k.clone(), v)).collect()
                 }
                 // 0.5.3 及以前：数组 + `match` 正则，读进来一次性转成域名键。
-                serde_json::Value::Array(list) => {
-                    for (i, v) in list.iter().enumerate() {
-                        match legacy_spec_from_row(v) {
-                            Ok(Some(spec)) => {
-                                doc.hosts.push(spec.0);
-                                doc.ips.extend(spec.1);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                salvaged = true;
-                                if let Some(l) = log {
-                                    l(&format!(
-                                        "[串发] routes.json routes[{i}] 写坏({e}), 该行丢弃"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+                serde_json::Value::Array(list) => list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (false, i.to_string(), v))
+                    .collect(),
                 _ => {
                     if let Some(l) = log {
                         l("[串发] routes.json routes 既不是对象也不是数组, 本次按种子重建");
                     }
                     return None;
+                }
+            };
+            for (is_v1, key, body) in rows {
+                let converted = if is_v1 {
+                    v1_route_spec(&key, body)
+                } else {
+                    legacy_spec_from_row(body)
+                };
+                match converted {
+                    Ok(Some(spec)) => {
+                        doc.hosts.push(spec.0);
+                        doc.ips.extend(spec.1);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        salvaged = true;
+                        if let Some(l) = log {
+                            l(&format!(
+                                "[串发] routes.json routes[{key}] 写坏({e}), 该行丢弃"
+                            ));
+                        }
+                    }
                 }
             }
         } else {
@@ -331,7 +316,6 @@ fn v1_route_spec(
         serde_json::Value::String(key.to_string()),
     );
     let spec: V1RouteBody = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    let direct = spec.action.as_deref() == Some("direct");
     let host = route::HostSpec {
         key: key.to_string(),
         // v2 实测后 direct 4 域进池；迁移时旧 direct 标志一并解除，IP 边由种子补。
@@ -356,7 +340,6 @@ fn v1_route_spec(
             latency: HashMap::new(),
         });
     }
-    let _ = direct;
     Ok(Some((host, ips)))
 }
 
@@ -364,9 +347,7 @@ fn v1_route_spec(
 #[serde(default)]
 struct V1RouteBody {
     action: Option<String>,
-    real: bool,
     content: bool,
-    donor: bool,
     fallback: Option<String>,
     plans: Vec<V1Plan>,
     #[serde(rename = "realPlans")]
@@ -782,7 +763,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         cursor: HashMap::new(),
     };
     // 游标圈预写空记号；settings.last_ip 非空值覆盖（表外旧键直接丢）。
-    for key in circle_keys() {
+        for key in route::cursor_keys() {
         tab.cursor.insert(key, String::new());
     }
     for (key, ip) in &last_ip {
@@ -1128,12 +1109,6 @@ pub fn note_dead(ip: &str) {
     }
 }
 
-/// 节点级死亡退避（键 = `ip|sni`）：TLS 握手超时。ClientHello 的 SNI 由节点配置决定，
-/// 与触发请求的 host 无关——同节点（同 IP 同 SNI）对所有 host 一并跳过，不冤枉任何 host。
-pub fn note_dead_node(ip: &str, sni: &str) {
-    note_dead(&format!("{ip}|{sni}"));
-}
-
 /// 该 IP 或该节点（ip|sni）是否在死亡冷却中：竞速取候选与外部预检共用这一个口径。
 pub fn dial_cooling(ip: &str, sni: &str) -> bool {
     let g = lock(&SERIAL);
@@ -1242,16 +1217,9 @@ pub async fn serial_dial_skip(
         let p = &circle[ci];
         // 死亡退避双键：TCP/h2 失败记 IP 粒度（TCP 在 SNI 之前、h2 在 TLS 之后，与 SNI 无关）；
         // TLS 握手超时记节点粒度 ip|sni（ClientHello 由节点配置决定，与触发请求的 host 无关）。
-        let node_dead_key = format!("{}|{}", p.ip, p.sni);
-        {
-            let mut g = lock(&SERIAL);
-            if let Some(t) = g.as_mut() {
-                let cooling = |k: &str| t.dead.get(k).is_some_and(|(until, _)| Instant::now() < *until);
-                if cooling(&p.ip) || cooling(&node_dead_key) {
-                    dead_skipped += 1;
-                    continue;
-                }
-            }
+        if dial_cooling(&p.ip, &p.sni) {
+            dead_skipped += 1;
+            continue;
         }
         // 同组互斥：对方试过/在试的 IP 绕行。
         if let Some(crew) = crew {
@@ -1329,7 +1297,9 @@ pub async fn serial_dial_skip(
                     || msg.contains("超时")
                     || msg.to_lowercase().contains("timed out");
                 if tls_handshake && !tcp_level && !cert_bad && timed_out {
-                    note_dead_node(&p.ip, &p.sni);
+                    // 节点级死亡退避（键 = `ip|sni`）：TLS 握手超时。ClientHello 的 SNI
+                    // 由节点配置决定，与触发请求的 host 无关，全局共享不冤枉。
+                    note_dead(&format!("{}|{}", p.ip, p.sni));
                 }
                 continue;
             }
@@ -1513,6 +1483,25 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     }
 }
 
+/// 复测/补建的并发结果折叠（两处逐字拷贝收口）：达标解锁计数、记录本轮最快。
+async fn fold_probe_results(
+    jobs: Vec<impl std::future::Future<Output = Option<(String, f64)>> + Send>,
+    ok: &mut usize,
+    best: &mut Option<f64>,
+) {
+    for (ip, k) in futures_util::future::join_all(jobs)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        if k >= speed::TARGET_KBPS {
+            speed::release(&ip);
+            *ok += 1;
+        }
+        *best = Some(best.map_or(k, |b: f64| b.max(k)));
+    }
+}
+
 /// 建连机器人：把 host 的其余 IP 通道都建出来（一 IP 一条）。
 /// 现成通道就地复测、不重拨；建成/复测的都交给池子，由池子按实测吞吐筛。
 fn ensure_coverage(host: &str, path: &str, log: LogFn) {
@@ -1542,18 +1531,7 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
                 Some((ip, st.kbps as f64))
             });
         }
-        for (ip, k) in futures_util::future::join_all(probes)
-            .await
-            .into_iter()
-            .flatten()
-        {
-            if k >= speed::TARGET_KBPS {
-                speed::release(&ip);
-                ok += 1;
-            }
-            best = Some(best.map_or(k, |b: f64| b.max(k)));
-        }
-
+        fold_probe_results(probes, &mut ok, &mut best).await;
         // ② 黑通道重建 + 缺的补建，慢通道不重建只复测：黑洞触发时肇事黑通道已当场
         // 摘除（on_channel_blackhole），此处只对没通道的 IP（含刚摘的黑通道、本来
         // 就缺的）直拨补建；有通道的（健康或暂缓中的慢通道）① 复测已覆盖，不动。
@@ -1581,17 +1559,7 @@ fn ensure_coverage(host: &str, path: &str, log: LogFn) {
             });
             built += 1;
         }
-        for (ip, k) in futures_util::future::join_all(dials)
-            .await
-            .into_iter()
-            .flatten()
-        {
-            if k >= speed::TARGET_KBPS {
-                speed::release(&ip);
-                ok += 1;
-            }
-            best = Some(best.map_or(k, |b: f64| b.max(k)));
-        }
+        fold_probe_results(dials, &mut ok, &mut best).await;
 
         if speed::finish_rebuild(&host, best) {
             (log)(&format!(

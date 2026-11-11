@@ -281,11 +281,7 @@ fn append_direct_gated_by_health_and_presence() {
 
 /// 测试用直连腿：恒失败(不拨真网)，用于驱动候选循环与失败降权路径。
 fn mirror_test_direct_leg() -> DirectLeg<'static> {
-    DirectLeg {
-        fetch: Box::pin(async {
-            Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into())
-        }),
-    }
+    Box::pin(async { Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into()) })
 }
 
 /// ECT 时间槽：on_frame 只累计本窗实收，ect_sweep 快照进 window_prev；
@@ -357,7 +353,7 @@ fn direct_competes_as_candidate() {
     let cands = [chain.as_slice(), &[direct_load_key("cand-host.test")][..]];
     let all: Vec<String> = cands.concat();
     // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
-    let d = mirror_load_for(&direct_load_key("cand-host.test"));
+    let d = mirror_load(&direct_load_key("cand-host.test"));
     d.window_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(

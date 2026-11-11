@@ -59,8 +59,7 @@ impl Logger {
         // 启动打点不进 WebUI 环形缓冲：界面一律不显示，也不给开关。
         // 仍写 .cache/tray.log 留开机慢的取证，headless 下照旧回显 stdout。
         if msg.starts_with("[启动]") {
-            boot_log(&line);
-            if self.inner.lock().unwrap().echo_stdout {
+            tray_log(&line);            if self.inner.lock().unwrap().echo_stdout {
                 println!("{line}");
             }
             return;
@@ -102,8 +101,9 @@ impl Logger {
     }
 }
 
-/// 启动打点只落本地文件，不占 WebUI 日志流；与托盘日志同一份文件，不新增垃圾。
-fn boot_log(line: &str) {
+/// 启动打点/托盘失败共用落点：只落本地文件，不占 WebUI 日志流；一份文件不新增垃圾。
+pub(crate) fn tray_log(line: &str) {
+    use std::io::Write;
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

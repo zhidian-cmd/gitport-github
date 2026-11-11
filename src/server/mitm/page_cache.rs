@@ -524,7 +524,9 @@ fn session_fingerprint(cookies: Option<&str>) -> String {
     };
     match account_name(cookies) {
         Some(u) => format!("-c{u}"),
-        None => format!("-cs{:016x}", fnv1a(sess)),
+        // 会话号散列进标签：稳定摘要即可，读取侧按 key 校验，无碰撞风险。
+        // 会话号散列进标签（复用 page_file_name 的稳定摘要），读取侧按 key 校验。
+        None => format!("-cs{}", page_file_name(sess)),
     }
 }
 
@@ -533,18 +535,16 @@ fn dbg_path(key: &str) -> &str {
     key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
 }
 
-/// 请求方要不要 JSON：GitHub 搜索页按 Accept 协商，同 URL 两种正文必须分钥匙。
-fn accept_wants_json(accept: Option<&str>) -> bool {
-    let Some(a) = accept else {
-        return false;
-    };
-    let a = a.to_ascii_lowercase();
-    a.contains("application/json") && !a.contains("text/html")
-}
-
 /// 搜索页的内容分钥匙：存侧看实际 Content-Type，取侧按 Accept 预测，猜错只是 miss。
+/// GitHub 搜索页按 Accept 协商，同 URL 两种正文必须分钥匙。
 fn search_variant(accept: Option<&str>) -> &'static str {
-    if accept_wants_json(accept) {
+    let wants_json = accept
+        .map(|a| {
+            let a = a.to_ascii_lowercase();
+            a.contains("application/json") && !a.contains("text/html")
+        })
+        .unwrap_or(false);
+    if wants_json {
         "-json"
     } else {
         "-html"
@@ -660,18 +660,11 @@ fn is_gate_page(plain: &str) -> bool {
     GATE_MARKERS.iter().any(|m| plain.contains(m))
 }
 
-/// key → 文件名：FNV-1a 64 位散列的 16 hex。碰撞由读时 key 校验兜底。
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
+/// key → 文件名：稳定 64 位摘要的 16 hex。碰撞由读时 key 校验兜底，只会 miss 不会串页。
 fn page_file_name(key: &str) -> String {
-    format!("{:016x}", fnv1a(key))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&key, &mut h);
+    format!("{:016x}", std::hash::Hasher::finish(&h))
 }
 
 /// 磁盘条目反序列化形态：状态码 + 规范化响应头 + 压缩体。
@@ -709,11 +702,8 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
     if raw.len() < 4 {
         return Err("文件过短");
     }
-    let Some(hlen_bytes) = raw.get(0..4) else {
-        return Err("文件过短");
-    };
     let hlen =
-        u32::from_be_bytes([hlen_bytes[0], hlen_bytes[1], hlen_bytes[2], hlen_bytes[3]]) as usize;
+        u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
     let end = 4usize.checked_add(hlen).ok_or("头部长度溢出")?;
     if raw.len() < end {
         return Err("条目截断"); // miss 自愈
@@ -808,16 +798,6 @@ fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     }
 }
 
-/// 旧版 cacache 残留（index-v5/content-v2）一次性清掉，防白占磁盘。
-static LEGACY_CACHE_PURGED: OnceLock<()> = OnceLock::new();
-fn purge_legacy_cache(dir: &std::path::Path) {
-    if LEGACY_CACHE_PURGED.set(()).is_ok() {
-        for sub in ["index-v5", "content-v2"] {
-            let _ = std::fs::remove_dir_all(dir.join(sub));
-        }
-    }
-}
-
 /// 落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
 fn persist_page_entry_blocking(
     dir: &std::path::Path,
@@ -829,7 +809,6 @@ fn persist_page_entry_blocking(
     if !ensure_cache_dir_with_acl(dir) {
         return Err("缓存目录创建失败".to_string());
     }
-    purge_legacy_cache(dir);
     let header = serde_json::json!({
         "key": key,
         "status": status,

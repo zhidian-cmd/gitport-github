@@ -110,8 +110,7 @@ pub(super) async fn gh_defuse(
     out: &hyper::Request<BoxBody>,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    let is_simple = true;
-    let mut resp = get_direct(log, out, host, info, is_simple, body).await?;
+    let mut resp = get_direct(log, out, host, info, body).await?;
     let mut tried = 0; // 已垫底重试候选数(仅日志)
     let mut seen: Vec<String> = Vec::new(); // 本轮已试 IP，保序只为日志链
     let mut empty_ip_retries = 0u8; // 归属缺失分支的重试上限
@@ -128,7 +127,7 @@ pub(super) async fn gh_defuse(
             if !defuse_retry(true, empty_ip_retries, tried) {
                 return Ok(resp);
             }
-            resp = match get_direct(log, out, host, info, is_simple, body).await {
+            resp = match get_direct(log, out, host, info, body).await {
                 Ok(r) => r,
                 Err(e) => return Err(e),
             };
@@ -157,7 +156,7 @@ pub(super) async fn gh_defuse(
         }
         // 每请求命中拦截页都打一条会在风控风暴时同秒刷十几行（看着像"一 IP 多通道"失效），
         // 物理换 IP 有 [上游] 拨号日志，这里静默重试。
-        resp = match get_direct(log, out, host, info, is_simple, body).await {
+        resp = match get_direct(log, out, host, info, body).await {
             Ok(r) => r,
             Err(e) => return Err(e), // 重试全灭(所有候选试遍): 交回错误
         };

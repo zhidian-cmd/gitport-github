@@ -29,26 +29,14 @@ pub struct App {
     pub version: &'static str,
 }
 
-fn local_host(h: &str) -> bool {
-    matches!(
-        crate::server::host_only(&h.to_lowercase()),
-        "127.0.0.1" | "localhost"
-    )
-}
-
 fn local_origin(o: &str) -> bool {
     let lower = o.to_lowercase();
     let o = lower.trim_end_matches('/');
     let port = config::webui_port();
-    for base in [
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ] {
-        if o == base || o.starts_with(&format!("{base}/")) {
-            return true;
-        }
-    }
-    false
+    ["127.0.0.1", "localhost"].iter().any(|h| {
+        let base = format!("http://{h}:{port}");
+        o == base || o.starts_with(&format!("{base}/"))
+    })
 }
 
 /// 写操作来源校验：浏览器必须同源，无 Origin/Referer 的本机脚本须显式带 `X-GitPort-Request: 1`。
@@ -73,7 +61,10 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !local_host(&host) {
+    if !matches!(
+        crate::server::host_only(&host.to_lowercase()),
+        "127.0.0.1" | "localhost"
+    ) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
     let m = req.method().clone();
@@ -156,38 +147,26 @@ async fn index() -> Response {
     (headers, INDEX_HTML).into_response()
 }
 
+/// 静态资源统一响应（style/app_js/img_jpeg 三处同构收口）：no-cache + mime 覆盖。
+fn static_asset<T: axum::response::IntoResponse>(body: T, mime: &'static str) -> Response {
+    let mut resp = body.into_response();
+    let h = resp.headers_mut();
+    h.insert("cache-control", HeaderValue::from_static("no-cache"));
+    h.insert("content-type", HeaderValue::from_static(mime));
+    resp
+}
+
 async fn style() -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "text/css; charset=utf-8"),
-        ],
-        STYLE_CSS,
-    )
-        .into_response()
+    static_asset(STYLE_CSS, "text/css; charset=utf-8")
 }
 
 async fn app_js() -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "application/javascript; charset=utf-8"),
-        ],
-        APP_JS,
-    )
-        .into_response()
+    static_asset(APP_JS, "application/javascript; charset=utf-8")
 }
 
 /// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
 async fn img_jpeg(bytes: &'static [u8]) -> Response {
-    (
-        [
-            ("cache-control", "no-cache"),
-            ("content-type", "image/jpeg"),
-        ],
-        bytes,
-    )
-        .into_response()
+    static_asset(bytes, "image/jpeg")
 }
 
 /// /guide/stepN.jpg → GUIDE_JPEGS[n-1]；其余 404。
@@ -464,18 +443,20 @@ async fn api_show() -> Response {
     }
 }
 
-async fn api_autostart(axum::Json(body): axum::Json<OnBody>) -> Response {
-    match settings::set_autostart(body.on) {
+/// 开关类设置的统一应答。
+fn on_flag_response(r: Result<(), String>) -> Response {
+    match r {
         Ok(_) => write_json(&serde_json::json!({"ok": true})),
         Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
     }
 }
 
+async fn api_autostart(axum::Json(body): axum::Json<OnBody>) -> Response {
+    on_flag_response(settings::set_autostart(body.on))
+}
+
 async fn api_close_to_tray(axum::Json(body): axum::Json<OnBody>) -> Response {
-    match settings::set_close_to_tray(body.on) {
-        Ok(_) => write_json(&serde_json::json!({"ok": true})),
-        Err(e) => write_json(&serde_json::json!({"ok": false, "error": e})),
-    }
+    on_flag_response(settings::set_close_to_tray(body.on))
 }
 
 async fn api_github_pac(

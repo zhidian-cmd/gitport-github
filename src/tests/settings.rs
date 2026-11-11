@@ -43,19 +43,19 @@ fn git_key_action_only_touches_ours() {
 #[test]
 fn clear_only_exact_last_pac() {
     let ours = "http://127.0.0.1:7811/proxy.pac";
-    assert!(is_our_current_pac(ours, ours));
+    assert!(pac_is_ours(ours, ours));
     assert!(
-        !is_our_current_pac("http://127.0.0.1:7890/proxy.pac", ours),
+        !pac_is_ours("http://127.0.0.1:7890/proxy.pac", ours),
         "别家同形态不算我们的，退出时不许动"
     );
     // 我们换过端口：上次写的那个仍是我们的
-    assert!(is_our_current_pac(
+    assert!(pac_is_ours(
         "http://127.0.0.1:9999/proxy.pac",
         "http://127.0.0.1:9999/proxy.pac"
     ));
     // 旧配置没有 last_pac：退回形状判定，老版本残留仍可清
-    assert!(is_our_current_pac(ours, ""));
-    assert!(!is_our_current_pac("http://corp.example/pac.js", ""));
+    assert!(pac_is_ours(ours, ""));
+    assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
 /// 备份还原：别家同形态的备份必须还回去，只有"恰是我们写过的"才丢弃。
@@ -63,14 +63,14 @@ fn clear_only_exact_last_pac() {
 fn restore_keeps_foreign_same_shape_backup() {
     let last = "http://127.0.0.1:7811/proxy.pac";
     assert!(
-        !backup_is_ours("http://127.0.0.1:7890/proxy.pac", last),
+        !pac_is_ours("http://127.0.0.1:7890/proxy.pac", last),
         "同形态的别家备份必须还原，按形状丢掉等于备份白做"
     );
-    assert!(!backup_is_ours("http://corp.example/pac.js", last));
-    assert!(backup_is_ours(last, last), "上次写的自己不该还原(死 PAC)");
+    assert!(!pac_is_ours("http://corp.example/pac.js", last));
+    assert!(pac_is_ours(last, last), "上次写的自己不该还原(死 PAC)");
     // 旧配置：形状判定兜底，防把我们的旧地址写回系统
-    assert!(backup_is_ours(last, ""));
-    assert!(!backup_is_ours("http://corp.example/pac.js", ""));
+    assert!(pac_is_ours(last, ""));
+    assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
 /// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
@@ -160,7 +160,7 @@ fn last_ip_canonicalizes_once_routes_are_loaded() {
     crate::pool::install_seed_routes();
     let v = parse(r#"{"lastIp":{"core/all":"1.1.1.1","stale/key":"9.9.9.9"}}"#);
     let marks = v.last_ip.marks().to_vec();
-    let expect = crate::pool::circle_keys();
+    let expect = crate::pool::route::cursor_keys();
     assert_eq!(marks.len(), expect.len(), "应铺满路由键位");
     assert_eq!(marks[0].0, expect[0]);
     assert!(
@@ -181,7 +181,7 @@ fn save_emits_full_schema_in_canonical_order() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     crate::pool::install_seed_routes();
-    let keys = crate::pool::circle_keys();
+    let keys = crate::pool::route::cursor_keys();
     let first = keys[0].clone();
     let f = SettingsFile {
         close_to_tray: true,

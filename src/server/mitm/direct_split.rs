@@ -27,8 +27,8 @@ const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
 /// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
-/// 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它。
-const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
+// 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它（常量与合并层共用，见 merge::SEG_BUFFER_MAX）。
+use super::merge::SEG_BUFFER_MAX;
 /// 段响应头预算：头应毫秒级，8s 只防上游装死。
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
@@ -111,7 +111,8 @@ fn skip_request_header(k: &str) -> bool {
     )
 }
 
-fn skip_response_header(k: &str) -> bool {
+/// 附加头过滤（镜像/直连共用）：Range 语义头与逐跳头不透传给浏览器。
+pub(super) fn skip_response_header(k: &str) -> bool {
     matches!(
         k,
         "content-range"

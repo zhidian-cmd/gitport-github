@@ -291,14 +291,10 @@ impl MergeBody {
         self.fill.pop_front()
     }
 
-    /// 补发请求失败：记一次空手，下次换家再来。
-    pub(super) fn fail_fill(&mut self) {
-        self.dead_fills += 1;
-    }
-
     /// 起流失败后把这段塞回队尾重试——不塞回去就再也没人管这个洞了。
+    /// 补发失败 = 记一次空手（dead_fills），下次换家再来。
     pub(super) fn retry_fill(&mut self, from: u64, to: u64) {
-        self.fail_fill();
+        self.dead_fills += 1;
         self.queue_fill(from, to);
     }
 

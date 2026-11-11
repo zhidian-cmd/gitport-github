@@ -20,12 +20,8 @@ type EdgeTable = std::sync::Mutex<Option<EdgeMap>>;
 
 static EDGES: EdgeTable = std::sync::Mutex::new(None);
 
-fn map() -> &'static EdgeTable {
-    &EDGES
-}
-
 fn set(ip: &str, key: &str, secs: u64, risk: bool) {
-    let mut g = lock(map());
+    let mut g = lock(&EDGES);
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() >= CAP {
         let now = Instant::now();
@@ -66,7 +62,7 @@ pub fn mark_risk(ip: &str, key: &str) {
 
 /// 边在冷却期？查询管线第③步据此滤黑。
 pub fn is_bad(ip: &str, key: &str) -> bool {
-    let mut g = lock(map());
+    let mut g = lock(&EDGES);
     let Some(m) = g.as_mut() else { return false };
     match m.get(&(ip.to_string(), key.to_string())) {
         Some((until, _)) if Instant::now() < *until => true,
@@ -81,7 +77,7 @@ pub fn is_bad(ip: &str, key: &str) -> bool {
 /// 成功只清短冷却（超时/421 的自愈通道）；风控冷却不可清，只随时间过期。
 pub fn clear(ip: &str, key: &str) {
     let k = (ip.to_string(), key.to_string());
-    if let Some(m) = lock(map()).as_mut() {
+    if let Some(m) = lock(&EDGES).as_mut() {
         if m.get(&k).is_some_and(|(_, risk)| !*risk) {
             m.remove(&k);
         }
@@ -90,5 +86,5 @@ pub fn clear(ip: &str, key: &str) {
 
 #[cfg(test)]
 pub(crate) fn clear_all() {
-    *lock(map()) = Some(HashMap::new());
+    *lock(&EDGES) = Some(HashMap::new());
 }

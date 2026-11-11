@@ -248,7 +248,7 @@ async fn mitm_http(
             return write_upstream(resp, "direct-split", &info);
         }
     }
-    let mut resp = match get_direct(&log, &out_body, &host, &info, is_simple, &replay).await {
+    let mut resp = match get_direct(&log, &out_body, &host, &info, &replay).await {
         Ok(r) => r,
         Err(e) => {
             match pool::route::fallback_for(&host) {
@@ -575,14 +575,14 @@ fn direct_leg<'a>(
     info: &UpstreamInfo,
     body: &Option<Bytes>,
 ) -> mirror::DirectLeg<'a> {
-    let load = mirror::mirror_load_for(&mirror::direct_load_key(chain_host));
+    let load = mirror::mirror_load(&mirror::direct_load_key(chain_host));
     let log2 = log.clone();
     let host2 = host.to_string();
     let body2 = body.clone();
     let info2 = info.clone();
     let fetch = Box::pin(async move {
         let mut guard = mirror::LoadGuard::charge(load, new_bytes, big);
-        match get_direct(&log2, out, &host2, &info2, true, &body2).await {
+        match get_direct(&log2, out, &host2, &info2, &body2).await {
             Ok(resp) => {
                 // 头已到：码表重跑，IP 表串发拨号/等待不进速度样本。
                 guard.restart_mark();
@@ -598,7 +598,7 @@ fn direct_leg<'a>(
             Err(e) => Err(e),
         }
     });
-    mirror::DirectLeg { fetch }
+    fetch
 }
 
 /// 两条路径共用的镜像链派发：组装直连腿 + chain_fetch + 按胜出者写诊断头。
@@ -637,7 +637,6 @@ pub(super) async fn get_direct(
     out: &hyper::Request<BoxBody>,
     host: &str,
     info: &UpstreamInfo,
-    _is_simple: bool,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
@@ -755,9 +754,9 @@ fn meter_body(
             let Some(s) = pool::speed::record(&self.ip, bytes, ms) else {
                 return;
             };
-            if s.kbps >= pool::speed::TARGET_KBPS {
+            if s >= pool::speed::TARGET_KBPS {
                 pool::speed::release(&self.ip);
-            } else if s.kbps < pool::speed::TRIGGER_KBPS {
+            } else if s < pool::speed::TRIGGER_KBPS {
                 // 够用线以下、触发线以上：将就用，不动。只有跌穿触发线才交给池子
                 // 判断「主副全低」——低一条不值得折腾。
                 pool::on_channel_slow(&self.host, &self.ip, &self.path, &self.log);
@@ -827,11 +826,10 @@ fn write_upstream(
     let (mut parts, body) = resp.into_parts();
     parts.headers.remove("connection");
     parts.headers.remove("transfer-encoding");
-    if !route.is_empty() {
-        parts
-            .headers
-            .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
-    }
+    // 调用点恒传非空路由名（cache/302memo/direct-split/dns/direct/stream/mirror），直写头。
+    parts
+        .headers
+        .insert("x-gitport-route", HeaderValue::from_str(route).unwrap());
     let ip = info.lock().unwrap().clone();
     if !ip.is_empty() {
         parts

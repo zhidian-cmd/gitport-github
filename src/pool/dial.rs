@@ -215,7 +215,7 @@ async fn tls_handshake(ssl: Ssl, tcp: TcpStream, label: &str) -> std::io::Result
     .map_err(|e| io_err(format!("{label}TLS 握手失败: {e}")))
 }
 
-pub async fn tls_connect(sni: &str, verify: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
+async fn tls_connect(sni: &str, verify: &str, tcp: TcpStream) -> std::io::Result<BoringTls> {
     let mut ssl = client_ssl(verify, sni, None)?;
     apply_cached_session(&mut ssl, sni);
     let tls = tls_handshake(ssl, tcp, "").await?;
