@@ -677,7 +677,15 @@ pub(super) async fn get_direct(
                 } else {
                     quiet::note_reuse(log, host, &ip, ms);
                 }
-                return Ok(meter_body(log, host, &path, &ip, resp));
+                return Ok(meter_body(
+                    log,
+                    host,
+                    &path,
+                    &ip,
+                    up.ect.clone(),
+                    up.inflight.clone(),
+                    resp,
+                ));
             }
             Err(e) => {
                 // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
@@ -712,16 +720,19 @@ fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
         == Some("0")
 }
 
-/// 响应体计量 + 黑洞看门狗。池子只认数据段吞吐（首数据字节起算）：低于够用线
-/// 交给触发链，达标解暂缓。**黑洞**：响应头到了但 BLACKHOLE_FIRST_BYTE_MS 内
-/// 第一个数据字节没来——看门狗只标记不杀在途请求（也许回源后能完成），
-/// 通道暂缓 + 触发换血；会话域则当场弃旧通道并预建替代（浏览器对未收到响应的
-/// 重置连接会自动重试，重试落在预建的新通道上）。
+/// 响应体计量 + 黑洞看门狗。速度判定走**被动测速窗**：响应字节逐帧喂进所属通道的
+/// ECT 窗（500ms 快照），每流速度 = 上一窗实收 ÷ 在途流数；慢（每流 < 触发线）交给
+/// 触发链。**黑洞**：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节
+/// 没来——看门狗只标记不杀在途请求（也许回源后能完成），通道暂缓 + 触发换血；
+/// 会话域则当场弃旧通道并预建替代（浏览器对未收到响应的重置连接会自动重试，
+/// 重试落在预建的新通道上）。
 fn meter_body(
     log: &LogFn,
     host: &str,
     path: &str,
     ip: &str,
+    ect: Arc<crate::server::upstream::EctWindow>,
+    inflight: Arc<std::sync::atomic::AtomicU32>,
     resp: hyper::Response<BoxBody>,
 ) -> hyper::Response<BoxBody> {
     struct WatchInner {
@@ -729,34 +740,41 @@ fn meter_body(
         host: String,
         path: String,
         ip: String,
+        ect: Arc<crate::server::upstream::EctWindow>,
+        inflight: Arc<std::sync::atomic::AtomicU32>,
         bytes: std::sync::atomic::AtomicU64,
-        /// 数据窗起点 = **第一个数据字节**到达的时刻。池子只认数据传输速度：
-        /// 响应头到首字节之间的等待是延迟不是吞吐，混进来就是把机器人侧的账
-        /// 算进池子——与探针的头部预算同一条纪律。
+        /// 数据窗起点 = **第一个数据字节**到达的时刻。
         first_frame: std::sync::Mutex<Option<std::time::Instant>>,
     }
     impl WatchInner {
         fn on_frame(&self, n: usize) {
+            let n = n as u64;
             self.bytes
-                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            // 被动测速：字节流经哪个通道就喂哪个通道的窗，500ms sweep 出每流速度。
+            self.ect
+                .window_bytes
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             let mut g = self.first_frame.lock().unwrap();
             if g.is_none() {
                 *g = Some(std::time::Instant::now());
             }
         }
-        /// body 结束（正常/中断）时结算：数据段吞吐入账并分流。
+        /// body 结束（正常/中断）时结算：按通道 ECT 每流速度分流（慢触发链）。
+        /// 每流速度 = 上一窗实收 ÷ 在途流数；窗为 0（响应跨窗已结算/闲置）不动。
         fn settle(&self) {
-            let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
-            let Some(t0) = *self.first_frame.lock().unwrap() else {
-                return; // 一个数据帧都没有：速度无从谈起（黑洞由看门狗处置）
-            };
-            let ms = t0.elapsed().as_millis() as u64;
-            let Some(s) = pool::speed::record(&self.ip, bytes, ms) else {
-                return;
-            };
-            if s >= pool::speed::TARGET_KBPS {
+            let prev = self.ect.prev_bytes();
+            if prev == 0 {
+                return; // 无窗数据：速度无从谈起（黑洞由看门狗处置）
+            }
+            let inflight = self
+                .inflight
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1) as f64;
+            let per_flow = prev as f64 / 512.0 / inflight;
+            if per_flow >= pool::speed::TARGET_KBPS {
                 pool::speed::release(&self.ip);
-            } else if s < pool::speed::TRIGGER_KBPS {
+            } else if per_flow < pool::speed::TRIGGER_KBPS {
                 // 够用线以下、触发线以上：将就用，不动。只有跌穿触发线才交给池子
                 // 判断「主副全低」——低一条不值得折腾。
                 pool::on_channel_slow(&self.host, &self.ip, &self.path, &self.log);
@@ -776,6 +794,8 @@ fn meter_body(
         host: host.to_string(),
         path: path.to_string(),
         ip: ip.to_string(),
+        ect,
+        inflight,
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
     });

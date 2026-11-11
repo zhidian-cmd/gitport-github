@@ -19,6 +19,7 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
         close: std::sync::Arc::new(tokio::sync::Notify::new()),
+        ect: Arc::new(crate::server::upstream::EctWindow::new()),
         send,
     }
 }
@@ -59,6 +60,7 @@ async fn live_conn(ip: &str) -> H2Upstream {
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
         close: std::sync::Arc::new(tokio::sync::Notify::new()),
+        ect: Arc::new(crate::server::upstream::EctWindow::new()),
         send,
     }
 }
@@ -239,9 +241,10 @@ async fn pool_prefers_idle_channel_over_full_one() {
     let idle_id = idle.id;
     store_h2(idle_ip, idle);
     // 把"满的那条"灌成明显更快：只看速度会选它，看空闲就该让给另一条。
-    crate::pool::speed::clear();
-    crate::pool::speed::record(full_ip, 262_144, 400); // ≈640KB/s
-    crate::pool::speed::record(idle_ip, 262_144, 6_000); // ≈43KB/s
+    // 被动测速：直接灌 ECT 上一窗实收（每流速度 = prev÷512÷在途流）。
+    // full 在途 4 → 每流 640KB/s 需 prev ≈ 4×512×640 ≈ 1.25MB；idle 在途 0 → 按 1 流算。
+    fill_ect(full_ip, 4 * 512 * 640);
+    fill_ect(idle_ip, 1 * 512 * 43);
     let ips = vec![full_ip.to_string(), idle_ip.to_string()];
     let up = cached_h2_in(&ips, None).expect("应有一条可用");
     assert_eq!(up.id, idle_id, "满了的通道不该再接新流");
@@ -358,18 +361,17 @@ async fn pool_prefers_fastest_across_ips() {
     let _fid = fast.id;
     store_h2(slow_ip, slow);
     store_h2(fast_ip, fast);
-    // 灌实测吞吐样本：慢的 ≈43KB/s，快的 ≈640KB/s
-    crate::pool::speed::clear();
-    crate::pool::speed::record(slow_ip, 262_144, 6_000);
-    crate::pool::speed::record(fast_ip, 262_144, 400);
+    // 灌被动测速窗：慢的 ≈43KB/s（prev=43×512），快的 ≈640KB/s（prev=640×512）
+    fill_ect(slow_ip, 43 * 512);
+    fill_ect(fast_ip, 640 * 512);
     let ips = vec![slow_ip.to_string(), fast_ip.to_string()];
     let up = cached_h2_in(&ips, Some(1)).expect("主通道应在池");
-    assert_eq!(up.id, _fid, "应在候选集合内取实测吞吐最快者");
+    assert_eq!(up.id, _fid, "应在候选集合内取每流速度最快者");
     let _ = lock(conn_pool()).remove(slow_ip);
     let _ = lock(conn_pool()).remove(fast_ip);
 }
 
-/// 样本决定择优：EWMA 快的恒赢（探索计数器先对齐到非探索相位，概率不进断言）。
+/// 无窗数据：取首条（确定性）
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn pool_no_samples_takes_first_candidate() {
@@ -384,21 +386,33 @@ async fn pool_no_samples_takes_first_candidate() {
     store_h2(slow_ip, slow);
     store_h2(fast_ip, fast);
     let ips = vec![slow_ip.to_string(), fast_ip.to_string()];
-    crate::pool::speed::clear();
-    // 全零样本：取首条（确定性）
+    // 全零窗：取首条（确定性）
     for _ in 0..3 {
         let up = cached_h2_in(&ips, None).expect("应有连接");
-        assert_eq!(up.ip, slow_ip, "全零样本时恒取首条");
+        assert_eq!(up.ip, slow_ip, "全零窗时恒取首条");
     }
-    // 灌实测吞吐：快的恒赢
-    crate::pool::speed::record(slow_ip, 262_144, 6_000);
-    crate::pool::speed::record(fast_ip, 262_144, 400);
+    // 灌被动测速窗：快的恒赢
+    fill_ect(slow_ip, 43 * 512);
+    fill_ect(fast_ip, 640 * 512);
     for _ in 0..3 {
         let up = cached_h2_in(&ips, None).expect("应有连接");
-        assert_eq!(up.ip, fast_ip, "有样本后实测吞吐快者恒胜");
+        assert_eq!(up.ip, fast_ip, "有窗数据后每流速度快者恒胜");
     }
     let _ = lock(conn_pool()).remove(slow_ip);
     let _ = lock(conn_pool()).remove(fast_ip);
+}
+
+/// 直填某 IP 通道的 ECT 上一窗实收（被动测速的测试脚手架）。
+fn fill_ect(ip: &str, prev_bytes: u64) {
+    let g = lock(conn_pool());
+    if let Some(h) = g.get(ip) {
+        if let Some(c) = h.first() {
+            c.up
+                .ect
+                .window_prev
+                .store(prev_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// 一次性探针（手动跑，走真网络）：实测 185.199 段每个边缘 IP 对每个内容域名的服务支持。
@@ -710,6 +724,7 @@ async fn conn_end_removes_itself_from_pool() {
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
         close: std::sync::Arc::new(tokio::sync::Notify::new()),
+        ect: Arc::new(crate::server::upstream::EctWindow::new()),
         send: send.clone(),
     };
     assert_eq!(store_h2(ip, up).id, id, "第一条应入库");

@@ -39,7 +39,41 @@ pub struct H2Upstream {
     pub overflow: bool,
     /// 主动关闭信号：竞速落败的腿靠它立刻断开，不等闲置超时。
     pub close: Arc<tokio::sync::Notify>,
+    /// 被动测速窗：流经的响应字节逐帧累进 window_bytes，500ms 快照进 window_prev，
+    /// 上一窗实收 ÷ 在途流数 = 每流速度。通道闲置窗口自然归零，零成本零门槛。
+    pub ect: Arc<EctWindow>,
     send: SendRequest<Bytes>,
+}
+
+/// 池通道的被动测速窗（与镜像负载表同款机制）。
+pub struct EctWindow {
+    /// 本窗实收字节：响应体逐帧累加。
+    pub window_bytes: std::sync::atomic::AtomicU64,
+    /// 上一窗实收快照：sweep 写、触发链/pick 读。
+    pub window_prev: std::sync::atomic::AtomicU64,
+}
+
+impl EctWindow {
+    pub(crate) fn new() -> Self {
+        Self {
+            window_bytes: std::sync::atomic::AtomicU64::new(0),
+            window_prev: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    /// 本窗实收快照进 window_prev 后清零；零收且在途不为零（卡死）= 清零，无债 = 空闲沿用。
+    pub(crate) fn sweep(&self, has_inflight: bool) {
+        use std::sync::atomic::Ordering;
+        let w = self.window_bytes.swap(0, Ordering::Relaxed);
+        if w > 0 {
+            self.window_prev.store(w, Ordering::Relaxed);
+        } else if has_inflight {
+            self.window_prev.store(0, Ordering::Relaxed);
+        }
+    }
+    /// 上一窗实收（字节/500ms 窗）；零 = 无样本（通道闲置或黑洞，都归零读数）。
+    pub fn prev_bytes(&self) -> u64 {
+        self.window_prev.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -153,7 +187,7 @@ pub(crate) fn pick(
             }
             let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
             let cap = c.up.max_streams.max(1);
-            let score = channel_score(ip, inflight, cap);
+            let score = channel_score(inflight, cap, c.up.ect.prev_bytes());
             cands.push((score, inflight >= cap, c.up.clone()));
         }
     }
@@ -197,9 +231,17 @@ pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Optio
 }
 
 /// 通道选路打分（pick 与 channels_for 共用）：占用率 × 吞吐倒数，闲着又快的分最小。
-/// 快慢只认池子那张实测吞吐表，握手耗时留在建造机器人自己的拨号排序里，不进选路。
-fn channel_score(ip: &str, inflight: u32, cap: u32) -> f64 {
-    let kbps = pool::speed::kbps_of(ip).unwrap_or(pool::speed::TARGET_KBPS);
+/// 吞吐走被动测速窗（每流速度 = 上一窗实收 ÷ 在途流数）；无窗数据（刚建/闲置）
+/// 按够用线处理，不冤枉新通道。
+/// 调用方必须已持有 conn_pool 锁并把手上的窗数据传进来——本函数纯计算，
+/// 严禁再查池（std Mutex 不可重入，二次加锁 = 死锁）。
+/// 零窗 = 无样本（刚建/闲置）：按够用线处理，不冤枉新通道。
+fn channel_score(inflight: u32, cap: u32, prev_bytes: u64) -> f64 {
+    let kbps = if prev_bytes == 0 {
+        pool::speed::TARGET_KBPS
+    } else {
+        prev_bytes as f64 / 512.0 / inflight.max(1) as f64
+    };
     (inflight as f64 + 1.0) / cap as f64 * (pool::speed::TARGET_KBPS / kbps.max(1.0))
 }
 
@@ -216,11 +258,33 @@ pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
             }
             let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed);
             let cap = c.up.max_streams.max(1);
-            cands.push((channel_score(ip, inflight, cap), c.up.clone()));
+            cands.push((channel_score(inflight, cap, c.up.ect.prev_bytes()), c.up.clone()));
         }
     }
     cands.sort_by(|a, b| a.0.total_cmp(&b.0));
     cands.into_iter().map(|(_, up)| up).collect()
+}
+
+/// 该 IP 通道的每流速度（KB/s）＝上一 500ms ECT 窗实收 ÷ 在途流数。
+/// None = 无窗数据（通道闲置/刚建/黑洞）——调用方按"无先验"处理。
+pub fn ect_flow_kbps(ip: &str) -> Option<f64> {
+    let g = lock(conn_pool());
+    let h = g.get(ip)?;
+    let c = h.first()?;
+    let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+    Some(c.up.ect.prev_bytes() as f64 / 512.0 / inflight)
+}
+
+/// 暂缓剩余秒数转发（状态行用）；判据表在 pool::speed。
+pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
+    pool::speed::bench_remaining_secs(ip)
+}
+
+/// 候选里是否还有已测通道的每流速度达到 line——有 = 慢的那条只是个别现象，
+/// 请求让给快的就行（将就用），不值得为它触发一轮重建。判据走被动测速窗。
+pub fn any_flow_at_or_above(ips: &[String], line: f64) -> bool {
+    ips.iter()
+        .any(|ip| ect_flow_kbps(ip).is_some_and(|k| k >= line))
 }
 
 /// 新连接入库唯一入口：同 IP 只留一条（一 IP 一通道），后到作废返现成的。
@@ -285,8 +349,7 @@ pub fn drop_h2(ip: &str) {
 
 /// 状态行快照：池内全部通道按 owner（建连时的 host）归组。
 /// 返回 (host, [(ip, 在途流, 流上限, 空闲秒)])，host 键稳定排序。
-pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)> {
-    let mut groups: std::collections::HashMap<String, Vec<(String, u32, u32, u64)>> =
+pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)> {    let mut groups: std::collections::HashMap<String, Vec<(String, u32, u32, u64)>> =
         std::collections::HashMap::new();
     {
         let g = lock(conn_pool());
@@ -478,6 +541,7 @@ pub async fn h2_from_dialed(
         inflight: Arc::new(AtomicU32::new(0)),
         overflow: false,
         close,
+        ect: Arc::new(EctWindow::new()),
         send,
     })
 }

@@ -1423,7 +1423,7 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
         .into_iter()
         .map(|t| t.ip)
         .collect();
-    if speed::any_at_or_above(&ips, speed::TRIGGER_KBPS) {
+    if chan::any_flow_at_or_above(&ips, speed::TRIGGER_KBPS) {
         return;
     }
     speed::bench(ip);
@@ -1432,9 +1432,9 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
     }
     speed::begin_rebuild(host);
     log(&format!(
-        "[池] {host} 全部已测通道低于触发线 {:.0}KB/s: {ip} {:.0}KB/s 暂缓; 通知机器人补齐其余 IP",
+        "[池] {host} 全部已测通道低于触发线 {:.0}KB/s: {ip} 每流 {:.0}KB/s 暂缓; 通知机器人补齐其余 IP",
         speed::TRIGGER_KBPS,
-        speed::kbps_of(ip).unwrap_or(0.0),
+        chan::ect_flow_kbps(ip).unwrap_or(0.0),
     ));
     ensure_coverage(host, path, log.clone());
 }
@@ -1516,6 +1516,19 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
     });
 }
 
+/// 池通道 ECT 窗 sweep：500ms 一拍（挂在 mirror 的 ECT ticker 线程上）。
+/// 快照本窗实收进 prev；通道闲置（无在途、本窗零收）时 prev 沿用旧值不衰减。
+pub(crate) fn sweep_channel_ect() {
+    use crate::server::upstream as chan;
+    let g = chan::conn_pool().lock().unwrap_or_else(|p| p.into_inner());
+    for h in g.values() {
+        for c in h.iter() {
+            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed) > 0;
+            c.up.ect.sweep(inflight);
+        }
+    }
+}
+
 /// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
 fn pick_channel(
     host: &str,
@@ -1549,11 +1562,12 @@ async fn overflow_build(
         .iter()
         .filter(|t| chan::conn_count_on_ip(&t.ip) == 0 && !dial_cooling(&t.ip, &t.sni))
         .next();
-    // ② 全占 → 同 IP 溢出：正编不慢（≥触发线）才配，挑最闲的一条；慢的交给触发链。
+    // ② 全占 → 同 IP 溢出：正编不慢（每流速度 ≥ 触发线，被动测速窗）才配，挑最闲的一条；
+    //    慢的交给触发链。无窗数据（刚建/闲置）不参与同 IP 溢出。
     let congested = targets.iter().filter_map(|t| {
         let (inflight, cap) = chan::channel_load(&t.ip)?;
-        let kbps = speed::kbps_of(&t.ip)?;
-        if (kbps as f64) < speed::TRIGGER_KBPS {
+        let kbps = chan::ect_flow_kbps(&t.ip)?;
+        if kbps < speed::TRIGGER_KBPS {
             return None; // 慢：溢出也快不了，触发链去换 IP
         }
         Some(((inflight as f64) / cap as f64, t))
@@ -1564,11 +1578,11 @@ async fn overflow_build(
         Some(t) => (t.clone(), "零通道 IP 补建".to_string()),
         None => {
             let (ratio, t) = congested.min_by(|a, b| a.0.total_cmp(&b.0))?;
-            let kbps = speed::kbps_of(&t.ip).unwrap_or(0.0);
+            let kbps = chan::ect_flow_kbps(&t.ip).unwrap_or(0.0);
             (
                 t.clone(),
                 format!(
-                    "同 IP 临时加班(正编满载 {:.0}%, 挑选时实测 {kbps:.0}KB/s ≥ 触发线)",
+                    "同 IP 临时加班(正编满载 {:.0}%, 挑选时每流 {kbps:.0}KB/s ≥ 触发线)",
                     ratio * 100.0
                 ),
             )

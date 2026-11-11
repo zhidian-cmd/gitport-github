@@ -98,10 +98,12 @@ fn ect_sweep() {
 }
 
 /// 启动 ECT 时间槽定时器：独立线程 500ms 一拍，零锁争用（快照只碰各镜像自己的原子量）。
+/// 池通道的被动测速窗同拍 sweep（同一份时间基准）。
 pub(crate) fn start_ect_ticker() {
     crate::logger::spawn("ect-tick", || loop {
         std::thread::sleep(Duration::from_millis(ECT_WINDOW_MS));
         ect_sweep();
+        pool::sweep_channel_ect();
     });
 }
 

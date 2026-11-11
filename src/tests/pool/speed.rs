@@ -11,36 +11,6 @@ fn s(ips: &[&str]) -> Vec<String> {
     ips.iter().map(|s| s.to_string()).collect()
 }
 
-/// 小样本不投票：低于 64KB 的响应测不准，一律不记。
-#[test]
-fn tiny_sample_is_ignored() {
-    let _g = guard();
-    clear();
-    assert_eq!(record("1.1.1.1", MIN_SAMPLE_BYTES - 1, 30_000), None);
-    assert_eq!(kbps_of("1.1.1.1"), None);
-}
-
-/// 够用线：达到 70KB/s 就解暂缓；没到就保持暂缓（不发单）。
-#[test]
-fn bench_until_reaches_target() {
-    let _g = guard();
-    clear();
-    let ips = s(&["1.1.1.1", "2.2.2.2"]);
-    // 9KB/s：低于够用线，暂缓
-    record("1.1.1.1", 273_758, 30_000);
-    bench("1.1.1.1");
-    assert!(bench_remaining_secs("1.1.1.1").is_some());
-    assert_eq!(usable(&ips), s(&["2.2.2.2"]), "暂缓的通道先不发");
-    // 同一条后来跑出 150KB/s：EWMA 平滑，9→65.4 一次就过 60 的够用线
-    record("1.1.1.1", 307_200, 2_000);
-    release("1.1.1.1");
-    assert!(
-        !bench_remaining_secs("1.1.1.1").is_some(),
-        "单次好样本足以越过 50KB/s 够用线"
-    );
-    assert_eq!(usable(&ips), ips);
-}
-
 /// 全暂缓才回来：所有候选都暂缓时原样放行，不把候选打空。
 #[test]
 fn all_benched_falls_back_to_full_list() {
@@ -68,27 +38,6 @@ fn rebuild_is_cooldown_limited() {
 
 /// 触发线判定：候选里还有一条已测 ≥45KB/s 就不该折腾（将就用），全低才返回 true。
 #[test]
-fn any_at_or_above_gates_rebuild_trigger() {
-    let _g = guard();
-    clear();
-    let ips = s(&["1.1.1.1", "2.2.2.2"]);
-    // 一条 ≈46KB/s（≥触发线）、一条 ≈30KB/s：有人能用，不触发
-    record("1.1.1.1", 262_144, 5_500);
-    record("2.2.2.2", 262_144, 8_500);
-    assert!(any_at_or_above(&ips, TRIGGER_KBPS), "有一条达标就不该触发");
-    // 达标的那条掉了：全低 → 触发
-    record("1.1.1.1", 262_144, 60_000);
-    assert!(
-        !any_at_or_above(&ips, TRIGGER_KBPS),
-        "全部低于触发线才允许触发重建"
-    );
-    // 从没测过的候选不算数：空表 = 全低
-    clear();
-    assert!(!any_at_or_above(&ips, TRIGGER_KBPS));
-}
-
-/// 换血冷却限流：begin 一轮后 60s 内不许再赛（熔断已随测速探针一并移除）。
-#[test]
 fn rebuild_cooldown_gates_reruns() {
     let _g = guard();
     clear();
@@ -97,26 +46,4 @@ fn rebuild_cooldown_gates_reruns() {
     begin_rebuild(host);
     assert!(!may_rebuild(host), "60 秒内不许再赛");
     assert!(may_rebuild("h2"), "不同 host 各算各的");
-}
-
-/// 状态行数据源：样本窗按取走即清，剩余时长查询与账本一致。
-#[test]
-fn drain_samples_and_remaining_queries() {
-    let _g = guard();
-    clear();
-    record("1.1.1.1", 262_144, 4_000); // ≈64KB/s
-    record("1.1.1.1", 262_144, 2_000); // ≈128KB/s，EWMA ≈85KB/s
-    record("2.2.2.2", 262_144, 10_000); // ≈26KB/s
-    let drained = drain_samples();
-    assert_eq!(drained.len(), 2, "两个 IP 各一组");
-    let (ip1, n1, mean1) = drained.iter().find(|(ip, _, _)| ip == "1.1.1.1").unwrap();
-    assert_eq!(*ip1, "1.1.1.1");
-    assert_eq!(*n1, 2);
-    assert!((95.0..=97.0).contains(mean1), "原始样本均值应 ≈96KB/s: {}", mean1);
-    // 取走即清
-    assert!(drain_samples().is_empty());
-    // 暂缓剩余：未发生 = None
-    assert_eq!(bench_remaining_secs("1.1.1.1"), None);
-    bench("1.1.1.1");
-    assert!(bench_remaining_secs("1.1.1.1").is_some(), "暂缓中有剩余时长");
 }
