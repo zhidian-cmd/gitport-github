@@ -1,25 +1,19 @@
-//! 通道池的速度账本：**被动测速**——每条通道挂 500ms ECT 窗（H2Upstream.ect），
-//! 每流速度 = 上一窗实收 ÷ 在途流数，通道闲置窗口自然归零、零门槛零样本。
-//! 本文件只管：够用线/触发线判定的分流（暂缓/解锁）与换血节奏（60s 冷却限流）。
+//! 通道池的暂缓/复测账本：判黑的通道先停车不发（60s 到期由真实流量复验），
+//! 换血按 host 限频（60s 冷却）。测速判定已拆除——失败信号（黑洞/超时/拨号失败）全权处置。
 use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// 触发线：比够用线再降一档。只有候选里所有已测通道都低于它（主副全低）才值得
-/// 催建连机器人补齐；还有一条在它之上就把请求让给它，将就用不折腾。
-pub const TRIGGER_KBPS: f64 = 45.0;
-/// 够用线：每流速度达到就认定够快，解暂缓。
-pub const TARGET_KBPS: f64 = 50.0;
-/// 暂缓时长：不够够用线的通道先放着不发，下一轮触发时复测，不重拨。
+/// 暂缓时长：判黑的通道先放着不发，到期复测，不重拨。
 const BENCH_SECS: u64 = 60;
-/// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报慢也只触发一轮。
+/// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报黑也只触发一轮。
 const REBUILD_COOLDOWN_SECS: u64 = 60;
 
 /// 暂缓表：ip → 到期时刻。
 static BENCH: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
-/// 暂缓：不够够用线的通道先不发（60 秒），下一轮触发时复测，不重拨。
+/// 暂缓：判黑的通道先不发（60 秒），到期复测，不重拨。
 pub fn bench(ip: &str) {
     let mut g = lock(&BENCH);
     let t = g.get_or_insert_with(HashMap::new);
@@ -27,11 +21,6 @@ pub fn bench(ip: &str) {
     if t.get(ip).is_none_or(|u| until > *u) {
         t.insert(ip.to_string(), until);
     }
-}
-
-/// 达标即解暂缓：这条通道已经够快，立刻恢复发单。
-pub fn release(ip: &str) {
-    lock(&BENCH).as_mut().and_then(|t| t.remove(ip));
 }
 
 /// 软排除：从候选里摘掉暂缓中的 IP。

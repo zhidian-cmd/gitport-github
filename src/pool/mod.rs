@@ -1408,43 +1408,13 @@ pub async fn get_or_build(
     }
 }
 
-/* ---------- 慢通道/黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
-
-/// 内容域某条通道实测低于触发线：先查候选里还有没有已测达标的通道——有就把请求
-/// 让给它，将就用不折腾；全部已测通道都低于触发线（主副全低）才暂缓慢通道并通知
-/// 建连机器人补齐该域其余 IP。冷却/熔断由池子把关，一页几百个请求同时报慢也只触发一轮。
-pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
-    use crate::server::upstream as chan;
-    if chan::host_class(host) != chan::HostClass::Content {
-        return;
-    }
-    let ips: Vec<String> = route::dial_targets(host)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.ip)
-        .collect();
-    if chan::any_flow_at_or_above(&ips, speed::TRIGGER_KBPS) {
-        return;
-    }
-    speed::bench(ip);
-    if !speed::may_rebuild(host) {
-        return;
-    }
-    speed::begin_rebuild(host);
-    log(&format!(
-        "[池] {host} 全部已测通道低于触发线 {:.0}KB/s: {ip} 每流 {:.0}KB/s 暂缓; 通知机器人补齐其余 IP",
-        speed::TRIGGER_KBPS,
-        chan::ect_flow_kbps(ip).unwrap_or(0.0),
-    ));
-    ensure_coverage(host, path, log.clone());
-}
+/* ---------- 黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
 
 /// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS=30s 数据窗零字节）：按域分流处置。
 /// 30s 才判黑：更短的窗把"服务端慢渲染/排队"误判成黑（数据最终都到，纯慢）。
 /// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
-/// - 内容域：**软禁黑 IP 60s**（不进 pick，在途流不杀）+ 全量换血补缺；
-///   慢通道不走这里（on_channel_slow 只 bench 复测，同样不摘不重建）。
+/// - 内容域：**软禁黑 IP 60s**（不进 pick，在途流不杀）+ 全量换血补缺。
 /// - 其他（低频单通道）：暂缓即可，不折腾。
 pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     use crate::server::upstream as chan;
@@ -1484,8 +1454,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
 }
 
 /// 建连机器人：把 host 缺通道的 IP 都建出来（一 IP 一条）。
-/// 测速探针已摘除（拨号耗时入 latency，传输快慢由真实请求记账）：
-/// 补建完直接入池，达标/暂缓交给流经的真实请求与触发链。
+/// 补建完直接入池，去留交给真实流量与黑洞看门狗。
 fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
     let host = host.to_string();
     tokio::spawn(async move {
@@ -1493,8 +1462,7 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
         let targets = route::dial_targets(&host).unwrap_or_default();
         let mut built = 0usize;
         for t in targets {
-            // 只补没通道且不在冷却的 IP；有通道的（健康或慢暂缓）不动——
-            // 慢通道不重建只复测的语义由真实请求记账承接。
+            // 只补没通道且不在冷却的 IP；有通道的不动。
             if chan::conn_count_on_ip(&t.ip) > 0 || dial_cooling(&t.ip, &t.sni) {
                 continue;
             }
@@ -1516,19 +1484,6 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
     });
 }
 
-/// 池通道 ECT 窗 sweep：500ms 一拍（挂在 mirror 的 ECT ticker 线程上）。
-/// 快照本窗实收进 prev；通道闲置（无在途、本窗零收）时 prev 沿用旧值不衰减。
-pub(crate) fn sweep_channel_ect() {
-    use crate::server::upstream as chan;
-    let g = chan::conn_pool().lock().unwrap_or_else(|p| p.into_inner());
-    for h in g.values() {
-        for c in h.iter() {
-            let inflight = c.up.inflight.load(std::sync::atomic::Ordering::Relaxed) > 0;
-            c.up.ect.sweep(inflight);
-        }
-    }
-}
-
 /// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
 fn pick_channel(
     host: &str,
@@ -1544,8 +1499,7 @@ fn pick_channel(
 }
 
 /// 溢出补一条临时通道。首选 = 还没有通道的候选 IP（"一 IP 一通道"的领地）；
-/// 候选 IP 全占时走**同 IP 溢出**例外——条件是正编"不慢"（实测吞吐 ≥ 触发线）：
-/// 速度没问题只是流挤满了，多一条连接就是多一份公平份额。
+/// 候选 IP 全占时走**同 IP 溢出**例外——流挤满了，多一条连接就是多一份公平份额。
 /// 溢出打 overflow 标记：pick 永不外发、空闲即焚，速来速走不算破常驻规矩。
 /// 直接拨不走串发（失败不牵动游标/冷却）。会话域不溢出；补不出返回 None。
 async fn overflow_build(
@@ -1562,29 +1516,18 @@ async fn overflow_build(
         .iter()
         .filter(|t| chan::conn_count_on_ip(&t.ip) == 0 && !dial_cooling(&t.ip, &t.sni))
         .next();
-    // ② 全占 → 同 IP 溢出：正编不慢（每流速度 ≥ 触发线，被动测速窗）才配，挑最闲的一条；
-    //    慢的交给触发链。无窗数据（刚建/闲置）不参与同 IP 溢出。
+    // ② 全占 → 同 IP 溢出：挑最闲的一条。
     let congested = targets.iter().filter_map(|t| {
         let (inflight, cap) = chan::channel_load(&t.ip)?;
-        let kbps = chan::ect_flow_kbps(&t.ip)?;
-        if kbps < speed::TRIGGER_KBPS {
-            return None; // 慢：溢出也快不了，触发链去换 IP
-        }
         Some(((inflight as f64) / cap as f64, t))
     });
-    // 分支与挑选时刻的速度一起定死：拨号要花一秒，账本在这段时间会被改写，
-    // 日志再回头查账本就会印出与决策时无关的数（「0KB/s ≥ 触发线」的自相矛盾行）。
     let (node, why) = match fresh {
         Some(t) => (t.clone(), "零通道 IP 补建".to_string()),
         None => {
             let (ratio, t) = congested.min_by(|a, b| a.0.total_cmp(&b.0))?;
-            let kbps = chan::ect_flow_kbps(&t.ip).unwrap_or(0.0);
             (
                 t.clone(),
-                format!(
-                    "同 IP 临时加班(正编满载 {:.0}%, 挑选时每流 {kbps:.0}KB/s ≥ 触发线)",
-                    ratio * 100.0
-                ),
+                format!("同 IP 临时加班(正编满载 {:.0}%)", ratio * 100.0),
             )
         }
     };

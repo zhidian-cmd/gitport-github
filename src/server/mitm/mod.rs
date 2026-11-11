@@ -677,15 +677,7 @@ pub(super) async fn get_direct(
                 } else {
                     quiet::note_reuse(log, host, &ip, ms);
                 }
-                return Ok(meter_body(
-                    log,
-                    host,
-                    &path,
-                    &ip,
-                    up.ect.clone(),
-                    up.inflight.clone(),
-                    resp,
-                ));
+                return Ok(meter_body(log, host, &path, &ip, resp));
             }
             Err(e) => {
                 // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
@@ -720,10 +712,8 @@ fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
         == Some("0")
 }
 
-/// 响应体计量 + 黑洞看门狗。速度判定走**被动测速窗**：响应字节逐帧喂进所属通道的
-/// ECT 窗（500ms 快照），每流速度 = 上一窗实收 ÷ 在途流数；慢（每流 < 触发线）交给
-/// 触发链。**黑洞**：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节
-/// 没来——看门狗只标记不杀在途请求（也许回源后能完成），通道暂缓 + 触发换血；
+/// 响应体计量 + 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节
+/// 没来 = 黑洞——看门狗只标记不杀在途请求（也许回源后能完成），通道暂缓 + 触发换血；
 /// 会话域则当场弃旧通道并预建替代（浏览器对未收到响应的重置连接会自动重试，
 /// 重试落在预建的新通道上）。
 fn meter_body(
@@ -731,8 +721,6 @@ fn meter_body(
     host: &str,
     path: &str,
     ip: &str,
-    ect: Arc<crate::server::upstream::EctWindow>,
-    inflight: Arc<std::sync::atomic::AtomicU32>,
     resp: hyper::Response<BoxBody>,
 ) -> hyper::Response<BoxBody> {
     struct WatchInner {
@@ -740,8 +728,6 @@ fn meter_body(
         host: String,
         path: String,
         ip: String,
-        ect: Arc<crate::server::upstream::EctWindow>,
-        inflight: Arc<std::sync::atomic::AtomicU32>,
         bytes: std::sync::atomic::AtomicU64,
         /// 数据窗起点 = **第一个数据字节**到达的时刻。
         first_frame: std::sync::Mutex<Option<std::time::Instant>>,
@@ -751,39 +737,10 @@ fn meter_body(
             let n = n as u64;
             self.bytes
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            // 被动测速：字节流经哪个通道就喂哪个通道的窗，500ms sweep 出每流速度。
-            self.ect
-                .window_bytes
-                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             let mut g = self.first_frame.lock().unwrap();
             if g.is_none() {
                 *g = Some(std::time::Instant::now());
             }
-        }
-        /// body 结束（正常/中断）时结算：按通道 ECT 每流速度分流（慢触发链）。
-        /// 每流速度 = 上一窗实收 ÷ 在途流数；窗为 0（响应跨窗已结算/闲置）不动。
-        fn settle(&self) {
-            let prev = self.ect.prev_bytes();
-            if prev == 0 {
-                return; // 无窗数据：速度无从谈起（黑洞由看门狗处置）
-            }
-            let inflight = self
-                .inflight
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .max(1) as f64;
-            let per_flow = prev as f64 / 512.0 / inflight;
-            if per_flow >= pool::speed::TARGET_KBPS {
-                pool::speed::release(&self.ip);
-            } else if per_flow < pool::speed::TRIGGER_KBPS {
-                // 够用线以下、触发线以上：将就用，不动。只有跌穿触发线才交给池子
-                // 判断「主副全低」——低一条不值得折腾。
-                pool::on_channel_slow(&self.host, &self.ip, &self.path, &self.log);
-            }
-        }
-    }
-    impl Drop for WatchInner {
-        fn drop(&mut self) {
-            self.settle();
         }
     }
     // 纯头响应（204/304/Content-Length: 0）没有数据阶段，不参与黑洞判定。
@@ -794,8 +751,6 @@ fn meter_body(
         host: host.to_string(),
         path: path.to_string(),
         ip: ip.to_string(),
-        ect,
-        inflight,
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
     });
@@ -816,7 +771,7 @@ fn meter_body(
                 return;
             };
             if w.first_frame.lock().unwrap().is_some() {
-                return; // 数据来了：不是黑洞，结算交给 body 结束时的 settle
+                return; // 数据来了：不是黑洞，不用做什么
             }
             let bytes = w.bytes.load(std::sync::atomic::Ordering::Relaxed);
             (w.log)(&format!(
@@ -828,7 +783,7 @@ fn meter_body(
             pool::on_channel_blackhole(&w.host, &w.ip, &w.path, &w.log);
         });
     }
-    // 闭包持有 inner：body 活多久它活多久——读完、客户端断开、连接出错都只结算一次。
+    // 闭包持有 inner：body 活多久它活多久——计数与看门狗判定跟着 body 走。
     let body = http_body_util::BodyExt::map_frame(body, move |frame| {
         if let Some(d) = frame.data_ref() {
             inner.on_frame(d.len());
