@@ -18,10 +18,6 @@ pub const TRIGGER_KBPS: f64 = 45.0;
 const BENCH_SECS: u64 = 60;
 /// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报慢也只触发一轮。
 const REBUILD_COOLDOWN_SECS: u64 = 60;
-/// 连续几轮重建都达不到够用线就熔断（这条线路就这水平，别烧流量折腾）。
-const BREAKER_STRIKES: u32 = 3;
-/// 熔断时长。
-const BREAKER_SECS: u64 = 600;
 /// EWMA 新样本权重。
 const ALPHA: f64 = 0.4;
 
@@ -45,18 +41,6 @@ pub fn record(ip: &str, bytes: u64, ms: u64) -> Option<f64> {
     }
     let kbps = bytes as f64 / 1024.0 / (ms as f64 / 1000.0);
     note_sample(ip, kbps)
-}
-
-/// 记一次探针/复测样本：时间窗 500ms 的刻意测量，任何字节量都入账——
-/// 快线慢线都有数，「无样本」只属于从没被探过的通道。
-/// 速度由调用方按 µs 精度算好传入——这里再收 bytes/ms 重算会撞毫秒截断，
-/// 头体同包的小响应（数据窗 0.8ms）会被 ms==0 误丢，「无样本」怪圈死灰复燃。
-/// 只入账（EWMA/样本窗/解锁暂缓），不触发暂缓与重建——那是真实请求慢时触发链的事。
-pub fn record_probe(ip: &str, kbps: u64, bytes: u64) -> Option<f64> {
-    if kbps == 0 || bytes == 0 {
-        return None;
-    }
-    note_sample(ip, kbps as f64)
 }
 
 fn note_sample(ip: &str, kbps: f64) -> Option<f64> {
@@ -156,15 +140,6 @@ pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
         .filter(|s| *s > 0)
 }
 
-/// 熔断剩余秒数（状态行用）；未熔断/已到期 = None。
-pub fn breaker_remaining_secs(host: &str) -> Option<u64> {
-    let g = lock(&HOSTS);
-    let st = g.as_ref()?.get(host)?;
-    st.open_until
-        .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
-        .filter(|s| *s > 0)
-}
-
 /// 取走自上次取走以来累计的（IP, 样本数, 均值 KB/s）——状态行 30s 一取，取走即清。
 pub fn drain_samples() -> Vec<(String, u32, f64)> {
     let mut g = lock(&SAMPLES);
@@ -177,28 +152,23 @@ pub fn drain_samples() -> Vec<(String, u32, f64)> {
         .collect()
 }
 
-/// 单 host 的重建节奏：60s 一轮，连续 3 轮不达标熔断 10 分钟。
+/// 单 host 的重建节奏：60s 一轮限流（探针已摘，无熔断——限流即约束）。
 #[derive(Default)]
 struct HostRace {
     last: Option<Instant>,
-    /// 连续几轮重建后仍没筛出达标通道。
-    strikes: u32,
-    open_until: Option<Instant>,
 }
 
 static HOSTS: Mutex<Option<HashMap<String, HostRace>>> = Mutex::new(None);
 
-/// 现在能不能为这个 host 触发一轮重建：熔断中/冷却中都不行。
+/// 现在能不能为这个 host 触发一轮重建：冷却中不行。
 pub fn may_rebuild(host: &str) -> bool {
-    let mut g = lock(&HOSTS);
-    let m = g.get_or_insert_with(HashMap::new);
-    let now = Instant::now();
-    let Some(st) = m.get(host) else { return true };
-    if st.open_until.is_some_and(|u| now < u) {
-        return false;
+    let g = lock(&HOSTS);
+    match g.as_ref().and_then(|m| m.get(host)) {
+        None => true,
+        Some(st) => st
+            .last
+            .is_none_or(|t| Instant::now().duration_since(t).as_secs() >= REBUILD_COOLDOWN_SECS),
     }
-    st.last
-        .is_none_or(|t| now.duration_since(t).as_secs() >= REBUILD_COOLDOWN_SECS)
 }
 
 /// 记一轮重建开始。
@@ -207,36 +177,6 @@ pub fn begin_rebuild(host: &str) {
     let m = g.get_or_insert_with(HashMap::new);
     let st = m.entry(host.to_string()).or_default();
     st.last = Some(Instant::now());
-}
-
-/// 一轮重建收尾：best = 本轮筛出的最快吞吐（None = 一条都没测成）。
-/// 返回 true 表示这一轮把熔断打开了。
-pub fn finish_rebuild(host: &str, best: Option<f64>) -> bool {
-    let hit = best.is_some_and(|k| k >= TARGET_KBPS);
-    let mut g = lock(&HOSTS);
-    let m = g.get_or_insert_with(HashMap::new);
-    let st = m.entry(host.to_string()).or_default();
-    if hit {
-        st.strikes = 0;
-        st.open_until = None;
-        return false;
-    }
-    st.strikes = st.strikes.saturating_add(1);
-    if st.strikes >= BREAKER_STRIKES {
-        st.strikes = 0;
-        st.open_until = Some(Instant::now() + Duration::from_secs(BREAKER_SECS));
-        return true;
-    }
-    false
-}
-
-/// 这个 host 是否处于熔断期（日志/测试用）。
-pub fn breaker_open(host: &str) -> bool {
-    let g = lock(&HOSTS);
-    g.as_ref()
-        .and_then(|m| m.get(host))
-        .and_then(|st| st.open_until)
-        .is_some_and(|u| Instant::now() < u)
 }
 
 /// 测试专用：清空速度账本与重建节奏表。

@@ -104,51 +104,29 @@ async fn one_ip_one_channel_and_slot_filter() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 竞速排名：量到吞吐的在前（降序）；探针失败/超时的排后面，按拨号耗时升序。
-/// 探针只是判据不判死——全探不动时仍按握手快慢给顺序，建连不因此失败。
+/// 竞速排名：按拨号耗时升序——通道即用即建几乎全新，拨号快慢是唯一速度先验。
 #[tokio::test]
-async fn race_ranks_by_measured_throughput_then_dial() {
+async fn race_ranks_by_dial_ms() {
     let legs = vec![
-        // 探针失败，但拨号最快
-        RaceLeg {
-            ip: "d".into(),
-            dial_ms: 50,
-            kbps: None,
-            sample: None,
-            fail: Some(ProbeFail::HeadTimeout),
-            up: mk_up("9.9.9.34", 1).await,
-        },
-        // 吞吐第二
-        RaceLeg {
-            ip: "b".into(),
-            dial_ms: 900,
-            kbps: Some(105),
-            sample: Some((262144, 800)),
-            fail: None,
-            up: mk_up("9.9.9.32", 1).await,
-        },
-        // 吞吐第一
         RaceLeg {
             ip: "c".into(),
             dial_ms: 500,
-            kbps: Some(321),
-            sample: Some((262144, 500)),
-            fail: None,
             up: mk_up("9.9.9.33", 1).await,
         },
-        // 探针失败，拨号慢
         RaceLeg {
             ip: "a".into(),
             dial_ms: 100,
-            kbps: None,
-            sample: None,
-            fail: Some(ProbeFail::HeadTimeout),
             up: mk_up("9.9.9.31", 1).await,
+        },
+        RaceLeg {
+            ip: "b".into(),
+            dial_ms: 300,
+            up: mk_up("9.9.9.32", 1).await,
         },
     ];
     let ranked = rank_legs(legs);
     let order: Vec<&str> = ranked.iter().map(|l| l.ip.as_str()).collect();
-    assert_eq!(order, vec!["c", "b", "d", "a"], "先按实测吞吐降序, 探针失败按拨号升序");
+    assert_eq!(order, vec!["a", "b", "c"], "按拨号耗时升序");
 }
 
 /// 内容域：同 IP 只准一条通道——第二条拨出来当场作废，返回池里现成那条。

@@ -361,118 +361,6 @@ fn conn_probe_state(ip: &str, id: u64) -> (u64, u32, bool) {
     }
 }
 
-/// 竞速探针的实测结果：500ms 时间窗内的（字节数 ÷ 实际耗时）。
-#[derive(Clone, Copy)]
-pub(crate) struct ProbeStat {
-    pub kbps: u64,
-    pub bytes: u64,
-    /// 数据窗耗时（µs）：小响应的头体同包到达时毫秒会截成 0，摘要要能显示亚毫秒。
-    pub us: u64,
-}
-
-/// 探针失败原因：两回事分开打日志，否则「头部超时」和「数据黑洞」混成一行没法归因。
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum ProbeFail {
-    /// 头部预算（3.5s）内连响应头都没到：TTFB 层的问题
-    HeadTimeout,
-    /// 头到了但数据窗一个字节没收：数据黑洞
-    NoData,
-}
-
-impl ProbeFail {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            ProbeFail::HeadTimeout => "头部超时",
-            ProbeFail::NoData => "零数据",
-        }
-    }
-}
-
-/// 内容域竞速探针：时间窗 500ms——从**第一个数据字节**起算，窗内收到多少字节
-/// 就按实际耗时折算多少速度。字节门槛（16KB 段 / 64KB 账本线）在快线上全是
-/// 延迟、在烂线上永远凑不齐（「零字节/拨号 615ms」就是这么来的），统一换时间窗；
-/// TTFB 单列 3 秒头部预算——头部等待是延迟不是速度，算进数据窗会把窗口吃光
-/// （实测 8 条腿全零字节、紧接着的真实请求却 14MB/s）。
-/// 失败带原因返回：头部超时与零数据是两种病，混打一行没法定位。
-pub(crate) async fn probe_speed(
-    send: &SendRequest<Bytes>,
-    owner: &str,
-    path: &str,
-) -> Result<ProbeStat, ProbeFail> {
-    const WINDOW_MS: u64 = 500;
-    const HEAD_BUDGET_MS: u64 = 3000;
-    let uri = if path.is_empty() {
-        format!("https://{owner}/")
-    } else {
-        format!("https://{owner}{path}")
-    };
-    // 头部阶段：预算内连头都没到 = 头部超时
-    let head = tokio::time::timeout(std::time::Duration::from_millis(HEAD_BUDGET_MS), async {
-        let mut ready = send.clone().ready().await.ok()?;
-        let req = hyper::Request::builder()
-            .method(hyper::Method::GET)
-            .uri(uri)
-            .header("range", "bytes=0-65535")
-            .body(())
-            .ok()?;
-        let (resp, _stream) = ready.send_request(req, true).ok()?;
-        let (_parts, body) = resp.await.ok()?.into_parts();
-        Some(body)
-    })
-    .await
-    .map_err(|_| ProbeFail::HeadTimeout)?
-    .ok_or(ProbeFail::HeadTimeout)?;
-    // 数据阶段：从第一个数据字节起算收 500ms（或 64KB 上限，或 EOF）
-    let mut body = head;
-    let data_t0 = Instant::now();
-    let mut got: u64 = 0;
-    loop {
-        let chunk = match tokio::time::timeout(
-            std::time::Duration::from_millis(WINDOW_MS),
-            body.data(),
-        )
-        .await
-        {
-            Ok(Some(c)) => c,
-            Ok(None) => break, // EOF
-            Err(_) => break,   // 数据窗到点
-        };
-        got += chunk
-            .ok()
-            .ok_or(ProbeFail::NoData)?
-            .len() as u64;
-        // 500ms 窗口内最多 64KB 就够算速度了：够了就停，体丢弃即 RST。
-        if got >= 64 * 1024 || data_t0.elapsed().as_millis() as u64 >= WINDOW_MS {
-            break;
-        }
-    }
-    // 微秒折算：小响应（头像 3KB）的头体常在同一个包里到达，毫秒精度会截成
-    // ms==0 而误判成零数据——最快的通道恰恰在这里被冤枉。
-    let us = data_t0.elapsed().as_micros() as u64;
-    if got == 0 || us == 0 {
-        return Err(ProbeFail::NoData);
-    }
-    // 样本下限：头体同包的小响应（41B/1µs 型）会算出 GB/s 级"缓冲速度"，
-    // 是测不出而不是线速——不到 16KB（等效 <32KB/s，够用线一半以下）与零数据
-    // 同归无样本，别让假满速通道达标入账被 pick 优先选中。
-    if got < 16 * 1024 {
-        return Err(ProbeFail::NoData);
-    }
-    // 钳顶：大样本的 µs 折算仍可能算出高于线速的读数，钳到 100MB/s 保排序单调。
-    const KBPS_CAP: f64 = 100_000.0;
-    Ok(ProbeStat {
-        kbps: ((got as f64 * 1_000_000.0 / 1024.0 / us as f64).min(KBPS_CAP)) as u64,
-        bytes: got,
-        us,
-    })
-}
-
-/// 池内通道复测：不重拨，直接在这条现成通道上量。
-pub async fn probe_channel(up: &H2Upstream, path: &str) -> Option<ProbeStat> {
-    let owner = up.owner.clone().unwrap_or_else(|| up.ip.clone());
-    probe_speed(&up.send, &owner, path).await.ok()
-}
-
 /// 一条连接 = 一个任务：持续 poll conn（协议硬要求）、收到关闭信号或闲置超限即焚。
 /// 即用即建、用完就丢：通道不再长期持有——闲置寿命（10s）远短于对端/中间设备的
 /// 静默掐死窗口（60~90s），「领到僵尸通道」在结构上不可能发生。
@@ -687,32 +575,21 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
 pub(crate) struct RaceLeg {
     pub ip: String,
     pub dial_ms: u64,
-    /// 探针实测吞吐（KB/s）；None = 探针失败，原因在 fail。
-    pub kbps: Option<u64>,
-    /// 样本可信度：探针的字节数与数据窗耗时，太小/太快的读数一眼可辨。
-    pub sample: Option<(u64, u64)>,
-    /// 探针失败原因：头部超时 / 零数据——两回事分开打，否则没法归因。
-    pub fail: Option<ProbeFail>,
     up: H2Upstream,
 }
 
-/// 竞速排名（纯函数）：量到吞吐的在前按降序；探针失败/超时的排后面，按拨号耗时升序。
-/// 探针只是判据，不判死——全探不动也照样建连，只是排序退回握手快慢。
+/// 竞速排名（纯函数）：拨号耗时升序——通道即用即建几乎全新，
+/// 拨号快慢就是当前可得的唯一速度先验；传输快慢由真实请求记账兜底。
 pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
-    legs.sort_by(|a, b| match (a.kbps, b.kbps) {
-        (Some(x), Some(y)) => y.cmp(&x),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.dial_ms.cmp(&b.dial_ms),
-    });
+    legs.sort_by_key(|l| l.dial_ms);
     legs
 }
 
 /// 内容域竞速建连：该 host 的**全部**候选 IP 一 IP 一条腿并发拨（数量随域的 IP 组走），
-/// 各自实测吞吐，取最快的两条入池，其余当场关闭。建连机器人返回最快那条。
+/// 按拨号耗时取最快的两条入池，其余当场关闭。建连机器人返回最快那条。
 const RACE_WINDOW_SECS: u64 = 8;
 
-async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
+async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let targets = pool::route::dial_targets(host).unwrap_or_default();
     // 跳过死亡冷却与暂缓；全被排除就用回全部（软排除，不能把候选打空）。
     let alive: Vec<crate::pool::route::NodeIp> = targets
@@ -737,7 +614,6 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
         let host2 = host.to_string();
         let log2 = log.clone();
         let tx2 = tx.clone();
-        let probe = probe_path.to_string();
         tokio::spawn(async move {
             // 错峰起跑：12 条腿同时砸向同一批新连接，Fastly 对新连接首请求
             // 会排队（实测 12 路全零字节、真实流量随即正常），错开 50ms 避开突发。
@@ -760,25 +636,10 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
                     return;
                 }
             };
-            let (stat, fail) = match probe_speed(&up.send, &host2, &probe).await {
-                Ok(st) => (Some(st), None),
-                Err(e) => (None, Some(e)),
-            };
-            // 赛道上就完成一次真实测速。达标的确保可用；不够的先不动——
-            // 全都不达标时通道要全部留用摊带宽（暂缓是触发链在真实请求慢时才做的事）。
-            if let Some(st) = &stat {
-                pool::speed::record_probe(&node.ip, st.kbps, st.bytes);
-                if (st.kbps as f64) >= pool::speed::TARGET_KBPS {
-                    pool::speed::release(&node.ip);
-                }
-            }
             let _ = tx2
                 .send(Ok(RaceLeg {
                     ip: node.ip.clone(),
                     dial_ms,
-                    kbps: stat.map(|s| s.kbps),
-                    sample: stat.map(|s| (s.bytes, s.us)),
-                    fail,
                     up,
                 }))
                 .await;
@@ -809,51 +670,18 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
         }
     });
     let mut ranked = rank_legs(got);
-    // 探针失败（头部超时/零数据）的腿 = 黑洞嫌疑：暂缓 60s，pick 不再选中它们——
-    // 竞速天然排除黑洞。µs 精度后 NoData 是真实的 500ms 零数据，不是毫秒截断误伤。
-    for leg in &ranked {
-        if leg.kbps.is_none() {
-            pool::speed::bench(&leg.ip);
-        }
-    }
-    // 有达标通道 → 留最快的两条，落败腿关闭；
-    // 全都不达标 → 一条不关全留用：N 条通道摊并发就是 N 份聚合带宽，
-    // 单通道的 h2 流排队才是瓶颈（DNS 兜底"更快"的真因就是它一个人独占一条新连接）。
-    let any_qualifies = ranked
-        .first()
-        .and_then(|l| l.kbps)
-        .is_some_and(|k| (k as f64) >= pool::speed::TARGET_KBPS);
-    let keep = if any_qualifies {
-        ranked.len().min(2)
-    } else {
-        ranked.len()
-    };
+    // 按拨号耗时取最快的两条，落败腿关闭；传输快慢由真实请求记账与
+    // 触发链兜底（黑洞 30s 看门狗 / settle 触发链），竞速不再做测速预判。
+    let keep = ranked.len().min(2);
     let winners: Vec<RaceLeg> = ranked.drain(..keep).collect();
     // 落败腿：主动关闭，不入池。
     for leg in ranked {
         leg.up.close.notify_one();
     }
-    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快、样本可信度如何。
+    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快。
     let summary: Vec<String> = winners
         .iter()
-        .map(|l| {
-            let t = l
-                .kbps
-                .map(|k| match l.sample {
-                    // 亚毫秒数据窗显示 µs：0ms 会引来下一个疑问
-                    Some((bytes, us)) if us < 1000 => format!("{k}KB/s({bytes}B/{us}µs)"),
-                    Some((bytes, us)) => format!("{k}KB/s({bytes}B/{}ms)", us / 1000),
-                    None => format!("{k}KB/s"),
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "{}/拨号{}ms",
-                        l.fail.map(|f| f.as_str()).unwrap_or("零字节"),
-                        l.dial_ms
-                    )
-                });
-            format!("{}({t})", l.ip)
-        })
+        .map(|l| format!("{}(拨{}ms)", l.ip, l.dial_ms))
         .collect();
     let mut kept: Vec<H2Upstream> = Vec::new();
     for (i, mut leg) in winners.into_iter().enumerate() {
@@ -863,15 +691,7 @@ async fn race_build(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstr
         }
         kept.push(store_h2(&leg.ip, leg.up));
     }
-    if any_qualifies {
-        (log)(&format!("[建连] {host} 竞速取前二: {}", summary.join(" / ")));
-    } else {
-        (log)(&format!(
-            "[建连] {host} 无达标通道, 全留 {} 条摊带宽: {}",
-            kept.len(),
-            summary.join(" / ")
-        ));
-    }
+    (log)(&format!("[建连] {host} 竞速取前二: {}", summary.join(" / ")));
     Ok(kept.remove(0))
 }
 

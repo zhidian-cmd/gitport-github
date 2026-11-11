@@ -47,9 +47,6 @@ fn emit(log: &LogFn) {
             }
             parts.push(format!("{ip} {p}"));
         }
-        let breaker = speed::breaker_remaining_secs(&host)
-            .map(|r| format!("; 熔断剩余{}s", r))
-            .unwrap_or_default();
         // 本窗真实样本：只统计这个 host 名下通道的。
         let (n, sum) = samples
             .iter()
@@ -61,10 +58,9 @@ fn emit(log: &LogFn) {
             String::new()
         };
         log(&format!(
-            "[状态] {host} {} 通道: {}{}{}",
+            "[状态] {host} {} 通道: {}{}",
             chans.len(),
             parts.join(" | "),
-            breaker,
             samp
         ));
     }

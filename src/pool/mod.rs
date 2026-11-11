@@ -1427,7 +1427,7 @@ pub fn on_channel_slow(host: &str, ip: &str, path: &str, log: &LogFn) {
         return;
     }
     speed::bench(ip);
-    if speed::breaker_open(host) || !speed::may_rebuild(host) {
+    if !speed::may_rebuild(host) {
         return;
     }
     speed::begin_rebuild(host);
@@ -1472,7 +1472,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
             (log)(&format!(
                 "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
             ));
-            if !speed::breaker_open(host) && speed::may_rebuild(host) {
+            if speed::may_rebuild(host) {
                 speed::begin_rebuild(host);
                 ensure_coverage(host, path, log.clone());
             }
@@ -1483,96 +1483,36 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     }
 }
 
-/// 复测/补建的并发结果折叠（两处逐字拷贝收口）：达标解锁计数、记录本轮最快。
-async fn fold_probe_results(
-    jobs: Vec<impl std::future::Future<Output = Option<(String, f64)>> + Send>,
-    ok: &mut usize,
-    best: &mut Option<f64>,
-) {
-    for (ip, k) in futures_util::future::join_all(jobs)
-        .await
-        .into_iter()
-        .flatten()
-    {
-        if k >= speed::TARGET_KBPS {
-            speed::release(&ip);
-            *ok += 1;
-        }
-        *best = Some(best.map_or(k, |b: f64| b.max(k)));
-    }
-}
-
-/// 建连机器人：把 host 的其余 IP 通道都建出来（一 IP 一条）。
-/// 现成通道就地复测、不重拨；建成/复测的都交给池子，由池子按实测吞吐筛。
-fn ensure_coverage(host: &str, path: &str, log: LogFn) {
+/// 建连机器人：把 host 缺通道的 IP 都建出来（一 IP 一条）。
+/// 测速探针已摘除（拨号耗时入 latency，传输快慢由真实请求记账）：
+/// 补建完直接入池，达标/暂缓交给流经的真实请求与触发链。
+fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
     let host = host.to_string();
-    let path = path.to_string();
     tokio::spawn(async move {
         use crate::server::upstream as chan;
         let targets = route::dial_targets(&host).unwrap_or_default();
-        let mut best: Option<f64> = None;
-        let mut ok = 0usize;
         let mut built = 0usize;
-
-        // ① 现成通道复测：暂缓的留在池里，直接量，不重拨。
-        let mut probes = Vec::new();
-        for t in targets.iter() {
-            if chan::conn_count_on_ip(&t.ip) == 0 {
-                continue;
-            }
-            let Some(up) = chan::cached_h2_in(std::slice::from_ref(&t.ip), None) else {
-                continue;
-            };
-            let ip = t.ip.clone();
-            let p = path.clone();
-            probes.push(async move {
-                let st = chan::probe_channel(&up, &p).await?;
-                speed::record_probe(&ip, st.kbps, st.bytes);
-                Some((ip, st.kbps as f64))
-            });
-        }
-        fold_probe_results(probes, &mut ok, &mut best).await;
-        // ② 黑通道重建 + 缺的补建，慢通道不重建只复测：黑洞触发时肇事黑通道已当场
-        // 摘除（on_channel_blackhole），此处只对没通道的 IP（含刚摘的黑通道、本来
-        // 就缺的）直拨补建；有通道的（健康或暂缓中的慢通道）① 复测已覆盖，不动。
-        let mut dials = Vec::new();
-        for t in targets.into_iter() {
+        for t in targets {
+            // 只补没通道且不在冷却的 IP；有通道的（健康或慢暂缓）不动——
+            // 慢通道不重建只复测的语义由真实请求记账承接。
             if chan::conn_count_on_ip(&t.ip) > 0 || dial_cooling(&t.ip, &t.sni) {
                 continue;
             }
             let host2 = host.clone();
-            let p = path.clone();
             let log2 = log.clone();
-            dials.push(async move {
+            let built_ip = t.ip.clone();
+            let dial_job = async move {
                 let conn = dial::dial_one(&t.ip, &t.sni, &t.verify, true).await.ok()?;
                 let up = chan::h2_from_dialed(&host2, conn, &t.ip, 1, &log2)
                     .await
                     .ok()?;
-                let up = chan::store_h2(&t.ip, up);
-                let Some(st) = chan::probe_channel(&up, &p).await else {
-                    // 补建后探针仍零数据：黑通道复活失败，继续暂缓别让它被 pick 选中
-                    speed::bench(&t.ip);
-                    return None;
-                };
-                speed::record_probe(&t.ip, st.kbps, st.bytes);
-                Some((t.ip.clone(), st.kbps as f64))
-            });
+                let _ = chan::store_h2(&t.ip, up);
+                Some(built_ip)
+            };
+            tokio::spawn(dial_job);
             built += 1;
         }
-        fold_probe_results(dials, &mut ok, &mut best).await;
-
-        if speed::finish_rebuild(&host, best) {
-            (log)(&format!(
-                "[池] {host} 熔断 10 分钟: 连续 3 轮仍不足 {:.0}KB/s, 改用现有最快的通道",
-                speed::TARGET_KBPS
-            ));
-        } else {
-            (log)(&format!(
-                "[池] {host} 补齐完成: 新拨 {built} 条, 达标 {ok} 条, 本轮最快 {}",
-                best.map(|b| format!("{b:.0}KB/s"))
-                    .unwrap_or_else(|| "无".to_string())
-            ));
-        }
+        (log)(&format!("[池] {host} 补齐完成: 新拨 {built} 条"));
     });
 }
 

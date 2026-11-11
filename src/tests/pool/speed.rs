@@ -87,24 +87,16 @@ fn any_at_or_above_gates_rebuild_trigger() {
     assert!(!any_at_or_above(&ips, TRIGGER_KBPS));
 }
 
-/// 连续 3 轮都达不到够用线 → 熔断 10 分钟；有一轮达标就从零计数。
+/// 换血冷却限流：begin 一轮后 60s 内不许再赛（熔断已随测速探针一并移除）。
 #[test]
-fn three_fruitless_rounds_open_breaker() {
+fn rebuild_cooldown_gates_reruns() {
     let _g = guard();
     clear();
     let host = "h1";
-    assert!(!finish_rebuild(host, Some(20.0)), "第 1 轮不熔断");
-    assert!(!finish_rebuild(host, Some(30.0)), "第 2 轮不熔断");
-    assert!(finish_rebuild(host, Some(40.0)), "第 3 轮开熔断");
-    assert!(breaker_open(host));
-    assert!(!may_rebuild(host), "熔断期不许再赛");
-    // 熔断后重新计数：先模拟过期
-    clear();
-    finish_rebuild(host, Some(20.0));
-    finish_rebuild(host, Some(20.0));
-    assert!(!finish_rebuild(host, Some(150.0)), "达标那轮清零，不熔断");
-    assert!(!breaker_open(host));
-    assert!(!finish_rebuild(host, Some(20.0)), "清零后重新从 1 数");
+    assert!(may_rebuild(host));
+    begin_rebuild(host);
+    assert!(!may_rebuild(host), "60 秒内不许再赛");
+    assert!(may_rebuild("h2"), "不同 host 各算各的");
 }
 
 /// 状态行数据源：样本窗按取走即清，剩余时长查询与账本一致。
@@ -123,15 +115,8 @@ fn drain_samples_and_remaining_queries() {
     assert!((95.0..=97.0).contains(mean1), "原始样本均值应 ≈96KB/s: {}", mean1);
     // 取走即清
     assert!(drain_samples().is_empty());
-    // 暂缓/熔断剩余：未发生 = None
+    // 暂缓剩余：未发生 = None
     assert_eq!(bench_remaining_secs("1.1.1.1"), None);
-    assert_eq!(breaker_remaining_secs("h9"), None);
     bench("1.1.1.1");
     assert!(bench_remaining_secs("1.1.1.1").is_some(), "暂缓中有剩余时长");
-    begin_rebuild("h9");
-    assert!(!breaker_remaining_secs("h9").is_some(), "冷却不是熔断");
-    finish_rebuild("h9", Some(10.0));
-    finish_rebuild("h9", Some(10.0));
-    finish_rebuild("h9", Some(10.0));
-    assert!(breaker_remaining_secs("h9").is_some(), "熔断后有剩余时长");
 }
