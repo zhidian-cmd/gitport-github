@@ -608,20 +608,7 @@ pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
 const RACE_WINDOW_SECS: u64 = 8;
 
 async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
-    let targets = pool::route::dial_targets(host).unwrap_or_default();
-    // 跳过死亡冷却与暂缓；全被排除就用回全部（软排除，不能把候选打空）。
-    let alive: Vec<crate::pool::route::NodeIp> = targets
-        .iter()
-        .filter(|t| !pool::dial_cooling(&t.ip, &t.sni))
-        .cloned()
-        .collect();
-    let alive = if alive.is_empty() { targets.clone() } else { alive };
-    let ips: Vec<String> = alive.iter().map(|t| t.ip.clone()).collect();
-    let keep_ips = pool::speed::usable(&ips);
-    let cands: Vec<crate::pool::route::NodeIp> = alive
-        .into_iter()
-        .filter(|t| keep_ips.iter().any(|ip| ip == &t.ip))
-        .collect();
+    let cands = pool::dial_candidates(host);
     if cands.len() < 2 {
         // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
         return h2_dial_slot(host, log, &[], 1, None).await;

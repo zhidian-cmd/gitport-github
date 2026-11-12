@@ -343,18 +343,27 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::route::is_managed(host) {
-        if let Ok((conn, ip, _shape)) = pool::serial_dial_skip(
-            pool::DialSkip {
-                host,
-                tls_handshake: false,
-                skip_ips: &[],
-                slot: 1,
-                prefer_shared: None,
-            },
-            None,
-        )
-        .await
+        // 按类分流：内容域公开 CDN 段——TCP 竞速（仅 MITM 关模式的隧道消费）；
+        // 会话域/其他——串发+游标保持现状，跨 IP 并发 SYN 是风控画像。
+        let dialed = if crate::server::upstream::host_class(host)
+            == crate::server::upstream::HostClass::Content
         {
+            pool::tcp_race_connect(host).await
+        } else {
+            pool::serial_dial_skip(
+                pool::DialSkip {
+                    host,
+                    tls_handshake: false,
+                    skip_ips: &[],
+                    slot: 1,
+                    prefer_shared: None,
+                },
+                None,
+            )
+            .await
+            .map(|(c, ip, _)| (c, ip))
+        };
+        if let Ok((conn, ip)) = dialed {
             return Ok((conn, ip));
         }
     }

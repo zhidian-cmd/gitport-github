@@ -1506,6 +1506,83 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
     });
 }
 
+/// 建连候选准备（h2 竞速与 TCP 竞速共用）：路由候选 → 滤死亡冷却 → 滤暂缓
+/// （软排除，全滤空回退全表，名单绝不打空）。调用方须非会话域——会话域
+/// 恒串发（风控），不走竞速。
+pub(crate) fn dial_candidates(host: &str) -> Vec<route::NodeIp> {
+    let targets = route::dial_targets(host).unwrap_or_default();
+    let alive: Vec<route::NodeIp> = targets
+        .iter()
+        .filter(|t| !dial_cooling(&t.ip, &t.sni))
+        .cloned()
+        .collect();
+    let alive = if alive.is_empty() { targets } else { alive };
+    let ips: Vec<String> = alive.iter().map(|t| t.ip.clone()).collect();
+    let keep = speed::usable(&ips);
+    alive
+        .into_iter()
+        .filter(|t| keep.iter().any(|ip| ip == &t.ip))
+        .collect()
+}
+
+/// 内容域隧道 TCP 竞速（仅 MITM 关模式的 CONNECT 隧道消费）：候选并发仅拨
+/// TCP，第一个通的开管交付。三条红线：不进认领集（1:1 消费品，同 IP 并发
+/// 多条 TCP 是浏览器常态）、不错峰（败腿在 SYN 阶段即弃，到不了「已建连接
+/// 抢首请求」的病灶）、不建池（无多路复用，用完即关）。
+/// 会话域不进来——跨 IP 并发 SYN 是风控画像，connect_upstream 按类分流。
+pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), String> {
+    if SERIAL_COOL.open(host) {
+        return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
+    }
+    let cands = dial_candidates(host);
+    if cands.is_empty() {
+        return Err(format!("{host} 候选 IP 全部在边冷却中, 走兜底"));
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(dial::Dialed, String), String>>(cands.len());
+    for node in cands {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let t0 = Instant::now();
+            match dial::dial_one(&node.ip, &node.sni, &node.verify, false).await {
+                Ok(conn) => {
+                    latency::note(&node.ip, t0.elapsed().as_millis() as u64);
+                    let _ = tx2.send(Ok((conn, node.ip.clone()))).await;
+                }
+                Err(e) => {
+                    // TCP 失败 = IP 对谁都死，进死亡退避（与串发同款判据）。
+                    if msg_is_tcp_dead(&e) {
+                        note_dead(&node.ip);
+                    }
+                    let _ = tx2.send(Err(format!("{} 拨号失败({e})", node.ip))).await;
+                }
+            }
+        });
+    }
+    drop(tx);
+    // 第一个通的即胜者；其余腿随 rx drop 自然销毁——未成握手的 SYN 自灭，
+    // 已成握手的 TcpStream drop 即关，不产生池外滞留。
+    let mut last: Option<String> = None;
+    loop {
+        match rx.recv().await {
+            Some(Ok((conn, ip))) => return Ok((conn, ip)),
+            Some(Err(e)) => last = Some(e),
+            None => {
+                // 全灭冷却：MITM 关模式下镜像腿不营业，无豁免，30s 内直落系统 DNS。
+                SERIAL_COOL.set(host);
+                return Err(last.unwrap_or_else(|| format!("{host} TCP 竞速全败")));
+            }
+        }
+    }
+}
+
+/// TCP 层失败判据（与串发同款）：IP 对谁都死才进死亡退避。
+fn msg_is_tcp_dead(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::ConnectionRefused
+        || e.kind() == std::io::ErrorKind::ConnectionReset
+        || e.kind() == std::io::ErrorKind::ConnectionAborted
+        || e.to_string().starts_with("TCP")
+}
+
 /// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
 fn pick_channel(
     host: &str,
