@@ -35,8 +35,13 @@ fn tpl() -> Tpl {
 #[test]
 fn session_hosts_never_enter_direct_split() {
     // README 的 /o/r/raw/... 第一跳在 github.com 上，是 302；会话域本就不在静态
-    // 资源 CDN 白名单里，不会进纯直连切片。
-    for h in ["github.com", "api.github.com", "objects.githubusercontent.com"] {
+    // 图片 CDN 白名单里，不会进纯直连切片。githubassets 已升格大文件域走镜像配额。
+    for h in [
+        "github.com",
+        "api.github.com",
+        "github.githubassets.com",
+        "objects.githubusercontent.com",
+    ] {
         assert!(!is_split_host(h), "{h} 不该进纯直连切片");
     }
     assert!(!is_split_host("GitHub.com"));
@@ -52,10 +57,9 @@ fn readme_image_cdns_are_allowed() {
         "camo.githubusercontent.com",
         "gist.githubusercontent.com",
         "avatars.githubusercontent.com",
-        "github.githubassets.com",
         "RAW.GitHubUserContent.com",
     ] {
-        assert!(is_split_host(h), "{h} 应该是静态资源落点");
+        assert!(is_split_host(h), "{h} 应该是 README 图片落点");
     }
 }
 
@@ -350,19 +354,8 @@ async fn rescue_swap_continues_byte_stream() {
 #[test]
 fn media_kind_routes_to_its_chain() {
     use super::MediaKind;
-    assert_eq!(
-        MediaKind::Image.chain("avatars.githubusercontent.com"),
-        crate::pool::MEDIA_IMAGE_CHAIN
-    );
-    assert_eq!(
-        MediaKind::Video.chain("avatars.githubusercontent.com"),
-        crate::pool::MEDIA_VIDEO_CHAIN
-    );
-    // 脚本段走 host 自己的镜像链：githubassets 的 worker 镜像就在自己的链里。
-    assert_eq!(
-        MediaKind::Script.chain("github.githubassets.com"),
-        "github.githubassets.com"
-    );
+    assert_eq!(MediaKind::Image.chain(), crate::pool::MEDIA_IMAGE_CHAIN);
+    assert_eq!(MediaKind::Video.chain(), crate::pool::MEDIA_VIDEO_CHAIN);
     assert_eq!(
         MediaKind::of_content_type(Some("video/mp4")),
         Some(MediaKind::Video)
@@ -370,14 +363,6 @@ fn media_kind_routes_to_its_chain() {
     assert_eq!(
         MediaKind::of_content_type(Some("image/png")),
         Some(MediaKind::Image)
-    );
-    assert_eq!(
-        MediaKind::of_content_type(Some("application/javascript")),
-        Some(MediaKind::Script)
-    );
-    assert_eq!(
-        MediaKind::of_content_type(Some("text/css")),
-        Some(MediaKind::Script)
     );
     assert_eq!(MediaKind::of_content_type(Some("text/html")), None);
     assert_eq!(MediaKind::of_content_type(None), None);

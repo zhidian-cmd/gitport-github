@@ -341,16 +341,6 @@ pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
 
 /// 该 IP 上正编通道的（在途流, 流上限）；无正编 = None。溢出临时通道不算。
 /// 拥挤判定用：溢出的前提是"正编满载且速度不慢"，不是"随便加一条"。
-pub(crate) fn channel_load(ip: &str) -> Option<(u32, u32)> {
-    let g = lock(conn_pool());
-    let h = g.get(ip)?;
-    let c = h.iter().find(|c| !c.up.overflow)?;
-    Some((
-        c.up.inflight.load(std::sync::atomic::Ordering::Relaxed),
-        c.up.max_streams.max(1),
-    ))
-}
-
 /// 摘除并关闭该 IP 的正编通道（cap=1 时即唯一一条）——替换黑通道/会话换血用。
 /// 只 notify：驱动走 close 分支退出并自摘出池，连接随任务收尾关闭。
 pub(crate) fn cull_channel(ip: &str) {

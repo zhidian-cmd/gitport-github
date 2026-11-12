@@ -208,9 +208,9 @@ fn host_classes_split_content_session_and_other() {
     );
     // 会话域按风控面划界(主站族之外的数据不是主站): githubassets/github.io/githubapp
     // 不标 session——githubassets 的长寿命通道会占住 185.199.154/215 这 8 个三类横跨的
-    // 共享 IP。githubassets 标 content 拿双通道：一页上百个资产挤单通道，React 水合等不起。
-    assert_eq!(host_class("githubassets.com"), HostClass::Content);
-    assert_eq!(host_class("github.githubassets.com"), HostClass::Content);
+    // 共享 IP。githubassets 升格大文件域(big)：Mirror 路由走镜像配额切片，单通道直连。
+    assert_eq!(host_class("githubassets.com"), HostClass::Other);
+    assert_eq!(host_class("github.githubassets.com"), HostClass::Other);
     assert_eq!(host_class("github.io"), HostClass::Other);
     assert_eq!(host_class("githubapp.com"), HostClass::Other);
     assert_eq!(host_class("codeload.github.com"), HostClass::Other);

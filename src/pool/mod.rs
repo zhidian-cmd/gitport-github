@@ -1602,8 +1602,9 @@ fn pick_channel(
     }
 }
 
-/// 溢出补一条临时通道。首选 = 还没有通道的候选 IP（"一 IP 一通道"的领地）；
-/// 候选 IP 全占时走**同 IP 溢出**例外——流挤满了，多一条连接就是多一份公平份额。
+/// 溢出补一条不同 IP 的临时通道：只认还没有通道的候选 IP（"一 IP 一通道"的领地）。
+/// 候选 IP 全占 → 不溢出：骑满载通道排队（h2 服务端配额）。同 IP 溢出已废——
+/// 实测 185.199 段聚合水管恒定 ~36KB/s，同 IP 第二条 TCP 只摊薄窗口不加吞吐。
 /// 溢出打 overflow 标记：pick 永不外发、空闲即焚，速来速走不算破常驻规矩。
 /// 直接拨不走串发（失败不牵动游标/冷却）。会话域不溢出；补不出返回 None。
 async fn overflow_build(
@@ -1615,25 +1616,14 @@ async fn overflow_build(
     if chan::host_class(host) == chan::HostClass::Session {
         return None;
     }
-    // ① 首选：零通道 IP。
-    let fresh = targets
+    // 首选且唯一：零通道 IP。
+    let Some(node) = targets
         .iter()
         .filter(|t| chan::conn_count_on_ip(&t.ip) == 0 && !dial_cooling(&t.ip, &t.sni))
-        .next();
-    // ② 全占 → 同 IP 溢出：挑最闲的一条。
-    let congested = targets.iter().filter_map(|t| {
-        let (inflight, cap) = chan::channel_load(&t.ip)?;
-        Some(((inflight as f64) / cap as f64, t))
-    });
-    let (node, why) = match fresh {
-        Some(t) => (t.clone(), "零通道 IP 补建".to_string()),
-        None => {
-            let (ratio, t) = congested.min_by(|a, b| a.0.total_cmp(&b.0))?;
-            (
-                t.clone(),
-                format!("同 IP 临时加班(正编满载 {:.0}%)", ratio * 100.0),
-            )
-        }
+        .next()
+        .cloned()
+    else {
+        return None;
     };
     let gate = build_lock(host);
     let Ok(_guard) = gate.try_lock() else {
@@ -1645,7 +1635,7 @@ async fn overflow_build(
         Ok(mut up) => {
             latency::note(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
-            (log)(&format!("[溢出] {host} {why}: {}", node.ip));
+            (log)(&format!("[溢出] {host} 零通道 IP 补建: {}", node.ip));
             Some(chan::store_h2(&node.ip, up))
         }
         Err(_) => {

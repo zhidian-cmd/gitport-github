@@ -45,7 +45,8 @@ use super::merge::SEG_BUFFER_MAX;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// host 白名单：静态资源 CDN 才切（大 JS/CSS 与大图同病同治）；会话域不在表内。
+/// host 白名单：静态图片 CDN 才切；会话域与 /raw/ 302 第一跳不在表内。
+/// githubassets 不在表内——它已升格大文件域走镜像配额切片（is_big_file_host）。
 pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -56,7 +57,6 @@ pub(super) fn is_split_host(host: &str) -> bool {
             | "camo.githubusercontent.com"
             | "gist.githubusercontent.com"
             | "avatars.githubusercontent.com"
-            | "github.githubassets.com"
     )
 }
 
@@ -146,21 +146,18 @@ pub(super) fn skip_response_header(k: &str) -> bool {
 // Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
 // 与镜像链的 206 校验用同一套标准，别再各写一份。
 
-/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链，
-/// 脚本段走 host 自己的镜像链（githubassets 的 worker 镜像就在自己的链里）。
+/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MediaKind {
     Image,
     Video,
-    Script,
 }
 
 impl MediaKind {
-    fn chain(self, host: &str) -> String {
+    fn chain(self) -> &'static str {
         match self {
-            MediaKind::Image => pool::MEDIA_IMAGE_CHAIN.to_string(),
-            MediaKind::Video => pool::MEDIA_VIDEO_CHAIN.to_string(),
-            MediaKind::Script => host.to_string(),
+            MediaKind::Image => pool::MEDIA_IMAGE_CHAIN,
+            MediaKind::Video => pool::MEDIA_VIDEO_CHAIN,
         }
     }
     fn of_content_type(ct: Option<&str>) -> Option<Self> {
@@ -169,8 +166,6 @@ impl MediaKind {
             Some(MediaKind::Image)
         } else if ct.starts_with("video/") {
             Some(MediaKind::Video)
-        } else if ct.contains("javascript") || ct.contains("css") {
-            Some(MediaKind::Script)
         } else {
             None
         }
@@ -239,13 +234,12 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
-    host: &str,
     chain: &[String],
     start: u64,
     e: u64,
     log: &LogFn,
 ) -> Option<(BoxBody, HeaderMap)> {
-    let chain_key = kind.chain(host);
+    let chain_key = kind.chain();
     if MEDIA_RESCUE_BREAKER.open(&chain_key) {
         return None;
     }
@@ -407,7 +401,7 @@ pub(super) async fn try_direct_split(
     }
     // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
     let t0 = Instant::now();
-    let chain = pool::mirror_chain(&kind.chain(host));
+    let chain = pool::mirror_chain(kind.chain());
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let up = chans[i % n].clone();
@@ -425,7 +419,7 @@ pub(super) async fn try_direct_split(
                     hs,
                     rescued: false,
                 }),
-                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, host, &chain, s, e, &log2).await {
+                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -433,7 +427,7 @@ pub(super) async fn try_direct_split(
                     }),
                     None => Err("段失败且镜像救援不可用".to_string()),
                 },
-                Err(_) => match rescue_segment(tpl_ref, kind, host, &chain, s, e, &log2).await {
+                Err(_) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -686,7 +680,7 @@ impl hyper::body::Body for SegmentedBody {
             {
                 match &me.rescue {
                     Some(ctx)
-                        if !MEDIA_RESCUE_BREAKER.open(&ctx.kind.chain(&ctx.host))
+                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain())
                             && !ctx.chain.is_empty() =>
                     {
                         seg.rescue_due = true;
@@ -699,7 +693,7 @@ impl hyper::body::Body for SegmentedBody {
                                 (ctx.log)(&format!(
                                     "[直连切片] {} 无{}救援链可用, 段停滞改为等待直连",
                                     ctx.host,
-                                    ctx.kind.chain(&ctx.host)
+                                    ctx.kind.chain()
                                 ));
                             }
                         }
@@ -712,7 +706,7 @@ impl hyper::body::Body for SegmentedBody {
                         let c = ctx.clone();
                         let (s, e, got) = (seg.s, seg.e, seg.got as u64);
                         seg.handle = Some(tokio::spawn(async move {
-                            rescue_segment(&c.tpl, c.kind, &c.host, &c.chain, s + got, e, &c.log)
+                            rescue_segment(&c.tpl, c.kind, &c.chain, s + got, e, &c.log)
                                 .await
                                 .map(|(body, _hs)| (body, s + got))
                         }));
