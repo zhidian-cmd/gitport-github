@@ -99,11 +99,12 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     }
 }
 
-/// 是否开双通道（批模型下通道总数上限 = 本批的主副两条腿，不再单独记账）：
-/// 双通道把页面的并发流摊到两条连接上——单连接 24 并发实测全部同一时刻返回
-/// （p50 1036ms），两条压到 332ms。
+/// 是否保留双通道（竞速取前二）：内容域且带 `dual` 标志的 host。
+/// 高扇出域（githubassets）二三十条并发流摊两条连接，实测 p50 1036→332ms；
+/// 其余内容域在途常态远低于上限——第二条通道整生命周期晒太阳，取一。
 fn dual_channel(host: &str) -> bool {
     host_class(host) == HostClass::Content
+        && pool::route::route_for(host).is_some_and(|r| r.flags.dual)
 }
 /// 会话域：建连时自建优先，连上了再复用自己那条。
 pub(crate) fn prefer_own_channel(host: &str) -> bool {
@@ -121,6 +122,10 @@ fn now_secs() -> u64 {
 
 /// 响应头预算超时：上层按它区分"真等超了"和别的失败。
 pub const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
+
+/// 建连候选全被其他 host 认领（一条都没轮到拨）：调用方应稍候重查池——
+/// 认领者的通道很快落池，重查即骑。真失败（拨了但败了）不走这个。
+pub const ERR_ALL_CLAIMED: &str = "建连候选全被其他 host 认领";
 
 /// 门房公式：在给定 IP 集合里挑活连接——按占用率，最闲的胜出。
 /// only_owner = 会话域只认自己建的通道；want_slot = 搜索路径固定骑主通道。
@@ -220,6 +225,15 @@ pub(crate) fn channels_for(ips: &[String]) -> Vec<H2Upstream> {
     }
     cands.sort_by(|a, b| a.0.total_cmp(&b.0));
     cands.into_iter().map(|(_, up)| up).collect()
+}
+
+/// 该 IP 池内现成常编通道（竞速收尾并集排名参赛用）；溢出临时通道不算。
+fn pooled_normal(ip: &str) -> Option<H2Upstream> {
+    let g = lock(conn_pool());
+    g.get(ip)?
+        .iter()
+        .find(|c| !c.up.overflow)
+        .map(|c| c.up.clone())
 }
 
 /// 暂缓剩余秒数转发（状态行用）；判据表在 pool::speed。
@@ -491,7 +505,6 @@ pub(crate) async fn h2_dial_slot(
     log: &LogFn,
     skip_ips: &[String],
     slot: u8,
-    crew: Option<&pool::DialCrew>,
     prefer_shared: Option<bool>,
 ) -> Result<H2Upstream, String> {
     let t_dial = std::time::Instant::now();
@@ -501,7 +514,6 @@ pub(crate) async fn h2_dial_slot(
             tls_handshake: true,
             skip_ips,
             slot,
-            crew,
             prefer_shared,
         },
         Some(log),
@@ -574,12 +586,14 @@ pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     }
 }
 
-/// 竞速腿的结果：拨号耗时（TCP+TLS+h2）与实测吞吐（500ms 探针）。
+/// 竞速腿：自己的腿带实测 dial_ms；池内现成通道（并集参赛）pooled=true，
+/// 耗时读延迟表，交付时不再入库。
 #[derive(Clone)]
 pub(crate) struct RaceLeg {
     pub ip: String,
     pub dial_ms: u64,
     up: H2Upstream,
+    pooled: bool,
 }
 
 /// 竞速排名（纯函数）：拨号耗时升序——通道即用即建几乎全新，
@@ -610,9 +624,11 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
         .collect();
     if cands.len() < 2 {
         // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
-        return h2_dial_slot(host, log, &[], 1, None, None).await;
+        return h2_dial_slot(host, log, &[], 1, None).await;
     }
     (log)(&format!("[建连] {host} {} 路竞速(错峰 50ms)", cands.len()));
+    // 参赛名单快照：收尾并集排名按它认领池内现成通道。
+    let raced: Vec<String> = cands.iter().map(|t| t.ip.clone()).collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RaceLeg, String>>(cands.len());
     for (li, node) in cands.into_iter().enumerate() {
         let host2 = host.to_string();
@@ -622,10 +638,15 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
             // 错峰起跑：12 条腿同时砸向同一批新连接，Fastly 对新连接首请求
             // 会排队（实测 12 路全零字节、真实流量随即正常），错开 50ms 避开突发。
             tokio::time::sleep(Duration::from_millis(li as u64 * 50)).await;
+            // 全局认领：同 IP 别的腿正在拨 → 本腿不出场（不发消息 = attempted 不计）。
+            if !pool::claim_dial(&node.ip) {
+                return;
+            }
             let t0 = Instant::now();
             let conn = match pool::dial::dial_one(&node.ip, &node.sni, &node.verify, true).await {
                 Ok(c) => c,
                 Err(e) => {
+                    pool::release_dial(&node.ip);
                     let _ = tx2.send(Err(format!("{} 拨号失败({e})", node.ip))).await;
                     return;
                 }
@@ -635,34 +656,66 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
             let up = match h2_from_dialed(&host2, conn, &node.ip, 1, &log2).await {
                 Ok(u) => u,
                 Err(e) => {
+                    pool::release_dial(&node.ip);
                     pool::note_dead(&node.ip);
                     let _ = tx2.send(Err(format!("{} h2 失败({e})", node.ip))).await;
                     return;
                 }
             };
+            // 拨完即释放认领：入库/关闭由收尾裁决，重复入库有 store_h2 兜底。
+            pool::release_dial(&node.ip);
             let _ = tx2
                 .send(Ok(RaceLeg {
                     ip: node.ip.clone(),
                     dial_ms,
                     up,
+                    pooled: false,
                 }))
                 .await;
         });
     }
     drop(tx);
-    // 收腿：窗口到就用手上的排名，不等磨蹭的腿。
+    // 收腿：窗口到就用手上的排名，不等磨蹭的腿。每条消息 = 一次真实尝试。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(RACE_WINDOW_SECS);
     let mut got: Vec<RaceLeg> = Vec::new();
     let mut last: Option<String> = None;
+    let mut attempted = 0usize;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(Ok(leg))) => got.push(leg),
-            Ok(Some(Err(e))) => last = Some(e),
+            Ok(Some(Ok(leg))) => {
+                attempted += 1;
+                got.push(leg);
+            }
+            Ok(Some(Err(e))) => {
+                attempted += 1;
+                last = Some(e);
+            }
             Ok(None) => break,
             Err(_) => break,
         }
     }
+    // 并集排名：候选里池内现成通道（其他 host 刚建的）也参赛——耗时读延迟表
+    // （认领者刚记的），同 IP 以自己的腿为准。全腿失败/全被认领时它是救援通道。
+    for ip in &raced {
+        if got.iter().any(|l| &l.ip == ip) {
+            continue;
+        }
+        if let Some(up) = pooled_normal(ip) {
+            let ms = pool::latency::get(ip).unwrap_or(u64::MAX);
+            got.push(RaceLeg {
+                ip: ip.clone(),
+                dial_ms: ms,
+                up,
+                pooled: true,
+            });
+        }
+    }
     if got.is_empty() {
+        if attempted == 0 {
+            // 一条都没轮到拨 = 候选全被其他 host 认领：哨兵让调用方稍候重查池。
+            return Err(ERR_ALL_CLAIMED.to_string());
+        }
+        // 真失败（腿拨了但全败）：照旧报错，冷却表已记账。
         return Err(last.unwrap_or_else(|| format!("{host} 竞速全败")));
     }
     // 迟到腿：后台收尸——已建成但没被选中的连接必须关，否则会在池外白养到闲置超时。
@@ -674,39 +727,60 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
         }
     });
     let mut ranked = rank_legs(got);
-    // 按拨号耗时取最快的两条，落败腿关闭；传输快慢由真实请求记账与
-    // 触发链兜底（黑洞 30s 看门狗 / settle 触发链），竞速不再做测速预判。
-    let keep = ranked.len().min(2);
+    // 按拨号耗时取最快的 keep 条，落败腿关闭；传输快慢由真实请求记账与
+    // 黑洞看门狗兜底，竞速不再做测速预判。
+    let keep = if dual_channel(host) { 2 } else { 1 };
+    let keep = keep.min(ranked.len());
     let winners: Vec<RaceLeg> = ranked.drain(..keep).collect();
-    // 落败腿：主动关闭，不入池。
+    // 落败腿：自己的主动关闭不入池；池内的本来就在池里，不动。
     for leg in ranked {
-        leg.up.close.notify_one();
+        if !leg.pooled {
+            leg.up.close.notify_one();
+        }
     }
-    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快。
+    // 先留排名摘要：入池后 leg 被拆开，日志还要说清谁快、谁是从池里捡的。
     let summary: Vec<String> = winners
         .iter()
-        .map(|l| format!("{}(拨{}ms)", l.ip, l.dial_ms))
+        .map(|l| {
+            if l.pooled {
+                format!("池·{}({}ms)", l.ip, l.dial_ms)
+            } else {
+                format!("{}(拨{}ms)", l.ip, l.dial_ms)
+            }
+        })
         .collect();
     let mut kept: Vec<H2Upstream> = Vec::new();
     for (i, mut leg) in winners.into_iter().enumerate() {
-        // 第二名按副通道记账（游标键分开），第一名仍是主通道。
-        if i == 1 {
-            leg.up.slot = 2;
+        if leg.pooled {
+            // 别人家的现成通道：已在池里，直接交付，不重复入库。
+            kept.push(leg.up);
+        } else {
+            // 第二名按副通道记账（游标键分开），第一名仍是主通道。
+            if i == 1 {
+                leg.up.slot = 2;
+            }
+            kept.push(store_h2(&leg.ip, leg.up));
         }
-        kept.push(store_h2(&leg.ip, leg.up));
     }
-    (log)(&format!("[建连] {host} 竞速取前二: {}", summary.join(" / ")));
+    (log)(&format!(
+        "[建连] {host} {}: {}",
+        if keep >= 2 {
+            "竞速取前二"
+        } else {
+            "竞速取最速"
+        },
+        summary.join(" / ")
+    ));
     Ok(kept.remove(0))
 }
 
 /// 串发建连（会话域/低频域恒单腿；内容域不走这里，见 race_build 竞速）。
-/// crew 互斥保证同一个 IP 只由一条腿试；只建新的、不查池——查池归 get_or_build。
+/// 全局认领保证同一个 IP 全进程同时只有一条腿在拨；只建新的、不查池——查池归 get_or_build。
 async fn dial_h2_race(
     host: &str,
     log: &LogFn,
     occupied: &[String],
 ) -> Result<H2Upstream, String> {
-    let crew = pool::DialCrew::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<H2Upstream, String>>(4);
     let targets = pool::route::dial_targets(host).unwrap_or_default();
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
@@ -728,9 +802,8 @@ async fn dial_h2_race(
         let host = host.to_string();
         let log2 = log.clone();
         let skip = occupied.to_vec();
-        let crew2 = crew.clone();
         tokio::spawn(async move {
-            let r = h2_dial_slot(&host, &log2, &skip, slot, Some(&crew2), prefer_shared).await;
+            let r = h2_dial_slot(&host, &log2, &skip, slot, prefer_shared).await;
             let _ = tx.send(r).await;
         });
     };

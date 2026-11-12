@@ -112,16 +112,19 @@ async fn race_ranks_by_dial_ms() {
             ip: "c".into(),
             dial_ms: 500,
             up: mk_up("9.9.9.33", 1).await,
+            pooled: false,
         },
         RaceLeg {
             ip: "a".into(),
             dial_ms: 100,
             up: mk_up("9.9.9.31", 1).await,
+            pooled: false,
         },
         RaceLeg {
             ip: "b".into(),
             dial_ms: 300,
             up: mk_up("9.9.9.32", 1).await,
+            pooled: false,
         },
     ];
     let ranked = rank_legs(legs);

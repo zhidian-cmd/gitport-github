@@ -563,6 +563,7 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
                 && !r.flags.content
                 && !r.flags.session
                 && !r.flags.big
+                && !r.flags.dual
                 && r.fallback == route::Fallback::Dns;
             !(plain && served.contains(r.key.as_str()))
         })
@@ -579,6 +580,9 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             }
             if r.flags.big {
                 fields.push("\"big\": true".to_string());
+            }
+            if r.flags.dual {
+                fields.push("\"dual\": true".to_string());
             }
             if r.fallback == route::Fallback::MirrorDns {
                 fields.push("\"fallback\": \"mirror\"".to_string());
@@ -1021,21 +1025,22 @@ fn dial_order(
     }
 }
 
-/// 冷启动双通道的互斥圈：同 IP 只认领一次，Arc 归零整组消亡。
-pub struct DialCrew {
-    claimed: Mutex<HashSet<String>>,
+/// 全局拨号认领集：同一 IP 全进程同时至多一条腿在拨——跨 host 拨号去重。
+/// 认领窗口 = 起拨到入库/失败。TCP 隧道腿是 1:1 消费品（同 IP 并发多条 TCP
+/// 是浏览器常态），不进认领。
+static DIAL_CLAIMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// 认领拨号：返回 false = 已有别的腿在拨这个 IP，本腿不出场。
+pub(crate) fn claim_dial(ip: &str) -> bool {
+    lock(&DIAL_CLAIMS)
+        .get_or_insert_with(HashSet::new)
+        .insert(ip.to_string())
 }
-impl DialCrew {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            claimed: Mutex::new(HashSet::new()),
-        })
-    }
-    pub fn claim(&self, ip: &str) -> bool {
-        self.claimed
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(ip.to_string())
+
+/// 释放认领：入库/失败后必调——漏放 = 该 IP 本进程永久哑火。
+pub(crate) fn release_dial(ip: &str) {
+    if let Some(t) = lock(&DIAL_CLAIMS).as_mut() {
+        t.remove(ip);
     }
 }
 
@@ -1045,7 +1050,6 @@ pub struct DialSkip<'a> {
     pub tls_handshake: bool,
     pub skip_ips: &'a [String],
     pub slot: u8,
-    pub crew: Option<&'a DialCrew>,
     /// Some = 独占档礼让在前的分档序（Some(true) 为副腿保留，当前活路径仅 Some(false)）；
     /// None = 不分档，维持纯游标+延迟序（真名透传兜底用）。
     pub prefer_shared: Option<bool>,
@@ -1162,7 +1166,6 @@ pub async fn serial_dial_skip(
         tls_handshake,
         skip_ips,
         slot,
-        crew,
         prefer_shared,
     } = req;
     if SERIAL_COOL.open(host) {
@@ -1214,7 +1217,7 @@ pub async fn serial_dial_skip(
     let mut last_err: Option<String> = None;
     let mut tried = 0usize;
     let mut dead_skipped = 0usize;
-    let mut crew_skipped = 0usize;
+    let mut claimed_skipped = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
         // 死亡退避双键：TCP/h2 失败记 IP 粒度（TCP 在 SNI 之前、h2 在 TLS 之后，与 SNI 无关）；
@@ -1223,16 +1226,18 @@ pub async fn serial_dial_skip(
             dead_skipped += 1;
             continue;
         }
-        // 同组互斥：对方试过/在试的 IP 绕行。
-        if let Some(crew) = crew {
-            if !crew.claim(&p.ip) {
-                crew_skipped += 1;
-                continue;
-            }
+        // 全局认领（仅建通道的 TLS 拨号；TCP 隧道腿 1:1 消费不认领）：
+        // 同一 IP 全进程同时至多一条腿在拨——跨 host 拨号去重。
+        if tls_handshake && !claim_dial(&p.ip) {
+            claimed_skipped += 1;
+            continue;
         }
         tried += 1;
         let t0 = Instant::now();
         let result = dial::dial_one(&p.ip, &p.sni, &p.verify, tls_handshake).await;
+        if tls_handshake {
+            release_dial(&p.ip);
+        }
         let dt = t0.elapsed();
         // 每次尝试都留一行（限速）：换 IP 的全过程以前完全无日志，出问题查不到。
         if let Some(log) = log {
@@ -1309,9 +1314,14 @@ pub async fn serial_dial_skip(
     }
 
     if tried == 0 {
+        // 一条都没轮到拨 = 候选全被其他 host 认领：哨兵让调用方稍候重查池——
+        // 认领者的通道很快落池，重查即骑。冷却/占用等别的跳过原因不算。
+        if claimed_skipped > 0 {
+            return Err(crate::server::upstream::ERR_ALL_CLAIMED.to_string());
+        }
         return Err(format!(
             "[{key}] {host} 无可拨候选: 共 {total_candidates} 个, {occupied_n} 个已有通道被跳过, \
-             {dead_skipped} 个死亡冷却, {slow_skipped} 个慢冷却, {crew_skipped} 个同组在建"
+             {dead_skipped} 个死亡冷却, {slow_skipped} 个慢冷却"
         ));
     }
     // 绕表全灭：无镜像兜底才冷却（camo 无链，豁免会让每张徽章重烧整表）。
@@ -1407,9 +1417,16 @@ pub async fn get_or_build(
         if let Some(up) = pick_channel(host, &ips, want_slot, session) {
             return Ok((up, false));
         }
-        // 建造：内容域双腿、其他/会话域单条，全在 dial_upstream 内。
-        let up = chan::dial_upstream(host, probe_path, log).await?;
-        return Ok((up, true));
+        // 建造：内容域竞速、其他/会话域串发，全在 dial_upstream 内。
+        match chan::dial_upstream(host, probe_path, log).await {
+            Err(e) if e == chan::ERR_ALL_CLAIMED => {
+                // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（3s 界照旧）。
+                drop(_guard);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            r => return Ok((r?, true)),
+        }
     }
 }
 
