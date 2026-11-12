@@ -22,9 +22,19 @@ use std::{
 
 /// 门槛：探片多一次往返，小图省不回来。
 const MIN_SPLIT_BYTES: u64 = 512 * 1024;
-/// 目标段大小；段数钳在 4~8。
+/// 目标段大小；常规档段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
+/// 慢档：探片 10KB 超过这个毫秒数 = 每流 drip 级，征援连接 + 细切到 32 段。
+const PROBE_BYTES: u64 = 10 * 1024;
+const PROBE_SLOW_MS: u64 = 1000;
+const SLOW_MAX_SEGS: usize = 32;
+/// 慢档段大小下限：别让段碎到只剩 header 开销。
+const SLOW_SEG_MIN_BYTES: u64 = 64 * 1024;
+/// 慢档征援的连接上限：段并行只在「不同连接」上才有吞吐增量。
+const MAX_SPLIT_CHANNELS: usize = 8;
+/// 慢档征援后的等待：新连接落池一小会儿再发段，后段与救援都能用上。
+const RECRUIT_WAIT_MS: u64 = 300;
 /// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
 // 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它（常量与合并层共用，见 merge::SEG_BUFFER_MAX）。
@@ -33,8 +43,8 @@ use super::merge::SEG_BUFFER_MAX;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// host 白名单：静态图片 CDN 才切；会话域与 /raw/ 302 第一跳不在表内。
-pub(super) fn is_image_split_host(host: &str) -> bool {
+/// host 白名单：静态资源 CDN 才切（大 JS/CSS 与大图同病同治）；会话域不在表内。
+pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
         "raw.githubusercontent.com"
@@ -44,6 +54,7 @@ pub(super) fn is_image_split_host(host: &str) -> bool {
             | "camo.githubusercontent.com"
             | "gist.githubusercontent.com"
             | "avatars.githubusercontent.com"
+            | "github.githubassets.com"
     )
 }
 
@@ -54,6 +65,11 @@ fn is_media(ct: Option<&str>) -> bool {
 
 pub(super) fn seg_count(total: u64) -> usize {
     ((total / SEG_TARGET_BYTES) as usize).clamp(4, MAX_SEGS)
+}
+
+/// 慢档段数：64KB 下限起算，钳在 4~32——段越多，跨连接摊得越开。
+fn seg_count_slow(total: u64) -> usize {
+    (((total + SLOW_SEG_MIN_BYTES - 1) / SLOW_SEG_MIN_BYTES) as usize).clamp(4, SLOW_MAX_SEGS)
 }
 
 /// 段请求的模板：原请求的 method/uri/headers，每次重建一份干净的 GET。
@@ -128,18 +144,21 @@ pub(super) fn skip_response_header(k: &str) -> bool {
 // Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
 // 与镜像链的 206 校验用同一套标准，别再各写一份。
 
-/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链。
+/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链，
+/// 脚本段走 host 自己的镜像链（githubassets 的 worker 镜像就在自己的链里）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MediaKind {
     Image,
     Video,
+    Script,
 }
 
 impl MediaKind {
-    fn chain(self) -> &'static str {
+    fn chain(self, host: &str) -> String {
         match self {
-            MediaKind::Image => pool::MEDIA_IMAGE_CHAIN,
-            MediaKind::Video => pool::MEDIA_VIDEO_CHAIN,
+            MediaKind::Image => pool::MEDIA_IMAGE_CHAIN.to_string(),
+            MediaKind::Video => pool::MEDIA_VIDEO_CHAIN.to_string(),
+            MediaKind::Script => host.to_string(),
         }
     }
     fn of_content_type(ct: Option<&str>) -> Option<Self> {
@@ -148,6 +167,8 @@ impl MediaKind {
             Some(MediaKind::Image)
         } else if ct.starts_with("video/") {
             Some(MediaKind::Video)
+        } else if ct.contains("javascript") || ct.contains("css") {
+            Some(MediaKind::Script)
         } else {
             None
         }
@@ -216,13 +237,14 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
+    host: &str,
     chain: &[String],
     start: u64,
     e: u64,
     log: &LogFn,
 ) -> Option<(BoxBody, HeaderMap)> {
-    let chain_key = kind.chain();
-    if MEDIA_RESCUE_BREAKER.open(chain_key) {
+    let chain_key = kind.chain(host);
+    if MEDIA_RESCUE_BREAKER.open(&chain_key) {
         return None;
     }
     if chain.is_empty() {
@@ -264,7 +286,7 @@ async fn rescue_segment(
             Err(_) => continue,
         }
     }
-    MEDIA_RESCUE_BREAKER.set(chain_key);
+    MEDIA_RESCUE_BREAKER.set(&chain_key);
     (log)(&format!("[直连切片] {chain_key} 链全灭, 60s 内段救援直接放弃"));
     None
 }
@@ -280,13 +302,13 @@ pub(super) async fn try_direct_split(
     if out.method() != Method::GET || out.headers().contains_key(http::header::RANGE) {
         return None; // 客户端自带 Range：multipart/byteranges 语义不同，别切
     }
-    if !is_image_split_host(host) {
+    if !is_split_host(host) {
         return None;
     }
     let key = format!("{host}{}", path_of(out.uri()));
-    let (total, kind) = match memo_get(&key) {
+    let (total, kind, prefix, probe_ms) = match memo_get(&key) {
         Some((0, _)) => return None,
-        Some(hit) => hit,
+        Some(hit) => (hit.0, hit.1, None, 0),
         None => {
             let tpl = Tpl::of(out);
             // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
@@ -294,7 +316,8 @@ pub(super) async fn try_direct_split(
                 return None;
             };
             *info.lock().unwrap() = up.ip.clone();
-            let req = tpl.build(0, 1).ok()?;
+            let req = tpl.build(0, PROBE_BYTES).ok()?;
+            let t0 = Instant::now();
             let resp = match tokio::time::timeout(
                 SEG_HEAD_BUDGET,
                 upstream::h2_send(&up, &req, &None::<Bytes>),
@@ -321,13 +344,24 @@ pub(super) async fn try_direct_split(
                     .get("content-type")
                     .and_then(|v| v.to_str().ok()),
             ) else {
-                drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
+                drop(resp.into_body()); // 及时关掉流别占连接窗口
                 memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内别再探、更别切
                 return None;
             };
-            drop(resp.into_body()); // 探片只有 1 字节，及时关掉流别占连接窗口
+            // 探片 10KB 计时 = 每流速度先验；字节不浪费，直接当交付首段。
+            let probe_ms = t0.elapsed().as_millis() as u64;
+            let probe_hs = resp.headers().clone();
+            let probe_body = match tokio::time::timeout(
+                SEG_HEAD_BUDGET,
+                http_body_util::BodyExt::collect(resp.into_body()),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c.to_bytes(),
+                _ => return None,
+            };
             memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
-            (t, kind)
+            (t, kind, Some((probe_body, probe_hs)), probe_ms)
         }
     };
     if total < MIN_SPLIT_BYTES {
@@ -336,19 +370,35 @@ pub(super) async fn try_direct_split(
     let guard = ActiveGuard::take()?;
     let tpl = Tpl::of(out);
     let tpl_ref = &tpl;
-    let segs = merge::split_even(0, total, seg_count(total));
-    if segs.len() < 2 {
+    // 自适应档位：探片 10KB > 1s = 每流 drip 级 → 征援连接 + 细切到 32 段；
+    // 常规档维持粗切。探片字节（首段前缀）有则先交付，段从它后面接着排。
+    let slow = probe_ms > PROBE_SLOW_MS;
+    let (seg_start, count) = if slow {
+        // 征援：补齐机器人后台把缺通道的候选 IP 建齐；等一小会儿让新连接落池。
+        pool::recruit_coverage(host, log);
+        tokio::time::sleep(Duration::from_millis(RECRUIT_WAIT_MS)).await;
+        (PROBE_BYTES, seg_count_slow(total - PROBE_BYTES))
+    } else {
+        (0, seg_count(total))
+    };
+    let segs = merge::split_even(seg_start, total, count);
+    if segs.is_empty() {
         return None;
     }
-    // 段摊到池内多条通道（一次最多借 3 条），不够按现有的摊。
+    // 段摊到池内多条通道：常规最多借 3 条，慢档征援后借满 8 条。
+    let want_chans = if slow {
+        MAX_SPLIT_CHANNELS
+    } else {
+        segs.len().min(3)
+    };
     let chans: std::sync::Arc<[upstream::H2Upstream]> =
-        std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
+        std::sync::Arc::from(pool::gather_channels(host, want_chans, log).await);
     if chans.is_empty() {
         return None;
     }
     // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
     let t0 = Instant::now();
-    let chain = pool::mirror_chain(kind.chain());
+    let chain = pool::mirror_chain(&kind.chain(host));
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let up = chans[i % n].clone();
@@ -366,7 +416,7 @@ pub(super) async fn try_direct_split(
                     hs,
                     rescued: false,
                 }),
-                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
+                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, host, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -374,7 +424,7 @@ pub(super) async fn try_direct_split(
                     }),
                     None => Err("段失败且镜像救援不可用".to_string()),
                 },
-                Err(_) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
+                Err(_) => match rescue_segment(tpl_ref, kind, host, &chain, s, e, &log2).await {
                     Some((body, hs)) => Ok(SegFetch {
                         body,
                         hs,
@@ -398,8 +448,13 @@ pub(super) async fn try_direct_split(
         ));
         return None;
     }
-    let mut entries: Vec<(BoxBody, usize, u64, bool)> = Vec::with_capacity(segs.len());
+    let mut entries: Vec<(BoxBody, usize, u64, bool)> = Vec::with_capacity(segs.len() + 1);
     let mut first_headers: Option<HeaderMap> = None;
+    if let Some((bytes, hs)) = &prefix {
+        // 探片 10KB = 交付首段：字节已在手，头用它（206 头，Range 语义头会被剥）。
+        first_headers = Some(hs.clone());
+        entries.push((protocol::full_body(bytes.clone()), bytes.len(), 0, false));
+    }
     for (i, r) in results.into_iter().enumerate() {
         let f = r.ok()?;
         if first_headers.is_none() {
@@ -439,9 +494,10 @@ pub(super) async fn try_direct_split(
         .hold(guard),
     );
     (log)(&format!(
-        "[直连切片] {host}{} {total}B 切 {} 段, 池内直连并发",
+        "[直连切片] {host}{} {total}B 切 {} 段{} 池内直连并发",
         path_of(out.uri()),
-        segs.len()
+        segs.len() + if prefix.is_some() { 1 } else { 0 },
+        if slow { "(慢档·已征援)" } else { "" },
     ));
     builder.body(body).ok()
 }
@@ -621,7 +677,7 @@ impl hyper::body::Body for SegmentedBody {
             {
                 match &me.rescue {
                     Some(ctx)
-                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain())
+                        if !MEDIA_RESCUE_BREAKER.open(&ctx.kind.chain(&ctx.host))
                             && !ctx.chain.is_empty() =>
                     {
                         seg.rescue_due = true;
@@ -634,7 +690,7 @@ impl hyper::body::Body for SegmentedBody {
                                 (ctx.log)(&format!(
                                     "[直连切片] {} 无{}救援链可用, 段停滞改为等待直连",
                                     ctx.host,
-                                    ctx.kind.chain()
+                                    ctx.kind.chain(&ctx.host)
                                 ));
                             }
                         }
@@ -647,7 +703,7 @@ impl hyper::body::Body for SegmentedBody {
                         let c = ctx.clone();
                         let (s, e, got) = (seg.s, seg.e, seg.got as u64);
                         seg.handle = Some(tokio::spawn(async move {
-                            rescue_segment(&c.tpl, c.kind, &c.chain, s + got, e, &c.log)
+                            rescue_segment(&c.tpl, c.kind, &c.host, &c.chain, s + got, e, &c.log)
                                 .await
                                 .map(|(body, _hs)| (body, s + got))
                         }));

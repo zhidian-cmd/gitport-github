@@ -12,10 +12,11 @@ use hyper_util::rt::TokioExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod defuse;
-mod direct_split;
-mod merge;
-mod page_cache;
+ mod defuse;
+ mod direct_split;
+ mod merge;
+ mod page_cache;
+ mod switchboard;
 pub(crate) mod quiet;
 mod redirect_memo;
 
@@ -172,7 +173,6 @@ async fn mitm_http(
         return mitm_unavailable(&req, &host, "上游请求构造失败, 代理正在按表自动重试。");
     };
 
-    let is_simple = req.method() == Method::GET || req.method() == Method::HEAD;
     let path = path_of(req.uri());
     // git 智能协议 POST 与声明超限转流式（缓冲路径 >1MB 必 502，push 必挂）。
     let mut streaming_reason = stream_decision(req.method(), &path, declared_content_len(&req));
@@ -214,100 +214,13 @@ async fn mitm_http(
         Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
-    if is_simple
-        && matches!(
-            pool::route::master_route(&host, req.method().as_str(), &path),
-            pool::route::Route::Mirror
-        )
-    {
-        let chain_host = pool::route::mirror_chain_host(&host, &path);
-        let new_bytes =
-            mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
-        // 直连同台：候选 = 镜像链 + 直连，ECT 统一派发；全部候选耗尽才 502。
-        match mirror_or_direct(
-            &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
-        )
+    // 总机分诊：镜像回落/切片/直连/风控重试的科室级联全在 switchboard，政策单点。
+    let resp = match switchboard::dispatch(&log, &req, &out_body, &host, &path, &info, &replay)
         .await
-        {
-            Ok(resp) => return resp,
-            // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
-            Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
-        }
-        return mitm_unavailable(
-            &req,
-            &host,
-            "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
-        );
-    }
-    // README 大图：只用池里现成的伪装 SNI 直连连接，多段 Range 并发拉再按字节边界合流。
-    // 不进镜像链、不扩 IP、不新拨连接；池冷或任一段没回 206 就交回下面的单流路径。
-    if is_simple {
-        if let Some(resp) =
-            direct_split::try_direct_split(&log, &out_body, &host, &info).await
-        {
-            return write_upstream(resp, "direct-split", &info);
-        }
-    }
-    let mut resp = match get_direct(&log, &out_body, &host, &info, &replay).await {
-        Ok(r) => r,
-        Err(e) => {
-            match pool::route::fallback_for(&host) {
-                pool::route::Fallback::MirrorDns if is_simple => {
-                    let chain_host = pool::route::mirror_chain_host(&host, &path);
-                    let new_bytes = mirror::range_bytes(
-                        req.headers().get("range").and_then(|v| v.to_str().ok()),
-                    );
-                    // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
-                    match mirror_or_direct(
-                        &log, &out_body, &host, chain_host, new_bytes, &info, &replay,
-                    )
-                    .await
-                    {
-                        Ok(resp) => return resp,
-                        Err(_) => (log)(&format!("[MITM] {host}{path} 直连和镜像都试不通")),
-                    }
-                }
-                _ => {
-                    (log)(&format!(
-                        "[MITM] {host}{} 上游失败: {e}",
-                        path_of(req.uri())
-                    ));
-                }
-            }
-            if is_simple {
-                match dns_direct_fetch(&log, &out_body, &host, &info, &replay).await {
-                    Ok(r) => return write_upstream(r, "dns", &info),
-                    Err(de) => {
-                        (log)(&format!("[MITM] {host}{path} DNS 备用直连也失败({de})"));
-                    }
-                }
-            }
-            return mitm_unavailable(
-                &req,
-                &host,
-                "直连与镜像链均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
-            );
-        }
-    };
-    if is_simple
-        && (host == "github.com" || host == "api.github.com")
-        && resp.status().as_u16() >= 400
     {
-        match gh_defuse(&log, &host, &info, &out_body, &replay).await {
-            Ok(r) => resp = r,
-            Err(e) => {
-                (log)(&format!(
-                    "[MITM] {host}{} 风控页重试也失败: {e}",
-                    path_of(req.uri())
-                ));
-                return mitm_unavailable(
-                    &req,
-                    &host,
-                    "全部边缘均返回风控拦截页, 代理正在按表自动重试。",
-                );
-            }
-        }
-    }
+        Ok(r) => r,
+        Err(bail) => return bail,
+    };
     // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
         && matches!(
