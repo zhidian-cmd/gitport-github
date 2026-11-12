@@ -20,8 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// 门槛：探片多一次往返，小图省不回来。
-const MIN_SPLIT_BYTES: u64 = 512 * 1024;
+/// 门槛：探片多一次往返，小图省不回来。切片判定（含 Range 路径）共用。
+pub(super) const MIN_SPLIT_BYTES: u64 = 512 * 1024;
 /// 目标段大小；常规档段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;

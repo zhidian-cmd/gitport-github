@@ -940,14 +940,13 @@ async fn split_download(
     if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
-    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连双通道共 8 份（每通道 4，
-    // 占满各通道的 h2 并发窗）。两份直连共享同一份负载记账，慢时 ECT 自然不给它补发。
-    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 8);
+    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连双通道各 1 份共 2 份——
+    // 段多了在黑洞窗集体空转，直连两段一通道一段更稳。两份共享同一份负载记账。
+    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 2);
     for m in &idle_src {
         if m.starts_with("direct/") {
-            for _ in 0..8 {
-                idle.push(*m);
-            }
+            idle.push(*m);
+            idle.push(*m);
         } else {
             for _ in 0..3 {
                 idle.push(*m);
@@ -960,7 +959,14 @@ async fn split_download(
     let (base, len, known_total) = match range {
         // 开区间/多区间/畸形：长度未知或语义不同，不切
         Some(_) => match merge::parse_range(range) {
-            Some((a, Some(b))) if b >= a => (a, b - a + 1, None),
+            Some((a, Some(b))) if b >= a => {
+                let len = b - a + 1;
+                // 小区间单流直发：切段纯白建连接（曾把 1394B 的文件切出 23 段）。
+                if len < crate::server::mitm::direct_split::MIN_SPLIT_BYTES {
+                    return Ok(None);
+                }
+                (a, len, None)
+            }
             _ => return Ok(None),
         },
         None => match total_memo_get(&slice_key) {
@@ -1000,8 +1006,8 @@ async fn split_download(
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数×3 + 直连双通道 8 份：镜像一家 3 份细切，直连每通道 4 份。
-            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 8, idle.len());
+            // 段位总数 = 镜像数×3 + 直连 2 份（双通道各 1）：镜像一家 3 份细切。
+            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 2, idle.len());
             (plan.want, Some(plan))
         }
         None => (
