@@ -25,16 +25,18 @@ const MIN_SPLIT_BYTES: u64 = 512 * 1024;
 /// 目标段大小；常规档段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
-/// 慢档：探片 10KB 超过这个毫秒数 = 每流 drip 级，征援连接 + 细切到 32 段。
+/// 慢档门槛改按文件大小（实测：单连接到 githubassets 恒 ~36KB/s，与代理/路径无关，
+/// 探片计时只会被 TCP 慢启动噪声晃点）——≥1MB 必征满全家候选连接。
+const SLOW_TOTAL_BYTES: u64 = 1024 * 1024;
+/// 探片段大小：兼作交付首段前缀。
 const PROBE_BYTES: u64 = 10 * 1024;
-const PROBE_SLOW_MS: u64 = 1000;
 const SLOW_MAX_SEGS: usize = 32;
 /// 慢档段大小下限：别让段碎到只剩 header 开销。
 const SLOW_SEG_MIN_BYTES: u64 = 64 * 1024;
 /// 慢档征援的连接上限：段并行只在「不同连接」上才有吞吐增量。
-const MAX_SPLIT_CHANNELS: usize = 8;
-/// 慢档征援后的等待：新连接落池一小会儿再发段，后段与救援都能用上。
-const RECRUIT_WAIT_MS: u64 = 300;
+const MAX_SPLIT_CHANNELS: usize = 12;
+/// 慢档征援等待：新连接落池（TCP+TLS+h2 ≈ 300~600ms/条）再发段，否则全压旧通道。
+const RECRUIT_WAIT_MS: u64 = 1500;
 /// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
 // 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它（常量与合并层共用，见 merge::SEG_BUFFER_MAX）。
@@ -306,9 +308,9 @@ pub(super) async fn try_direct_split(
         return None;
     }
     let key = format!("{host}{}", path_of(out.uri()));
-    let (total, kind, prefix, probe_ms) = match memo_get(&key) {
+    let (total, kind, prefix) = match memo_get(&key) {
         Some((0, _)) => return None,
-        Some(hit) => (hit.0, hit.1, None, 0),
+        Some(hit) => (hit.0, hit.1, None),
         None => {
             let tpl = Tpl::of(out);
             // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
@@ -317,7 +319,6 @@ pub(super) async fn try_direct_split(
             };
             *info.lock().unwrap() = up.ip.clone();
             let req = tpl.build(0, PROBE_BYTES).ok()?;
-            let t0 = Instant::now();
             let resp = match tokio::time::timeout(
                 SEG_HEAD_BUDGET,
                 upstream::h2_send(&up, &req, &None::<Bytes>),
@@ -348,8 +349,7 @@ pub(super) async fn try_direct_split(
                 memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内别再探、更别切
                 return None;
             };
-            // 探片 10KB 计时 = 每流速度先验；字节不浪费，直接当交付首段。
-            let probe_ms = t0.elapsed().as_millis() as u64;
+            // 探片 10KB：字节不浪费，直接当交付首段。
             let probe_hs = resp.headers().clone();
             let probe_body = match tokio::time::timeout(
                 SEG_HEAD_BUDGET,
@@ -361,7 +361,7 @@ pub(super) async fn try_direct_split(
                 _ => return None,
             };
             memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
-            (t, kind, Some((probe_body, probe_hs)), probe_ms)
+            (t, kind, Some((probe_body, probe_hs)))
         }
     };
     if total < MIN_SPLIT_BYTES {
@@ -370,13 +370,22 @@ pub(super) async fn try_direct_split(
     let guard = ActiveGuard::take()?;
     let tpl = Tpl::of(out);
     let tpl_ref = &tpl;
-    // 自适应档位：探片 10KB > 1s = 每流 drip 级 → 征援连接 + 细切到 32 段；
-    // 常规档维持粗切。探片字节（首段前缀）有则先交付，段从它后面接着排。
-    let slow = probe_ms > PROBE_SLOW_MS;
+    // 自适应档位（实测：单连接恒 ~36KB/s，与路径无关）——唯一的吞吐杠杆是并行
+    // 连接数。≥1MB：征援全家候选（≤12 条）+ 细切到 32 段；<1MB：现有连接粗切。
+    // 探片字节（首段前缀）无论档位都先交付，段从它后面接着排。
+    let slow = total >= SLOW_TOTAL_BYTES;
     let (seg_start, count) = if slow {
-        // 征援：补齐机器人后台把缺通道的候选 IP 建齐；等一小会儿让新连接落池。
+        // 征援 + 等新连接落池：不等的话段全压旧通道，征来的连接闲置 10s 被焚。
         pool::recruit_coverage(host, log);
-        tokio::time::sleep(Duration::from_millis(RECRUIT_WAIT_MS)).await;
+        let mut waited = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 100;
+            let have = pool::gather_channels(host, MAX_SPLIT_CHANNELS, log).await.len();
+            if have >= MAX_SPLIT_CHANNELS || waited >= RECRUIT_WAIT_MS {
+                break;
+            }
+        }
         (PROBE_BYTES, seg_count_slow(total - PROBE_BYTES))
     } else {
         (0, seg_count(total))
