@@ -1386,21 +1386,24 @@ pub async fn get_or_build(
         };
     }
 
-    // 3) 池空 → 建造。等在途建造最多 3s（30ms 步进重查池），超时交 Err 走兜底。
+    // 3) 池空 → 排队等在途建造：建造锁的等待队列就是「host 正在建造」登记簿。
+    // 被唤醒后双检（轮到我时前一位可能刚建成）；前一位失败则自己顶上重建，重试链天然形成。
+    // 每个等待者自己的 3s 界：建造迟迟不回就交 Err 走兜底。
+    let gate = build_lock(host);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(up) = pick_channel(host, &ips, want_slot, session) {
-            return Ok((up, false)); // 等锁期间别人可能刚建好
+            return Ok((up, false)); // 排队期间被喂饱了
         }
-        if Instant::now() >= deadline {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
             return Err(format!("{host} 建造在途等待超时(3s), 走兜底"));
         }
-        let gate = build_lock(host);
-        let Ok(_guard) = gate.try_lock() else {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            continue;
+        let _guard = match tokio::time::timeout(wait, gate.lock()).await {
+            Ok(g) => g,
+            Err(_) => return Err(format!("{host} 建造在途等待超时(3s), 走兜底")),
         };
-        // 双检：拿锁前一刻可能刚有人建成。
+        // 双检：轮到我时前一位可能刚建成。
         if let Some(up) = pick_channel(host, &ips, want_slot, session) {
             return Ok((up, false));
         }
