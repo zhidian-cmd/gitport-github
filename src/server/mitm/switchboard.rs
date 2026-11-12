@@ -36,8 +36,9 @@ pub(super) async fn dispatch(
         )
     {
         let chain_host = pool::route::mirror_chain_host(host, path);
-        let new_bytes = mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
-        match mirror_or_direct(log, out_body, host, chain_host, new_bytes, info, replay).await {
+        let new_bytes =
+            mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
+        match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay).await {
             Ok(resp) => return Ok(resp),
             // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
@@ -64,7 +65,7 @@ pub(super) async fn dispatch(
                     let new_bytes =
                         mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
                     // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
-                    match mirror_or_direct(log, out_body, host, chain_host, new_bytes, info, replay)
+                    match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay)
                         .await
                     {
                         Ok(resp) => return Ok(resp),

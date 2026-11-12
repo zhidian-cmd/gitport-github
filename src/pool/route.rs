@@ -482,14 +482,18 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
 }
 
 /// 镜像链归属：请求 host → 实际内容 host 的专属链。（codeload 已迁池，Archive 路径不再走镜像。）
-pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
+/// 大文件域返回**路由键**——链按路由键铺（githubassets 的请求 host 是子域，
+/// 链键是 githubassets.com，按请求 host 查会永远扑空）。
+pub fn mirror_chain_host(host: &str, path: &str) -> String {
     if is_big_file_host(host) {
-        return host;
+        return route_for(host)
+            .map(|hit| hit.key.clone())
+            .unwrap_or_else(|| host.to_string());
     }
     if is_release_asset_path(host, path) {
-        "release-assets.githubusercontent.com"
+        "release-assets.githubusercontent.com".to_string()
     } else {
-        host
+        host.to_string()
     }
 }
 

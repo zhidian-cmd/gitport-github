@@ -415,7 +415,7 @@ pub(super) async fn chain_fetch(
     // 凭据串请求：签名 URL 不落第三方，除非镜像被标记为可信；全不可信则剥空仅直连。
     let chain = if cred_locked {
         let trusted_set = crate::settings::trusted_mirrors();
-        let trusted: Vec<String> = pool::mirror_chain(chain_host)
+        let trusted: Vec<String> = pool::mirror_chain(&chain_host)
             .into_iter()
             .filter(|m| trusted_set.iter().any(|t| same_origin(m, t)))
             .collect();
@@ -432,22 +432,22 @@ pub(super) async fn chain_fetch(
             trusted
         }
     } else {
-        pool::mirror_chain(chain_host)
+        pool::mirror_chain(&chain_host)
     };
     // 直连同台：直连以 direct/{host} 的身份参与 ECT；502 只在镜像与直连全灭时发生。
-        let direct_key = direct_load_key(chain_host);
+        let direct_key = direct_load_key(&chain_host);
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
     // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
-    if !chain.is_empty() && pool::MIRROR_BREAKER.open(chain_host) {
+    if !chain.is_empty() && pool::MIRROR_BREAKER.open(&chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
-    let limit = mirror_chain_cap(chain_host)
+    let limit = mirror_chain_cap(&chain_host)
         .unwrap_or(candidates.len())
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
     // 单字节探片是下载器探路，按小文件走：链头直通，不切分、不记账。
-    let big = pool::route::is_big_file_host(chain_host) && !merge::is_probe_range(range);
+    let big = pool::route::is_big_file_host(&chain_host) && !merge::is_probe_range(range);
     // 镜像有富余时切片并发拉；条件不满足(探片/开区间/不支持 Range/无空闲镜像)交回单流。
     if big {
         match split_download(log, out, &orig_url, host, &candidates, info, replay).await {
@@ -493,7 +493,7 @@ pub(super) async fn chain_fetch(
                         i + 1,
                         candidates.len()
                     ));
-                    pool::MIRROR_BREAKER.clear(chain_host);
+                    pool::MIRROR_BREAKER.clear(&chain_host);
                     return Ok(resp);
                 }
                 Err(e) => {
@@ -527,7 +527,7 @@ pub(super) async fn chain_fetch(
                 }
                 // 只在「首次用这家 / 换链 / 头过慢」时出声：正常派发不再每请求一条。
                 let first = quiet::first_time("mirror", m);
-                let rotated = quiet::mirror_rotated(chain_host, m);
+                let rotated = quiet::mirror_rotated(&chain_host, m);
                 let ms = t0.elapsed().as_millis();
                 if first || rotated || ms > 800 {
                     (log)(&format!(
@@ -538,7 +538,7 @@ pub(super) async fn chain_fetch(
                         len = chain.len(),
                     ));
                 }
-                pool::MIRROR_BREAKER.clear(chain_host);
+                pool::MIRROR_BREAKER.clear(&chain_host);
                 let (mut parts, body) = resp.into_parts();
                 parts.extensions.insert("mirror");
                 let body = if big {
@@ -573,7 +573,7 @@ pub(super) async fn chain_fetch(
     }
     // 纯直连耗尽(零镜像/凭据串剥空)不给链上熔断——镜像没参与，别连坐。
     if !chain.is_empty() {
-        pool::MIRROR_BREAKER.set(chain_host);
+        pool::MIRROR_BREAKER.set(&chain_host);
     }
     let why = if cred_locked {
         "凭据串仅直连, 直连失败"

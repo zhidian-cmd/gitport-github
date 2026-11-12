@@ -27,6 +27,7 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "media.githubusercontent.com",
+    "githubassets.com",
 ];
 
 /// 媒体救援链（直连切片 5s 没拉完的段换镜像续传）：保留键，加载/落盘专门伺候，

@@ -211,6 +211,11 @@ fn host_classes_split_content_session_and_other() {
     // 共享 IP。githubassets 升格大文件域(big)：Mirror 路由走镜像配额切片，单通道直连。
     assert_eq!(host_class("githubassets.com"), HostClass::Other);
     assert_eq!(host_class("github.githubassets.com"), HostClass::Other);
+    // 大文件域的镜像链键 = 路由键：githubassets 的请求 host 是子域，按它查链会扑空。
+    assert_eq!(
+        pool::route::mirror_chain_host("github.githubassets.com", "/x"),
+        "githubassets.com"
+    );
     assert_eq!(host_class("github.io"), HostClass::Other);
     assert_eq!(host_class("githubapp.com"), HostClass::Other);
     assert_eq!(host_class("codeload.github.com"), HostClass::Other);
