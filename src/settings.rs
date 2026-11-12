@@ -59,13 +59,20 @@ fn on_by_default() -> bool {
 /// 初次使用（无 settings.json）时内置的镜像注册表：公共前缀型镜像，拨测
 /// 逐字节一致才入选。用户删掉后落盘即不再出现——默认值只在首启生效。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
-    vec![WorkerMirror {
-        url: "https://gh-proxy.com".to_string(),
+    [
+        "https://gh-proxy.com",
+        "https://v6.gh-proxy.org",
+        "https://cdn.gh-proxy.org",
+    ]
+    .iter()
+    .map(|u| WorkerMirror {
+        url: u.to_string(),
         on: true,
         trusted: false,
         template: String::new(), // 前缀型用法不需要模板
         invalid: false,
-    }]
+    })
+    .collect()
 }
 
 static SETTINGS: OnceLock<SettingsState> = OnceLock::new();

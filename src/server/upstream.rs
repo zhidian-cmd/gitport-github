@@ -99,11 +99,11 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     }
 }
 
-/// 是否保留双通道（竞速取前二）：内容域且带 `dual` 标志的 host。
+/// 是否保留双通道（竞速取前二 / 镜像配额直连双腿）：非会话域且带 `dual` 标志的 host。
 /// 高扇出域（githubassets）二三十条并发流摊两条连接，实测 p50 1036→332ms；
 /// 其余内容域在途常态远低于上限——第二条通道整生命周期晒太阳，取一。
 fn dual_channel(host: &str) -> bool {
-    host_class(host) == HostClass::Content
+    host_class(host) != HostClass::Session
         && pool::route::route_for(host).is_some_and(|r| r.flags.dual)
 }
 /// 会话域：建连时自建优先，连上了再复用自己那条。

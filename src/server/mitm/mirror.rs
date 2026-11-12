@@ -940,13 +940,18 @@ async fn split_download(
     if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
-    // 直连有两条 h2 通道（主/副），初始分片按两份派，否则第二条通道全程闲着；
-    // 镜像一家一份。两份共享同一份负载记账，慢时 ECT 自然不给它补发。
-    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() + 1);
+    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连双通道共 8 份（每通道 4，
+    // 占满各通道的 h2 并发窗）。两份直连共享同一份负载记账，慢时 ECT 自然不给它补发。
+    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 8);
     for m in &idle_src {
-        idle.push(*m);
         if m.starts_with("direct/") {
-            idle.push(*m);
+            for _ in 0..8 {
+                idle.push(*m);
+            }
+        } else {
+            for _ in 0..3 {
+                idle.push(*m);
+            }
         }
     }
     // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用；与直连切片共用同一个 Tpl（direct_split.rs）。
@@ -995,9 +1000,8 @@ async fn split_download(
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数 + 直连一条通道：大文件域归"其他"，单通道、不再给直连两片；
-            // 实际只能占空着的那几个。
-            let plan = plan_range_segments(&slice_key, len, mirrors + 1, idle.len());
+            // 段位总数 = 镜像数×3 + 直连双通道 8 份：镜像一家 3 份细切，直连每通道 4 份。
+            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 8, idle.len());
             (plan.want, Some(plan))
         }
         None => (
