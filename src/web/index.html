@@ -146,14 +146,16 @@
     const cacheable = !isGit && !hasCreds && (request.method === "GET" || request.method === "HEAD")
       && !request.headers.get("range");
     if (cacheable) {
-      const cached = await caches.default.match(request.method + " " + target.toString());
+      // 缓存键必须是合法 URL："GET https://..." 这种方法前缀串会让 match 抛 TypeError → 整个请求 500。
+      let cached = null;
+      try { cached = await caches.default.match(target.toString()); } catch (e) {}
       if (cached) return cached;
     }
     const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
     if (cacheable && upstream.ok && upstream.status === 200) {
       // put 对 206/304/Vary:* 会 reject, 限 200 且 catch 掉防未处理拒绝刷屏。
       ctx.waitUntil(
-        caches.default.put(request.method + " " + target.toString(), upstream.clone())
+        caches.default.put(target.toString(), upstream.clone())
           .catch(() => {})
       );
     }
