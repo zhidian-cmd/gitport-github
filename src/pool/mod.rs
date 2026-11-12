@@ -983,8 +983,9 @@ fn cursor_key(key: &str, slot: u8) -> String {
 }
 
 /// 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底并保持表序。
-/// 指定档位（prefer_shared）时独占/共享分档：优先档整档在前、另一档垫后，
-/// 档内同样游标优先 + 延迟升序——主/副通道的"独占优先/共享优先"在这里落成顺序。
+/// prefer_shared 分档只是礼让排序：优先档整档在前、另一档垫后，档内同样游标优先 + 延迟
+/// 升序；无任何保证，优先档耗尽自动轮到另一档。内容域竞速不看此序；当前活路径仅单腿
+/// 串发以 Some(false)（独占礼让）使用，Some(true) 为副腿保留，None 为真名透传兜底用。
 fn dial_order(
     circle: &[route::NodeIp],
     start_ip: Option<&str>,
@@ -1045,7 +1046,8 @@ pub struct DialSkip<'a> {
     pub skip_ips: &'a [String],
     pub slot: u8,
     pub crew: Option<&'a DialCrew>,
-    /// Some = 独占/共享分档排序（主副通道分家用）；None = 不分档，维持纯游标+延迟序。
+    /// Some = 独占档礼让在前的分档序（Some(true) 为副腿保留，当前活路径仅 Some(false)）；
+    /// None = 不分档，维持纯游标+延迟序（真名透传兜底用）。
     pub prefer_shared: Option<bool>,
 }
 

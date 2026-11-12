@@ -556,16 +556,17 @@ fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> Str
     }
 }
 
-/// 这一轮发哪几条腿：主通道只管开新坑，副通道多一步「先看有没有现成的可捡」。
+/// 这一轮发哪几条腿。内容域建连已整体走竞速（dial_upstream 提前分流），本函数
+/// 实际只接单通道域（会话/其他）——活路径恒只发主腿；副腿参数留给双通道回归那天。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LegPlan {
     /// 主通道：还有没被已有通道占用的 IP 就发，串发新建。
     pub primary: bool,
-    /// 副通道拨号：空 IP 够两家才发。
+    /// 副通道拨号：仅双通道域且空 IP 够两家才发（当前活路径恒 false）。
     pub vice_dial: bool,
 }
 
-/// 主副分工：会话域不设副腿（跨 IP 是风控特征），其余空 IP 够两家才拨副腿。
+/// 入参 = 是否单通道域：是则不设副腿（会话域防风控/低频域规则），否则空 IP 够两家发副腿。
 pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
     LegPlan {
         primary: free > 0,
@@ -698,8 +699,8 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
     Ok(kept.remove(0))
 }
 
-/// 双腿建连：主副各拨各的新连接，crew 互斥保证同一个 IP 只由一条腿试。
-/// 只建新的、不查池——查池归 get_or_build。
+/// 串发建连（会话域/低频域恒单腿；内容域不走这里，见 race_build 竞速）。
+/// crew 互斥保证同一个 IP 只由一条腿试；只建新的、不查池——查池归 get_or_build。
 async fn dial_h2_race(
     host: &str,
     log: &LogFn,
@@ -734,12 +735,12 @@ async fn dial_h2_race(
         });
     };
     if legs.primary {
-        // 主通道：独占档在前（独占用尽才轮到共享），游标用主键。
+        // 主通道：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证；游标用主键。
         dial_leg(1, Some(false), tx.clone());
         launched += 1;
     }
     if legs.vice_dial {
-        // 副通道：共享档在前，游标用 _vice 副键。
+        // 副通道：共享档礼让在前，游标用 _vice 副键（当前活路径不发出，见 plan_legs）。
         dial_leg(2, Some(true), tx.clone());
         launched += 1;
     }
@@ -748,7 +749,7 @@ async fn dial_h2_race(
         return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
     drop(tx);
-    // 两条腿同时拨 = 一次等待把两条容量通道都建好；只发主通道时说清为什么单通道。
+    // 副腿发出时两条腿同时拨 = 一次等待把两条容量通道都建好；只发主通道时说清为什么单通道。
     if legs.primary && legs.vice_dial {
         (log)(&format!("[建连] {host} 主副双通道同时开建"));
     } else if legs.primary {
