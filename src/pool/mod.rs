@@ -27,7 +27,6 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "media.githubusercontent.com",
-    "githubassets.com",
 ];
 
 /// 媒体救援链（直连切片 5s 没拉完的段换镜像续传）：保留键，加载/落盘专门伺候，
@@ -1582,11 +1581,6 @@ fn msg_is_tcp_dead(e: &std::io::Error) -> bool {
         || e.kind() == std::io::ErrorKind::ConnectionReset
         || e.kind() == std::io::ErrorKind::ConnectionAborted
         || e.to_string().starts_with("TCP")
-}
-
-/// 外部征援：补齐机器人后台把该域缺通道的候选 IP 全部建齐（慢切片征用连接用）。
-pub fn recruit_coverage(host: &str, log: &LogFn) {
-    ensure_coverage(host, "", log.clone());
 }
 
 /// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。

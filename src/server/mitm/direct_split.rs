@@ -22,21 +22,11 @@ use std::{
 
 /// 门槛：探片多一次往返，小图省不回来。切片判定（含 Range 路径）共用。
 pub(super) const MIN_SPLIT_BYTES: u64 = 512 * 1024;
-/// 目标段大小；常规档段数钳在 4~8。
+/// 目标段大小；段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
-/// 慢档门槛改按文件大小（实测：单连接到 githubassets 恒 ~36KB/s，与代理/路径无关，
-/// 探片计时只会被 TCP 慢启动噪声晃点）——≥1MB 必征满全家候选连接。
-const SLOW_TOTAL_BYTES: u64 = 1024 * 1024;
 /// 探片段大小：兼作交付首段前缀。
 const PROBE_BYTES: u64 = 10 * 1024;
-const SLOW_MAX_SEGS: usize = 32;
-/// 慢档段大小下限：别让段碎到只剩 header 开销。
-const SLOW_SEG_MIN_BYTES: u64 = 64 * 1024;
-/// 慢档征援的连接上限：段并行只在「不同连接」上才有吞吐增量。
-const MAX_SPLIT_CHANNELS: usize = 12;
-/// 慢档征援等待：新连接落池（TCP+TLS+h2 ≈ 300~600ms/条）再发段，否则全压旧通道。
-const RECRUIT_WAIT_MS: u64 = 1500;
 /// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
 // 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它（常量与合并层共用，见 merge::SEG_BUFFER_MAX）。
@@ -45,8 +35,7 @@ use super::merge::SEG_BUFFER_MAX;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// host 白名单：静态图片 CDN 才切；会话域与 /raw/ 302 第一跳不在表内。
-/// githubassets 不在表内——它已升格大文件域走镜像配额切片（is_big_file_host）。
+/// host 白名单：静态资源 CDN 才切（大图与大 JS/CSS 同病同治）；会话域不在表内。
 pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -57,6 +46,7 @@ pub(super) fn is_split_host(host: &str) -> bool {
             | "camo.githubusercontent.com"
             | "gist.githubusercontent.com"
             | "avatars.githubusercontent.com"
+            | "github.githubassets.com"
     )
 }
 
@@ -67,11 +57,6 @@ fn is_media(ct: Option<&str>) -> bool {
 
 pub(super) fn seg_count(total: u64) -> usize {
     ((total / SEG_TARGET_BYTES) as usize).clamp(4, MAX_SEGS)
-}
-
-/// 慢档段数：64KB 下限起算，钳在 4~32——段越多，跨连接摊得越开。
-fn seg_count_slow(total: u64) -> usize {
-    (((total + SLOW_SEG_MIN_BYTES - 1) / SLOW_SEG_MIN_BYTES) as usize).clamp(4, SLOW_MAX_SEGS)
 }
 
 /// 段请求的模板：原请求的 method/uri/headers，每次重建一份干净的 GET。
@@ -146,11 +131,13 @@ pub(super) fn skip_response_header(k: &str) -> bool {
 // Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
 // 与镜像链的 206 校验用同一套标准，别再各写一份。
 
-/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链。
+/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链，
+/// 脚本段链为空（公共镜像不收 githubassets，实测零字节）——直连独走不设救援。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MediaKind {
     Image,
     Video,
+    Script,
 }
 
 impl MediaKind {
@@ -158,6 +145,7 @@ impl MediaKind {
         match self {
             MediaKind::Image => pool::MEDIA_IMAGE_CHAIN,
             MediaKind::Video => pool::MEDIA_VIDEO_CHAIN,
+            MediaKind::Script => "",
         }
     }
     fn of_content_type(ct: Option<&str>) -> Option<Self> {
@@ -166,6 +154,8 @@ impl MediaKind {
             Some(MediaKind::Image)
         } else if ct.starts_with("video/") {
             Some(MediaKind::Video)
+        } else if ct.contains("javascript") || ct.contains("css") {
+            Some(MediaKind::Script)
         } else {
             None
         }
@@ -364,38 +354,15 @@ pub(super) async fn try_direct_split(
     let guard = ActiveGuard::take()?;
     let tpl = Tpl::of(out);
     let tpl_ref = &tpl;
-    // 自适应档位（实测：单连接恒 ~36KB/s，与路径无关）——唯一的吞吐杠杆是并行
-    // 连接数。≥1MB：征援全家候选（≤12 条）+ 细切到 32 段；<1MB：现有连接粗切。
-    // 探片字节（首段前缀）无论档位都先交付，段从它后面接着排。
-    let slow = total >= SLOW_TOTAL_BYTES;
-    let (seg_start, count) = if slow {
-        // 征援 + 等新连接落池：不等的话段全压旧通道，征来的连接闲置 10s 被焚。
-        pool::recruit_coverage(host, log);
-        let mut waited = 0u64;
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            waited += 100;
-            let have = pool::gather_channels(host, MAX_SPLIT_CHANNELS, log).await.len();
-            if have >= MAX_SPLIT_CHANNELS || waited >= RECRUIT_WAIT_MS {
-                break;
-            }
-        }
-        (PROBE_BYTES, seg_count_slow(total - PROBE_BYTES))
-    } else {
-        (0, seg_count(total))
-    };
-    let segs = merge::split_even(seg_start, total, count);
+    // 恒 8 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
+    let seg_start = if prefix.is_some() { PROBE_BYTES } else { 0 };
+    let segs = merge::split_even(seg_start, total, seg_count(total - seg_start));
     if segs.is_empty() {
         return None;
     }
-    // 段摊到池内多条通道：常规最多借 3 条，慢档征援后借满 8 条。
-    let want_chans = if slow {
-        MAX_SPLIT_CHANNELS
-    } else {
-        segs.len().min(3)
-    };
+    // 段摊到池内多条通道：最多借 3 条。
     let chans: std::sync::Arc<[upstream::H2Upstream]> =
-        std::sync::Arc::from(pool::gather_channels(host, want_chans, log).await);
+        std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
     if chans.is_empty() {
         return None;
     }
@@ -497,10 +464,9 @@ pub(super) async fn try_direct_split(
         .hold(guard),
     );
     (log)(&format!(
-        "[直连切片] {host}{} {total}B 切 {} 段{} 池内直连并发",
+        "[直连切片] {host}{} {total}B 切 {} 段 池内直连并发",
         path_of(out.uri()),
         segs.len() + if prefix.is_some() { 1 } else { 0 },
-        if slow { "(慢档·已征援)" } else { "" },
     ));
     builder.body(body).ok()
 }
