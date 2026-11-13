@@ -155,6 +155,12 @@ fn repo_home_canonical_and_asset_gate() {
     );
     assert!(k.ends_with("-br-k"), "{k}");
     assert!(!k.contains("-s"), "资产键不得带会话号: {k}");
+    // 内容类型闸：只认 JS/CSS；200 的 HTML 错误页绝不盖一年期头/入缓存
+    assert!(asset_content_type_ok(Some("application/javascript; charset=utf-8")));
+    assert!(asset_content_type_ok(Some("text/css")));
+    assert!(asset_content_type_ok(Some("text/javascript")));
+    assert!(!asset_content_type_ok(Some("text/html; charset=utf-8")));
+    assert!(!asset_content_type_ok(None));
 }
 
 /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。

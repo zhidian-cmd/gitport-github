@@ -122,6 +122,16 @@ fn is_asset_req<B>(host: &str, req: &hyper::Request<B>) -> bool {
     host == ASSET_HOST && req.method() == Method::GET && is_asset_path(req.uri().path())
 }
 
+/// 资产内容类型闸：只认 JS/CSS。CDN 若对资产回 200 的 HTML 错误页，不盖头不入库——
+/// 否则错误页会被浏览器/本地缓存钉住一年。
+fn asset_content_type_ok(ct: Option<&str>) -> bool {
+    let Some(ct) = ct else { return false };
+    let ct = ct.trim().to_ascii_lowercase();
+    ct.starts_with("application/javascript")
+        || ct.starts_with("text/javascript")
+        || ct.starts_with("text/css")
+}
+
 /// 资产长期缓存头：内容哈希 URL 永不变，让浏览器自己留一年（连本代理都不用再问）。
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
@@ -284,7 +294,13 @@ pub(super) fn cache_take(
             ));
         }
         let mut hit = rebuild_cached_response(status, &hdrs, body);
-        stamp_asset_immutable(&mut hit);
+        // 旧条目可能存于内容类型闸之前：存的是错内容也绝不盖一年期头。
+        let ct = hdrs.iter().find_map(|(k, v)| {
+            (k.as_str() == "content-type").then(|| v.to_str().ok()).flatten()
+        });
+        if asset_content_type_ok(ct) {
+            stamp_asset_immutable(&mut hit);
+        }
         return Some(hit);
     }
     // 仓库首页无尾杠：尾杠版已在缓存 → 本地 301（省一次上游往返；
@@ -945,7 +961,8 @@ fn persist_page_entry_blocking(
     })
 }
 
-/// 资产入库：200 才存；单文件上限 16MB；头照存（content-encoding 随体），Set-Cookie 剔。
+/// 资产入库：200 且内容类型是 JS/CSS 才存（CDN 抽风回 200 错误页不缓存一年）；
+/// 单文件上限 16MB；头照存（content-encoding 随体），Set-Cookie 剔。
 async fn cache_put_asset(
     log: &LogFn,
     req: &hyper::Request<Incoming>,
@@ -954,6 +971,23 @@ async fn cache_put_asset(
 ) -> axum::response::Response<BoxBody> {
     if resp.status() != StatusCode::OK {
         return resp;
+    }
+    let ct_ok = asset_content_type_ok(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+    );
+    if !ct_ok {
+        if super::quiet::first_time("cachebadct", req.uri().path()) {
+            (log)(&format!(
+                "[缓存] 资产内容类型不符, 不缓存 {} ({:?})",
+                req.uri().path(),
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+            ));
+        }
+        return resp; // 原样透传：不盖头、不入库
     }
     let key = asset_cache_key(req.uri(), host, upstream::encoding_bucket(req));
     let (parts, body) = resp.into_parts();
