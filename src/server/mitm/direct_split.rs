@@ -285,13 +285,14 @@ fn log_skip(log: &LogFn, host: &str, path: &str, why: &str) {
     }
 }
 
-/// 主入口：不满足条件、或任一段没拿到 206，一律返回 None 让 mitm_http 走原来的单流。
-/// 只在所有段的响应头都确认之后才组装 200，中途失败不会出现「头已发出、图却花掉」。
+/// 切片下载器主入口：总机下发片数，段级重试/续传内置，输出合并后的 200 流。
+/// 任一段最终失败仍返回 None 交回单流——头未发出，不会出现「头已发、体花掉」。
 pub(super) async fn try_direct_split(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
     host: &str,
     info: &UpstreamInfo,
+    want_segs: usize,
 ) -> Option<hyper::Response<BoxBody>> {
     if out.method() != Method::GET || out.headers().contains_key(http::header::RANGE) {
         return None; // 客户端自带 Range：multipart/byteranges 语义不同，别切
@@ -384,60 +385,51 @@ pub(super) async fn try_direct_split(
         return None;
     };
     let tpl = Tpl::of(out);
-    let tpl_ref = &tpl;
-    // 恒 8 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
+    // 恒 N 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
     let seg_start = if prefix.is_some() { PROBE_BYTES } else { 0 };
-    let segs = merge::split_even(seg_start, total, seg_count(total - seg_start));
+    let segs = merge::split_even(
+        seg_start,
+        total,
+        seg_count(total - seg_start).min(want_segs.max(1)),
+    );
     if segs.is_empty() {
         return None;
     }
-    // 段摊到池内多条通道：最多借 3 条。
-    let chans: std::sync::Arc<[upstream::H2Upstream]> =
-        std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
-    if chans.is_empty() {
+    // 单通道模型：全部段骑池给的这一条（切片是并行流，不是并行连接——
+    // 实测 185.199 段聚合水管恒定，多连接不加吞吐）。
+    let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
         log_skip(log, host, &path, "池内无可用通道");
         return None;
-    }
-    // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
-    // Script（githubassets）无救援：公共镜像不收该域（实测零字节），段直连独走，链都不查。
-    let t0 = Instant::now();
-    let chain = match kind {
-        MediaKind::Script => Vec::new(),
-        _ => pool::mirror_chain(kind.chain()),
     };
-    let n = chans.len();
-    let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
-        let up = chans[i % n].clone();
-        let log2 = log.clone();
-        let chain = chain.clone();
+    // 段级重试：头阶段失败（连接死/超时）→ 同通道再试，至多 3 次。
+    let futs = segs.iter().map(|&(s, e)| {
+        let up = up.clone();
+        let tpl2 = tpl.clone();
         async move {
-            match tokio::time::timeout(
-                Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
-                fetch_segment(&up, tpl_ref, s, e),
-            )
-            .await
-            {
-                Ok(Ok((body, hs))) => Ok(SegFetch {
-                    body,
-                    hs,
-                    rescued: false,
-                }),
-                Ok(Err(_why)) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
-                    Some((body, hs)) => Ok(SegFetch {
-                        body,
-                        hs,
-                        rescued: true,
-                    }),
-                    None => Err("段失败且镜像救援不可用".to_string()),
-                },
-                Err(_) => match rescue_segment(tpl_ref, kind, &chain, s, e, &log2).await {
-                    Some((body, hs)) => Ok(SegFetch {
-                        body,
-                        hs,
-                        rescued: true,
-                    }),
-                    None => Err("段直连 5s 无响应头, 镜像救援也不可用".to_string()),
-                },
+            let mut attempt = 0u8;
+            loop {
+                attempt += 1;
+                let res = tokio::time::timeout(
+                    Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+                    fetch_segment(&up, &tpl2, s, e),
+                )
+                .await;
+                match res {
+                    Ok(Ok((body, hs))) => {
+                        return Ok(SegFetch {
+                            body,
+                            hs,
+                            rescued: false,
+                        });
+                    }
+                    _ => {
+                        if attempt >= 3 {
+                            return Err("段拉取重试耗尽".to_string());
+                        }
+                        // 同通道重试：段边界不变，整段重拉（共享通道不能中途摘——
+                        // 摘了会杀死同通道其他段的在途流）。
+                    }
+                }
             }
         }
     });
@@ -483,23 +475,31 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
-    // 链空（Script / 未配镜像）= 无救援：不挂救援上下文——段直连独走，不检查不等待。
-    let rescue = if chain.is_empty() {
-        None
+    // 续传上下文：有救援链（已配镜像的图片/视频段）→ 镜像链救援；
+    // 无链（Script / 未配镜像）→ 停滞时直连同通道从剩余偏移重拉。
+    let chain = match kind {
+        MediaKind::Script => Vec::new(),
+        _ => pool::mirror_chain(kind.chain()),
+    };
+    let resume = if chain.is_empty() {
+        Some(Resume::Direct {
+            tpl: tpl.clone(),
+            host: host.to_string(),
+            log: log.clone(),
+        })
     } else {
-        Some(RescueCtx {
+        Some(Resume::Mirror(RescueCtx {
             tpl: tpl.clone(),
             kind,
             chain,
             log: log.clone(),
-        })
+        }))
     };
     let body = BoxBody::new(
         SegmentedBody::build(
             entries,
             total,
-            rescue,
-            t0,
+            resume,
             Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
         )
         .hold(guard),
@@ -571,33 +571,41 @@ struct Seg {
     s: u64,
     /// 本段终点（Range 尾 +1），换体时期望字节按它重算。
     e: u64,
-    /// 5s 界触发：冻结直连体，buf 榨干后起救援。
-    rescue_due: bool,
-    /// 在途的镜像救援任务；就绪即换体。
+    /// 在途的续传任务（镜像救援或直连重拉）；就绪即换体。
     handle: Option<tokio::task::JoinHandle<Option<(BoxBody, u64)>>>,
-    /// 体已来自镜像（或不可救援）：不再触发体级 5s 换镜。
+    /// 体已来自镜像（或不可续传）：不再触发体级停滞续传。
     no_rescue: bool,
-    /// 段起点计时：5s 界从开流算起，不是从拼装算起。
-    started: Instant,
+    /// 连续无新字节的起点；来数据即清。None = 有数据或尚未看过。
+    stall_since: Option<Instant>,
+    /// 本段已重拉次数（直连独走模式的续传上限）。
+    refetches: u8,
 }
 
 impl Seg {
-    /// 镜像救援换体：直连残体与缓冲一并丢弃，期望字节从续传点重算——
-    /// 已交付的都是连续前缀，镜像从同一偏移接着发，流内无重复无缺口。
-    fn install_rescue(&mut self, body: BoxBody, start: u64) {
+    /// 续传换体：直连残体与缓冲一并丢弃，期望字节从续传点重算——
+    /// 已交付的都是连续前缀，续传从同一偏移接着发，流内无重复无缺口。
+    fn install_rescue(&mut self, body: BoxBody, start: u64, no_rescue: bool) {
         self.buf.clear();
         self.buffered = 0;
         self.got = 0;
         self.expected = (self.e - start) as usize;
         self.body = body;
         self.handle = None;
-        self.no_rescue = true; // 换上来的就是镜像体，不再二次救援
-        self.rescue_due = false;
+        self.no_rescue = no_rescue; // 镜像体不再二次救援；直连重拉体允许再停滞再重拉
+        self.stall_since = None;
     }
 }
 
+/// 段停滞（5s 无进度）时的续传方式。
+enum Resume {
+    /// 镜像链救援（链序逐个试）。
+    Mirror(RescueCtx),
+    /// 直连同通道从剩余偏移重拉（池自动重建死通道）。
+    Direct { tpl: Tpl, host: String, log: LogFn },
+}
+
 /// 按段序交付，但每轮把所有段都 poll 一次——只盯队首会让未读段占死连接级流控窗口。
-/// 每段挂 5s 界：没拉完的段冻结直连侧，镜像按已交付偏移续传。
+/// 每段挂停滞界：没拉完的段冻结直连侧，从已交付偏移续传。
 pub(super) struct SegmentedBody {
     segs: Vec<Seg>,
     idx: usize,
@@ -605,27 +613,26 @@ pub(super) struct SegmentedBody {
     sent: u64,
     guard: Option<ActiveGuard>,
     finished: bool,
-    rescue: Option<RescueCtx>,
-    rescue_after: Duration,
+    resume: Option<Resume>,
+    resume_after: Duration,
 }
 
 impl SegmentedBody {
-    /// 无救援的拼装（仅测试用）：5s 界整个关掉，生产路径一律走 build。
+    /// 无续传的拼装（仅测试用）：停滞界整个关掉，生产路径一律走 build。
     #[cfg(test)]
     fn new(entries: Vec<(BoxBody, usize)>, total: u64) -> Self {
         let entries = entries
             .into_iter()
             .map(|(body, expected)| (body, expected, 0, true))
             .collect();
-        Self::build(entries, total, None, Instant::now(), Duration::MAX)
+        Self::build(entries, total, None, Duration::MAX)
     }
 
     fn build(
         entries: Vec<(BoxBody, usize, u64, bool)>,
         total: u64,
-        rescue: Option<RescueCtx>,
-        started: Instant,
-        rescue_after: Duration,
+        resume: Option<Resume>,
+        resume_after: Duration,
     ) -> Self {
         SegmentedBody {
             segs: entries
@@ -639,10 +646,10 @@ impl SegmentedBody {
                     done: false,
                     s,
                     e: s + expected as u64,
-                    rescue_due: false,
                     handle: None,
                     no_rescue: rescued,
-                    started,
+                    stall_since: None,
+                    refetches: 0,
                 })
                 .collect(),
             idx: 0,
@@ -650,8 +657,8 @@ impl SegmentedBody {
             sent: 0,
             guard: None,
             finished: false,
-            rescue,
-            rescue_after,
+            resume,
+            resume_after,
         }
     }
 
@@ -677,49 +684,77 @@ impl hyper::body::Body for SegmentedBody {
             if seg.done {
                 continue;
             }
-            // 5s 界（仅配置了救援链的段）：没拉完就冻结直连体，镜像从已交付偏移续传。
-            // 无救援上下文（镜像退场/未配置）：段直连独走——不检查、不等待、不落日志。
-            if me.rescue.is_some()
-                && !seg.no_rescue
-                && !seg.rescue_due
+            // 停滞检测（5s 无新字节）：有救援链 → 镜像从已交付偏移续传；
+            // 无链（直连独走）→ 同通道从剩余偏移重拉（池自动重建死通道），每段至多 3 次。
+            if !seg.no_rescue
+                && seg.handle.is_none()
                 && seg.got < seg.expected
-                && seg.started.elapsed() >= me.rescue_after
+                && seg
+                    .stall_since
+                    .is_some_and(|t| t.elapsed() >= me.resume_after)
             {
-                if let Some(ctx) = &me.rescue {
-                    if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain()) {
-                        seg.rescue_due = true;
+                match &me.resume {
+                    Some(Resume::Mirror(ctx)) => {
+                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain()) && !ctx.chain.is_empty() {
+                            let start = seg.s + seg.got as u64;
+                            let e = seg.e;
+                            let tpl = ctx.tpl.clone();
+                            let kind = ctx.kind;
+                            let chain = ctx.chain.clone();
+                            let log = ctx.log.clone();
+                            seg.handle = Some(tokio::spawn(async move {
+                                rescue_segment(&tpl, kind, &chain, start, e, &log)
+                                    .await
+                                    .map(|(body, _hs)| (body, start))
+                            }));
+                        }
+                        // 熔断开着：不置位不判死，骑直连流（60s 后熔断关自然恢复）。
                     }
-                    // 熔断开着：不置位不判死，继续骑直连流（60s 后熔断关，救援自然恢复）。
+                    Some(Resume::Direct { tpl, host, log }) => {
+                        if seg.refetches < 3 {
+                            seg.refetches += 1;
+                            let start = seg.s + seg.got as u64;
+                            let e = seg.e;
+                            let tpl = tpl.clone();
+                            let host = host.clone();
+                            let log = log.clone();
+                            seg.handle = Some(tokio::spawn(async move {
+                                let (up, _) = pool::get_or_build(&host, None, "", &log).await.ok()?;
+                                let req = tpl.build(start, e).ok()?;
+                                let resp = tokio::time::timeout(
+                                    Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+                                    upstream::h2_send(&up, &req, &None::<Bytes>),
+                                )
+                                .await
+                                .ok()?
+                                .ok()?;
+                                if resp.status() != http::StatusCode::PARTIAL_CONTENT {
+                                    return None;
+                                }
+                                Some((resp.into_body(), start))
+                            }));
+                        }
+                        // 重试耗尽：段错误上抛（浏览器对断流会自行重试整页）。
+                    }
+                    None => {}
                 }
             }
-            if seg.rescue_due {
-                if let Some(ctx) = &me.rescue {
-                    if seg.handle.is_none() && seg.buf.is_empty() && seg.got < seg.expected {
-                        let c = ctx.clone();
-                        let (s, e, got) = (seg.s, seg.e, seg.got as u64);
-                        seg.handle = Some(tokio::spawn(async move {
-                            rescue_segment(&c.tpl, c.kind, &c.chain, s + got, e, &c.log)
-                                .await
-                                .map(|(body, _hs)| (body, s + got))
-                        }));
+            if let Some(handle) = &mut seg.handle {
+                match Pin::new(handle).poll(cx) {
+                    Poll::Ready(Ok(Some((body, start)))) => {
+                        let mirror_body = matches!(&me.resume, Some(Resume::Mirror(_)));
+                        seg.install_rescue(body, start, mirror_body);
                     }
-                }
-                if let Some(handle) = &mut seg.handle {
-                    match Pin::new(handle).poll(cx) {
-                        Poll::Ready(Ok(Some((body, start)))) => {
-                            seg.install_rescue(body, start);
-                        }
-                        Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
-                            me.finished = true;
-                            return Poll::Ready(Some(Err(std::io::Error::other(
-                                "直连段 5s 未完且镜像救援失败",
-                            ))));
-                        }
-                        Poll::Pending => {}
+                    Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
+                        me.finished = true;
+                        return Poll::Ready(Some(Err(std::io::Error::other(
+                            "段停滞续传失败(重试耗尽)",
+                        ))));
                     }
+                    Poll::Pending => {}
                 }
                 if seg.handle.is_some() {
-                    continue; // 救援在途：本段冻结，等其他段的数据把窗口腾出来
+                    continue; // 续传在途：本段冻结，等其他段的数据把窗口腾出来
                 }
             }
             if seg.buffered >= SEG_BUFFER_MAX {
@@ -729,6 +764,7 @@ impl hyper::body::Body for SegmentedBody {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Ok(d) = frame.into_data() {
                         seg.got += d.len();
+                        seg.stall_since = None;
                         // 终点超长的字节会吃掉全局总长预算，尾段发不完——直接报错。
                         if seg.got > seg.expected {
                             me.finished = true;
@@ -745,7 +781,11 @@ impl hyper::body::Body for SegmentedBody {
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => seg.done = true,
-                Poll::Pending => {}
+                Poll::Pending => {
+                    if seg.stall_since.is_none() {
+                        seg.stall_since = Some(Instant::now());
+                    }
+                }
             }
         }
         loop {

@@ -49,10 +49,10 @@ pub(super) async fn dispatch(
             "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
         ));
     }
-    // 大文件切片：只用池里现成的伪装 SNI 直连连接，多段 Range 并发拉再按字节边界合流。
-    // 不进镜像链、不扩 IP、不新拨连接；池冷或任一段没回 206 就交回下面的单流路径。
+    // 大文件切片：总机下发片数（策略单点），切片器内置重试/续传/br 协商。
+    // 不满足条件或段最终失败一律回单流；池冷/闸满同样回单流。
     if is_simple {
-        if let Some(resp) = direct_split::try_direct_split(log, out_body, host, info).await {
+        if let Some(resp) = direct_split::try_direct_split(log, out_body, host, info, 8).await {
             return Ok(write_upstream(resp, "direct-split", info));
         }
     }

@@ -249,7 +249,7 @@ impl hyper::body::Body for StallBody {
 /// （回归：冻结后救援必败曾把能自愈的停滞毁成整图错误）。
 #[tokio::test]
 async fn empty_rescue_chain_never_kills_stalled_segment() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let _g = crate::pool::TEST_LOCK
         .lock()
@@ -267,7 +267,6 @@ async fn empty_rescue_chain_never_kills_stalled_segment() {
         entries,
         30,
         None, // 未配置救援链 = 无救援上下文，段直连独走
-        Instant::now(),
         Duration::ZERO,
     );
     let mut delivered = 0usize;
@@ -294,9 +293,9 @@ async fn empty_rescue_chain_never_kills_stalled_segment() {
 /// 救援换体算术：直连交付的连续前缀 + 镜像续传 = 与整文件逐字节一致（图会不会花的核心）。
 #[tokio::test]
 async fn rescue_swap_continues_byte_stream() {
-    use super::{RescueCtx, MediaKind};
+    use super::{MediaKind, RescueCtx, Resume};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let _g = crate::pool::TEST_LOCK
         .lock()
@@ -313,13 +312,12 @@ async fn rescue_swap_continues_byte_stream() {
     let mut body = SegmentedBody::build(
         entries,
         30,
-        Some(RescueCtx {
+        Some(Resume::Mirror(RescueCtx {
             tpl: tpl(),
             kind: MediaKind::Image,
             chain: vec!["https://unused.example.com".to_string()],
             log: Arc::new(|_| {}),
-        }),
-        Instant::now(),
+        })),
         Duration::MAX, // 不自动冻结：换体由测试手动驱动
     );
     // 先收直连的 6 字节前缀。StallBody 只吐这一帧、之后永久 Pending 且不注册唤醒，
@@ -332,7 +330,11 @@ async fn rescue_swap_continues_byte_stream() {
     assert_eq!(got, b"abcdef");
     // 模拟救援成功：镜像从 6 续传到 30（install_rescue 的算术：期望 = 30-6 = 24）。
     let rest: Vec<u8> = (6u8..30).map(|i| b'a' + i % 26).collect();
-    body.segs[0].install_rescue(BoxBody::new(protocol::full_body(Bytes::from(rest.clone()))), 6);
+    body.segs[0].install_rescue(
+        BoxBody::new(protocol::full_body(Bytes::from(rest.clone()))),
+        6,
+        true,
+    );
     assert_eq!(body.segs[0].expected, 24, "期望字节从续传点重算");
     // 续传体接着交付，拼起来与整文件逐字节一致。
     let tail = BodyExt::collect(body)
