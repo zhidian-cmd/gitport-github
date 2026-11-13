@@ -238,7 +238,7 @@ pub(super) fn cache_take(
         req.uri(),
         host,
         cookies,
-        upstream::accepts_gzip(req),
+        upstream::encoding_bucket(req),
         variant,
     );
     let (status, hdrs, body) = match load_disk_entry_reason(&key, session_value(cookies).is_some())
@@ -347,7 +347,7 @@ pub(super) async fn cache_put(
         req.uri(),
         host,
         cookies,
-        upstream::accepts_gzip(req),
+        upstream::encoding_bucket(req),
         variant,
     );
     let has_session = session_value(cookies).is_some();
@@ -556,10 +556,10 @@ fn live_cache_key(
     uri: &http::Uri,
     host: &str,
     cookies: Option<&str>,
-    gzip: bool,
+    enc: &str,
     variant: &str,
 ) -> String {
-    let base = page_cache_key(uri, host, cookies, gzip);
+    let base = page_cache_key(uri, host, cookies, enc);
     if is_home_path(uri.path()) {
         format!("{base}-k") // 骨架：不带会话号，跨会话复用
     } else {
@@ -567,14 +567,18 @@ fn live_cache_key(
     }
 }
 
-fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, gzip: bool) -> String {
+fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) -> String {
     let q = uri
         .query()
         .map(|q| normalize_query(uri.path(), q))
         .unwrap_or_default();
     let cookie_tag = session_fingerprint(cookies);
-    // 编码进键：gzip 那条不能给没声明 gzip 的 curl。
-    let enc_tag = if gzip { "-gz" } else { "-id" };
+    // 编码进键：br 条目不能给只收 gzip 的 curl。
+    let enc_tag = match enc {
+        "br" => "-br",
+        "gzip" => "-gz",
+        _ => "-id",
+    };
     format!("GET {host}{}{q}{cookie_tag}{enc_tag}", uri.path())
 }
 
@@ -593,34 +597,33 @@ fn normalize_query(path: &str, q: &str) -> String {
     }
 }
 
-/// 这段正文是不是 gzip（决定要不要先解压）。
-fn is_gzip_encoding(v: &str) -> bool {
-    v.trim().eq_ignore_ascii_case("gzip")
+/// 这段正文的压缩编码（决定门检怎么解压）：gzip/br，其余按 identity。
+fn body_encoding(v: &str) -> &'static str {
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("gzip") {
+        "gzip"
+    } else if t.eq_ignore_ascii_case("br") {
+        "br"
+    } else {
+        "identity"
+    }
 }
 
-/// 解压后取前 8KB 并转小写：主站正文恒 gzip，不解压扫不到字面量。
-fn plain_prefix(bytes: &[u8], gzip: bool) -> String {
-    let plain = if gzip {
-        super::defuse::gunzip_partial(bytes, 8192)
-    } else {
-        bytes[..bytes.len().min(4096)].to_vec()
-    };
+/// 解压后取前 8KB 并转小写：主站正文恒压缩（gzip/br），不解压扫不到字面量。
+fn plain_prefix(bytes: &[u8], enc: &str) -> String {
+    let plain = super::defuse::decompress_partial(bytes, enc, 8192);
     String::from_utf8_lossy(&plain).to_lowercase()
 }
 
 /// 限流降级骨架（缺 embeddedData）不入缓存，否则一次降级会被刷新固化成“一直坏”。
-fn is_search_skeleton(key: &str, bytes: &[u8], gzip: bool) -> bool {
+fn is_search_skeleton(key: &str, bytes: &[u8], enc: &str) -> bool {
     if !key.contains("/search?") {
         return false;
     }
     if key.contains("-json-") {
         return false; // JSON 正文本就没有 HTML 结果载体，骨架判定只对 HTML 分支生效
     }
-    let plain = if gzip {
-        super::defuse::gunzip_partial(bytes, PAGE_CACHE_MAX_BODY_BYTES)
-    } else {
-        bytes.to_vec()
-    };
+    let plain = super::defuse::decompress_partial(bytes, enc, PAGE_CACHE_MAX_BODY_BYTES);
     let text = String::from_utf8_lossy(&plain);
     !text.contains("react-app.embeddedData")
 }
@@ -633,12 +636,8 @@ fn is_logged_out_body(plain: &str) -> bool {
 /// HTML 是否完整（末 2KB 内有 </html>）：GitHub 的 h2 响应没有 content-length，
 /// 上游流中途断掉时 collect 仍返回 Ok —— 截断页落进 keep/ 会被 7 天寿命内
 /// 的每次后退命中，等于必现白屏。读写两侧都用它把关。
-fn html_complete(bytes: &[u8], gzip: bool) -> bool {
-    let full = if gzip {
-        super::defuse::gunzip_partial(bytes, 32 << 20)
-    } else {
-        bytes.to_vec()
-    };
+fn html_complete(bytes: &[u8], enc: &str) -> bool {
+    let full = super::defuse::decompress_partial(bytes, enc, 32 << 20);
     full.len() >= 7
         && full[full.len().saturating_sub(2048)..]
             .windows(7)
@@ -739,11 +738,12 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
             hdrs.push((name, val));
         }
     }
-    let gzip = hdrs.iter().any(|(k, v)| {
-        k.as_str() == "content-encoding" && v.to_str().map(is_gzip_encoding).unwrap_or(false)
-    });
+    let enc = hdrs.iter().find(|(k, _)| k.as_str() == "content-encoding")
+        .and_then(|(_, v)| v.to_str().ok())
+        .map(body_encoding)
+        .unwrap_or("identity");
     let body = &raw[end..];
-    let plain = plain_prefix(body, gzip);
+    let plain = plain_prefix(body, enc);
     if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
         return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
     }
@@ -755,7 +755,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
                     .map(|v| v.starts_with("text/html"))
                     .unwrap_or(false)
         })
-        && !html_complete(body, gzip)
+        && !html_complete(body, enc)
     {
         let _ = std::fs::remove_file(&path);
         return Err("骨架条目截断(无</html>)");
@@ -881,12 +881,12 @@ async fn collect_and_submit(
         }
     }
     // 污染/闸门检测要先解压才看得见标记。
-    let gzip = parts
+    let enc = parts
         .headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
-        .map(is_gzip_encoding)
-        .unwrap_or(false);
+        .map(body_encoding)
+        .unwrap_or("identity");
     // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
     let cache_hdrs: Vec<Vec<String>> = parts
         .headers
@@ -904,13 +904,13 @@ async fn collect_and_submit(
                 bytes = Bytes::from(full);
             }
             // 不缓存"顶替真实内容"的页：未登录页（会话已死）与各类闸门页。
-            let plain = plain_prefix(&bytes, gzip);
+            let plain = plain_prefix(&bytes, enc);
             // 首页骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
-                && (!key.ends_with("-k") || html_complete(&bytes, gzip))
+                && (!key.ends_with("-k") || html_complete(&bytes, enc))
                 && !(has_session && is_logged_out_body(&plain))
                 && !is_gate_page(&plain)
-                && !is_search_skeleton(key, &bytes, gzip);
+                && !is_search_skeleton(key, &bytes, enc);
             if cacheable {
                 let status = parts.status.as_u16();
                 worker_send(
@@ -930,7 +930,7 @@ async fn collect_and_submit(
                     "未登录页(会话已死)"
                 } else if is_gate_page(&plain) {
                     "闸门页"
-                } else if is_search_skeleton(key, &bytes, gzip) {
+                } else if is_search_skeleton(key, &bytes, enc) {
                     "限流骨架"
                 } else {
                     "未知原因"

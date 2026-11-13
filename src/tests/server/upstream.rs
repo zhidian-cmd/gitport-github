@@ -21,6 +21,26 @@ fn accepts_gzip_respects_explicit_reject() {
     assert!(!accepts_gzip(&mk("br, gzip;q=0")));
 }
 
+/// br 同款 q 值解析：接受/拒绝矩阵与 gzip 一致。
+#[test]
+fn accepts_brotli_respects_explicit_reject() {
+    let mk = |ae: &str| {
+        hyper::Request::builder()
+            .header("accept-encoding", ae)
+            .body(())
+            .unwrap()
+    };
+    assert!(accepts_brotli(&mk("br, gzip")));
+    assert!(accepts_brotli(&mk("BR")));
+    assert!(accepts_brotli(&mk("gzip;q=1, br")));
+    assert!(!accepts_brotli(&mk("br;q=0")));
+    assert!(!accepts_brotli(&mk("gzip")));
+    // 分号/等号两侧的空白合法(HTTP OWS)，照样是明确拒绝
+    assert!(!accepts_brotli(&mk("br; q=0")));
+    assert!(!accepts_brotli(&mk("br ; q=0")));
+    assert!(!accepts_brotli(&mk("gzip, br;q=0")));
+}
+
 /// 上行泵（git push 请求体通道）：2MB 体必须一字节不差送达——此前无测试，窗口/背压改错只会让 push 卡住不会变红。
 #[tokio::test]
 async fn h2_body_pump_delivers_every_byte() {
@@ -84,7 +104,7 @@ async fn h2_body_pump_delivers_every_byte() {
 }
 
 #[test]
-fn forced_gzip_gated_on_client_accept() {
+fn forced_encoding_prefers_br_gzip_fallback() {
     let req = hyper::Request::builder()
         .uri("https://github.com/a")
         .header("accept-encoding", "gzip, deflate, br")
@@ -93,8 +113,20 @@ fn forced_gzip_gated_on_client_accept() {
     let out = upstream_request(&req, "github.com").unwrap();
     assert_eq!(
         out.headers().get("accept-encoding").unwrap(),
+        "br",
+        "接受 br 的客户端应被强制 br（比 gzip 再小 16%）"
+    );
+
+    let req_gz = hyper::Request::builder()
+        .uri("https://github.com/a")
+        .header("accept-encoding", "gzip, deflate")
+        .body(())
+        .unwrap();
+    let out_gz = upstream_request(&req_gz, "github.com").unwrap();
+    assert_eq!(
+        out_gz.headers().get("accept-encoding").unwrap(),
         "gzip",
-        "声明过 gzip 的客户端应被强制 gzip"
+        "只收 gzip 的客户端强制 gzip"
     );
 
     let req2 = hyper::Request::builder()

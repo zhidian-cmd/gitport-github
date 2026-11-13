@@ -4,18 +4,18 @@ fn search_skeleton_gate() {
     let k = "GET github.com/search?q=x&type=repositories-cloggedout-gz";
     let full = "<html>{}react-app.embeddedData{}</html>".to_string();
     assert!(
-        !is_search_skeleton(k, full.as_bytes(), false),
+        !is_search_skeleton(k, full.as_bytes(), "identity"),
         "含结果载体的正常页应缓存"
     );
     assert!(
-        is_search_skeleton(k, b"<html>Your search did not match</html>", false),
+        is_search_skeleton(k, b"<html>Your search did not match</html>", "identity"),
         "无结果载体的骨架应拦截"
     );
     // 非 /search? 键不受此判定(count XHR 的骨架照缓存,无害)
     assert!(!is_search_skeleton(
         "GET github.com/search/count?q=x-cloggedout",
         b"{}",
-        false
+        "identity"
     ));
 }
 
@@ -30,14 +30,14 @@ fn search_skeleton_gate_gzip() {
         .unwrap();
     let gz = enc.finish().unwrap();
     assert!(
-        !is_search_skeleton(k, &gz, true),
+        !is_search_skeleton(k, &gz, "gzip"),
         "gzip 正常页解压后应命中载体标志"
     );
     let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
     enc.write_all(b"<html>Your search did not match any</html>")
         .unwrap();
     let gz = enc.finish().unwrap();
-    assert!(is_search_skeleton(k, &gz, true), "gzip 骨架应拦截");
+    assert!(is_search_skeleton(k, &gz, "gzip"), "gzip 骨架应拦截");
 }
 
 use super::*;
@@ -93,7 +93,7 @@ fn search_query_normalization() {
             })
             .build()
             .unwrap();
-        page_cache_key(&uri, "github.com", None, true)
+        page_cache_key(&uri, "github.com", None, "gzip")
     };
     let base = mk("/search", Some("q=rust&type=repositories"));
     assert_eq!(
@@ -492,39 +492,39 @@ async fn keys_invalidation_and_pollution() {
     let uri: http::Uri = "https://github.com/settings/profile?tab=x".parse().unwrap();
     let alice = "user_session=s1; dotcom_user=alice";
     let bob = "user_session=s2; dotcom_user=bob";
-    let gz = page_cache_key(&uri, "github.com", Some(alice), true);
-    let id = page_cache_key(&uri, "github.com", Some(alice), false);
+    let gz = page_cache_key(&uri, "github.com", Some(alice), "gzip");
+    let id = page_cache_key(&uri, "github.com", Some(alice), "identity");
     assert!(gz.contains("?tab=x") && gz.ends_with("-calice-gz"), "{gz}");
     assert!(id.ends_with("-calice-id"), "{id}");
     assert_ne!(
         gz,
-        page_cache_key(&uri, "github.com", Some(bob), true),
+        page_cache_key(&uri, "github.com", Some(bob), "gzip"),
         "同机换账号必须换键"
     );
     // ⑩a 首页键带 -k（不带会话号，跨会话复用）
     let home_uri: http::Uri = "https://github.com/".parse().unwrap();
     assert!(
-        live_cache_key(&home_uri, "github.com", Some(alice), true, "").ends_with("-k"),
+        live_cache_key(&home_uri, "github.com", Some(alice), "gzip", "").ends_with("-k"),
         "首页骨架键必须带 -k"
     );
 
     // ⑩b 换会话后旧键必须失效（不依赖清盘是否成功）
-    let k_before = live_cache_key(&uri, "github.com", Some(alice), true, "");
+    let k_before = live_cache_key(&uri, "github.com", Some(alice), "gzip", "");
     set_last_nav(0);
     assert!(note_nav(), "伪造一次空闲");
-    let k_after = live_cache_key(&uri, "github.com", Some(alice), true, "");
+    let k_after = live_cache_key(&uri, "github.com", Some(alice), "gzip", "");
     assert_ne!(k_before, k_after, "换会话后同一页面必须是新键");
     // ⑩c 两次"进程首启"的会话号必须不同：否则重启后又拿回 -s2，与上一轮的盘上条目撞号
     let k1 = {
         set_last_nav(0);
         note_nav();
-        live_cache_key(&uri, "github.com", None, true, "")
+        live_cache_key(&uri, "github.com", None, "gzip", "")
     };
     std::thread::sleep(std::time::Duration::from_millis(3));
     let k2 = {
         set_last_nav(0);
         note_nav();
-        live_cache_key(&uri, "github.com", None, true, "")
+        live_cache_key(&uri, "github.com", None, "gzip", "")
     };
     assert_ne!(k1, k2, "重启后会话号不得与上一轮相同");
 
@@ -576,11 +576,11 @@ async fn keys_invalidation_and_pollution() {
     std::io::Write::write_all(&mut enc, &html).unwrap();
     let gzbody = enc.finish().unwrap();
     assert!(
-        !is_logged_out_body(&plain_prefix(&gzbody, false)),
+        !is_logged_out_body(&plain_prefix(&gzbody, "identity")),
         "压缩体裸扫扫不到——这就是旧版失效的原因"
     );
     assert!(
-        is_logged_out_body(&plain_prefix(&gzbody, true)),
+        is_logged_out_body(&plain_prefix(&gzbody, "gzip")),
         "解压后必须认出未登录页"
     );
     let poisoned_gz = hyper::Response::builder()
@@ -606,13 +606,13 @@ async fn keys_invalidation_and_pollution() {
     // ⑪c 闸门页：按请求 URL 回 200，写入侧与读侧都必须拦
     let gate_html = b"<html><head><title>Verify your two-factor authentication (2FA) settings</title></head><body><h1>Verify your two-factor authentication (2FA) settings</h1><p>This is a one-time verification of your recently configured 2FA credentials.</p></body></html>";
     assert!(
-        is_gate_page(&plain_prefix(gate_html, false)),
+        is_gate_page(&plain_prefix(gate_html, "identity")),
         "2FA 验证页必须识别"
     );
     assert!(
         !is_gate_page(&plain_prefix(
             b"<html><body class=\"logged-in env-production\">repo</body></html>",
-            false
+            "identity"
         )),
         "普通页面不得误判"
     );

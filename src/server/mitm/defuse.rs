@@ -21,7 +21,7 @@ fn giveup_logged_recently(host: &str) -> bool {
     g.insert(host.to_string(), now).is_some()
 }
 
-/// 上游强制 gzip 后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
+/// 上游压缩协商（br/gzip）后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     let ct = resp
         .headers()
@@ -39,10 +39,10 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !enc.is_empty() && enc != "identity" && enc != "gzip" {
+    if !enc.is_empty() && enc != "identity" && enc != "gzip" && enc != "br" {
         return false;
     }
-    let gz = enc == "gzip";
+    let compressed = !enc.is_empty() && enc != "identity";
     let mut raw: Vec<Bytes> = Vec::new();
     let mut comp: Vec<u8> = Vec::new();
     let mut plain: Vec<u8> = Vec::new();
@@ -51,14 +51,14 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         match http_body_util::BodyExt::frame(body).await {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
-                    if gz {
+                    if compressed {
                         comp.extend_from_slice(&data);
-                        plain = gunzip_partial(&comp, 8192);
+                        plain = decompress_partial(&comp, &enc, 8192);
                     } else {
                         plain.extend_from_slice(&data);
                     }
                     raw.push(data);
-                    if gz && comp.len() > 128 * 1024 {
+                    if compressed && comp.len() > 128 * 1024 {
                         break;
                     }
                 }
@@ -93,13 +93,23 @@ fn defuse_retry(ip_empty: bool, empty_retries: u8, tried: usize) -> bool {
     tried < DEFUSE_MAX_TRIES
 }
 
-/// 解 gzip 的前 max 字节（page_cache 的未登录页检测共用：主站正文恒压缩）。
-pub(super) fn gunzip_partial(data: &[u8], max: usize) -> Vec<u8> {
+/// 解压缩的前 max 字节（page_cache 的门检共用）。enc 按响应 content-encoding
+/// 分发：gzip → GzDecoder，br → BrotliDecoder，identity/未知 → 原样截取。
+pub(super) fn decompress_partial(data: &[u8], enc: &str, max: usize) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
-    let _ = flate2::read::GzDecoder::new(data)
-        .take(max as u64)
-        .read_to_end(&mut out);
+    match enc {
+        "gzip" => {
+            let _ = flate2::read::GzDecoder::new(data)
+                .take(max as u64)
+                .read_to_end(&mut out);
+        }
+        "br" => {
+            let dec = brotli_decompressor::Decompressor::new(data, 4096);
+            let _ = dec.take(max as u64).read_to_end(&mut out);
+        }
+        _ => out.extend_from_slice(&data[..data.len().min(max)]),
+    }
     out
 }
 

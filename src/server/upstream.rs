@@ -1024,8 +1024,8 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
     })
 }
 pub const MAX_REPLAY_BODY: usize = 1024 * 1024;
-/// 客户端是否接受 gzip：强制压缩与缓存分桶的唯一判定，两处各写一份必有一边漏改。
-pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
+/// 客户端是否接受指定压缩编码：裸 token = 默认接受；q=0/0.0/0.000 = 明确拒绝。
+fn accepts_token<B>(req: &hyper::Request<B>, token: &str) -> bool {
     let Some(v) = req
         .headers()
         .get("accept-encoding")
@@ -1040,14 +1040,14 @@ pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .to_ascii_lowercase();
-        let Some(rest) = item.strip_prefix("gzip") else {
+        let Some(rest) = item.strip_prefix(token) else {
             continue;
         };
         if rest.is_empty() {
-            return true; // 裸 "gzip" = 默认接受
+            return true; // 裸 token = 默认接受
         }
         let Some(params) = rest.strip_prefix(';') else {
-            continue; // "gzipx" 之类前缀误中，跳过
+            continue; // 前缀误中（"gzipx" 之于 "gzip"），跳过
         };
         for kv in params.split(';') {
             if let Some(q) = kv.strip_prefix("q=") {
@@ -1058,12 +1058,34 @@ pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
                 return !zero;
             }
         }
-        return true; // 有 gzip 无 q 参数 = 接受
+        return true; // 有 token 无 q 参数 = 接受
     }
     false
 }
 
-/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制 gzip。
+/// 客户端是否接受 gzip：缓存分桶与强制压缩的判定之一。
+pub fn accepts_gzip<B>(req: &hyper::Request<B>) -> bool {
+    accepts_token(req, "gzip")
+}
+
+/// 客户端是否接受 br（Brotli）：比 gzip 再小 16%（实测 2.87MB→2.41MB）。
+pub fn accepts_brotli<B>(req: &hyper::Request<B>) -> bool {
+    accepts_token(req, "br")
+}
+
+/// 压缩协商的编码档：br 优先，gzip 兜底，都没有 = identity。
+/// 上游强制编码与此解析必须同源——缓存桶才对得上实际 served 的字节。
+pub fn encoding_bucket<B>(req: &hyper::Request<B>) -> &'static str {
+    if accepts_brotli(req) {
+        "br"
+    } else if accepts_gzip(req) {
+        "gzip"
+    } else {
+        "identity"
+    }
+}
+
+/// 重写上游请求：绝对 URL 化 + 剥代理头；嗅探型 host 强制压缩协商。
 pub fn upstream_request<B>(
     req: &hyper::Request<B>,
     host: &str,
@@ -1078,7 +1100,8 @@ pub fn upstream_request<B>(
         .parse()
         .map_err(|_| format!("非法上游 URI: {host}{path}"))?;
     let mut out = hyper::Request::builder().method(method).uri(uri);
-    // github.com/api 强制 gzip（大页面裸传是进页面慢的主因），边收边解压，原始压缩帧照转。
+    // github.com/api 强制压缩（大页面裸传是进页面慢的主因），边收边解压，原始压缩帧照转。
+    // br 优先（比 gzip 再小 16%），gzip 兜底；defuse 窥探与缓存门检按响应编码解码。
     let sniffed = host == "github.com" || host == "api.github.com";
     for (k, v) in req.headers() {
         let low = k.as_str().to_lowercase();
@@ -1090,9 +1113,18 @@ pub fn upstream_request<B>(
         }
         out = out.header(k, v);
     }
-    // 只在客户端声明接受 gzip 时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
-    if sniffed && accepts_gzip(req) {
-        out = out.header("accept-encoding", "gzip");
+    // 只在客户端声明接受时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
+    if sniffed {
+        let forced = if accepts_brotli(req) {
+            Some("br")
+        } else if accepts_gzip(req) {
+            Some("gzip")
+        } else {
+            None
+        };
+        if let Some(enc) = forced {
+            out = out.header("accept-encoding", enc);
+        }
     }
     out.body(empty_body()).map_err(|e| e.to_string())
 }
