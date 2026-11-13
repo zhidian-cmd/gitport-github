@@ -401,64 +401,71 @@ pub(super) async fn try_direct_split(
         log_skip(log, host, &path, "池内无可用通道");
         return None;
     };
-    // 段级重试：头阶段失败（连接死/超时）→ 同通道再试，至多 3 次。
+    // 段拉取：单次尝试（5s 头预算），失败不连坐——该段挂起走停滞续传，其余段照常交付。
     let futs = segs.iter().map(|&(s, e)| {
         let up = up.clone();
         let tpl2 = tpl.clone();
         async move {
-            let mut attempt = 0u8;
-            loop {
-                attempt += 1;
-                let res = tokio::time::timeout(
-                    Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
-                    fetch_segment(&up, &tpl2, s, e),
-                )
-                .await;
-                match res {
-                    Ok(Ok((body, hs))) => {
-                        return Ok(SegFetch {
-                            body,
-                            hs,
-                            rescued: false,
-                        });
-                    }
-                    _ => {
-                        if attempt >= 3 {
-                            return Err("段拉取重试耗尽".to_string());
-                        }
-                        // 同通道重试：段边界不变，整段重拉（共享通道不能中途摘——
-                        // 摘了会杀死同通道其他段的在途流）。
-                    }
-                }
+            match tokio::time::timeout(
+                Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+                fetch_segment(&up, &tpl2, s, e),
+            )
+            .await
+            {
+                Ok(Ok((body, hs))) => Ok(SegFetch {
+                    body,
+                    hs,
+                    rescued: false,
+                }),
+                Ok(Err(why)) => Err(why),
+                Err(_) => Err(format!(
+                    "段头超时({}s)",
+                    crate::config::MEDIA_RESCUE_WAIT_SECS
+                )),
             }
         }
     });
     let results = join_all(futs).await;
-    if let Some((i, why)) = results
-        .iter()
-        .enumerate()
-        .find_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
-    {
+    // 全段皆败才回单流；部分失败 → 失败段挂起等续传，余段照常拼装。
+    if results.iter().all(|r| r.is_err()) {
+        let why = results
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .cloned()
+            .unwrap_or_default();
         (log)(&format!(
-            "[直连切片] {host}{} 第 {} 段失败({why}), 回单流",
-            path_of(out.uri()),
-            i + 1
+            "[直连切片] {host}{} 全部段失败({why}), 回单流",
+            path_of(out.uri())
         ));
         return None;
     }
-    let mut entries: Vec<(BoxBody, usize, u64, bool)> = Vec::with_capacity(segs.len() + 1);
+    let mut entries: Vec<(BoxBody, usize, u64, bool, bool)> =
+        Vec::with_capacity(segs.len() + 1);
     let mut first_headers: Option<HeaderMap> = None;
     if let Some((bytes, hs)) = &prefix {
         // 探片 10KB = 交付首段：字节已在手，头用它（206 头，Range 语义头会被剥）。
         first_headers = Some(hs.clone());
-        entries.push((protocol::full_body(bytes.clone()), bytes.len(), 0, false));
+        entries.push((protocol::full_body(bytes.clone()), bytes.len(), 0, false, false));
     }
     for (i, r) in results.into_iter().enumerate() {
-        let f = r.ok()?;
-        if first_headers.is_none() {
-            first_headers = Some(f.hs);
+        let expected = (segs[i].1 - segs[i].0) as usize;
+        match r {
+            Ok(f) => {
+                if first_headers.is_none() {
+                    first_headers = Some(f.hs);
+                }
+                entries.push((f.body, expected, segs[i].0, f.rescued, false));
+            }
+            Err(why) => {
+                // 挂起段：空体永久 Pending，5s 后由停滞续传从段首重拉（每段 ≤3 次）。
+                (log)(&format!(
+                    "[直连切片] {host}{} 第 {} 段挂起等续传({why})",
+                    path_of(out.uri()),
+                    i + 1
+                ));
+                entries.push((never_body(), expected, segs[i].0, false, true));
+            }
         }
-        entries.push((f.body, (segs[i].1 - segs[i].0) as usize, segs[i].0, f.rescued));
     }
     // 总长记忆命中时没走过探片，用第一段的 content-type 补一道媒体校验。
     let hs = first_headers.as_ref()?;
@@ -596,6 +603,13 @@ impl Seg {
     }
 }
 
+/// 永不给数据的体：挂起段的占位，等停滞续传换体。
+fn never_body() -> BoxBody {
+    BoxBody::new(http_body_util::StreamBody::new(
+        futures_util::stream::pending::<Result<hyper::body::Frame<Bytes>, std::io::Error>>(),
+    ))
+}
+
 /// 段停滞（5s 无进度）时的续传方式。
 enum Resume {
     /// 镜像链救援（链序逐个试）。
@@ -623,13 +637,13 @@ impl SegmentedBody {
     fn new(entries: Vec<(BoxBody, usize)>, total: u64) -> Self {
         let entries = entries
             .into_iter()
-            .map(|(body, expected)| (body, expected, 0, true))
+            .map(|(body, expected)| (body, expected, 0, true, false))
             .collect();
         Self::build(entries, total, None, Duration::MAX)
     }
 
     fn build(
-        entries: Vec<(BoxBody, usize, u64, bool)>,
+        entries: Vec<(BoxBody, usize, u64, bool, bool)>,
         total: u64,
         resume: Option<Resume>,
         resume_after: Duration,
@@ -637,7 +651,7 @@ impl SegmentedBody {
         SegmentedBody {
             segs: entries
                 .into_iter()
-                .map(|(body, expected, s, rescued)| Seg {
+                .map(|(body, expected, s, rescued, deferred)| Seg {
                     body,
                     buf: VecDeque::new(),
                     buffered: 0,
@@ -648,7 +662,7 @@ impl SegmentedBody {
                     e: s + expected as u64,
                     handle: None,
                     no_rescue: rescued,
-                    stall_since: None,
+                    stall_since: deferred.then(Instant::now),
                     refetches: 0,
                 })
                 .collect(),

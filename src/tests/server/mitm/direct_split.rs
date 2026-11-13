@@ -262,6 +262,7 @@ async fn empty_rescue_chain_never_kills_stalled_segment() {
         30usize,
         0u64,
         false,
+        false,
     )];
     let mut body = SegmentedBody::build(
         entries,
@@ -307,6 +308,7 @@ async fn rescue_swap_continues_byte_stream() {
         }),
         30usize,
         0u64,
+        false,
         false,
     )];
     let mut body = SegmentedBody::build(
