@@ -277,6 +277,13 @@ async fn rescue_segment(
     None
 }
 
+/// 跳过原因落一行（每 host 一次，不刷屏）：静默分支全部显式化，排查不再靠猜。
+fn log_skip(log: &LogFn, host: &str, path: &str, why: &str) {
+    if super::quiet::first_time("split-skip", host) {
+        (log)(&format!("[直连切片] {host}{path} 单流直发({why})"));
+    }
+}
+
 /// 主入口：不满足条件、或任一段没拿到 206，一律返回 None 让 mitm_http 走原来的单流。
 /// 只在所有段的响应头都确认之后才组装 200，中途失败不会出现「头已发出、图却花掉」。
 pub(super) async fn try_direct_split(
@@ -292,13 +299,18 @@ pub(super) async fn try_direct_split(
         return None;
     }
     let key = format!("{host}{}", path_of(out.uri()));
+    let path = path_of(out.uri());
     let (total, kind, prefix) = match memo_get(&key) {
-        Some((0, _)) => return None,
+        Some((0, _)) => {
+            log_skip(log, host, &path, "上次探明不可切(10min 记忆)");
+            return None;
+        }
         Some(hit) => (hit.0, hit.1, None),
         None => {
             let tpl = Tpl::of(out);
             // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
             let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
+                log_skip(log, host, &path, "池冷且建连失败");
                 return None;
             };
             *info.lock().unwrap() = up.ip.clone();
@@ -310,10 +322,19 @@ pub(super) async fn try_direct_split(
             .await
             {
                 Ok(Ok(r)) => r,
-                _ => return None,
+                _ => {
+                    log_skip(log, host, &path, "探片超时/失败");
+                    return None;
+                }
             };
             if resp.status() != StatusCode::PARTIAL_CONTENT {
                 memo_put(&key, 0, MediaKind::Image); // 上游忽略 Range：10 分钟内别再白探
+                log_skip(
+                    log,
+                    host,
+                    &path,
+                    &format!("上游不回 206(状态 {}), 记忆不可切", resp.status()),
+                );
                 return None;
             }
             let Some(t) = merge::content_range_total(
@@ -322,6 +343,7 @@ pub(super) async fn try_direct_split(
                     .and_then(|v| v.to_str().ok()),
             ) else {
                 memo_put(&key, 0, MediaKind::Image);
+                log_skip(log, host, &path, "206 缺 Content-Range");
                 return None;
             };
             let Some(kind) = MediaKind::of_content_type(
@@ -331,6 +353,7 @@ pub(super) async fn try_direct_split(
             ) else {
                 drop(resp.into_body()); // 及时关掉流别占连接窗口
                 memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内别再探、更别切
+                log_skip(log, host, &path, "非媒体类响应");
                 return None;
             };
             // 探片 10KB：字节不浪费，直接当交付首段。
@@ -342,16 +365,23 @@ pub(super) async fn try_direct_split(
             .await
             {
                 Ok(Ok(c)) => c.to_bytes(),
-                _ => return None,
+                _ => {
+                    log_skip(log, host, &path, "探片体收集超时");
+                    return None;
+                }
             };
             memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
             (t, kind, Some((probe_body, probe_hs)))
         }
     };
     if total < MIN_SPLIT_BYTES {
+        log_skip(log, host, &path, "文件小于 512KB");
         return None;
     }
-    let guard = ActiveGuard::take()?;
+    let Some(guard) = ActiveGuard::take() else {
+        log_skip(log, host, &path, "并发切片闸已满(6)");
+        return None;
+    };
     let tpl = Tpl::of(out);
     let tpl_ref = &tpl;
     // 恒 8 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
@@ -364,6 +394,7 @@ pub(super) async fn try_direct_split(
     let chans: std::sync::Arc<[upstream::H2Upstream]> =
         std::sync::Arc::from(pool::gather_channels(host, segs.len().min(3), log).await);
     if chans.is_empty() {
+        log_skip(log, host, &path, "池内无可用通道");
         return None;
     }
     // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
