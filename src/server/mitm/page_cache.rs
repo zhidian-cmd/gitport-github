@@ -122,17 +122,6 @@ fn is_asset_req<B>(host: &str, req: &hyper::Request<B>) -> bool {
     host == ASSET_HOST && req.method() == Method::GET && is_asset_path(req.uri().path())
 }
 
-/// 资产长期缓存头：内容哈希 URL 永不变，让浏览器自己留一年（连本代理都不用再问）。
-const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
-
-/// 资产响应盖长期缓存头（命中/回源两条路都盖）。
-fn stamp_asset_immutable(resp: &mut axum::response::Response<BoxBody>) {
-    resp.headers_mut().insert(
-        hyper::header::CACHE_CONTROL,
-        hyper::header::HeaderValue::from_static(ASSET_CACHE_CONTROL),
-    );
-}
-
 /// 资产缓存键：无会话/无变体，只按编码分桶；`-k` 进跨会话 keep/ 目录。
 fn asset_cache_key(uri: &http::Uri, host: &str, enc: &str) -> String {
     let enc_tag = match enc {
@@ -283,9 +272,7 @@ pub(super) fn cache_take(
                 body.len() / 1024
             ));
         }
-        let mut hit = rebuild_cached_response(status, &hdrs, body);
-        stamp_asset_immutable(&mut hit);
-        return Some(hit);
+        return Some(rebuild_cached_response(status, &hdrs, body));
     }
     // 仓库首页无尾杠：尾杠版已在缓存 → 本地 301（省一次上游往返；
     // 浏览器落到尾杠地址后相对链接才解析得对）。尾杠版没缓存则正常回源。
@@ -989,8 +976,6 @@ async fn cache_put_asset(
                 .body(protocol::full_body(bytes))
                 .unwrap();
             *rebuilt.headers_mut() = parts.headers;
-            // 哈希 URL 内容永不变：浏览器留一年，下次连本代理都不用问。
-            stamp_asset_immutable(&mut rebuilt);
             rebuilt
         }
         Err(_) => hyper::Response::builder()
