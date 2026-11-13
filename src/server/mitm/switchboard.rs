@@ -1,7 +1,9 @@
-//! 总机：浏览器 ↔ GitHub 的第一接头人。host 级路由政策的单点——
-//! 会话域/其他 → 直连串发；镜像回落域 → 镜像+直连同台；切片资格 → 多段并发；
-//! 其余 → 直连单流。mitm_http 只管缓冲与响应善后（缓存失效/写路由），
-//! 「谁该去哪个科室」只看这里。
+//! 总机：浏览器 ↔ GitHub 的第一接头人。URL 级分诊政策的单点——
+//! 缓存已在上游先行（page_cache）；这里按 URL 属性分科室：
+//! - 镜像回落域（big/附件）→ 镜像加速（mirror_or_direct：ECT 同台 + 串发兜底）；
+//! - 切片资格域（静态资源）→ 切片加速（direct_split：片数由本文件策略下发）；
+//! - 其余 → 直连线路优化（get_direct，通道池+建连机器人供血）。
+//! mitm_http 只管缓冲与响应善后（缓存失效/写路由），「谁去哪个科室」只看这里。
 use super::{
     direct_split, dns_direct_fetch, gh_defuse, get_direct, mirror, mirror_or_direct,
     mitm_unavailable, write_upstream, UpstreamInfo,

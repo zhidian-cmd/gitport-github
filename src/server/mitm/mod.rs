@@ -514,7 +514,8 @@ fn direct_leg<'a>(
     fetch
 }
 
-/// 两条路径共用的镜像链派发：组装直连腿 + chain_fetch + 按胜出者写诊断头。
+/// 镜像加速派发（两处共用）：组装直连腿 + chain_fetch + 按胜出者写诊断头。
+/// ECT 同台竞速为主，串发链序只在直连腿失败后兜底（mirror.rs 的 walk_order）。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
