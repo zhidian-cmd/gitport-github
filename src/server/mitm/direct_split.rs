@@ -399,8 +399,12 @@ pub(super) async fn try_direct_split(
         return None;
     }
     // 先直连后镜像：每段 5s 界——头拿不到/段失败立即换镜像，体在 SegmentedBody 里继续受界。
+    // Script（githubassets）无救援：公共镜像不收该域（实测零字节），段直连独走，链都不查。
     let t0 = Instant::now();
-    let chain = pool::mirror_chain(kind.chain());
+    let chain = match kind {
+        MediaKind::Script => Vec::new(),
+        _ => pool::mirror_chain(kind.chain()),
+    };
     let n = chans.len();
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let up = chans[i % n].clone();
@@ -479,17 +483,22 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
+    // 链空（Script / 未配镜像）= 无救援：不挂救援上下文——段直连独走，不检查不等待。
+    let rescue = if chain.is_empty() {
+        None
+    } else {
+        Some(RescueCtx {
+            tpl: tpl.clone(),
+            kind,
+            chain,
+            log: log.clone(),
+        })
+    };
     let body = BoxBody::new(
         SegmentedBody::build(
             entries,
             total,
-            Some(RescueCtx {
-                tpl: tpl.clone(),
-                kind,
-                chain,
-                host: host.to_string(),
-                log: log.clone(),
-            }),
+            rescue,
             t0,
             Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
         )
@@ -541,7 +550,6 @@ struct RescueCtx {
     tpl: Tpl,
     kind: MediaKind,
     chain: Vec<String>,
-    host: String,
     log: LogFn,
 }
 
@@ -669,33 +677,19 @@ impl hyper::body::Body for SegmentedBody {
             if seg.done {
                 continue;
             }
-            // 5s 界：没拉完就冻结直连体，buf 榨干后从已交付偏移起镜像续传。
-            // 链没配置或熔断开着 = 救援注定失败：不冻结不判死，继续骑直连流（慢会自己恢复）。
-            if !seg.no_rescue
+            // 5s 界（仅配置了救援链的段）：没拉完就冻结直连体，镜像从已交付偏移续传。
+            // 无救援上下文（镜像退场/未配置）：段直连独走——不检查、不等待、不落日志。
+            if me.rescue.is_some()
+                && !seg.no_rescue
                 && !seg.rescue_due
                 && seg.got < seg.expected
                 && seg.started.elapsed() >= me.rescue_after
             {
-                match &me.rescue {
-                    Some(ctx)
-                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain())
-                            && !ctx.chain.is_empty() =>
-                    {
+                if let Some(ctx) = &me.rescue {
+                    if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain()) {
                         seg.rescue_due = true;
                     }
-                    _ => {
-                        seg.no_rescue = true;
-                        // 空链/熔断：救援注定失败，改为静默等直连——但要让"图卡住"有据可查。
-                        if let Some(ctx) = &me.rescue {
-                            if super::quiet::first_time("split-nochain", &ctx.host) {
-                                (ctx.log)(&format!(
-                                    "[直连切片] {} 无{}救援链可用, 段停滞改为等待直连",
-                                    ctx.host,
-                                    ctx.kind.chain()
-                                ));
-                            }
-                        }
-                    }
+                    // 熔断开着：不置位不判死，继续骑直连流（60s 后熔断关，救援自然恢复）。
                 }
             }
             if seg.rescue_due {

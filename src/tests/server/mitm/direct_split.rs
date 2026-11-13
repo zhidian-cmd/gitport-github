@@ -245,12 +245,10 @@ impl hyper::body::Body for StallBody {
     }
 }
 
-/// 5s 界拨到 0、救援链为空：直连段不得被判死——标记 no_rescue 后继续骑直连流
+/// 5s 界拨到 0、无救援上下文：直连段不得被判死——继续骑直连流
 /// （回归：冻结后救援必败曾把能自愈的停滞毁成整图错误）。
 #[tokio::test]
 async fn empty_rescue_chain_never_kills_stalled_segment() {
-    use super::{RescueCtx, MediaKind};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     let _g = crate::pool::TEST_LOCK
@@ -268,13 +266,7 @@ async fn empty_rescue_chain_never_kills_stalled_segment() {
     let mut body = SegmentedBody::build(
         entries,
         30,
-        Some(RescueCtx {
-            tpl: tpl(),
-            kind: MediaKind::Image,
-            chain: Vec::new(), // 未配置救援链
-            host: "raw.example.com".to_string(),
-            log: Arc::new(|_| {}),
-        }),
+        None, // 未配置救援链 = 无救援上下文，段直连独走
         Instant::now(),
         Duration::ZERO,
     );
@@ -295,9 +287,8 @@ async fn empty_rescue_chain_never_kills_stalled_segment() {
             Ok(None) | Err(_) => {} // Pending：直连流挂着等数据，正是期望
         }
     }
-    assert!(!err, "空链不许把停滞段判死");
+    assert!(!err, "无救援不许把停滞段判死");
     assert_eq!(delivered, 6, "只交付直连已到的字节");
-    assert!(body.segs[0].no_rescue, "空链应标记不可救援并解冻");
 }
 
 /// 救援换体算术：直连交付的连续前缀 + 镜像续传 = 与整文件逐字节一致（图会不会花的核心）。
@@ -326,7 +317,6 @@ async fn rescue_swap_continues_byte_stream() {
             tpl: tpl(),
             kind: MediaKind::Image,
             chain: vec!["https://unused.example.com".to_string()],
-            host: "raw.example.com".to_string(),
             log: Arc::new(|_| {}),
         }),
         Instant::now(),
