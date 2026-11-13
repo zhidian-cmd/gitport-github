@@ -152,44 +152,7 @@ fn single_channel_reason_separates_rule_from_shortage() {
     assert_ne!(other, rule);
 }
 
-/// 主副分工：会话域只有主腿；其余候选空 IP 够两家才开副腿去拨（复用归池子的骑池）。
-#[test]
-fn leg_plan_session_single_others_dual_when_room() {
-    // 会话域：只有主通道，绝不跨 IP。
-    assert_eq!(
-        plan_legs(true, 5),
-        LegPlan {
-            primary: true,
-            vice_dial: false,
-        }
-    );
-    // 空 IP 够两家：主副都去拨。
-    assert_eq!(
-        plan_legs(false, 2),
-        LegPlan {
-            primary: true,
-            vice_dial: true,
-        }
-    );
-    // 只剩一个空 IP：老实单通道，不硬凑。
-    assert_eq!(
-        plan_legs(false, 1),
-        LegPlan {
-            primary: true,
-            vice_dial: false,
-        }
-    );
-    // 全被已有通道占住：一条腿都发不出来（会话域交上层走兜底）。
-    assert_eq!(
-        plan_legs(true, 0),
-        LegPlan {
-            primary: false,
-            vice_dial: false,
-        }
-    );
-}
-
-/// host 三分类：内容域双通道；会话域单通道自建优先；大文件/docs 单通道复用优先。
+/// host 三分类：内容域单通道竞速；会话域单通道自建优先；大文件/docs 单通道复用优先。
 #[test]
 fn host_classes_split_content_session_and_other() {
     let _g = crate::pool::TEST_LOCK

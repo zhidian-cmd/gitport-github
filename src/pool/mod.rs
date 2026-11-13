@@ -563,7 +563,6 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
                 && !r.flags.content
                 && !r.flags.session
                 && !r.flags.big
-                && !r.flags.dual
                 && r.fallback == route::Fallback::Dns;
             !(plain && served.contains(r.key.as_str()))
         })
@@ -580,9 +579,6 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>) -> String {
             }
             if r.flags.big {
                 fields.push("\"big\": true".to_string());
-            }
-            if r.flags.dual {
-                fields.push("\"dual\": true".to_string());
             }
             if r.fallback == route::Fallback::MirrorDns {
                 fields.push("\"fallback\": \"mirror\"".to_string());

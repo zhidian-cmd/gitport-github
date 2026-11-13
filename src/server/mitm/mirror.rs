@@ -940,12 +940,11 @@ async fn split_download(
     if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
-    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连双通道各 1 份共 2 份——
-    // 段多了在黑洞窗集体空转，直连两段一通道一段更稳。两份共享同一份负载记账。
-    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 2);
+    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连单通道 1 份——
+    // 实测 185.199 段聚合水管恒定，直连多段只摊薄窗口不加吞吐。
+    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 1);
     for m in &idle_src {
         if m.starts_with("direct/") {
-            idle.push(*m);
             idle.push(*m);
         } else {
             for _ in 0..3 {
@@ -1006,8 +1005,8 @@ async fn split_download(
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数×3 + 直连 2 份（双通道各 1）：镜像一家 3 份细切。
-            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 2, idle.len());
+            // 段位总数 = 镜像数×3 + 直连 1 份：镜像一家 3 份细切。
+            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 1, idle.len());
             (plan.want, Some(plan))
         }
         None => (

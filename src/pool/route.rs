@@ -29,9 +29,6 @@ pub struct Flags {
     pub session: bool,
     /// 大文件域：单通道（一条长流占满槽位）+ 大镜像链。数据源自 mirrors_big 键集。
     pub big: bool,
-    /// 双通道（竞速取前二）：仅高扇出内容域（githubassets 实测 p50 1036→332ms）。
-    /// 其余内容域取一——在途常态远低于上限，第二条通道整生命周期晒太阳。
-    pub dual: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,9 +54,6 @@ pub struct HostSpec {
     /// 大文件域：单通道 + 大镜像链。
     #[serde(default)]
     pub big: bool,
-    /// 双通道（竞速取前二）：高扇出内容域专用。
-    #[serde(default)]
-    pub dual: bool,
     /// "dns"（默认）或 "mirror"。
     #[serde(default)]
     pub fallback: Option<String>,
@@ -166,7 +160,6 @@ impl RouteRow {
                 content: spec.content,
                 session: spec.session,
                 big: spec.big,
-                dual: spec.dual,
             },
             fallback,
             bare,

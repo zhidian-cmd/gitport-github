@@ -99,13 +99,6 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     }
 }
 
-/// 是否保留双通道（竞速取前二 / 镜像配额直连双腿）：非会话域且带 `dual` 标志的 host。
-/// 高扇出域（githubassets）二三十条并发流摊两条连接，实测 p50 1036→332ms；
-/// 其余内容域在途常态远低于上限——第二条通道整生命周期晒太阳，取一。
-fn dual_channel(host: &str) -> bool {
-    host_class(host) != HostClass::Session
-        && pool::route::route_for(host).is_some_and(|r| r.flags.dual)
-}
 /// 会话域：建连时自建优先，连上了再复用自己那条。
 pub(crate) fn prefer_own_channel(host: &str) -> bool {
     host_class(host) == HostClass::Session
@@ -558,24 +551,6 @@ fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> Str
     }
 }
 
-/// 这一轮发哪几条腿。内容域建连已整体走竞速（dial_upstream 提前分流），本函数
-/// 实际只接单通道域（会话/其他）——活路径恒只发主腿；副腿参数留给双通道回归那天。
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct LegPlan {
-    /// 主通道：还有没被已有通道占用的 IP 就发，串发新建。
-    pub primary: bool,
-    /// 副通道拨号：仅双通道域且空 IP 够两家才发（当前活路径恒 false）。
-    pub vice_dial: bool,
-}
-
-/// 入参 = 是否单通道域：是则不设副腿（会话域防风控/低频域规则），否则空 IP 够两家发副腿。
-pub(crate) fn plan_legs(session: bool, free: usize) -> LegPlan {
-    LegPlan {
-        primary: free > 0,
-        vice_dial: !session && free >= 2,
-    }
-}
-
 /// 竞速腿：自己的腿带实测 dial_ms；池内现成通道（并集参赛）pooled=true，
 /// 耗时读延迟表，交付时不再入库。
 #[derive(Clone)]
@@ -594,7 +569,7 @@ pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
 }
 
 /// 内容域竞速建连：该 host 的**全部**候选 IP 一 IP 一条腿并发拨（数量随域的 IP 组走），
-/// 按拨号耗时取最快的两条入池，其余当场关闭。建连机器人返回最快那条。
+/// 按拨号耗时取最快的一条入池，其余当场关闭。建连机器人返回最快那条。
 const RACE_WINDOW_SECS: u64 = 8;
 
 async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
@@ -704,10 +679,9 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
         }
     });
     let mut ranked = rank_legs(got);
-    // 按拨号耗时取最快的 keep 条，落败腿关闭；传输快慢由真实请求记账与
+    // 按拨号耗时取最快一条，落败腿关闭；传输快慢由真实请求记账与
     // 黑洞看门狗兜底，竞速不再做测速预判。
-    let keep = if dual_channel(host) { 2 } else { 1 };
-    let keep = keep.min(ranked.len());
+    let keep = ranked.len().min(1);
     let winners: Vec<RaceLeg> = ranked.drain(..keep).collect();
     // 落败腿：自己的主动关闭不入池；池内的本来就在池里，不动。
     for leg in ranked {
@@ -727,31 +701,22 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
         })
         .collect();
     let mut kept: Vec<H2Upstream> = Vec::new();
-    for (i, mut leg) in winners.into_iter().enumerate() {
+    for leg in winners.into_iter() {
         if leg.pooled {
             // 别人家的现成通道：已在池里，直接交付，不重复入库。
             kept.push(leg.up);
         } else {
-            // 第二名按副通道记账（游标键分开），第一名仍是主通道。
-            if i == 1 {
-                leg.up.slot = 2;
-            }
             kept.push(store_h2(&leg.ip, leg.up));
         }
     }
     (log)(&format!(
-        "[建连] {host} {}: {}",
-        if keep >= 2 {
-            "竞速取前二"
-        } else {
-            "竞速取最速"
-        },
+        "[建连] {host} 竞速取最速: {}",
         summary.join(" / ")
     ));
     Ok(kept.remove(0))
 }
 
-/// 串发建连（会话域/低频域恒单腿；内容域不走这里，见 race_build 竞速）。
+/// 串发建连（会话域/低频域恒单腿单通道；内容域不走这里，见 race_build 竞速）。
 /// 全局认领保证同一个 IP 全进程同时只有一条腿在拨；只建新的、不查池——查池归 get_or_build。
 async fn dial_h2_race(
     host: &str,
@@ -769,52 +734,31 @@ async fn dial_h2_race(
     } else {
         distinct
     };
-    // 单通道判定：内容域之外都是。
-    let single = !dual_channel(host);
-    let legs = plan_legs(single, free);
-
-    let mut launched = 0usize;
-    // 一条腿 = 一个拨号任务：串发选 IP → h2 握手 → 入库，结果回执 tx。
-    let dial_leg = |slot: u8, prefer_shared: Option<bool>, tx: tokio::sync::mpsc::Sender<Result<H2Upstream, String>>| {
-        let host = host.to_string();
-        let log2 = log.clone();
-        let skip = occupied.to_vec();
-        tokio::spawn(async move {
-            let r = h2_dial_slot(&host, &log2, &skip, slot, prefer_shared).await;
-            let _ = tx.send(r).await;
-        });
-    };
-    if legs.primary {
-        // 主通道：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证；游标用主键。
-        dial_leg(1, Some(false), tx.clone());
-        launched += 1;
-    }
-    if legs.vice_dial {
-        // 副通道：共享档礼让在前，游标用 _vice 副键（当前活路径不发出，见 plan_legs）。
-        dial_leg(2, Some(true), tx.clone());
-        launched += 1;
-    }
-    if launched == 0 {
+    if free == 0 {
         // 会话域候选全被占：重拨必被 store_h2 作废，立即交兜底。
         return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
-    drop(tx);
-    // 副腿发出时两条腿同时拨 = 一次等待把两条容量通道都建好；只发主通道时说清为什么单通道。
-    if legs.primary && legs.vice_dial {
-        (log)(&format!("[建连] {host} 主副双通道同时开建"));
-    } else if legs.primary {
-        (log)(&format!(
-            "[建连] {host} 单通道({})",
-            single_channel_reason(host_class(host), distinct, free)
-        ));
-    }
-    // 等第一个成功;两个全败则整组失败
+    // 单腿串发：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证；游标用主键。
+    tokio::spawn({
+        let host = host.to_string();
+        let log2 = log.clone();
+        let skip = occupied.to_vec();
+        async move {
+            let r = h2_dial_slot(&host, &log2, &skip, 1, Some(false)).await;
+            let _ = tx.send(r).await;
+        }
+    });
+    (log)(&format!(
+        "[建连] {host} 单通道({})",
+        single_channel_reason(host_class(host), distinct, free)
+    ));
+    // 等串发结果
     let mut last: Option<String> = None;
     let won = loop {
         match rx.recv().await {
             Some(Ok(up)) => break up,
             Some(Err(e)) => last = Some(e),
-            None => return Err(last.unwrap_or_else(|| "并行建连全败".into())),
+            None => return Err(last.unwrap_or_else(|| "串发建连全败".into())),
         }
     };
     // 晚成腿已自入库，不等不补——重建是下一个请求自己的事。
