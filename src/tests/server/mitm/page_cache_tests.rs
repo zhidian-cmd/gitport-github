@@ -147,13 +147,14 @@ fn repo_home_canonical_and_asset_gate() {
     assert!(is_asset_path("/assets/main-abc.css"));
     assert!(!is_asset_path("/assets/logo.png"));
     assert!(!is_asset_path("/other/x.js"));
-    // 资产键：无会话、按编码分桶、进 keep 目录（-k 结尾）
+    // 资产键：无会话、按编码分桶、进 keep 目录（-ak 结尾 → -k 前缀命中）
     let k = asset_cache_key(
         &"/assets/index-CP7YztOi.js".parse::<http::Uri>().unwrap(),
         "github.githubassets.com",
         "br",
     );
-    assert!(k.ends_with("-br-k"), "{k}");
+    assert!(k.ends_with("-br-ak"), "{k}");
+    assert!(k.ends_with("-ak"), "{k}");
     assert!(!k.contains("-s"), "资产键不得带会话号: {k}");
 }
 
