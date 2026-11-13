@@ -76,11 +76,16 @@ fn segment_request_keeps_credentials_and_sets_exact_range() {
         req.headers().get("proxy-authorization").unwrap(),
         "Basic SECRET"
     );
-    // 这几类会改变段语义或属于逐跳头，必须剥掉。
-    for k in ["if-none-match", "if-range", "accept-encoding", "connection"] {
+    // 这几类会改变段语义或属于逐跳头，必须剥掉。accept-encoding 透传（压缩协商）。
+    for k in ["if-none-match", "if-range", "connection"] {
         assert!(req.headers().get(k).is_none(), "{k} 不该被复制进段请求");
     }
     assert_eq!(req.headers().get("user-agent").unwrap(), "bench/1.0");
+    assert_eq!(
+        req.headers().get("accept-encoding").unwrap(),
+        "gzip",
+        "压缩协商必须透传——切片按压缩流字节切"
+    );
     assert_eq!(
         req.headers().get("host").unwrap(),
         "raw.githubusercontent.com"
@@ -165,9 +170,11 @@ fn range_helpers_parse_206_headers() {
 
 #[test]
 fn hop_by_hop_and_range_headers_are_not_carried_to_client() {
-    for k in ["content-range", "content-length", "transfer-encoding", "connection", "content-encoding"] {
+    for k in ["content-range", "content-length", "transfer-encoding", "connection"] {
         assert!(skip_response_header(k), "{k} 必须剥掉");
     }
+    // content-encoding 透传：压缩流原样交浏览器解压，代理不花 CPU。
+    assert!(!skip_response_header("content-encoding"));
     assert!(!skip_response_header("content-type"), "图片 content-type 必须保留");
     assert!(!skip_response_header("etag"));
     assert!(!skip_request_header("cookie"));

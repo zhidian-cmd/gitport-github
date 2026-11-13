@@ -95,6 +95,9 @@ impl Tpl {
     }
 }
 
+/// 段/探片请求头过滤：Range 语义头与逐跳头不透传；条件头剥掉（探片/段不该 304）。
+/// accept-encoding **透传**：上游压缩后传输量缩 3 倍（8.6MB→2.87MB 实测），切片按
+/// 压缩流字节切，段拼接仍是完整压缩流，content-encoding 原样交浏览器解压。
 fn skip_request_header(k: &str) -> bool {
     matches!(
         k,
@@ -102,7 +105,6 @@ fn skip_request_header(k: &str) -> bool {
             | "if-range"
             | "if-none-match"
             | "if-modified-since"
-            | "accept-encoding"
             | "connection"
             | "proxy-connection"
             | "transfer-encoding"
@@ -122,7 +124,6 @@ pub(super) fn skip_response_header(k: &str) -> bool {
             | "content-length"
             | "transfer-encoding"
             | "connection"
-            | "content-encoding"
             | "keep-alive"
             | "proxy-connection"
     )
