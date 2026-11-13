@@ -73,10 +73,26 @@ fn no_cache_header_bypasses_cache() {
         None,
         true
     ));
-    assert!(!cache_eligible_rules(
+    // 仓库首页（两段）现在准入：v6.2 起仓库页入缓存
+    assert!(cache_eligible_rules(
         "github.com",
         &Method::GET,
         "/octocat/repo",
+        None,
+        true
+    ));
+    assert!(cache_eligible_rules(
+        "github.com",
+        &Method::GET,
+        "/octocat/repo/",
+        None,
+        true
+    ));
+    // 三段非列表段仍不准入
+    assert!(!cache_eligible_rules(
+        "github.com",
+        &Method::GET,
+        "/octocat/repo/foo",
         None,
         true
     ));
@@ -109,6 +125,36 @@ fn search_query_normalization() {
     // 非 /search：原样保留（顺序与 p=1 都不动）
     let repo = mk("/octocat/repo/issues", Some("q=1&page=2"));
     assert!(repo.contains("?q=1&page=2"), "其他路径的查询串不能被归一化");
+    // v6.2：默认页显式补 p=1（无 p 的键里必须出现 p=1）
+    assert!(base.contains("p=1"), "无 p 的搜索键应补 p=1: {base}");
+    // 翻到第 N 页不能被合并成第一页
+    let p2 = mk("/search", Some("q=rust&type=repositories&p=2"));
+    assert_ne!(p2, base, "p=2 与默认页必须不同键");
+    assert!(p2.contains("p=2"));
+}
+
+/// v6.2：仓库首页键归一（/owner/repo 与 /owner/repo/ 同键）与资产准入。
+#[test]
+fn repo_home_canonical_and_asset_gate() {
+    let mk = |path: &str| page_cache_key(&path.parse::<http::Uri>().unwrap(), "github.com", None, "br");
+    assert_eq!(
+        mk("/octocat/repo"),
+        mk("/octocat/repo/"),
+        "仓库首页无尾杠与有尾杠必须同键"
+    );
+    // 资产路径判定
+    assert!(is_asset_path("/assets/index-CP7YztOi.js"));
+    assert!(is_asset_path("/assets/main-abc.css"));
+    assert!(!is_asset_path("/assets/logo.png"));
+    assert!(!is_asset_path("/other/x.js"));
+    // 资产键：无会话、按编码分桶、进 keep 目录（-k 结尾）
+    let k = asset_cache_key(
+        &"/assets/index-CP7YztOi.js".parse::<http::Uri>().unwrap(),
+        "github.githubassets.com",
+        "br",
+    );
+    assert!(k.ends_with("-br-k"), "{k}");
+    assert!(!k.contains("-s"), "资产键不得带会话号: {k}");
 }
 
 /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。

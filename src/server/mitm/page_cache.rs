@@ -83,6 +83,55 @@ fn is_search_page(path: &str) -> bool {
     path == "/search"
 }
 
+/// 仓库首页：/owner/repo（两段，可带尾斜杠）。整页 HTML 列表语义。
+fn is_repo_home(path: &str) -> bool {
+    path.split('/').filter(|s| !s.is_empty()).count() == 2 && !path.is_empty()
+}
+
+/// 缓存键的路径归一：仓库首页补尾斜杠（/owner/repo 与 /owner/repo/ 同键）。
+fn canonical_path(path: &str) -> String {
+    if is_repo_home(path) && !path.ends_with('/') {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    }
+}
+
+/// /owner/repo → /owner/repo/ 的完整 URI（保留查询串），本地 301 的键用。
+fn slash_uri(req: &hyper::Request<Incoming>, host: &str) -> http::Uri {
+    let q = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    format!("https://{host}{}/{q}", req.uri().path())
+        .parse()
+        .unwrap_or_else(|_| req.uri().clone())
+}
+
+/// JS/CSS 资产（内容哈希 URL 永不变）：独立准入，跨会话长寿命。
+const ASSET_HOST: &str = "github.githubassets.com";
+/// 资产单文件上限：大 index.js 才是大头，放宽到 16MB（页面仍 2MB）。
+const ASSET_MAX_BYTES: usize = 16 << 20;
+
+fn is_asset_path(path: &str) -> bool {
+    path.starts_with("/assets/") && (path.ends_with(".js") || path.ends_with(".css"))
+}
+
+fn is_asset_req<B>(host: &str, req: &hyper::Request<B>) -> bool {
+    host == ASSET_HOST && req.method() == Method::GET && is_asset_path(req.uri().path())
+}
+
+/// 资产缓存键：无会话/无变体，只按编码分桶；`-k` 进跨会话 keep/ 目录。
+fn asset_cache_key(uri: &http::Uri, host: &str, enc: &str) -> String {
+    let enc_tag = match enc {
+        "br" => "-br",
+        "gzip" => "-gz",
+        _ => "-id",
+    };
+    format!("GET {host}{}{enc_tag}-k", uri.path())
+}
+
 /// 条目落点：键尾 `-k` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     if key.ends_with("-k") {
@@ -200,7 +249,7 @@ fn cache_eligible_rules(
             .unwrap_or(false)
         && (is_xhr_path(path)
             || is_search_page(path)
-            || (doc_nav && (is_list_path(path) || is_home_path(path))))
+            || (doc_nav && (is_list_path(path) || is_home_path(path) || is_repo_home(path))))
 }
 
 /// 取路由：命中 = 纯本地读（对 GitHub 零请求）；未命中/空闲后第一页 = None，走上游。
@@ -209,6 +258,44 @@ pub(super) fn cache_take(
     req: &hyper::Request<Incoming>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
+    // JS/CSS 资产（内容哈希 URL 不可变）：跨会话直出，不掺会话/导航判定。
+    if is_asset_req(host, req) {
+        let key = asset_cache_key(req.uri(), host, upstream::encoding_bucket(req));
+        let (status, hdrs, body) = match load_disk_entry_reason(&key, false) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        if super::quiet::first_time("cachehit", req.uri().path()) {
+            (log)(&format!(
+                "[缓存] 命中 {} ({}KB 本地)",
+                req.uri().path(),
+                body.len() / 1024
+            ));
+        }
+        return Some(rebuild_cached_response(status, &hdrs, body));
+    }
+    // 仓库首页无尾杠：尾杠版已在缓存 → 本地 301（省一次上游往返；
+    // 浏览器落到尾杠地址后相对链接才解析得对）。尾杠版没缓存则正常回源。
+    if is_repo_home(req.uri().path()) && !req.uri().path().ends_with('/') {
+        let cookies = all_cookies(req.headers());
+        let slash_key = live_cache_key(
+            &slash_uri(req, host),
+            host,
+            cookies.as_deref(),
+            upstream::encoding_bucket(req),
+            "",
+        );
+        if load_disk_entry_reason(&slash_key, false).is_ok() {
+            let resp = axum::response::Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(hyper::header::LOCATION, format!("{}/", req.uri().path()))
+                .body(BoxBody::new(protocol::full_body(Bytes::new())))
+                .ok()?;
+            (log)(&format!("[缓存] 本地 301 {}", req.uri().path()));
+            return Some(resp);
+        }
+        return None;
+    }
     let xhr = is_xhr_nav(req, host);
     let search_page = is_search_page(req.uri().path());
     if !is_doc_nav(req) && !xhr && !search_page {
@@ -292,6 +379,10 @@ pub(super) async fn cache_put(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+    // JS/CSS 资产：不可变内容，独立存取（跳过会话/导航/正文类型门）。
+    if is_asset_req(host, req) {
+        return cache_put_asset(log, req, host, resp).await;
+    }
     if !cache_eligible(req, host) {
         if search_dbg {
             (log)(&format!("[缓存] 拒存 {path_q} (非准入)"));
@@ -568,6 +659,7 @@ fn live_cache_key(
 }
 
 fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) -> String {
+    let path = canonical_path(uri.path());
     let q = uri
         .query()
         .map(|q| normalize_query(uri.path(), q))
@@ -579,22 +671,23 @@ fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str)
         "gzip" => "-gz",
         _ => "-id",
     };
-    format!("GET {host}{}{q}{cookie_tag}{enc_tag}", uri.path())
+    format!("GET {host}{path}{q}{cookie_tag}{enc_tag}")
 }
 
-/// /search 查询串归一化：去掉 p=1 并按键名排序；其他路径保持原样，个别接口参数顺序有语义。
+/// /search 查询串归一化：默认页显式补 p=1（无 p 与 p=1 同键），参数按键名排序；
+/// 其他路径保持原样，个别接口参数顺序有语义。
 fn normalize_query(path: &str, q: &str) -> String {
     if path != "/search" {
         return format!("?{q}");
     }
     let mut pairs: Vec<&str> = q.split('&').filter(|s| !s.is_empty()).collect();
     pairs.retain(|s| *s != "p=1");
-    pairs.sort_unstable();
-    if pairs.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", pairs.join("&"))
+    // 没给页码 = 第一页；补 p=1 让两种写法同键。
+    if !pairs.iter().any(|s| s.starts_with("p=")) {
+        pairs.push("p=1");
     }
+    pairs.sort_unstable();
+    format!("?{}", pairs.join("&"))
 }
 
 /// 这段正文的压缩编码（决定门检怎么解压）：gzip/br，其余按 identity。
@@ -837,6 +930,61 @@ fn persist_page_entry_blocking(
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })
+}
+
+/// 资产入库：200 才存；单文件上限 16MB；头照存（content-encoding 随体），Set-Cookie 剔。
+async fn cache_put_asset(
+    log: &LogFn,
+    req: &hyper::Request<Incoming>,
+    host: &str,
+    resp: axum::response::Response<BoxBody>,
+) -> axum::response::Response<BoxBody> {
+    if resp.status() != StatusCode::OK {
+        return resp;
+    }
+    let key = asset_cache_key(req.uri(), host, upstream::encoding_bucket(req));
+    let (parts, body) = resp.into_parts();
+    let hdrs: Vec<Vec<String>> = parts
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+        .collect();
+    match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            if bytes.len() <= ASSET_MAX_BYTES {
+                if super::quiet::first_time("cachesave", req.uri().path()) {
+                    (log)(&format!(
+                        "[缓存] 存入资产 {} ({}KB)",
+                        req.uri().path(),
+                        bytes.len() / 1024
+                    ));
+                }
+                worker_send(
+                    CacheMsg::Save {
+                        key,
+                        bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
+                        status: StatusCode::OK.as_u16(),
+                        hdrs,
+                    },
+                    log,
+                );
+            }
+            let mut rebuilt = hyper::Response::builder()
+                .status(parts.status)
+                .body(protocol::full_body(bytes))
+                .unwrap();
+            *rebuilt.headers_mut() = parts.headers;
+            rebuilt
+        }
+        Err(_) => hyper::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(protocol::full_body(Bytes::from_static(
+                b"asset collect failed",
+            )))
+            .unwrap(),
+    }
 }
 
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
