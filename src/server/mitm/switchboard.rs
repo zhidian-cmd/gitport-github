@@ -55,7 +55,7 @@ pub(super) async fn dispatch(
     // 不满足条件或段最终失败一律回单流；池冷/闸满同样回单流。
     if is_simple {
         if let Some(resp) = direct_split::try_direct_split(log, out_body, host, info, 8).await {
-            return Ok(write_upstream(resp, "direct-split", info));
+            return Ok(write_upstream(&log, resp, "direct-split", info, host, path));
         }
     }
     let mut resp = match get_direct(log, out_body, host, info, replay).await {
@@ -80,7 +80,7 @@ pub(super) async fn dispatch(
             }
             if is_simple {
                 match dns_direct_fetch(log, out_body, host, info, replay).await {
-                    Ok(r) => return Ok(write_upstream(r, "dns", info)),
+                    Ok(r) => return Ok(write_upstream(&log, r, "dns", info, host, path)),
                     Err(de) => {
                         (log)(&format!("[MITM] {host}{path} DNS 备用直连也失败({de})"));
                     }

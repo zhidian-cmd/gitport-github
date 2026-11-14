@@ -52,11 +52,16 @@ fn readme_image_cdns_are_allowed() {
         "camo.githubusercontent.com",
         "gist.githubusercontent.com",
         "avatars.githubusercontent.com",
-        "github.githubassets.com",
         "RAW.GitHubUserContent.com",
     ] {
         assert!(is_split_host(h), "{h} 应该是静态资源落点");
     }
+    // v6.7：githubassets 的 JS/CSS 不再切片——脚本分片直连独走无救援，一段卡死
+    // 整文件卡死（9MB index.js 实测从未走通），改单流直连 + 缓存兜底。
+    assert!(
+        !is_split_host("github.githubassets.com"),
+        "githubassets 不得再进切片"
+    );
 }
 
 #[test]

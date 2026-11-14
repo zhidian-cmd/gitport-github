@@ -133,29 +133,15 @@ fn search_query_normalization() {
     assert!(p2.contains("p=2"));
 }
 
-/// v6.2：仓库首页键归一（/owner/repo 与 /owner/repo/ 同键）与资产准入。
+/// v6.2：仓库首页键归一（/owner/repo 与 /owner/repo/ 同键）。
 #[test]
-fn repo_home_canonical_and_asset_gate() {
+fn repo_home_canonical() {
     let mk = |path: &str| page_cache_key(&path.parse::<http::Uri>().unwrap(), "github.com", None, "br");
     assert_eq!(
         mk("/octocat/repo"),
         mk("/octocat/repo/"),
         "仓库首页无尾杠与有尾杠必须同键"
     );
-    // 资产路径判定
-    assert!(is_asset_path("/assets/index-CP7YztOi.js"));
-    assert!(is_asset_path("/assets/main-abc.css"));
-    assert!(!is_asset_path("/assets/logo.png"));
-    assert!(!is_asset_path("/other/x.js"));
-    // 资产键：无会话、按编码分桶、进 keep 目录（-ak 结尾 → -k 前缀命中）
-    let k = asset_cache_key(
-        &"/assets/index-CP7YztOi.js".parse::<http::Uri>().unwrap(),
-        "github.githubassets.com",
-        "br",
-    );
-    assert!(k.ends_with("-br-ak"), "{k}");
-    assert!(k.ends_with("-ak"), "{k}");
-    assert!(!k.contains("-s"), "资产键不得带会话号: {k}");
 }
 
 /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
@@ -810,4 +796,18 @@ fn split_cookie_headers_still_fingerprint_account() {
     assert_eq!(session_value(Some(&joined)), Some("tok123"));
     assert_eq!(account_name(Some(&joined)), Some("zhidian-cmd"));
     assert_eq!(session_fingerprint(Some(&joined)), "-czhidian-cmd");
+}
+
+/// v6.9 资产缓存已停用并物理删除：JS/CSS 一律直连（实测 48 分钟 132 个请求 0 命中）。
+/// 本测试的存在就是文档——如果将来想重启资产缓存，先读 git 历史里这套机制的教训：
+/// 逻辑键互踩、手捏条目缺 CORS 头、强制单 token br 协商收窄，三颗雷都踩过。
+#[test]
+fn asset_cache_is_removed_by_design() {
+    // 没有可断言的函数了（is_asset_req/asset_cache_key 均已删除）。
+    // 这里只钉一个事实：页面缓存的键从不包含资产域。
+    let mk = |p: &str| page_cache_key(&p.parse::<http::Uri>().unwrap(), "github.com", None, "br");
+    assert!(
+        !mk("/octocat/repo").contains("githubassets"),
+        "页面键与资产域无关"
+    );
 }

@@ -1114,8 +1114,12 @@ pub fn upstream_request<B>(
         out = out.header(k, v);
     }
     // 只在客户端声明接受时才强制（curl/git 无解压能力，无条件强制曾致其解码失败）。
+    // v6.10：br 档改双档 "br, gzip"——单发 br 时（实测 GitHub 主站不吃 br）服务器
+    // 无可接受编码只能回 identity 裸奔 320KB；双档让服务器自选，永远有压缩可用。
     if sniffed {
-        let forced = if accepts_brotli(req) {
+        let forced = if accepts_brotli(req) && accepts_gzip(req) {
+            Some("br, gzip")
+        } else if accepts_brotli(req) {
             Some("br")
         } else if accepts_gzip(req) {
             Some("gzip")

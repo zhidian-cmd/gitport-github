@@ -35,7 +35,9 @@ use super::merge::SEG_BUFFER_MAX;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// host 白名单：静态资源 CDN 才切（大图与大 JS/CSS 同病同治）；会话域不在表内。
+/// host 白名单：静态资源 CDN 才切（图片/视频为主）；会话域不在表内。
+/// v6.7 起 githubassets 的 JS/CSS 不再切：脚本分片直连独走无救援，一段卡死整文件
+/// 卡死（9MB 的 index.js 实测从未走通），改单流直连 + 缓存兜底。
 pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -46,7 +48,6 @@ pub(super) fn is_split_host(host: &str) -> bool {
             | "camo.githubusercontent.com"
             | "gist.githubusercontent.com"
             | "avatars.githubusercontent.com"
-            | "github.githubassets.com"
     )
 }
 

@@ -56,40 +56,20 @@ fn on_by_default() -> bool {
     true
 }
 
-/// 初次使用（无 settings.json）时内置的镜像注册表：公共前缀型镜像，2026-11-13
-/// 逐一拨测（raw README 200+内容校验）后按耗时排序收录。公共镜像随时可能失效，
+/// 初次使用（无 settings.json）时内置的镜像注册表：公共前缀型镜像。2026-11-14 复测：
+/// 原 29 家全测（raw README 200+内容校验，5 种用法家族，双轮计时），1 家死亡
+/// （git.yylx.win 全模板超时），按耗时排序收录最优 8 家。公共镜像随时可能失效，
 /// 运行期探针/熔断自动淘汰；用户删掉后落盘即不再出现——默认值只在首启生效。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
     [
-        "https://github.chenc.dev",
-        "https://cdn.akaere.online",
-        "https://ghproxy.icu",
-        "https://ghgo.de5.net",
-        "https://gh.acmsz.top",
-        "https://gh.meali.top",
-        "https://ghp.keleyaa.com",
-        "https://tvv.tw",
-        "https://fastgit.cc",
-        "https://down.mxw.xx.kg",
-        "https://ghfile.geekertao.top",
-        "https://gh.07150721.xyz",
-        "https://eogh.719831.xyz",
-        "https://git.yylx.win",
-        "https://gh.sixyin.com",
-        "https://gh.jjj.gv.uy",
-        "https://gh-proxy.com",
-        "https://gh.dpik.top",
-        "https://ghproxy.felicity.land",
-        "https://jiashu.1win.eu.org",
-        "https://github.ikgy.top",
-        "https://gh.inkchills.cn",
-        "https://xsadwsd.kdns.fr",
-        "https://github.ednovas.xyz",
-        "https://cfgh.ikgy.top",
-        "https://ghproxy.monkeyray.net",
-        "https://git.669966.xyz",
-        "https://g.blfrp.cn",
-        "https://gh-proxy.org",
+        "https://gh-proxy.org",       // 788ms
+        "https://gh-proxy.com",       // 822ms
+        "https://ghgo.de5.net",       // 950ms
+        "https://ghfile.geekertao.top", // 972ms
+        "https://gh.meali.top",       // 1011ms
+        "https://github.chenc.dev",   // 1050ms
+        "https://gh.dpik.top",        // 1064ms
+        "https://ghproxy.icu",        // 1070ms
     ]
     .iter()
     .map(|u| WorkerMirror {

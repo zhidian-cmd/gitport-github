@@ -152,13 +152,14 @@ async fn mitm_http(
     let info = UpstreamInfo::default();
     // 页面缓存命中即秒回；勿加 SWR/ETag 验证，旧 cookie 重用会被判账号泄露。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
-        return write_upstream(cached, "cache", &info);
+        return write_upstream(&log, cached, "cache", &info, &host, &path_of(req.uri()));
     }
     // 头像入口 302 记忆：跳转目标按用户稳定，记住后本地直答，省掉每次渲染的来回。
     if req.method() == Method::GET {
         if let Some(loc) =
             redirect_memo::cached_location(&host, req.uri().path(), req.uri().query())
         {
+            let memo_path = path_of(req.uri());
             let _ = http_body_util::BodyExt::collect(req.into_body()).await;
             let resp = hyper::Response::builder()
                 .status(StatusCode::FOUND)
@@ -166,7 +167,7 @@ async fn mitm_http(
                 .header("cache-control", "no-cache")
                 .body(protocol::full_body(Bytes::new()))
                 .unwrap();
-            return write_upstream(resp, "302memo", &info);
+            return write_upstream(&log, resp, "302memo", &info, &host, &memo_path);
         }
     }
     let Ok(out) = upstream::upstream_request(&req, &host) else {
@@ -219,7 +220,13 @@ async fn mitm_http(
         .await
     {
         Ok(r) => r,
-        Err(bail) => return bail,
+        Err(bail) => {
+            (log)(&format!(
+                "[请求] {host}{path} -> {} (不可用兜底)",
+                bail.status()
+            ));
+            return bail;
+        }
     };
     // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
@@ -241,7 +248,7 @@ async fn mitm_http(
             HeaderValue::from_static("no-store"),
         );
     }
-    write_upstream(resp, "direct", &info)
+    write_upstream(&log, resp, "direct", &info, &host, &path)
 }
 /// codeload 的规范路径：/owner/repo/(zip|tar.gz)/refs/... 只存在于 codeload.github.com。
 /// 出现在 github.com 上必然是那条被错 IP 踢回来的死路径，主站一律 404。
@@ -348,7 +355,7 @@ async fn stream_passthrough(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
             ));
-            write_upstream(resp, "stream", info)
+            write_upstream(&log, resp, "stream", info, host, &path)
         }
         Ok(Err(e)) => {
             if let Some(h) = &pump {
@@ -541,7 +548,14 @@ async fn mirror_or_direct(
         .get::<&'static str>()
         .copied()
         .unwrap_or("mirror");
-    Ok(write_upstream(resp, route, info))
+    Ok(write_upstream(
+        log,
+        resp,
+        route,
+        info,
+        host,
+        &path_of(out_body.uri()),
+    ))
 }
 
 /// 直连腿：通道获取一站式在 pool::get_or_build，这里只管发请求与记账。
@@ -708,10 +722,15 @@ fn meter_body(
 }
 
 fn write_upstream(
+    log: &LogFn,
     resp: hyper::Response<BoxBody>,
     route: &str,
     info: &UpstreamInfo,
+    host: &str,
+    path: &str,
 ) -> axum::response::Response<BoxBody> {
+    // 调试抓包：每请求一行（host+路径+状态+科室），复用连接上的单个请求从此可见。
+    (log)(&format!("[请求] {host}{path} -> {} ({route})", resp.status()));
     let (mut parts, body) = resp.into_parts();
     parts.headers.remove("connection");
     parts.headers.remove("transfer-encoding");

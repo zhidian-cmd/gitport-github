@@ -1,16 +1,15 @@
-//! 列表页缓存：只缓存 github.com 列表页与跟班 XHR，按会话存活；存 pages/<hash>，不做后台 SWR，闸门页/未登录页/跨账号不缓存。
-//! v6.6 起兼任资产长期缓存：github.githubassets.com 的 JS/CSS 存 keep/，365 天 TTL + 后台重拉 + 容量清扫。
+//! 页面缓存：github.com 列表页/仓库页快照按会话分存（存 pages/<hash>），闸门页/未登录页/
+//! 跨账号不缓存。资产（JS/CSS）一律直连不缓存——v6.9 实测 48 分钟 132 个资产请求 0 命中，
+//! 机制与开关已物理删除（要找回来翻 git 历史）。
 use super::BoxBody;
-use crate::pool;
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
-use crate::util::{lock, now_ms, LogFn};
+use crate::util::{now_ms, LogFn};
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// 会话攒到这么多就整盘清空。
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
@@ -112,32 +111,11 @@ fn slash_uri(req: &hyper::Request<Incoming>, host: &str) -> http::Uri {
         .unwrap_or_else(|_| req.uri().clone())
 }
 
-/// JS/CSS 资产（内容哈希 URL 永不变）：独立准入，跨会话长寿命。
-const ASSET_HOST: &str = "github.githubassets.com";
-/// 资产单文件上限：大 index.js 才是大头，放宽到 16MB（页面仍 2MB）。
-const ASSET_MAX_BYTES: usize = 16 << 20;
-
-fn is_asset_path(path: &str) -> bool {
-    path.starts_with("/assets/") && (path.ends_with(".js") || path.ends_with(".css"))
-}
-
-fn is_asset_req<B>(host: &str, req: &hyper::Request<B>) -> bool {
-    host == ASSET_HOST && req.method() == Method::GET && is_asset_path(req.uri().path())
-}
-
-/// 资产缓存键：无会话/无变体，只按编码分桶；`-ak` 进跨会话 keep/ 目录。
-fn asset_cache_key(uri: &http::Uri, host: &str, enc: &str) -> String {
-    let enc_tag = match enc {
-        "br" => "-br",
-        "gzip" => "-gz",
-        _ => "-id",
-    };
-    format!("GET {host}{}{enc_tag}-ak", uri.path())
-}
-
-/// 条目落点：键尾 `-k`/`-ak` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
+/// 条目落点：键尾 `-k` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
+/// v6.9 资产缓存整体停用并物理删除：实测 48 分钟 132 个 githubassets 请求 0 命中
+/// （没变的 URL 浏览器自己消化，换哈希的代理也没见过），机制与开关一并移除。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
-    if key.ends_with("-k") || key.ends_with("-ak") {
+    if key.ends_with("-k") {
         dir.join("keep")
     } else {
         dir.join("pages")
@@ -146,8 +124,6 @@ fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
 
 /// 长寿命条目的保质期：GitHub 改版后旧骨架就是坏的，超期当 miss 重取。
 const KEEP_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-/// 资产条目保质期：内容哈希 URL 永不变，代理副本留一年；到期后台重拉。
-const ASSET_MAX_AGE_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
 /// 正文类型闸门：列表页只收 HTML，跟班 XHR 放宽到 JSON/纯文本。
 fn body_type_allowed(content_type: Option<&str>, xhr: bool) -> bool {
@@ -263,32 +239,6 @@ pub(super) fn cache_take(
     req: &hyper::Request<Incoming>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
-    // JS/CSS 资产（内容哈希 URL 不可变）：代理第二层长期缓存，跨会话/跨浏览器直出。
-    // 过期不判死：先交旧副本（前台丝滑）+ 后台单流重拉（慢无所谓），拉成覆盖入库。
-    if is_asset_req(host, req) {
-        let bucket = upstream::encoding_bucket(req);
-        let key = asset_cache_key(req.uri(), host, bucket);
-        match load_asset_entry(&key) {
-            Some(((status, hdrs, body), expired)) => {
-                if expired {
-                    (log)(&format!(
-                        "[缓存] 资产过期, 交旧副本 + 后台重拉 {}",
-                        req.uri().path()
-                    ));
-                    spawn_asset_refetch(log, host, req.uri().path(), bucket);
-                }
-                if super::quiet::first_time("cachehit", req.uri().path()) {
-                    (log)(&format!(
-                        "[缓存] 命中 {} ({}KB 本地)",
-                        req.uri().path(),
-                        body.len() / 1024
-                    ));
-                }
-                return Some(rebuild_cached_response(status, &hdrs, body));
-            }
-            None => return None,
-        }
-    }
     // 仓库首页无尾杠：尾杠版已在缓存 → 本地 301（省一次上游往返；
     // 浏览器落到尾杠地址后相对链接才解析得对）。尾杠版没缓存则正常回源。
     if is_repo_home(req.uri().path()) && !req.uri().path().ends_with('/') {
@@ -394,10 +344,6 @@ pub(super) async fn cache_put(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
-    // JS/CSS 资产：不可变内容，独立存取（跳过会话/导航/正文类型门）。
-    if is_asset_req(host, req) {
-        return cache_put_asset(log, req, host, resp).await;
-    }
     if !cache_eligible(req, host) {
         if search_dbg {
             (log)(&format!("[缓存] 拒存 {path_q} (非准入)"));
@@ -513,7 +459,6 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
                 }
                 CacheMsg::Purge => {
                     let n = wipe_pages(dir);
-                    sweep_assets_if_bloated(dir);
                     (log)(&format!(
                         "[缓存] 空闲超 {} 分钟, 清空 {n} 条",
                         IDLE_SESSION_GAP_MS / 60_000
@@ -795,17 +740,7 @@ fn load_disk_entry(
 /// 带拒绝原因的读取，供命中侧按需落日志。
 fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'static str> {    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
-    if key.ends_with("-ak") {
-        let age = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if age > ASSET_MAX_AGE_MS {
-            return Err("资产条目过期");
-        }
-    } else if key.ends_with("-k") {
+    if key.ends_with("-k") {
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -866,9 +801,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
         return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
     }
     // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
-    // 资产条目（-ak）没有 </html> 概念，跳过此门。
     if key.ends_with("-k")
-        && !key.ends_with("-ak")
         && hdrs.iter().any(|(k, v)| {
             k.as_str() == "content-type"
                 && v.to_str()
@@ -881,147 +814,6 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
         return Err("骨架条目截断(无</html>)");
     }
     Ok((status, hdrs, Bytes::copy_from_slice(body)))
-}
-
-/// 资产条目读取（独立于页面门检）：返回 (条目, 是否已过 365 天)。
-/// 页面的骨架/污染门检不适用——JS/CSS 没有 </html> 概念。
-fn load_asset_entry(key: &str) -> Option<(DiskEntry, bool)> {
-    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
-    let raw = std::fs::read(&path).ok()?;
-    if raw.len() < 4 {
-        return None;
-    }
-    let hlen = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    let end = 4usize.checked_add(hlen)?;
-    if raw.len() < end {
-        return None;
-    }
-    let header: serde_json::Value = serde_json::from_slice(&raw[4..end]).ok()?;
-    if header.get("key").and_then(|k| k.as_str()) != Some(key) {
-        return None;
-    }
-    let status = u16::try_from(header.get("status")?.as_u64()?).ok()?;
-    let hdrs: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> = header
-        .get("headers")?
-        .as_array()?
-        .iter()
-        .filter_map(|pair| {
-            let k = pair.get(0)?.as_str()?;
-            let v = pair.get(1)?.as_str()?;
-            Some((
-                hyper::header::HeaderName::from_bytes(k.as_bytes()).ok()?,
-                hyper::header::HeaderValue::from_bytes(v.as_bytes()).ok()?,
-            ))
-        })
-        .collect();
-    let expired = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|d| d.as_millis() as u64)
-        .is_some_and(|age| age > ASSET_MAX_AGE_MS);
-    Some(((status, hdrs, Bytes::copy_from_slice(&raw[end..])), expired))
-}
-
-/// 在途资产重拉去重：同一路径同时只跑一个后台任务。
-static ASSET_REFETCHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn asset_refetch_inflight(path: &str) -> bool {
-    let g = ASSET_REFETCHING.get_or_init(|| Mutex::new(HashSet::new()));
-    lock(g).insert(path.to_string())
-}
-
-fn asset_refetch_done(path: &str) {
-    let g = ASSET_REFETCHING.get_or_init(|| Mutex::new(HashSet::new()));
-    lock(g).remove(path);
-}
-
-/// 后台单流重拉过期资产：慢无所谓，拉成覆盖入库，失败保留旧副本下轮再试。
-/// 桶决定协商头：br 桶发 "br"，gzip 桶发 "gzip"，identity 桶不发。
-fn spawn_asset_refetch(log: &LogFn, host: &str, path: &str, enc: &str) {
-    if asset_refetch_inflight(path) {
-        return;
-    }
-    asset_refetch_inflight(path);
-    let host = host.to_string();
-    let path = path.to_string();
-    let enc = enc.to_string();
-    let log = log.clone();
-    tokio::spawn(async move {
-        let key = asset_cache_key(
-            &format!("https://{host}{path}")
-                .parse()
-                .unwrap_or_else(|_| "https://invalid.invalid/".parse().unwrap()),
-            &host,
-            &enc,
-        );
-        let ae_header = match enc.as_str() {
-            "br" => "br",
-            "gzip" => "gzip",
-            _ => return,
-        };
-        let (up, _) = match pool::get_or_build(&host, None, &path, &log).await {
-            Ok(v) => v,
-            Err(_) => {
-                asset_refetch_done(&path);
-                return;
-            }
-        };
-        let req = match hyper::Request::builder()
-            .uri(format!("https://{host}{path}"))
-            .header("accept-encoding", ae_header)
-            .body(protocol::empty_body())
-        {
-            Ok(r) => r,
-            Err(_) => {
-                asset_refetch_done(&path);
-                return;
-            }
-        };
-        let resp = match upstream::h2_send(&up, &req, &None::<Bytes>).await {
-            Ok(r) => r,
-            Err(_) => {
-                asset_refetch_done(&path);
-                return;
-            }
-        };
-        if resp.status() != http::StatusCode::OK {
-            asset_refetch_done(&path);
-            return;
-        }
-        // content-length 头在 into_body 消费前先取下；头与体一起拆出。
-        let declared = resp
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok());
-        let (rparts, rbody) = resp.into_parts();
-        let Ok(collected) = http_body_util::BodyExt::collect(rbody).await else {
-            asset_refetch_done(&path);
-            return;
-        };
-        let bytes = collected.to_bytes();
-        if declared.is_some_and(|n| n != bytes.len()) {
-            asset_refetch_done(&path);
-            return; // 截断副本不覆盖好副本
-        }
-        let hdrs: Vec<Vec<String>> = rparts
-            .headers
-            .iter()
-            .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
-            .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
-            .collect();
-        worker_send(
-            CacheMsg::Save {
-                key,
-                bytes,
-                status: http::StatusCode::OK.as_u16(),
-                hdrs,
-            },
-            &log,
-        );
-        asset_refetch_done(&path);
-    });
 }
 
 /// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。
@@ -1098,84 +890,6 @@ fn persist_page_entry_blocking(
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })
-}
-
-/// 资产入库：200 才存；单文件上限 16MB；头照存（content-encoding 随体），Set-Cookie 剔。
-async fn cache_put_asset(
-    log: &LogFn,
-    req: &hyper::Request<Incoming>,
-    host: &str,
-    resp: axum::response::Response<BoxBody>,
-) -> axum::response::Response<BoxBody> {
-    if resp.status() != StatusCode::OK {
-        return resp;
-    }
-    let key = asset_cache_key(req.uri(), host, upstream::encoding_bucket(req));
-    // 入库闸：content-length 头存在且与实收字节数不符 = 截断副本，拒存——
-    // 上次事故（1391KB 残缺副本被钉一年）的直接补丁。chunked 无该头靠 collect 完整性。
-    let declared = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    let (parts, body) = resp.into_parts();
-    let hdrs: Vec<Vec<String>> = parts
-        .headers
-        .iter()
-        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
-        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
-        .collect();
-    match http_body_util::BodyExt::collect(body).await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            if declared.is_some_and(|n| n != bytes.len()) {
-                if super::quiet::first_time("asset-trunc", req.uri().path()) {
-                    (log)(&format!(
-                        "[缓存] 资产截断拒存 {} (声明 {} 收到 {})",
-                        req.uri().path(),
-                        declared.unwrap_or(0),
-                        bytes.len()
-                    ));
-                }
-                let mut rebuilt = hyper::Response::builder()
-                    .status(parts.status)
-                    .body(protocol::full_body(bytes))
-                    .unwrap();
-                *rebuilt.headers_mut() = parts.headers;
-                return rebuilt;
-            }
-            if bytes.len() <= ASSET_MAX_BYTES {
-                if super::quiet::first_time("cachesave", req.uri().path()) {
-                    (log)(&format!(
-                        "[缓存] 存入资产 {} ({}KB)",
-                        req.uri().path(),
-                        bytes.len() / 1024
-                    ));
-                }
-                worker_send(
-                    CacheMsg::Save {
-                        key,
-                        bytes: bytes.clone(), // Bytes 引用计数浅克隆，跨线程零拷贝
-                        status: StatusCode::OK.as_u16(),
-                        hdrs,
-                    },
-                    log,
-                );
-            }
-            let mut rebuilt = hyper::Response::builder()
-                .status(parts.status)
-                .body(protocol::full_body(bytes))
-                .unwrap();
-            *rebuilt.headers_mut() = parts.headers;
-            rebuilt
-        }
-        Err(_) => hyper::Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(protocol::full_body(Bytes::from_static(
-                b"asset collect failed",
-            )))
-            .unwrap(),
-    }
 }
 
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
@@ -1343,38 +1057,6 @@ pub(super) fn invalidate_after_write(log: &LogFn, host: &str, path: &str) {
         },
         log,
     );
-}
-
-/// 资产目录容量清扫：keep/ 总量 > 500MB → 按修改时间从旧到新删到 ≤300MB。
-/// 旧哈希的资产不再被引用，删了无感；在用的新资产 mtime 新，排在队尾幸存。
-fn sweep_assets_if_bloated(dir: &std::path::Path) {
-    const CAP: u64 = 500 << 20;
-    const FLOOR: u64 = 300 << 20;
-    let Ok(rd) = std::fs::read_dir(dir.join("keep")) else {
-        return;
-    };
-    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = rd
-        .flatten()
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| {
-            let md = e.metadata().ok()?;
-            Some((e.path(), md.len(), md.modified().ok()?))
-        })
-        .collect();
-    let total: u64 = files.iter().map(|(_, l, _)| *l).sum();
-    if total <= CAP {
-        return;
-    }
-    files.sort_by_key(|(_, _, t)| *t);
-    let mut cur = total;
-    for (p, len, _) in &files {
-        if cur <= FLOOR {
-            break;
-        }
-        if std::fs::remove_file(p).is_ok() {
-            cur -= len;
-        }
-    }
 }
 
 /// 清空缓存（测试专用）。

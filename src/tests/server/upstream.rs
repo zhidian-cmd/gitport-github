@@ -113,8 +113,8 @@ fn forced_encoding_prefers_br_gzip_fallback() {
     let out = upstream_request(&req, "github.com").unwrap();
     assert_eq!(
         out.headers().get("accept-encoding").unwrap(),
-        "br",
-        "接受 br 的客户端应被强制 br（比 gzip 再小 16%）"
+        "br, gzip",
+        "接受 br 的客户端强制双档：服务器不吃 br 时自动落 gzip（实测主站不吃 br，单发 br 曾致 320KB identity 裸奔）"
     );
 
     let req_gz = hyper::Request::builder()
@@ -203,7 +203,7 @@ fn host_classes_split_content_session_and_other() {
     );
     // 会话域按风控面划界(主站族之外的数据不是主站): githubassets/github.io/githubapp
     // 不标 session——githubassets 的长寿命通道会占住 185.199.154/215 这 8 个三类横跨的
-    // 共享 IP。githubassets 回归内容域：直连恒 8 段切片（公共镜像不收 githubassets）。
+    // 共享 IP。githubassets 是内容域：单流直连（v6.9 起资产不切片不缓存）。
     assert_eq!(host_class("githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.io"), HostClass::Other);
