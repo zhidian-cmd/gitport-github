@@ -4,12 +4,13 @@
 use super::BoxBody;
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
-use crate::util::{now_ms, LogFn};
+use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use http::{Method, StatusCode};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// 会话攒到这么多就整盘清空。
 const PAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
@@ -293,22 +294,23 @@ pub(super) fn cache_take(
         upstream::encoding_bucket(req),
         variant,
     );
-    let (status, hdrs, body) = match load_disk_entry_reason(&key, session_value(cookies).is_some())
-    {
-        Ok(v) => v,
-        Err(reason) => {
-            // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
-            if search_page && reason != "无此条目" {
-                let path = req
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_else(|| req.uri().path().to_string());
-                (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+    let ((status, hdrs, body), swr_expired) =
+        match load_disk_entry_reason(&key, session_value(cookies).is_some())
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
+                if search_page && reason != "无此条目" {
+                    let path = req
+                        .uri()
+                        .path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| req.uri().path().to_string());
+                    (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
     // 命中要留痕：写盘是静默的，没有这行用户无从判断"到底用没用缓存"。
     let path = req
         .uri()
@@ -324,6 +326,19 @@ pub(super) fn cache_take(
     // 命中是常态：每路径只留首条，否则浏览高峰整页都是「缓存命中」。
     if super::quiet::first_time("cachehit", &path) {
         (log)(&format!("[缓存] 命中 {path} ({size} 本地)"));
+    }
+    // v6.11 SWR：过期 -k/-rk 快照不判死——交旧（浏览器缓存直出）+ 后台静默重拉（带 cookie）。
+    if swr_expired {
+        (log)(&format!("[缓存] 页面快照过期, 交旧 + 后台重拉 {path}"));
+        spawn_page_refetch(
+            log,
+            host,
+            &key,
+            &path,
+            cookies,
+            upstream::encoding_bucket(req),
+            session_value(cookies).is_some(),
+        );
     }
     Some(rebuild_cached_response(status, &hdrs, body))
 }
@@ -745,12 +760,14 @@ fn load_disk_entry(
     // 带会话却拿到未登录页 = 会话已死；匿名页必须能正常命中。
     logged_in: bool,
 ) -> Option<DiskEntry> {
-    load_disk_entry_reason(key, logged_in).ok()
+    load_disk_entry_reason(key, logged_in).ok().map(|(e, _)| e)
 }
 
-/// 带拒绝原因的读取，供命中侧按需落日志。
-fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'static str> {    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
+/// 带拒绝原因的读取，供命中侧按需落日志。第二个元素 = 页面快照是否过期（SWR 触发）。
+fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool), &'static str> {    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
+    // v6.11 SWR：-k/-rk 快照过期不判死——交旧 + 后台静默重拉（过期标记随条目返回）。
+    let mut swr_expired = false;
     if key.ends_with("-k") || key.ends_with("-rk") {
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -758,9 +775,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if age > KEEP_MAX_AGE_MS {
-            return Err("长寿命条目过期");
-        }
+        swr_expired = age > KEEP_MAX_AGE_MS;
     }
     if raw.len() < 4 {
         return Err("文件过短");
@@ -847,7 +862,163 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
         }
         (hdrs, Bytes::copy_from_slice(body))
     };
-    Ok((status, hdrs, out_body))
+    Ok(((status, hdrs, out_body), swr_expired))
+}
+
+// ---------- 页面快照 SWR（v6.11：过期交旧 + 后台静默重拉，前台零等待） ----------
+
+/// 页面快照后台重拉去重：同键同时只跑一个。
+static PAGE_REFRESHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn page_refresh_done(key: &str) {
+    let g = PAGE_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
+    lock(g).remove(key);
+}
+
+/// 过期页面快照的后台静默重拉：带 cookie 拉最新壳，200+完整+会话存活才覆盖。
+/// 重试循环：代理在跑就一直拉（失败 60s 后再试），直到成功入库或确认页面不存在；
+/// 全程前台零感知（旧壳继续服务）。
+fn spawn_page_refetch(
+    log: &LogFn,
+    host: &str,
+    key: &str,
+    path_q: &str,
+    cookie: Option<&str>,
+    bucket: &'static str,
+    logged_in: bool,
+) {
+    let g = PAGE_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
+    if !lock(g).insert(key.to_string()) {
+        return; // 同键在途去重
+    }
+    let host = host.to_string();
+    let key = key.to_string();
+    let path_q = path_q.to_string();
+    let cookie = cookie.map(str::to_string);
+    let log = log.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            // ① 通道：池内现成通道，没有就拨（单流）
+            let (up, _) = match crate::pool::get_or_build(&host, None, &path_q, &log).await {
+                Ok(v) => v,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次拨号失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            // ② 请求：带 cookie + 按桶协商压缩
+            let mut b = hyper::Request::builder()
+                .uri(format!("https://{host}{path_q}"))
+                .header("accept", "text/html, */*")
+                .header(
+                    "user-agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+                );
+            b = match bucket {
+                "br" => b.header("accept-encoding", "br"),
+                "gzip" => b.header("accept-encoding", "gzip"),
+                _ => b,
+            };
+            if let Some(c) = &cookie {
+                b = b.header("cookie", c);
+            }
+            let req = match b.body(protocol::empty_body()) {
+                Ok(r) => r,
+                Err(e) => {
+                    (log)(&format!("[缓存] 页面重拉请求构造失败({e}), 放弃重拉"));
+                    page_refresh_done(&key);
+                    return;
+                }
+            };
+            let resp = match upstream::h2_send(&up, &req, &None::<Bytes>).await {
+                Ok(r) => r,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let st = resp.status();
+            if st != http::StatusCode::OK {
+                // 404/410 = 页面在上游已不存在 → 永久放弃（旧壳继续顶）
+                if st == http::StatusCode::NOT_FOUND || st == http::StatusCode::GONE {
+                    (log)(&format!(
+                        "[缓存] 页面重拉确认上游 {st}(页面已不存在), 放弃重拉, 旧壳继续"
+                    ));
+                    page_refresh_done(&key);
+                    return;
+                }
+                (log)(&format!(
+                    "[缓存] 页面重拉第 {attempt} 次非 200({}), 60s 后再试, 旧壳继续",
+                    st.as_u16()
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let (parts, body) = resp.into_parts();
+            let hdrs: Vec<Vec<String>> = parts
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+                .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+                .collect();
+            let collected = match http_body_util::BodyExt::collect(body).await {
+                Ok(c) => c,
+                Err(e) => {
+                    (log)(&format!(
+                        "[缓存] 页面重拉第 {attempt} 次收体失败({e}), 60s 后再试, 旧壳继续"
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+            let bytes = collected.to_bytes();
+            // ③ 门检：完整 + 会话存活，才覆盖（重拉的货不可用，旧壳继续顶）
+            let enc = parts
+                .headers
+                .iter()
+                .find(|(k, _)| k.as_str() == "content-encoding")
+                .and_then(|(_, v)| v.to_str().ok())
+                .map(body_encoding)
+                .unwrap_or("identity");
+            let plain = super::defuse::decompress_partial(&bytes, enc, 64 << 20);
+            if !html_complete(&plain, "identity") {
+                (log)(&format!(
+                    "[缓存] 页面重拉第 {attempt} 次不完整, 60s 后再试, 旧壳继续"
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let n = plain.len().min(8192);
+            let p8 = String::from_utf8_lossy(&plain[..n]).to_lowercase();
+            if logged_in && is_logged_out_body(&p8) {
+                (log)("[缓存] 页面重拉回未登录页(会话已死), 放弃重拉, 旧壳继续");
+                page_refresh_done(&key);
+                return;
+            }
+            // ④ 覆盖入库（全量格式，替换旧快照）
+            let header = serde_json::json!({
+                "key": key,
+                "status": http::StatusCode::OK.as_u16(),
+                "headers": hdrs,
+            });
+            match write_entry_file(&page_cache_dir(), &key, &bytes, &header) {
+                Ok(_) => (log)(&format!(
+                    "[缓存] 页面重拉完成, 快照已更新 (尝试 {attempt} 次)"
+                )),
+                Err(e) => (log)(&format!("[缓存] 页面重拉落盘失败({e}), 旧壳继续")),
+            }
+            page_refresh_done(&key);
+            return;
+        }
+    });
 }
 
 /// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。

@@ -885,3 +885,29 @@ fn asset_cache_is_removed_by_design() {
         "页面键与资产域无关"
     );
 }
+
+/// v6.11 SWR：仓库页快照过期交旧不判死 + 过期标记（后台重拉由 spawn 触发，测试只验服务侧）。
+#[test]
+fn repo_snapshot_swr_serves_stale() {
+    let (dir, _g) = own_dir("swr");
+    let uri: http::Uri = "https://github.com/octocat/repo/".parse().unwrap();
+    let key = live_cache_key(&uri, "github.com", None, "br", "");
+    assert!(key.ends_with("-rk"), "{key}");
+    let hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
+    persist_page_entry_blocking(&dir, &key, b"<html>repo v1</html>", 200, &hdrs).unwrap();
+    // 新快照不过期
+    let (_, expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(!expired, "新快照不该标记过期");
+    // 回拨 mtime 到 8 天前 → 过期
+    let entry_path = dir.join("keep").join(page_file_name(&key));
+    let f = std::fs::OpenOptions::new().write(true).open(&entry_path).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+    f.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+    drop(f);
+    // 过期标记 + 交旧不判死
+    let ((status, _, body), expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(expired, "8 天前的快照必须标记过期");
+    assert_eq!(status, 200, "过期照常交旧（不判死）");
+    assert_eq!(body.as_ref(), b"<html>repo v1</html>", "交旧的体必须完整");
+    let _ = std::fs::remove_dir_all(&dir);
+}
