@@ -54,7 +54,7 @@ struct SerialTab {
     /// TCP 层死亡退避 60s→5min→30min，成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
     mirrors: HashMap<String, Vec<String>>,
-    /// 每路由（`key`）一个游标记号；表序冻结，不随游标重排。
+    /// 每条串发路由（会话域+其他低频域）一个游标记号；内容域竞速不记；表序冻结，不随游标重排。
     cursor: HashMap<String, String>,
 }
 
@@ -945,6 +945,8 @@ fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
 }
 
 /// 数据层结果回写游标：成功驻留、失败前移，零写盘。
+/// 内容域（竞速选路）不记游标——游标唯一读者是串发起步，竞速按拨号耗时排名；
+/// 但成功仍清死亡退避与 421/超时短冷却（421 拉黑靠成功请求洗白，这块内容域真实在用）。
 pub fn cursor_note(host: &str, ip: &str, ok: bool) {
     let Some(row) = route::route_for(host) else {
         return;
@@ -953,6 +955,7 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool) {
         return;
     }
     let key = row.key.clone();
+    let track = !row.flags.content;
     let Some(circle) = route::dial_targets(host) else {
         return;
     };
@@ -963,14 +966,18 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool) {
     let Some(t) = g.as_mut() else { return };
     if ok {
         t.dead.remove(ip);
-        t.cursor.insert(key, ip.to_string());
+        if track {
+            t.cursor.insert(key, ip.to_string());
+        }
         edges::clear(ip, &row.key); // 成功只清短冷却(超时/421)；风控冷却不可清，只随时间过期
         return;
     }
-    // 失败：前移到下一候选(整圈后自然复测)。
-    if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
-        let next = &circle[(pos + 1) % circle.len()];
-        t.cursor.insert(key, next.ip.clone());
+    // 失败：前移到下一候选(整圈后自然复测)；内容域竞速选路，游标无人读，不挪。
+    if track {
+        if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
+            let next = &circle[(pos + 1) % circle.len()];
+            t.cursor.insert(key, next.ip.clone());
+        }
     }
 }
 
@@ -1676,9 +1683,7 @@ pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fres
     if let Some(row) = route::route_for(host) {
         edges::mark_stall(&up.ip, &row.key);
     }
-    if !route::is_content(host) {
-        cursor_note(host, &up.ip, false);
-    }
+    cursor_note(host, &up.ip, false);
 }
 
 /// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。

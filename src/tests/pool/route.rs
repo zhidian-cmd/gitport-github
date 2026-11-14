@@ -194,7 +194,7 @@ fn pac_lists_split_direct_and_proxy() {
     );
 }
 
-/// 游标键跟路由行一一对应：每条非直连路由一把主键；直连行不占键，`_vice` 副键不再生成。
+/// 游标键只跟串发域一一对应：内容域竞速选路不记游标，直连行不占键。
 #[test]
 fn cursor_keys_follow_routes() {
     let _g = crate::pool::TEST_LOCK
@@ -207,8 +207,8 @@ fn cursor_keys_follow_routes() {
     ]);
     assert_eq!(
         cursor_keys(),
-        vec!["b.example", "c.example"],
-        "内容域也不该再多记一把永远为空的 `_vice` 副键"
+        vec!["b.example"],
+        "内容域(c.example)竞速选路, 游标无人读, 不占键位"
     );
 }
 

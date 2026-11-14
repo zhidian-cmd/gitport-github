@@ -813,6 +813,33 @@ fn success_clears_bad_edge() {
     assert!(!edges::is_bad(&ip, "github.com"), "成功必须清黑");
 }
 
+/// 内容域竞速选路，游标无人读：成功不落游标；但清边冷却的兼职保留（421 洗白）。
+#[test]
+fn content_host_success_never_parks_cursor_but_clears_edges() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    let dir = tmpdir();
+    crate::settings::save_worker_mirrors(Vec::new());
+    serial_load(&dir, Vec::new(), None);
+    let host = "raw.githubusercontent.com";
+    let ip = target_ips(host)[0].clone();
+    let key = route::route_for(host)
+        .expect("内容域应有路由")
+        .key
+        .clone();
+    edges::mark_reject(&ip, &key);
+    cursor_note(host, &ip, true);
+    {
+        let g = SERIAL.lock().unwrap();
+        assert_eq!(
+            g.as_ref().unwrap().cursor.get(&key).map(String::as_str),
+            None,
+            "内容域成功不该落游标(竞速选路无人读)"
+        );
+    }
+    assert!(!edges::is_bad(&ip, &key), "内容域成功仍要洗白 421 短冷却");
+}
+
 /// 风控冷却免疫"成功"回写：block 页本身也是一次成功的 HTTP 交换，可清就会在风暴里
 /// 被并发回写当场洗掉（实测 26 家候选 3 轮回头的事件根因）。
 #[test]

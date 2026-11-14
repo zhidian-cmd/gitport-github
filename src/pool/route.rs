@@ -370,7 +370,8 @@ pub fn fallback_for(host: &str) -> Fallback {
     route_for(host).map_or(Fallback::Dns, |r| r.fallback)
 }
 
-/// 游标键：每条非直连路由一把主键；双通道已下线，不再生成 `_vice` 副键。
+/// 游标键：只记串发域（会话域+其他低频域）的主键；内容域竞速选路，游标无人读，不占键位。
+/// 直连行不占键。settings.lastIp 的键位与顺序恒为此表。
 pub fn cursor_keys() -> Vec<String> {
     let g = lock(&TABLE);
     let Some(t) = g.as_ref() else {
@@ -378,7 +379,7 @@ pub fn cursor_keys() -> Vec<String> {
     };
     let mut out = Vec::with_capacity(t.rows.len());
     for r in t.rows.iter() {
-        if r.flags.direct {
+        if r.flags.direct || r.flags.content {
             continue;
         }
         out.push(r.key.clone());
