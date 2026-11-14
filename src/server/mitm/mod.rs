@@ -312,9 +312,9 @@ async fn stream_passthrough(
         .collect::<Vec<_>>();
     let (fut, send, guard, up) = 'conn: {
         let cached = if upstream::prefer_own_channel(host) {
-            upstream::cached_h2_own(host, &ips, None)
+            upstream::cached_h2_own(host, &ips)
         } else {
-            upstream::cached_h2_in(&ips, None)
+            upstream::cached_h2_in(&ips)
         };
         if let Some(up) = cached {
             match upstream::h2_open_stream(&up, out, false).await {
@@ -350,7 +350,7 @@ async fn stream_passthrough(
     match timed {
         Ok(Ok(resp)) => {
             *info.lock().unwrap() = up.ip.clone();
-            pool::cursor_note(host, &up.ip, true, up.slot);
+            pool::cursor_note(host, &up.ip, true);
             (log)(&format!(
                 "[流式] {host}{path} 直通({reason}), 响应头 {}ms",
                 t0.elapsed().as_millis()
@@ -411,11 +411,6 @@ fn request_budget(host: &str) -> Duration {
         upstream::HostClass::Session => SESSION_REQUEST_BUDGET,
         upstream::HostClass::Other => REQUEST_BUDGET,
     }
-}
-
-/// 搜索请求固定走主通道：GitHub 反爬对同会话跨 IP 敏感，漂移会被降级成无结果骨架。
-fn is_search_path(path: &str) -> bool {
-    path.starts_with("/search")
 }
 
 /// 复用失败的文案：断链和超时是两种病，别用一句话糊过去。
@@ -568,15 +563,13 @@ pub(super) async fn get_direct(
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
-    let want_slot = if is_search_path(&path) { Some(1) } else { None };
     let budget = request_budget(host);
-    let (mut up, mut fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
+    let (mut up, mut fresh) = pool::get_or_build(host, &path, log).await?;
     let mut retried = false;
     loop {
         match stream_on(&up, out, body, budget).await {
             Ok((resp, ms)) => {
                 let id = up.id;
-                let slot = up.slot;
                 let ip = up.ip.clone();
                 // 服务端回 421 = 这个 IP 服务不了这个 host：边级长冷却，换下一条。
                 // 边状态按路由键记（子域请求的 host ≠ 路由键，按 host 记永远对不上）。
@@ -592,12 +585,12 @@ pub(super) async fn get_direct(
                         return Err("421 边缘连续拒绝".to_string());
                     }
                     retried = true;
-                    (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
+                    (up, fresh) = pool::get_or_build(host, &path, log).await?;
                     continue;
                 }
                 *info.lock().unwrap() = ip.clone();
                 // HTTP 交换完成即回写（是不是风控页这里看不见）；成功只清短冷却，洗不掉风控冷却。
-                pool::cursor_note(host, &ip, true, slot);
+                pool::cursor_note(host, &ip, true);
                 // 头像入口的 302 顺手记一笔：下次同入口本地直答（见 redirect_memo）。
                 redirect_memo::observe_response(host, out.uri(), resp.status(), resp.headers());
                 if fresh {
@@ -622,7 +615,7 @@ pub(super) async fn get_direct(
                     return Err(e);
                 }
                 retried = true;
-                (up, fresh) = pool::get_or_build(host, want_slot, &path, log).await?;
+                (up, fresh) = pool::get_or_build(host, &path, log).await?;
             }
         }
     }
@@ -814,7 +807,7 @@ async fn dns_direct_fetch(
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
         // 这个 IP 已经有通道就直接用：兜底路径也绝不为了再发一次请求而并存两条。
-        let up = if let Some(up) = upstream::cached_h2_in(std::slice::from_ref(&ip), None) {
+        let up = if let Some(up) = upstream::cached_h2_in(std::slice::from_ref(&ip)) {
             up
         } else {
             let conn = match pool::dial::dial_one(&ip, host, host, true).await {
@@ -824,7 +817,7 @@ async fn dns_direct_fetch(
                     continue;
                 }
             };
-            let up = match upstream::h2_from_dialed(host, conn, &ip, 1, log).await {
+            let up = match upstream::h2_from_dialed(host, conn, &ip, log).await {
                 Ok(u) => u,
                 Err(e) => {
                     (log)(&format!("[DNS直连] {host} <- {ip} h2 失败({e})"));

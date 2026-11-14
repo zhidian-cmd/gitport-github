@@ -143,7 +143,7 @@ pub(super) async fn gh_defuse(
             };
             continue;
         }
-        pool::cursor_note(host, &ip, false, 1); // 数据层失败: 记号前移, 重试自动跳过该 IP
+        pool::cursor_note(host, &ip, false); // 数据层失败: 记号前移, 重试自动跳过该 IP
                                                 // 风控页记 10 分钟边冷却, 免疫"成功"回写(否则会被并发的 block 页当场洗掉)。
         if let Some(row) = pool::route::route_for(host) {
             pool::edges::mark_risk(&ip, &row.key);

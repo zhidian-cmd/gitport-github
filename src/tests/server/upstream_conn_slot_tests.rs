@@ -1,7 +1,7 @@
 use super::*;
 
 /// 造一条合法 H2Upstream：h2 握手用本机 duplex 对拉（无需真网），server 端由 h2::server 回 SETTINGS 即完成。
-async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
+async fn mk_up(ip: &str) -> H2Upstream {
     let (client_io, server_io) = tokio::io::duplex(4096);
     tokio::spawn(async move {
         let _ = h2::server::handshake(server_io).await;
@@ -13,7 +13,6 @@ async fn mk_up(ip: &str, slot: u8) -> H2Upstream {
     H2Upstream {
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        slot,
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
@@ -53,7 +52,6 @@ async fn live_conn(ip: &str) -> H2Upstream {
     H2Upstream {
         ip: ip.to_string(),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        slot: 1,
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
@@ -64,20 +62,19 @@ async fn live_conn(ip: &str) -> H2Upstream {
 }
 
 /// 会话域硬约束：同一 IP 只留一条通道。后到的当场作废、返回池里已有的那条。
-/// 顺带验证槽位过滤：主通道被摘后不回落到别的槽位。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn one_ip_one_channel_and_slot_filter() {
+async fn one_ip_one_channel() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let ip = "9.9.9.1";
-    let mut first = mk_up(ip, 1).await;
+    let mut first = mk_up(ip).await;
     first.owner = Some("github.com".to_string()); // 会话域 → cap 1
     let first_id = first.id;
     assert_eq!(store_h2(ip, first).id, first_id, "第一条应入库");
 
-    let mut second = mk_up(ip, 2).await;
+    let mut second = mk_up(ip).await;
     second.owner = Some("github.com".to_string());
     let second_id = second.id;
     let kept = store_h2(ip, second);
@@ -89,17 +86,13 @@ async fn one_ip_one_channel_and_slot_filter() {
     }
 
     for _ in 0..4 {
-        let up = cached_h2_in(&[ip.to_string()], Some(1)).expect("主通道应在池");
-        assert_eq!(up.slot, 1, "Some(1) 永远拿主通道,轮转计数不动");
+        let up = cached_h2_in(&[ip.to_string()]).expect("通道应在池");
+        assert_eq!(up.id, first_id, "重复取应始终是池里那条,轮转计数不动");
     }
     drop_h2_id(ip, first_id);
     assert!(
-        cached_h2_in(&[ip.to_string()], Some(1)).is_none(),
-        "主通道被摘后应回 None 走重建"
-    );
-    assert!(
-        cached_h2_in(&[ip.to_string()], None).is_none(),
-        "同 IP 不该还留着第二条通道"
+        cached_h2_in(&[ip.to_string()]).is_none(),
+        "通道被摘后应回 None 走重建, 同 IP 不该还留着第二条"
     );
     let _ = lock(conn_pool()).remove(ip);
 }
@@ -111,19 +104,19 @@ async fn race_ranks_by_dial_ms() {
         RaceLeg {
             ip: "c".into(),
             dial_ms: 500,
-            up: mk_up("9.9.9.33", 1).await,
+            up: mk_up("9.9.9.33").await,
             pooled: false,
         },
         RaceLeg {
             ip: "a".into(),
             dial_ms: 100,
-            up: mk_up("9.9.9.31", 1).await,
+            up: mk_up("9.9.9.31").await,
             pooled: false,
         },
         RaceLeg {
             ip: "b".into(),
             dial_ms: 300,
-            up: mk_up("9.9.9.32", 1).await,
+            up: mk_up("9.9.9.32").await,
             pooled: false,
         },
     ];
@@ -141,12 +134,12 @@ async fn content_ip_keeps_single_channel() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let ip = "9.9.9.2";
-    let mut a = mk_up(ip, 1).await;
+    let mut a = mk_up(ip).await;
     a.owner = Some("raw.githubusercontent.com".to_string());
     let a_id = a.id;
     assert_eq!(store_h2(ip, a).id, a_id, "第一条应入库");
 
-    let mut b = mk_up(ip, 2).await;
+    let mut b = mk_up(ip).await;
     b.owner = Some("raw.githubusercontent.com".to_string());
     let b_id = b.id;
     let kept = store_h2(ip, b);
@@ -177,7 +170,7 @@ async fn empty_entry_is_not_an_occupied_channel() {
         occupied_ips(&[ip.to_string()]).is_empty(),
         "没有连接的条目不算占用"
     );
-    store_h2(ip, mk_up(ip, 1).await);
+    store_h2(ip, mk_up(ip).await);
     assert_eq!(
         occupied_ips(&[ip.to_string()]),
         vec![ip.to_string()],
@@ -197,22 +190,22 @@ async fn session_host_prefers_own_channel_over_public() {
 
     let own_ip = "9.9.7.1";
     let public_ip = "9.9.7.2";
-    let mut own = mk_up(own_ip, 1).await;
+    let mut own = mk_up(own_ip).await;
     own.owner = Some("api.github.com".into());
     let own_id = own.id;
     store_h2(own_ip, own);
-    let mut public = mk_up(public_ip, 1).await;
+    let mut public = mk_up(public_ip).await;
     public.owner = Some("raw.githubusercontent.com".into());
     store_h2(public_ip, public);
 
     let ips = vec![own_ip.to_string(), public_ip.to_string()];
-    let up = cached_h2_own("api.github.com", &ips, None).expect("应有连接");
+    let up = cached_h2_own("api.github.com", &ips).expect("应有连接");
     assert_eq!(up.id, own_id, "会话域先认自己建的通道");
 
     // 自己没建过：入口不抢公共，返回 None，让调用方去自建。
     let ips_public_first = vec![public_ip.to_string(), own_ip.to_string()];
     assert!(
-        cached_h2_own("gist.github.com", &ips_public_first, None).is_none(),
+        cached_h2_own("gist.github.com", &ips_public_first).is_none(),
         "入口只认自己的通道；公共连接留给拨号失败后的兜底"
     );
 
@@ -231,18 +224,18 @@ async fn pool_prefers_idle_channel_over_full_one() {
 
     let full_ip = "9.9.4.1";
     let idle_ip = "9.9.4.2";
-    let mut full = mk_up(full_ip, 1).await;
+    let mut full = mk_up(full_ip).await;
     full.max_streams = 4;
     full.inflight
         .store(4, std::sync::atomic::Ordering::Relaxed);
     let _full_id = full.id;
     store_h2(full_ip, full);
-    let mut idle = mk_up(idle_ip, 1).await;
+    let mut idle = mk_up(idle_ip).await;
     idle.max_streams = 4;
     let idle_id = idle.id;
     store_h2(idle_ip, idle);
     let ips = vec![full_ip.to_string(), idle_ip.to_string()];
-    let up = cached_h2_in(&ips, None).expect("应有一条可用");
+    let up = cached_h2_in(&ips).expect("应有一条可用");
     assert_eq!(up.id, idle_id, "满了的通道不该再接新流");
     let _ = lock(conn_pool()).remove(full_ip);
     let _ = lock(conn_pool()).remove(idle_ip);
@@ -268,7 +261,7 @@ async fn inflight_count_follows_response_body_lifecycle() {
 }
 
 /// 两个 host 并发入库同一 IP（内容域）：两条通道并存，不互斥。
-/// 会话域仍然恒单通道（见 one_ip_one_channel_and_slot_filter）。
+/// 会话域仍然恒单通道（见 one_ip_one_channel）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn concurrent_content_hosts_coexist_on_one_ip() {
@@ -278,8 +271,8 @@ async fn concurrent_content_hosts_coexist_on_one_ip() {
 
     let same = "9.9.9.2";
     let other = "9.9.9.3";
-    let a = mk_up(same, 1).await;
-    let b = mk_up(same, 2).await;
+    let a = mk_up(same).await;
+    let b = mk_up(same).await;
     let (ra, rb) = tokio::join!(
         async move { store_h2(same, a) },
         async move { store_h2(same, b) },
@@ -291,7 +284,7 @@ async fn concurrent_content_hosts_coexist_on_one_ip() {
         assert_eq!(g.get(same).unwrap().len(), 2, "内容域同 IP 两条并存");
     }
     // 第二条通道落在另一个 IP：仍然允许， EWMA 轮转也照旧。
-    store_h2(other, mk_up(other, 2).await);
+    store_h2(other, mk_up(other).await);
     let ips = vec![same.to_string(), other.to_string()];
     assert_eq!(
         lock(conn_pool())
@@ -302,7 +295,7 @@ async fn concurrent_content_hosts_coexist_on_one_ip() {
         3,
         "同 IP 两条 + 另一 IP 一条 = 三条"
     );
-    assert!(cached_h2_in(&ips, None).is_some());
+    assert!(cached_h2_in(&ips).is_some());
     let _ = lock(conn_pool()).remove(same);
     let _ = lock(conn_pool()).remove(other);
 
@@ -328,7 +321,7 @@ async fn shared_conn_keeps_target_authority_across_hosts() {
             .uri(format!("https://{target}/u/1?s=40"))
             .body(empty_body())
             .unwrap();
-        let resp = h2_send(&cached_h2_in(&[ip.to_string()], None).unwrap(), &out, &None)
+        let resp = h2_send(&cached_h2_in(&[ip.to_string()]).unwrap(), &out, &None)
             .await
             .expect("共享连接请求应成功");
         assert_eq!(resp.status(), 200);
@@ -388,7 +381,7 @@ async fn probe_content_edges() {
                     continue;
                 }
             };
-            let up = match h2_from_dialed("probe", dialed, &ip, 1, &log).await {
+            let up = match h2_from_dialed("probe", dialed, &ip, &log).await {
                 Ok(u) => u,
                 Err(e) => {
                     println!("PROBE\t{ip}\t{verify}\th2\tERR {e}");
@@ -489,7 +482,7 @@ async fn probe_new_hosts() {
                 println!("HOSTPROBE\t{ip}\t{host}\t-\tERR {last_err}");
                 continue;
             };
-            let up = match h2_from_dialed(host, dialed, ip, 1, &log).await {
+            let up = match h2_from_dialed(host, dialed, ip, &log).await {
                 Ok(u) => u,
                 Err(e) => {
                     println!("HOSTPROBE\t{ip}\t{host}\t{anchor}\th2 ERR {e}");
@@ -536,7 +529,7 @@ async fn probe_cross_sni_reuse() {
     let dialed = dial_one(ip, "api.mcp.github.com", "api.mcp.github.com", true)
         .await
         .expect("api.mcp 握手应成功");
-    let up = h2_from_dialed("api.mcp.github.com", dialed, ip, 1, &log)
+    let up = h2_from_dialed("api.mcp.github.com", dialed, ip, &log)
         .await
         .expect("h2 握手");
     for host in [
@@ -590,7 +583,7 @@ async fn probe_baseline_actions() {
                 continue;
             }
         };
-        let up = match h2_from_dialed("baseline", dialed, ip, 1, &log).await {
+        let up = match h2_from_dialed("baseline", dialed, ip, &log).await {
             Ok(u) => u,
             Err(e) => {
                 println!("BASE\t{ip}\th2 ERR {e}");
@@ -646,7 +639,6 @@ async fn conn_end_removes_itself_from_pool() {
     let up = H2Upstream {
         ip: ip.to_string(),
         id,
-        slot: 1,
         owner: None,
         max_streams: 100,
         inflight: Arc::new(AtomicU32::new(0)),
@@ -679,7 +671,7 @@ async fn conn_end_removes_itself_from_pool() {
     }
     assert!(gone, "连接结束后应把自己从池里摘除，该 IP 才能重新拨号");
     assert!(
-        cached_h2_in(&[ip.to_string()], None).is_none(),
+        cached_h2_in(&[ip.to_string()]).is_none(),
         "死连接不该还留在池里被复用"
     );
     assert!(lock(conn_pool()).get(ip).is_none(), "池里不该留这条僵尸");
@@ -696,18 +688,18 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let ip_normal = "9.9.2.1";
-    let mut normal = mk_up(ip_normal, 1).await;
+    let mut normal = mk_up(ip_normal).await;
     normal.owner = Some("raw.githubusercontent.com".to_string());
     let normal_id = normal.id;
     store_h2(ip_normal, normal);
     // 溢出通道：与正编同 IP（同 IP 溢出例外），标了 overflow。
-    let mut temp = mk_up(ip_normal, 1).await;
+    let mut temp = mk_up(ip_normal).await;
     temp.owner = Some("raw.githubusercontent.com".to_string());
     temp.overflow = true;
     let temp_id = temp.id;
     store_h2(ip_normal, temp);
     // 第二条溢出拒收：每 IP 至多一条溢出，关掉新的、递回正编。
-    let mut temp2 = mk_up(ip_normal, 1).await;
+    let mut temp2 = mk_up(ip_normal).await;
     temp2.owner = Some("raw.githubusercontent.com".to_string());
     temp2.overflow = true;
     let temp2_id = temp2.id;
@@ -719,7 +711,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     // pick 永远只给正常通道：溢出通道对后来者不存在。
     for _ in 0..3 {
         assert_eq!(
-            cached_h2_in(&ips, None).expect("正常通道应在池").id,
+            cached_h2_in(&ips).expect("正常通道应在池").id,
             normal_id,
             "pick 不得外发溢出通道句柄"
         );
@@ -751,12 +743,12 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
         .expect("种子表必有 github.com 行")[0]
         .ip
         .clone();
-    let mut up = mk_up(&ip, 1).await;
+    let mut up = mk_up(&ip).await;
     up.owner = Some("github.com".to_string());
     let id = up.id;
     store_h2(&ip, up);
     let log: LogFn = Arc::new(|_| {});
-    let (got, fresh) = crate::pool::get_or_build("github.com", None, "", &log)
+    let (got, fresh) = crate::pool::get_or_build("github.com", "", &log)
         .await
         .expect("池里有通道应直接返回");
     assert_eq!(got.id, id, "应骑池里现成的那条");

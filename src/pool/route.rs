@@ -370,22 +370,18 @@ pub fn fallback_for(host: &str) -> Fallback {
     route_for(host).map_or(Fallback::Dns, |r| r.fallback)
 }
 
-/// 游标键：每条非直连路由至少一把主键；只有内容域才有 `_vice` 副键。
-/// 会话域固定单通道，记副键没有意义，还会让 settings.json 里多出一堆永远为空的键。
+/// 游标键：每条非直连路由一把主键；双通道已下线，不再生成 `_vice` 副键。
 pub fn cursor_keys() -> Vec<String> {
     let g = lock(&TABLE);
     let Some(t) = g.as_ref() else {
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(t.rows.len() * 2);
+    let mut out = Vec::with_capacity(t.rows.len());
     for r in t.rows.iter() {
         if r.flags.direct {
             continue;
         }
         out.push(r.key.clone());
-        if r.flags.content {
-            out.push(format!("{}_vice", r.key));
-        }
     }
     out
 }

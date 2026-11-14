@@ -54,7 +54,7 @@ struct SerialTab {
     /// TCP 层死亡退避 60s→5min→30min，成功拨号清除。
     dead: HashMap<String, (Instant, u32)>,
     mirrors: HashMap<String, Vec<String>>,
-    /// 每路由（`key` / `key_vice`）一个游标记号；表序冻结，不随游标重排。
+    /// 每路由（`key`）一个游标记号；表序冻结，不随游标重排。
     cursor: HashMap<String, String>,
 }
 
@@ -945,14 +945,14 @@ fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
 }
 
 /// 数据层结果回写游标：成功驻留、失败前移，零写盘。
-pub fn cursor_note(host: &str, ip: &str, ok: bool, slot: u8) {
+pub fn cursor_note(host: &str, ip: &str, ok: bool) {
     let Some(row) = route::route_for(host) else {
         return;
     };
     if row.flags.direct {
         return;
     }
-    let key = cursor_key(&row.key, slot);
+    let key = row.key.clone();
     let Some(circle) = route::dial_targets(host) else {
         return;
     };
@@ -971,14 +971,6 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool, slot: u8) {
     if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
         let next = &circle[(pos + 1) % circle.len()];
         t.cursor.insert(key, next.ip.clone());
-    }
-}
-
-fn cursor_key(key: &str, slot: u8) -> String {
-    if slot > 1 {
-        format!("{key}_vice")
-    } else {
-        key.to_string()
     }
 }
 
@@ -1045,7 +1037,6 @@ pub struct DialSkip<'a> {
     pub host: &'a str,
     pub tls_handshake: bool,
     pub skip_ips: &'a [String],
-    pub slot: u8,
     /// Some = 独占档礼让在前的分档序（Some(true) 为副腿保留，当前活路径仅 Some(false)）；
     /// None = 不分档，维持纯游标+延迟序（真名透传兜底用）。
     pub prefer_shared: Option<bool>,
@@ -1151,7 +1142,7 @@ fn brief_err(msg: &str) -> String {
     }
 }
 
-/// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是双通道硬排除。
+/// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是已占用 IP 的硬排除，重拨不撞旧通道。
 /// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
@@ -1161,7 +1152,6 @@ pub async fn serial_dial_skip(
         host,
         tls_handshake,
         skip_ips,
-        slot,
         prefer_shared,
     } = req;
     if SERIAL_COOL.open(host) {
@@ -1201,12 +1191,10 @@ pub async fn serial_dial_skip(
     if circle.is_empty() {
         return Err(format!("路由 [{key}] 没有可用候选 IP({host})"));
     }
-    let cursor_key = cursor_key(&key, slot);
-
     // 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底保持表序。
     let start_ip = {
         let g = lock(&SERIAL);
-        g.as_ref().unwrap().cursor.get(&cursor_key).cloned()
+        g.as_ref().unwrap().cursor.get(&key).cloned()
     };
     let order = dial_order(&circle, start_ip.as_deref(), prefer_shared);
 
@@ -1257,7 +1245,7 @@ pub async fn serial_dial_skip(
                 let snap = {
                     let mut g = lock(&SERIAL);
                     let t = g.as_mut().unwrap();
-                    t.cursor.insert(cursor_key.clone(), p.ip.clone());
+                    t.cursor.insert(key.clone(), p.ip.clone());
                     t.cursor
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
@@ -1274,7 +1262,7 @@ pub async fn serial_dial_skip(
                     let n = order.len();
                     let next = &circle[order[(oi + 1) % n]];
                     if let Some(t) = g.as_mut() {
-                        t.cursor.insert(cursor_key.clone(), next.ip.clone());
+                        t.cursor.insert(key.clone(), next.ip.clone());
                     }
                 }
                 // TCP 失败 = IP 对谁都死，进死亡退避；TLS 失败是按域干扰，只前移。
@@ -1362,7 +1350,6 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// 来源对调用方不可见；返回的 fresh 只用于失败归因——本轮新拨的罚边冷却，沿用的只摘不罚（见 report_failure）。
 pub async fn get_or_build(
     host: &str,
-    want_slot: Option<u8>,
     probe_path: &str,
     log: &LogFn,
 ) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
@@ -1379,7 +1366,7 @@ pub async fn get_or_build(
     let ips = if session { ips } else { speed::usable(&ips) };
 
     // 1) 选：会话域只认自己建的通道；内容域/其他谁闲用谁。
-    if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+    if let Some(up) = pick_channel(host, &ips, session) {
         let saturated =
             up.inflight.load(std::sync::atomic::Ordering::Relaxed) >= up.max_streams.max(1);
         if !saturated || session {
@@ -1398,7 +1385,7 @@ pub async fn get_or_build(
     let gate = build_lock(host);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+        if let Some(up) = pick_channel(host, &ips, session) {
             return Ok((up, false)); // 排队期间被喂饱了
         }
         let wait = deadline.saturating_duration_since(Instant::now());
@@ -1410,7 +1397,7 @@ pub async fn get_or_build(
             Err(_) => return Err(format!("{host} 建造在途等待超时(3s), 走兜底")),
         };
         // 双检：轮到我时前一位可能刚建成。
-        if let Some(up) = pick_channel(host, &ips, want_slot, session) {
+        if let Some(up) = pick_channel(host, &ips, session) {
             return Ok((up, false));
         }
         // 建造：内容域竞速、其他/会话域串发，全在 dial_upstream 内。
@@ -1439,7 +1426,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
     match chan::host_class(host) {
         chan::HostClass::Session => {
             chan::cull_channel(ip);
-            cursor_note(host, ip, false, 1); // 游标挪到下一候选，别死磕黑 IP
+            cursor_note(host, ip, false); // 游标挪到下一候选，别死磕黑 IP
             latency::sink(ip); // 拨号排序同步降权，不然游标挪了排序还把它排第一
             (log)(&format!(
                 "[黑洞] {host} 会话通道 {ip} 弃用, 游标挪动并预建替代通道"
@@ -1449,7 +1436,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
             let log = log.clone();
             tokio::spawn(async move {
                 // 预建：池空即拨，游标已指向下一候选 IP
-                let _ = get_or_build(&host, None, &path, &log).await;
+                let _ = get_or_build(&host, &path, &log).await;
             });
         }
         chan::HostClass::Content => {
@@ -1489,7 +1476,7 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
             let built_ip = t.ip.clone();
             let dial_job = async move {
                 let conn = dial::dial_one(&t.ip, &t.sni, &t.verify, true).await.ok()?;
-                let up = chan::h2_from_dialed(&host2, conn, &t.ip, 1, &log2)
+                let up = chan::h2_from_dialed(&host2, conn, &t.ip, &log2)
                     .await
                     .ok()?;
                 let _ = chan::store_h2(&t.ip, up);
@@ -1583,13 +1570,12 @@ fn msg_is_tcp_dead(e: &std::io::Error) -> bool {
 fn pick_channel(
     host: &str,
     ips: &[String],
-    want_slot: Option<u8>,
     session: bool,
 ) -> Option<crate::server::upstream::H2Upstream> {
     if session {
-        crate::server::upstream::cached_h2_own(host, ips, want_slot)
+        crate::server::upstream::cached_h2_own(host, ips)
     } else {
-        crate::server::upstream::cached_h2_in(ips, want_slot)
+        crate::server::upstream::cached_h2_in(ips)
     }
 }
 
@@ -1622,7 +1608,7 @@ async fn overflow_build(
     };
     let t0 = Instant::now();
     let conn = dial::dial_one(&node.ip, &node.sni, &node.verify, true).await.ok()?;
-    match chan::h2_from_dialed(host, conn, &node.ip, 1, log).await {
+    match chan::h2_from_dialed(host, conn, &node.ip, log).await {
         Ok(mut up) => {
             latency::note(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
@@ -1659,7 +1645,7 @@ pub async fn gather_channels(
     }
     // 池空先建（双腿可能直接带回两条），一并收进来。
     if got.is_empty() {
-        match get_or_build(host, None, "", log).await {
+        match get_or_build(host, "", log).await {
             Ok((up, _)) => got.push(up),
             Err(_) => return Vec::new(),
         }
@@ -1691,7 +1677,7 @@ pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fres
         edges::mark_stall(&up.ip, &row.key);
     }
     if !route::is_content(host) {
-        cursor_note(host, &up.ip, false, up.slot);
+        cursor_note(host, &up.ip, false);
     }
 }
 

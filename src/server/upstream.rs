@@ -26,8 +26,6 @@ pub struct H2Upstream {
     /// 进程内唯一：同一 IP 若将来有多条连接，摘除时也才能精确到条、不删错。
     /// 连接驱动结束时靠它把自己从池里摘掉（对端回收空闲连接时不留僵尸）。
     pub id: u64,
-    /// 游标槽位：1 主通道、2 副通道，记账跟着连接走，各记各的钥匙。
-    pub slot: u8,
     /// 建这条连接时用的 host。会话域靠它认出"自己的通道"：优先复用它，
     /// 而不是额度还没建就连别人的公共通道。
     pub owner: Option<String>,
@@ -121,12 +119,8 @@ pub const ERR_BUDGET_TIMEOUT: &str = "响应预算超时";
 pub const ERR_ALL_CLAIMED: &str = "建连候选全被其他 host 认领";
 
 /// 门房公式：在给定 IP 集合里挑活连接——按占用率，最闲的胜出。
-/// only_owner = 会话域只认自己建的通道；want_slot = 搜索路径固定骑主通道。
-pub(crate) fn pick(
-    ips: &[String],
-    want_slot: Option<u8>,
-    only_owner: Option<&str>,
-) -> Option<H2Upstream> {
+/// only_owner = 会话域只认自己建的通道。
+pub(crate) fn pick(ips: &[String], only_owner: Option<&str>) -> Option<H2Upstream> {
     let mut g = lock(conn_pool());
     // 暂缓（低于够用线）的 IP 先不发；全暂缓时 usable 原样返回，不让请求饿死。
     let usable = pool::speed::usable(ips);
@@ -135,11 +129,6 @@ pub(crate) fn pick(
     for ip in &usable {
         let Some(h) = g.get_mut(ip) else { continue };
         for c in h.iter() {
-            if let Some(want) = want_slot {
-                if c.up.slot != want {
-                    continue;
-                }
-            }
             if let Some(owner) = only_owner {
                 if c.up.owner.as_deref() != Some(owner) {
                     continue;
@@ -185,13 +174,13 @@ pub async fn stream_on(
 }
 
 /// 在给定 IP 集合里取活连接：按占用率挑最闲的那条。
-pub fn cached_h2_in(ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
-    pick(ips, want_slot, None)
+pub fn cached_h2_in(ips: &[String]) -> Option<H2Upstream> {
+    pick(ips, None)
 }
 
 /// 会话域只认自己建的通道；没有就返回 None 让调用方自建——蹭公共通道 = 风控漂移。
-pub fn cached_h2_own(host: &str, ips: &[String], want_slot: Option<u8>) -> Option<H2Upstream> {
-    pick(ips, want_slot, Some(host))
+pub fn cached_h2_own(host: &str, ips: &[String]) -> Option<H2Upstream> {
+    pick(ips, Some(host))
 }
 
 /// 通道选路打分（pick 与 channels_for 共用）：占用率，闲着的分最小。
@@ -432,7 +421,6 @@ pub async fn h2_from_dialed(
     host: &str,
     conn_io: Dialed,
     ip: &str,
-    slot: u8,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
     // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s），放大为流 1MB/连接 4MB。
@@ -472,7 +460,6 @@ pub async fn h2_from_dialed(
     Ok(H2Upstream {
         ip: ip.to_string(),
         id,
-        slot,
         owner: Some(host.to_string()),
         max_streams,
         inflight: Arc::new(AtomicU32::new(0)),
@@ -483,11 +470,10 @@ pub async fn h2_from_dialed(
 }
 
 /// 单通道拨号：串发选 IP → boring 握手（SNI 骗墙，证书按锚点校验）→ h2。
-pub(crate) async fn h2_dial_slot(
+pub(crate) async fn h2_dial(
     host: &str,
     log: &LogFn,
     skip_ips: &[String],
-    slot: u8,
     prefer_shared: Option<bool>,
 ) -> Result<H2Upstream, String> {
     let t_dial = std::time::Instant::now();
@@ -496,7 +482,6 @@ pub(crate) async fn h2_dial_slot(
             host,
             tls_handshake: true,
             skip_ips,
-            slot,
             prefer_shared,
         },
         Some(log),
@@ -508,7 +493,7 @@ pub(crate) async fn h2_dial_slot(
     // 撞上 GFW 抖动（慢成功）时游标挪窝，别让"上次成功"把一页请求都黏在慢 IP 上。
     pool::latency::note(&ip, dial_ms as u64);
     if dial_ms as u64 >= DIAL_SLOW_MS {
-        pool::cursor_note(host, &ip, false, slot);
+        pool::cursor_note(host, &ip, false);
     }
     let form = if sni.is_empty() {
         "无"
@@ -520,7 +505,7 @@ pub(crate) async fn h2_dial_slot(
     let t_h2 = std::time::Instant::now();
     // h2 谈不成（TCP+TLS 都过、SETTINGS 不回）也是"这个 IP 现在建不成通道"：
     // 进全局死亡退避，别 host 的串发直接跳过，不再对着同一个 IP 重复付 5s。
-    let up = h2_from_dialed(host, conn_io, &ip, slot, log)
+    let up = h2_from_dialed(host, conn_io, &ip, log)
         .await
         .map_err(|e| {
             pool::note_dead(&ip);
@@ -531,13 +516,8 @@ pub(crate) async fn h2_dial_slot(
     // 若期间别人已经建好同一个 IP，这里丢弃刚拨的、返回池里那条现成的。
     let up = store_h2(&ip, up);
     // 分段计时落一行：慢在拨号(TCP+TLS)还是 h2 握手，一眼可辨。
-    let chan = if slot > 1 {
-        format!(", 通道{slot}")
-    } else {
-        String::new()
-    };
     (log)(&format!(
-        "[上游] {host} <- {ip} ({form}SNI 直连, h2{chan}, 拨{dial_ms}ms+握手{h2_ms}ms)"
+        "[上游] {host} <- {ip} ({form}SNI 直连, h2, 拨{dial_ms}ms+握手{h2_ms}ms)"
     ));
     Ok(up)
 }
@@ -576,7 +556,7 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
     let cands = pool::dial_candidates(host);
     if cands.len() < 2 {
         // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
-        return h2_dial_slot(host, log, &[], 1, None).await;
+        return h2_dial(host, log, &[], None).await;
     }
     (log)(&format!("[建连] {host} {} 路竞速(错峰 50ms)", cands.len()));
     // 参赛名单快照：收尾并集排名按它认领池内现成通道。
@@ -605,7 +585,7 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
             };
             let dial_ms = t0.elapsed().as_millis() as u64;
             pool::latency::note(&node.ip, dial_ms);
-            let up = match h2_from_dialed(&host2, conn, &node.ip, 1, &log2).await {
+            let up = match h2_from_dialed(&host2, conn, &node.ip, &log2).await {
                 Ok(u) => u,
                 Err(e) => {
                     pool::release_dial(&node.ip);
@@ -738,13 +718,13 @@ async fn dial_h2_race(
         // 会话域候选全被占：重拨必被 store_h2 作废，立即交兜底。
         return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
-    // 单腿串发：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证；游标用主键。
+    // 单腿串发：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证。
     tokio::spawn({
         let host = host.to_string();
         let log2 = log.clone();
         let skip = occupied.to_vec();
         async move {
-            let r = h2_dial_slot(&host, &log2, &skip, 1, Some(false)).await;
+            let r = h2_dial(&host, &log2, &skip, Some(false)).await;
             let _ = tx.send(r).await;
         }
     });

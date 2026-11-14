@@ -445,7 +445,7 @@ fn cursor_park_is_memory_only_and_freezes_order() {
     let target = base[2].clone();
     assert_ne!(head_before, target, "测试前提: 目标条目不在表头");
     let file_before = std::fs::read_to_string(dir.join("routes.json")).unwrap();
-    cursor_note("github.com", &target, true, 1);
+    cursor_note("github.com", &target, true);
     // 表序冻结:成功驻留只动内存游标,不动物理顺序、不触发写盘
     assert_eq!(target_ips("github.com")[0], head_before, "表序冻结");
     assert_eq!(
@@ -772,7 +772,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     let next = base[1].clone();
 
     // 失败:记号前移到圈中下一候选
-    cursor_note("github.com", &head, false, 1);
+    cursor_note("github.com", &head, false);
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
@@ -783,7 +783,7 @@ fn cursor_advance_on_failure_then_park_on_success() {
     }
 
     // 成功:记号驻留;表序全程未变
-    cursor_note("github.com", &next, true, 1);
+    cursor_note("github.com", &next, true);
     {
         let g = SERIAL.lock().unwrap();
         assert_eq!(
@@ -809,7 +809,7 @@ fn success_clears_bad_edge() {
     let ip = target_ips("github.com")[0].clone();
     edges::mark_reject(&ip, "github.com");
     assert!(edges::is_bad(&ip, "github.com"));
-    cursor_note("github.com", &ip, true, 1);
+    cursor_note("github.com", &ip, true);
     assert!(!edges::is_bad(&ip, "github.com"), "成功必须清黑");
 }
 
@@ -825,14 +825,14 @@ fn risk_cooldown_survives_success_note() {
     let ip = target_ips("github.com")[0].clone();
     edges::mark_risk(&ip, "github.com");
     assert!(edges::is_bad(&ip, "github.com"));
-    cursor_note("github.com", &ip, true, 1);
+    cursor_note("github.com", &ip, true);
     assert!(
         edges::is_bad(&ip, "github.com"),
         "风控冷却不得被成功回写清掉"
     );
     // 活着的风控冷却也不被短冷却降级成"可清"
     edges::mark_stall(&ip, "github.com");
-    cursor_note("github.com", &ip, true, 1);
+    cursor_note("github.com", &ip, true);
     assert!(edges::is_bad(&ip, "github.com"), "短冷却不得降级活着的风控");
 }
 
@@ -864,7 +864,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            slot: 1,
             prefer_shared: None,
         },
         None,
@@ -890,7 +889,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            slot: 1,
             prefer_shared: None,
         },
         None,

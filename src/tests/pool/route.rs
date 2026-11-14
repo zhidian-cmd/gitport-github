@@ -194,7 +194,7 @@ fn pac_lists_split_direct_and_proxy() {
     );
 }
 
-/// 游标键跟路由行一一对应：会话域只有主键，内容域才有 `_vice`；直连行不占键。
+/// 游标键跟路由行一一对应：每条非直连路由一把主键；直连行不占键，`_vice` 副键不再生成。
 #[test]
 fn cursor_keys_follow_routes() {
     let _g = crate::pool::TEST_LOCK
@@ -207,8 +207,8 @@ fn cursor_keys_follow_routes() {
     ]);
     assert_eq!(
         cursor_keys(),
-        vec!["b.example", "c.example", "c.example_vice"],
-        "会话域固定单通道，不该再记一个永远为空的副键"
+        vec!["b.example", "c.example"],
+        "内容域也不该再多记一把永远为空的 `_vice` 副键"
     );
 }
 

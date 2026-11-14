@@ -162,9 +162,9 @@ impl ProxyServer {
 
         if pool::route::is_managed(&host) && ip != "system-dns" {
             match (sent, recv) {
-                (s, r) if s > 0 && r > 0 => pool::cursor_note(&host, &ip, true, 1),
+                (s, r) if s > 0 && r > 0 => pool::cursor_note(&host, &ip, true),
                 (s, r) if s > 0 && r == 0 => {
-                    pool::cursor_note(&host, &ip, false, 1);
+                    pool::cursor_note(&host, &ip, false);
                     (self.log)(&format!(
                         "[串发] {host} 客户端已握手但没收到回包, 换下一个 IP"
                     ));
@@ -245,7 +245,7 @@ impl ProxyServer {
             0
         };
         if pool::route::is_managed(&host) && ip != "system-dns" {
-            pool::cursor_note(&host, &ip, recv > 0, 1);
+            pool::cursor_note(&host, &ip, recv > 0);
         }
     }
 }
@@ -355,7 +355,6 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
                     host,
                     tls_handshake: false,
                     skip_ips: &[],
-                    slot: 1,
                     prefer_shared: None,
                 },
                 None,

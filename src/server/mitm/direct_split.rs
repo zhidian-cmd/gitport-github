@@ -720,7 +720,7 @@ impl hyper::body::Body for SegmentedBody {
                             let host = host.clone();
                             let log = log.clone();
                             seg.handle = Some(tokio::spawn(async move {
-                                let (up, _) = pool::get_or_build(&host, None, "", &log).await.ok()?;
+                                let (up, _) = pool::get_or_build(&host, "", &log).await.ok()?;
                                 let req = tpl.build(start, e).ok()?;
                                 let resp = tokio::time::timeout(
                                     Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
