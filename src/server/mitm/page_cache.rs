@@ -111,11 +111,11 @@ fn slash_uri(req: &hyper::Request<Incoming>, host: &str) -> http::Uri {
         .unwrap_or_else(|_| req.uri().clone())
 }
 
-/// 条目落点：键尾 `-k` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
+/// 条目落点：键尾 `-k`/`-rk` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
 /// v6.9 资产缓存整体停用并物理删除：实测 48 分钟 132 个 githubassets 请求 0 命中
 /// （没变的 URL 浏览器自己消化，换哈希的代理也没见过），机制与开关一并移除。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
-    if key.ends_with("-k") {
+    if key.ends_with("-k") || key.ends_with("-rk") {
         dir.join("keep")
     } else {
         dir.join("pages")
@@ -612,8 +612,19 @@ fn live_cache_key(
     variant: &str,
 ) -> String {
     let base = page_cache_key(uri, host, cookies, enc);
-    if is_home_path(uri.path()) {
-        format!("{base}-k") // 骨架：不带会话号，跨会话复用
+    if is_home_path(uri.path())
+        || (is_repo_home(uri.path()) && !uri.path().starts_with("/settings"))
+    {
+        // v6.11：仓库页快照与首页骨架同待遇——跨会话存 keep/，7 天温和重同步。
+        // 发版换哈希在窗口内隐身：旧壳引用旧 chunk，浏览器 immutable 缓存直出。
+        // 页面数据（提交/文件列表）走独立 XHR 实时直通，壳旧不影响数据新。
+        // /settings/* 是账号敏感页（两段路径会被仓库页启发式误中），保持会话键。
+        // 仓库页用 -rk 标记：走底稿+分段增量存储（首页骨架 -k 保持全量存储）。
+        if is_repo_home(uri.path()) {
+            format!("{base}-rk")
+        } else {
+            format!("{base}-k")
+        }
     } else {
         format!("{base}{variant}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
     }
@@ -740,7 +751,7 @@ fn load_disk_entry(
 /// 带拒绝原因的读取，供命中侧按需落日志。
 fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'static str> {    let path = entry_dir(&page_cache_dir(), key).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
-    if key.ends_with("-k") {
+    if key.ends_with("-k") || key.ends_with("-rk") {
         let age = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -796,24 +807,47 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<DiskEntry, &'sta
         .map(body_encoding)
         .unwrap_or("identity");
     let body = &raw[end..];
-    let plain = plain_prefix(body, enc);
-    if (logged_in && is_logged_out_body(&plain)) || is_gate_page(&plain) {
-        return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
-    }
-    // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
-    if key.ends_with("-k")
-        && hdrs.iter().any(|(k, v)| {
-            k.as_str() == "content-type"
-                && v.to_str()
-                    .map(|v| v.starts_with("text/html"))
-                    .unwrap_or(false)
-        })
-        && !html_complete(body, enc)
-    {
-        let _ = std::fs::remove_file(&path);
-        return Err("骨架条目截断(无</html>)");
-    }
-    Ok((status, hdrs, Bytes::copy_from_slice(body)))
+    let segs = header.get("stoenc").and_then(|v| v.as_str()) == Some("segs");
+    // v6.11 分段快照：底稿+增量还原明文；门检跑明文；交付重压 gzip
+    //（头里 content-encoding: gzip 与重压后的体一致；content-length 剥掉由 hyper 按实际体重设）。
+    let (hdrs, out_body) = if segs {
+        let base = load_repo_base(&page_cache_dir()).ok_or("底稿缺失")?;
+        let full = seg_decode(&base, body).ok_or("分段增量损坏")?;
+        let n = full.len().min(8192);
+        let p8 = String::from_utf8_lossy(&full[..n]).to_lowercase();
+        if (logged_in && is_logged_out_body(&p8)) || is_gate_page(&p8) {
+            return Err("会话已死的未登录页/闸门页"); // 旧快照自愈
+        }
+        if !html_complete(full.as_slice(), "identity") {
+            // 快照还原不完整：连底稿一起清掉，下次全部重建（自愈）
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(base_repo_path(&page_cache_dir()));
+            return Err("快照条目截断(无</html>)");
+        }
+        let mut h = hdrs;
+        h.retain(|(k, _)| k.as_str() != "content-length");
+        (h, Bytes::from(gz_compress(full.as_slice())))
+    } else {
+        let p = plain_prefix(body, enc);
+        if (logged_in && is_logged_out_body(&p)) || is_gate_page(&p) {
+            return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
+        }
+        // keep 条目（首页骨架/仓库页快照）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
+        if key.ends_with("-k")
+            && hdrs.iter().any(|(k, v)| {
+                k.as_str() == "content-type"
+                    && v.to_str()
+                        .map(|v| v.starts_with("text/html"))
+                        .unwrap_or(false)
+            })
+            && !html_complete(body, enc)
+        {
+            let _ = std::fs::remove_file(&path);
+            return Err("骨架条目截断(无</html>)");
+        }
+        (hdrs, Bytes::copy_from_slice(body))
+    };
+    Ok((status, hdrs, out_body))
 }
 
 /// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。
@@ -851,33 +885,150 @@ fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     }
 }
 
-/// 落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
-fn persist_page_entry_blocking(
+// ---------- 底稿 + 分段增量（v6.11：仓库页快照存储，强制不随 GitHub 更新） ----------
+
+/// 底稿文件：第一份仓库页快照的解压原文，冻结不随发版更新。
+const BASE_REPO_FILE: &str = "base-repo.html";
+/// 分段引用阈值：≥32 字节的相同段引用底稿，更短差异并入字面量。
+const SEG_MIN_MATCH: usize = 32;
+
+fn base_repo_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(BASE_REPO_FILE)
+}
+
+/// 读底稿（明文）。缺失/过小 = None（调用方决定是否立底稿）。
+fn load_repo_base(dir: &std::path::Path) -> Option<Vec<u8>> {
+    let b = std::fs::read(base_repo_path(dir)).ok()?;
+    (b.len() >= SEG_MIN_MATCH).then_some(b)
+}
+
+/// 立底稿：明文落盘（tmp+rename 原子写，防半截底稿）。
+fn store_repo_base(dir: &std::path::Path, plain: &[u8]) {
+    let tmp = dir.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    let final_path = base_repo_path(dir);
+    let tmp_path = tmp.join(BASE_REPO_FILE);
+    if std::fs::write(&tmp_path, plain).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &final_path);
+    }
+}
+
+/// 分段增量编码：底稿里找 ≥32 字节的相同段（贪心最长匹配，8 字节索引），
+/// 段间差异存字面量。序列化 = [4B op 数] + 每 op [4B 字面长][字面][4B 底稿位][4B 段长]。
+fn seg_encode(base: &[u8], plain: &[u8]) -> Vec<u8> {
+    let mut index: std::collections::HashMap<[u8; 8], Vec<u32>> = std::collections::HashMap::new();
+    if base.len() >= 8 {
+        for i in 0..=(base.len() - 8) {
+            index.entry(base[i..i + 8].try_into().unwrap()).or_default().push(i as u32);
+        }
+    }
+    let mut ops: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    let mut lit: Vec<u8> = Vec::new();
+    let mut np = 0usize;
+    while np + 8 <= plain.len() {
+        let key: [u8; 8] = plain[np..np + 8].try_into().unwrap();
+        let mut best: Option<(usize, usize)> = None;
+        if let Some(cands) = index.get(&key) {
+            for (j, &cand) in cands.iter().enumerate() {
+                if j >= 64 {
+                    break; // 候选上限：病态重复标记防炸
+                }
+                let cu = cand as usize;
+                let mut l = 8usize;
+                while cu + l < base.len() && np + l < plain.len() && base[cu + l] == plain[np + l] {
+                    l += 1;
+                }
+                if l >= SEG_MIN_MATCH && best.map(|(_, bl)| l > bl).unwrap_or(true) {
+                    best = Some((cu, l));
+                }
+            }
+        }
+        match best {
+            Some((cand, l)) => {
+                ops.push((std::mem::take(&mut lit), cand as u32, l as u32));
+                np += l;
+            }
+            None => {
+                lit.push(plain[np]);
+                np += 1;
+            }
+        }
+    }
+    if np < plain.len() {
+        lit.extend_from_slice(&plain[np..]);
+    }
+    ops.push((std::mem::take(&mut lit), 0, 0)); // 尾字面量（copy 0,0 = 无）
+
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+    for (l, cpos, clen) in ops {
+        out.extend_from_slice(&(l.len() as u32).to_be_bytes());
+        out.extend_from_slice(&l);
+        out.extend_from_slice(&cpos.to_be_bytes());
+        out.extend_from_slice(&clen.to_be_bytes());
+    }
+    out
+}
+
+/// 分段增量解码：底稿 + op 序列 → 精确明文。任何损坏 = None（调用方当 miss 自愈）。
+fn seg_decode(base: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let n = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let mut p = 4usize;
+    let mut out = Vec::with_capacity(base.len());
+    for _ in 0..n {
+        if p + 4 > data.len() {
+            return None;
+        }
+        let ll = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
+        p += 4;
+        if p + ll > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&data[p..p + ll]);
+        p += ll;
+        if p + 8 > data.len() {
+            return None;
+        }
+        let cpos = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
+        let clen = u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]) as usize;
+        p += 8;
+        if cpos + clen > base.len() {
+            return None;
+        }
+        out.extend_from_slice(&base[cpos..cpos + clen]);
+    }
+    Some(out)
+}
+
+/// 明文 → gzip（分段快照交付用：头里 content-encoding 与重压后的体保持一致）。
+fn gz_compress(plain: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = e.write_all(plain);
+    e.finish().unwrap_or_default()
+}
+
+/// 条目落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
+fn write_entry_file(
     dir: &std::path::Path,
     key: &str,
-    bytes: &[u8],
-    status: u16,
-    hdrs: &[Vec<String>],
+    body: &[u8],
+    header: &serde_json::Value,
 ) -> Result<(), String> {
-    if !ensure_cache_dir_with_acl(dir) {
-        return Err("缓存目录创建失败".to_string());
-    }
-    let header = serde_json::json!({
-        "key": key,
-        "status": status,
-        "headers": hdrs,
-    });
-    let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
+    let hbytes = serde_json::to_vec(header).map_err(|e| e.to_string())?;
     // 记账口径必须等于实际写入量：4 字节长度前缀 + 头部 JSON + 正文。
-    maybe_wipe_on_growth(dir, 4 + hbytes.len() + bytes.len());
+    maybe_wipe_on_growth(dir, 4 + hbytes.len() + body.len());
     let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&pages).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(4 + hbytes.len() + bytes.len());
+    let mut buf = Vec::with_capacity(4 + hbytes.len() + body.len());
     buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(&hbytes);
-    buf.extend_from_slice(bytes);
+    buf.extend_from_slice(body);
     // 纳秒时钟防极端重入（管家线程本已串行）
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -890,6 +1041,77 @@ fn persist_page_entry_blocking(
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })
+}
+
+/// 页面缓存落盘统一入口：仓库页快照（-rk）走底稿+分段增量，其余走全量。
+fn persist_page_entry_blocking(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+    status: u16,
+    hdrs: &[Vec<String>],
+) -> Result<(), String> {
+    if !ensure_cache_dir_with_acl(dir) {
+        return Err("缓存目录创建失败".to_string());
+    }
+    // v6.11：仓库页快照（-rk）走底稿+分段增量存储（强制不随 GitHub 发版更新）
+    if key.ends_with("-rk") {
+        return persist_repo_snapshot(dir, key, bytes, status, hdrs);
+    }
+    write_entry_file(
+        dir,
+        key,
+        bytes,
+        &serde_json::json!({
+            "key": key,
+            "status": status,
+            "headers": hdrs,
+        }),
+    )
+}
+
+/// 仓库页快照入库：解压明文 → 底稿缺失则立底稿 → 分段增量编码 →
+/// 增量不比全量 gzip 体小时自动改存全量（自愈，永不亏损）。
+fn persist_repo_snapshot(
+    dir: &std::path::Path,
+    key: &str,
+    bytes: &[u8],
+    status: u16,
+    hdrs: &[Vec<String>],
+) -> Result<(), String> {
+    let enc = hdrs
+        .iter()
+        .find(|pair| pair.len() >= 2 && pair[0].eq_ignore_ascii_case("content-encoding"))
+        .and_then(|pair| pair.get(1))
+        .map(|v| v.as_str().to_string())
+        .map(|v| body_encoding(&v))
+        .unwrap_or("identity");
+    let plain = super::defuse::decompress_partial(bytes, enc, 64 << 20);
+    // 底稿：缺失或过小则立底稿（本页即底稿）
+    let base = match load_repo_base(dir) {
+        Some(b) if b.len() >= SEG_MIN_MATCH => b,
+        _ => {
+            store_repo_base(dir, &plain);
+            plain.clone()
+        }
+    };
+    let delta = seg_encode(&base, &plain);
+    // 自动兜底：增量不比全量 gzip 体小 → 存全量（自愈，永不亏损）
+    if delta.len() >= bytes.len() {
+        let header = serde_json::json!({
+            "key": key,
+            "status": status,
+            "headers": hdrs,
+        });
+        return write_entry_file(dir, key, bytes, &header);
+    }
+    let header = serde_json::json!({
+        "key": key,
+        "status": status,
+        "headers": hdrs,
+        "stoenc": "segs",
+    });
+    write_entry_file(dir, key, &delta, &header)
 }
 
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
@@ -1024,13 +1246,16 @@ fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
             prefixes.push(format!("GET {host}{parent}"));
         }
     }
-    let Ok(rd) = std::fs::read_dir(dir.join("pages")) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if read_page_key(&p).is_some_and(|k| prefixes.iter().any(|pre| k.starts_with(pre))) {
-            let _ = std::fs::remove_file(&p);
+    // 会话条目在 pages/，仓库页快照在 keep/（v6.11 起仓库页换 -k 键），两处都要扫。
+    for sub in ["pages", "keep"] {
+        let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if read_page_key(&p).is_some_and(|k| prefixes.iter().any(|pre| k.starts_with(pre))) {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 }

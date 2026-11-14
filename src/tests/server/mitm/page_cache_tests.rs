@@ -144,6 +144,80 @@ fn repo_home_canonical() {
     );
 }
 
+/// v6.11 仓库页快照跨会话：-k 进 keep/，空闲清盘/重启不丢（发版换哈希在窗口内
+/// 隐身——旧壳引用旧 chunk，浏览器 immutable 缓存直出；数据走 XHR 实时）。
+/// 写失效（star/评论等深层写路径）必须能扫进 keep/ 命中它。
+// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn repo_home_snapshot_cross_session() {
+    let (dir, _g) = own_dir("v611");
+    let uri: http::Uri = "https://github.com/octocat/repo/".parse().unwrap();
+    let key = live_cache_key(&uri, "github.com", None, "br", "");
+    assert!(key.ends_with("-rk"), "仓库页快照必须换 -rk 跨会话键: {key}");
+    assert!(!key.contains("-s"), "仓库页快照不得带会话号: {key}");
+    let hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
+    persist_page_entry_blocking(&dir, &key, b"<html>repo</html>", 200, &hdrs).unwrap();
+    // 会话清盘（空闲 15 分钟/重启）不得牵连仓库页快照
+    wipe_pages(&dir);
+    assert!(
+        load_disk_entry(&key, false).is_some(),
+        "仓库页快照必须跨会话存活"
+    );
+    // 写失效（深层写路径，父段 ≥2 个斜杠）必须扫进 keep/ 命中对应快照
+    let deep_key = "GET github.com/octocat/repo/issues/5-br-k";
+    let deep_hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
+    persist_page_entry_blocking(&dir, deep_key, b"<html>d</html>", 200, &deep_hdrs).unwrap();
+    invalidate_prefix_blocking(&dir, "github.com", "/octocat/repo/issues/5/comment");
+    assert!(
+        load_disk_entry(deep_key, false).is_none(),
+        "写失效必须覆盖 keep/ 里的快照"
+    );
+    // 深层写失效按前缀匹配，不得误伤仓库页快照本体
+    assert!(
+        load_disk_entry(&key, false).is_some(),
+        "深层写不得误伤仓库页快照"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v6.11 分段增量编解码：底稿+增量往返无损（同壳不同身份/长度变化/完全不同三档全测），
+/// 同壳页面的增量必须显著小于全量（体积断言）。
+#[test]
+fn seg_delta_roundtrip_and_volume() {
+    let mut base = String::from("<html><head><title>shell</title>");
+    base.push_str("<meta name=\"description\" content=\"shared shell description\">");
+    base.push_str("<link rel=\"stylesheet\" href=\"/assets/primer-2aeb1babdc762f70.css\">");
+    base.push_str(
+        &"<script src=\"/assets/octicons~index~global-nav-layout-00000000.js\"></script>".repeat(30),
+    );
+    base.push_str("</head><body><div id=\"repo-body\">初始仓库内容</div></body></html>");
+    let pages: Vec<(&str, String)> = vec![
+        ("与底稿全同", base.clone()),
+        ("同壳换身份数据", base.replace("初始仓库内容", "另一个仓库的文件列表 A")),
+        ("同壳换资产哈希", base.replace("00000000.js", "99999999.js").replace("初始仓库内容", "第二个仓库 B")),
+        ("身份长度大变", base.replace("初始仓库内容", "这个仓库的名字特别长导致后续字节全部错位移动")),
+    ];
+    for (tag, page) in &pages {
+        let delta = seg_encode(base.as_bytes(), page.as_bytes());
+        let back = seg_decode(base.as_bytes(), &delta).expect("解码必须成功");
+        assert_eq!(back.as_slice(), page.as_bytes(), "{tag} 往返必须无损");
+    }
+    // 体积断言：同壳页面（仅身份数据不同）的增量必须小于底稿的 1/4
+    let delta = seg_encode(base.as_bytes(), pages[1].1.as_bytes());
+    assert!(
+        delta.len() < base.len() / 4,
+        "同壳页面的增量应小于底稿的 1/4: {} vs {}",
+        delta.len(),
+        base.len()
+    );
+    // 完全不同的页面：往返也必须无损（自动兜底由 persist 层按体积判定）
+    let alien = "完全不同的页面，与底稿没有任何 32 字节以上的公共段。1234567890".repeat(20);
+    let delta_alien = seg_encode(base.as_bytes(), alien.as_bytes());
+    let back = seg_decode(base.as_bytes(), &delta_alien).expect("解码必须成功");
+    assert_eq!(back.as_slice(), alien.as_bytes(), "完全不同页面往返必须无损");
+}
+
 /// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
 #[test]
 fn search_page_eligible_regardless_of_nav_kind() {
