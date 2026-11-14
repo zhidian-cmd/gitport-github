@@ -25,25 +25,12 @@ fn all_benched_falls_back_to_full_list() {
     assert_eq!(usable(&ips), ips, "全暂缓必须原样返回，否则无处可拨");
 }
 
-/// 每 host 60 秒最多触发一轮；冷却内再来慢样本不重复催建。
+/// 每 host 60 秒最多触发一轮；try_begin 原子完成检查+写入，冷却内重复调用只成功一次。
 #[test]
 fn rebuild_is_cooldown_limited() {
     let _g = guard();
     clear();
-    assert!(may_rebuild("h1"));
-    begin_rebuild("h1");
-    assert!(!may_rebuild("h1"), "60 秒内不许再赛");
-    assert!(may_rebuild("h2"), "不同 host 各算各的");
-}
-
-/// 触发线判定：候选里还有一条已测 ≥45KB/s 就不该折腾（将就用），全低才返回 true。
-#[test]
-fn rebuild_cooldown_gates_reruns() {
-    let _g = guard();
-    clear();
-    let host = "h1";
-    assert!(may_rebuild(host));
-    begin_rebuild(host);
-    assert!(!may_rebuild(host), "60 秒内不许再赛");
-    assert!(may_rebuild("h2"), "不同 host 各算各的");
+    assert!(try_begin_rebuild("h1"));
+    assert!(!try_begin_rebuild("h1"), "60 秒内不许再赛");
+    assert!(try_begin_rebuild("h2"), "不同 host 各算各的");
 }

@@ -756,5 +756,38 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let _ = lock(conn_pool()).remove(&ip);
 }
 
+/// 失败记账顺序（审计 #14 回归）：report_failure 必须先挪游标再拉黑——
+/// 反了的话候选圈已把刚拉黑的 IP 滤掉，游标永远挪不动，冷却一过又优先拨刚失败的它。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn report_failure_moves_cursor_before_blacklisting() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
+    let targets = crate::pool::route::dial_targets("github.com").expect("种子表必有 github.com");
+    assert!(targets.len() >= 2, "前提：github.com 至少两个候选");
+    let head = targets[0].ip.clone();
+    let next = targets[1].ip.clone();
+    let key = crate::pool::route::route_for("github.com")
+        .expect("路由行存在")
+        .key
+        .clone();
+    let up = mk_up(&head).await;
+    crate::pool::report_failure(&up, "github.com", true);
+    assert_eq!(
+        crate::pool::cursor_of(&key).as_deref(),
+        Some(next.as_str()),
+        "失败后游标应挪到下一候选（顺序反了会停在原候选）"
+    );
+    // 拉黑也要发生：dial_targets 会滤掉 is_bad 的 IP，表首应变成原第二候选
+    assert_eq!(
+        crate::pool::route::dial_targets("github.com").unwrap()[0].ip,
+        next,
+        "刚失败的 IP 必须进边冷却"
+    );
+    let _ = lock(conn_pool()).remove(&head);
+}
+
 // 看护任务不再做保活与补拨（即用即建取代），旧的隧道打点与补拨节流
 // 测试随之退役：连接死亡由请求结果发现，通道重建是下一个请求自己的事。

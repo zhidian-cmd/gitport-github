@@ -572,12 +572,14 @@ async fn keys_invalidation_and_pollution() {
     );
     assert!(page_cache_get(other_key).is_some(), "无关页面不得被牵连");
 
-    // ⑩ 身份标签：账号进键（同机两个账号不得共享页面）
+    // ⑩ 身份标签：会话号哈希进键（同机两个会话不得共享页面）；伪造 dotcom_user 不改变键
     let a = session_fingerprint(Some("user_session=abc; dotcom_user=alice"));
+    let forged = session_fingerprint(Some("user_session=forged; dotcom_user=alice"));
     let a2 = session_fingerprint(Some("user_session=zzz; dotcom_user=alice"));
     let b = session_fingerprint(Some("dotcom_user=bob; user_session=q"));
-    assert_eq!(a, "-calice", "登录态标签带账号名");
-    assert_eq!(a, a2, "同账号轮换 user_session 不换键");
+    assert_eq!(a, format!("-cs{}", page_file_name("abc")), "登录态标签 = 会话号摘要");
+    assert_ne!(a, forged, "伪造 user_session 不得撞出别人的键");
+    assert_ne!(a, a2, "会话号变了必须换键(账号名不再是键的一部分)");
     assert_ne!(a, b, "不同账号必须分键（A 的设置页不能给 B）");
     assert_eq!(session_fingerprint(None), "-cloggedout", "未登录固定标签");
     assert_eq!(
@@ -585,11 +587,7 @@ async fn keys_invalidation_and_pollution() {
         "-cloggedout",
         "只有 _gh_sess 不算登录"
     );
-    // 拿不到 dotcom_user：退回 session 值哈希，仍按账号分开（轮换只损失命中）
-    let h1 = session_fingerprint(Some("user_session=abc"));
-    let h2 = session_fingerprint(Some("user_session=xyz"));
-    assert!(h1.starts_with("-cs") && h1 != h2, "{h1} / {h2}");
-    // _gh_sess 每个响应都轮换：兜底哈希只取 user_session 值，键必须稳住
+    // _gh_sess 每个响应都轮换：哈希只取 user_session 值，键必须稳住
     assert_eq!(
         session_fingerprint(Some("user_session=abc; _gh_sess=r1; _octo=GH1.1")),
         session_fingerprint(Some("user_session=abc; _gh_sess=r2; _octo=GH1.1")),
@@ -601,8 +599,9 @@ async fn keys_invalidation_and_pollution() {
     let bob = "user_session=s2; dotcom_user=bob";
     let gz = page_cache_key(&uri, "github.com", Some(alice), "gzip");
     let id = page_cache_key(&uri, "github.com", Some(alice), "identity");
-    assert!(gz.contains("?tab=x") && gz.ends_with("-calice-gz"), "{gz}");
-    assert!(id.ends_with("-calice-id"), "{id}");
+    let fp = session_fingerprint(Some(alice));
+    assert!(gz.contains("?tab=x") && gz.ends_with(&format!("{fp}-gz")), "{gz}");
+    assert!(id.ends_with(&format!("{fp}-id")), "{id}");
     assert_ne!(
         gz,
         page_cache_key(&uri, "github.com", Some(bob), "gzip"),
@@ -868,8 +867,11 @@ fn split_cookie_headers_still_fingerprint_account() {
         "两行 cookie 都要在: {joined}"
     );
     assert_eq!(session_value(Some(&joined)), Some("tok123"));
-    assert_eq!(account_name(Some(&joined)), Some("zhidian-cmd"));
-    assert_eq!(session_fingerprint(Some(&joined)), "-czhidian-cmd");
+    assert_eq!(
+        session_fingerprint(Some(&joined)),
+        format!("-cs{}", page_file_name("tok123")),
+        "自报账号名(dotcom_user)不参与指纹，只认会话号摘要"
+    );
 }
 
 /// v6.9 资产缓存已停用并物理删除：JS/CSS 一律直连（实测 48 分钟 132 个请求 0 命中）。
@@ -909,5 +911,66 @@ fn repo_snapshot_swr_serves_stale() {
     assert!(expired, "8 天前的快照必须标记过期");
     assert_eq!(status, 200, "过期照常交旧（不判死）");
     assert_eq!(body.as_ref(), b"<html>repo v1</html>", "交旧的体必须完整");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// no-store 明说不许存的响应不落盘；private 不拒——GitHub 用它表达"浏览器别共享"，
+/// 代理侧缓存已按会话号哈希分钥匙语义等价，全拒会把页面缓存整个干掉。
+#[test]
+fn no_store_responses_are_never_saved() {
+    let mk = |cc: &str| {
+        let mut h = http::HeaderMap::new();
+        h.insert("cache-control", cc.parse().unwrap());
+        h
+    };
+    assert!(resp_no_store(&mk("no-store, max-age=0")));
+    assert!(resp_no_store(&mk("private, NO-STORE")), "大小写不敏感");
+    assert!(!resp_no_store(&mk("max-age=0, private, must-revalidate")));
+    assert!(!resp_no_store(&http::HeaderMap::new()));
+}
+
+/// v6.11 分段快照交付头红线：重压成 gzip 后头必须写 `content-encoding: gzip`——
+/// 存侧头是原体（br/无本编码）的，直交会让浏览器按错编码解码、仓库页白屏。
+#[tokio::test]
+async fn segs_snapshot_serves_gzip_header() {
+    let (dir, _guard) = own_dir("segs");
+    // 底稿 + 对一项差 1 byte 的页面：delta 必然远小于全量，必走 segs 存储形态。
+    let base = format!("<html>{}<div>x</div></html>", "A".repeat(256)).into_bytes();
+    store_repo_base(&dir, &base);
+    let plain = format!("<html>{}<div>y</div></html>", "A".repeat(256)).into_bytes();
+    let delta = seg_encode(&base, &plain);
+    assert!(delta.len() < plain.len(), "前提：增量应小于全量（{} < {}）", delta.len(), plain.len());
+    let key = "GET github.com/octocat/repo-crk";
+    write_entry_file(
+        &dir,
+        key,
+        &delta,
+        &serde_json::json!({
+            "key": key,
+            "status": 200,
+            "headers": [
+                ["content-type", "text/html; charset=utf-8"],
+                ["content-encoding", "br"],
+            ],
+            "stoenc": "segs",
+        }),
+    )
+    .unwrap();
+    let ((status, hdrs, body), _) = load_disk_entry_reason(key, false).expect("segs 条目应命中");
+    assert_eq!(status, 200);
+    let ce = hdrs
+        .iter()
+        .find(|(k, _)| k.as_str() == "content-encoding")
+        .map(|(_, v)| v.to_str().unwrap().to_string());
+    assert_eq!(ce.as_deref(), Some("gzip"), "交付头必须是 gzip: {hdrs:?}");
+    assert!(
+        !hdrs.iter().any(|(k, _)| k.as_str() == "content-length"),
+        "content-length 应剥掉由 hyper 按实际体重设"
+    );
+    use std::io::Read as _;
+    let mut d = flate2::read::GzDecoder::new(&body[..]);
+    let mut out = Vec::new();
+    d.read_to_end(&mut out).unwrap();
+    assert_eq!(out, plain, "按 gzip 解压应完整还原明文");
     let _ = std::fs::remove_dir_all(&dir);
 }

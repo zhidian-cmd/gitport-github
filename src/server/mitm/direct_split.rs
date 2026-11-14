@@ -387,10 +387,11 @@ pub(super) async fn try_direct_split(
     };
     let tpl = Tpl::of(out);
     // 恒 N 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
+    // 长度按 [seg_start, total) 算——传 total 会切到文件尾外 10KB，严格 416 的 CDN 直接退单流。
     let seg_start = if prefix.is_some() { PROBE_BYTES } else { 0 };
     let segs = merge::split_even(
         seg_start,
-        total,
+        total - seg_start,
         seg_count(total - seg_start).min(want_segs.max(1)),
     );
     if segs.is_empty() {

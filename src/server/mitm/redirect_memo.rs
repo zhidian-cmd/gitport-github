@@ -29,6 +29,27 @@ fn memo_key(path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 302 落点必须是已知头像域：登录跳转/风控页/被污染的回包不记仇——
+/// 否则一次异常 302 会让该路径 6 小时内全部本地直答这个跳转。
+fn is_avatar_target(location: &str) -> bool {
+    let host = location
+        .strip_prefix("https://")
+        .or_else(|| location.strip_prefix("http://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    let host = host
+        .rsplit('@')
+        .next()
+        .unwrap_or(host) // 剥 userinfo
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "user-images.githubusercontent.com"
+        || host == "private-user-images.githubusercontent.com"
+        || (host.starts_with("avatars") && host.ends_with(".githubusercontent.com"))
+}
+
 /// 命中 = 本地直答的 302 目标；未命中/过期 = None（照常走上游，顺手重学）。
 pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Option<String> {
     if host != "github.com" || !is_avatar_entry(path) {
@@ -39,6 +60,10 @@ pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Op
     let (loc, at) = g.get(&k)?.clone();
     if at.elapsed() > MEMO_TTL {
         g.remove(&k);
+        return None;
+    }
+    if !is_avatar_target(&loc) {
+        g.remove(&k); // 历史遗留的异常落点：当场清掉
         return None;
     }
     Some(loc)
@@ -59,9 +84,13 @@ pub(super) fn observe_response(
     }
 }
 
-/// 上游回了 302 就记一笔（只认头像入口形态；非 302/空 Location 调用方自会过滤）。
+/// 上游回了 302 就记一笔（只认头像入口形态 + 头像域落点；其余一律不记）。
 pub(super) fn observe(host: &str, path: &str, query: Option<&str>, location: &str) {
-    if host != "github.com" || !is_avatar_entry(path) || location.is_empty() {
+    if host != "github.com"
+        || !is_avatar_entry(path)
+        || location.is_empty()
+        || !is_avatar_target(location)
+    {
         return;
     }
     let mut g = memo().lock().unwrap_or_else(|p| p.into_inner());

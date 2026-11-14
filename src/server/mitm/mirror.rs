@@ -316,6 +316,18 @@ fn validate_mirror_response(
     Ok(())
 }
 
+/// 单流 206 必须对得上请求刀口：起点错位(要 A 给 B)/未带 Range 却回 206，
+/// 字节会整体错位、文件静默损坏——返回 Some(原因) 按这家失败处理。
+fn stream_start_mismatch(req_range: Option<&str>, resp: &hyper::Response<BoxBody>) -> Option<String> {
+    if resp.status() != http::StatusCode::PARTIAL_CONTENT {
+        return None; // 200/304 等照旧走各自校验
+    }
+    let range = req_range?;
+    let want = merge::parse_range(Some(range)).map(|(a, _)| a)?;
+    let cr = resp.headers().get("content-range").and_then(|v| v.to_str().ok());
+    merge::check_segment_start(cr, want).err()
+}
+
 // ---- 段日志：只记账、只打吞吐，慢段由合并层缩边界让位，掐了就是个洞 ----
 
 /// 段收尾一行：字节/毫秒/MB/s——此前日志只有“谁胜出”没有“跑多快”，判不出直连是真快还是只抢到了位置。
@@ -414,25 +426,13 @@ pub(super) async fn chain_fetch(
     if let Some(c) = cond {
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
-    // 凭据串请求：签名 URL 不落第三方，除非镜像被标记为可信；全不可信则剥空仅直连。
+    // 凭据串请求 = 私库下载的替身信号：剥空镜像仅直连，签名 URL 不落任何第三方。
+    // 其余下载全部镜像照常参与（302 落点签名随 URL 交给镜像，属既定取舍）。
     let chain = if cred_locked {
-        let trusted_set = crate::settings::trusted_mirrors();
-        let trusted: Vec<String> = pool::mirror_chain(&chain_host)
-            .into_iter()
-            .filter(|m| trusted_set.iter().any(|t| same_origin(m, t)))
-            .collect();
-        if trusted.is_empty() {
-            (log)(&format!(
-                "[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(防外泄; 可在工作台标记镜像「信任」以放行)"
-            ));
-            Vec::new()
-        } else {
-            (log)(&format!(
-                "[镜像] {host}{path} 凭据查询串放行 {} 个可信镜像(签名将随 URL 交予第三方, 用户已授权)",
-                trusted.len()
-            ));
-            trusted
-        }
+        (log)(&format!(
+            "[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(私有下载不走镜像)"
+        ));
+        Vec::new()
     } else {
         pool::mirror_chain(&chain_host)
     };
@@ -520,8 +520,24 @@ pub(super) async fn chain_fetch(
         };
         let mut guard = LoadGuard::charge(mirror_load(m), new_bytes, big);
         let t0 = Instant::now();
+        // 请求的 Range 先抽出来（mirror_do 会拿走 req）：206 刀口校验要用。
+        let req_range = req
+            .headers()
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         match mirror_do(req, m, log).await {
             Ok(resp) => {
+                // 单流 206 刀口校验：第三方镜像错位回包按这家失败处理，换下一家。
+                if let Some(e) = stream_start_mismatch(req_range.as_deref(), &resp) {
+                    if big {
+                        mark_fail(&mirror_load(m), false);
+                    }
+                    (log)(&format!(
+                        "[镜像] {host}{path} {m} 刀口不符({e}), 链内下一个"
+                    ));
+                    continue;
+                }
                 // 头已到：码表重跑，建连/等待耗时留在墙钟不进速度样本。
                 guard.restart_mark();
                 if big {
@@ -1752,17 +1768,29 @@ fn calib_fail_label(e: &str) -> &'static str {
     }
 }
 
-/// 同源判定：忽略大小写与尾斜杠后全等；前缀匹配会把 gh-proxy.org.evil.tld 当成自己人。
-fn same_origin(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> String {
-        s.trim().trim_end_matches('/').to_ascii_lowercase()
+/// 查询键名百分号解码：`?%73ig=x` 也得认成 sig。
+fn decode_query_key(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
     }
-    norm(a) == norm(b)
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn has_credential_query(query: &str) -> bool {
-    query.split('&').any(|kv| {
-        let name = kv.split('=').next().unwrap_or("").to_lowercase();
+    query.split(['&', ';']).any(|kv| {
+        let name = decode_query_key(kv.split('=').next().unwrap_or("")).to_lowercase();
         name == "token"
             || name == "sig"
             || name == "signature"
@@ -1777,6 +1805,8 @@ fn has_credential_query(query: &str) -> bool {
             || name == "secret"
             || name == "password"
             || name.starts_with("x-amz-")
+            || name.starts_with("x-goog-")
+            || name.starts_with("x-ms-")
     })
 }
 

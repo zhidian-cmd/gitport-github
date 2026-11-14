@@ -26,14 +26,24 @@ pub fn bench(ip: &str) {
 /// 软排除：从候选里摘掉暂缓中的 IP。
 /// 全部暂缓时原样返回——「全慢才回来」就落在这里，绝不因为筛选把候选清空。
 pub fn usable(ips: &[String]) -> Vec<String> {
-    let g = lock(&BENCH);
-    let Some(t) = g.as_ref() else {
+    let mut g = lock(&BENCH);
+    let Some(t) = g.as_mut() else {
         return ips.to_vec();
     };
     let now = Instant::now();
+    // 顺手清过期项：候选集有限但表键是全量 IP，不清的话过期项永远躺着。
+    let mut expired: Vec<String> = Vec::new();
+    for (ip, until) in t.iter() {
+        if now >= *until {
+            expired.push(ip.clone());
+        }
+    }
+    for ip in &expired {
+        t.remove(ip);
+    }
     let live: Vec<String> = ips
         .iter()
-        .filter(|ip| !t.get(*ip).is_some_and(|u| now < *u))
+        .filter(|ip| !t.contains_key(*ip))
         .cloned()
         .collect();
     if live.is_empty() {
@@ -60,22 +70,27 @@ struct HostRace {
 
 static HOSTS: Mutex<Option<HashMap<String, HostRace>>> = Mutex::new(None);
 
-/// 现在能不能为这个 host 触发一轮重建：冷却中不行。
-pub fn may_rebuild(host: &str) -> bool {
-    let g = lock(&HOSTS);
-    match g.as_ref().and_then(|m| m.get(host)) {
-        None => true,
-        Some(st) => st
-            .last
-            .is_none_or(|t| Instant::now().duration_since(t).as_secs() >= REBUILD_COOLDOWN_SECS),
-    }
-}
-
-/// 记一轮重建开始。
-pub fn begin_rebuild(host: &str) {
+/// 能不能为这个 host 触发一轮重建：能 = 原子地记下这轮开始。
+/// 检查+写入必须一次持锁完成——分开写的话一页几十个并发报黑全都读到"可以重建"、
+/// 全都触发换血，同一批 IP 重复拨号占满拨号闸门（注释里"只触发一轮"靠的就是这里的原子性）。
+pub fn try_begin_rebuild(host: &str) -> bool {
     let mut g = lock(&HOSTS);
     let m = g.get_or_insert_with(HashMap::new);
-    m.entry(host.to_string()).or_default().last = Some(Instant::now());
+    // 顺带卫生：24h 没动静的 host 条目清掉；表只涨不清会跟着子域数膨胀。
+    let cutoff = Instant::now() - Duration::from_secs(24 * 3600);
+    m.retain(|_, st| st.last.is_some_and(|t| t > cutoff));
+    if m.len() > 1024 {
+        m.clear();
+    }
+    let st = m.entry(host.to_string()).or_default();
+    if st
+        .last
+        .is_some_and(|t| Instant::now().duration_since(t).as_secs() < REBUILD_COOLDOWN_SECS)
+    {
+        return false;
+    }
+    st.last = Some(Instant::now());
+    true
 }
 
 /// 测试专用：清空暂缓表与重建节奏表。

@@ -34,7 +34,7 @@ struct SettingsState {
     worker_mirrors: Mutex<Vec<WorkerMirror>>,
 }
 
-/// 一条自定义镜像：url 为反代地址，on 为是否进链，trusted 表示用户授权把签名 URL 交给它。
+/// 一条自定义镜像：url 为反代地址，on 为是否进链。
 /// template = 该镜像的用法模板（占位符 {mirror}/{url}/{url_enc}/{owner}/{repo}/{ref}/{path}），
 /// 添加时由后台探测自动试出并保存；空 = 未探测，按老拼法（前缀拼接）用。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -44,7 +44,6 @@ pub struct WorkerMirror {
     /// 手写一条镜像时的默认意图就是"用它"：不写 on 视为启用，别让人写半天结果是关的。
     #[serde(default = "on_by_default")]
     pub on: bool,
-    pub trusted: bool,
     #[serde(default)]
     pub template: String,
     /// 用法试探没过：标红给用户看，且不进镜像链（试探是 best-effort，不删条目）。
@@ -75,7 +74,6 @@ fn default_worker_mirrors() -> Vec<WorkerMirror> {
     .map(|u| WorkerMirror {
         url: u.to_string(),
         on: true,
-        trusted: false,
         template: String::new(), // 前缀型用法不需要模板
         invalid: false,
     })
@@ -309,7 +307,7 @@ pub fn ensure_system_proxy() -> Result<String, String> {
         *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
         refresh_wininet();
         let git_note = ensure_git_proxy();
-        let _ = save();
+        save_logged();
         return Ok(format!("{note}; {git_note}"));
     }
     clear_if_ours(&key, &cur);
@@ -351,7 +349,7 @@ fn restore_or_clear(key: &RegKey) {
     *state().proxy_backup.lock().unwrap() = String::new();
     *state().last_pac.lock().unwrap() = String::new();
     refresh_wininet();
-    let _ = save();
+    save_logged();
 }
 
 /// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空），还原时决定要不要保留。
@@ -512,7 +510,6 @@ where
                 One::Url(url) => WorkerMirror {
                     url,
                     on: true,
-                    trusted: false,
                     template: String::new(),
                     invalid: false,
                 },
@@ -526,7 +523,6 @@ where
             Some(WorkerMirror {
                 url: url.to_string(),
                 on: m.on,
-                trusted: m.trusted,
                 template: m.template,
                 invalid: m.invalid,
             })
@@ -570,10 +566,28 @@ fn settings_path() -> PathBuf {
 
 pub fn load() {
     match std::fs::read_to_string(settings_path()) {
-        Ok(raw) => apply(parse(&raw)),
+        Ok(raw) => {
+            // 记事本可能写入 UTF-8 BOM，serde_json 不认
+            let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+            match serde_json::from_str::<SettingsFile>(raw) {
+                Ok(v) => apply(v),
+                Err(e) => {
+                    // 整份回默认前先把坏文件原样留底：git_proxy_backup（用户的原 git 代理）
+                    // 只有这一份副本，断电/手滑写坏 JSON 不该让原配置无声蒸发。
+                    // 留底后逐字段回默认；单字段容错只在语法合法时生效（见 lenient）。
+                    let bak = settings_path().with_extension("json.bak");
+                    let _ = std::fs::write(&bak, raw.as_bytes());
+                    crate::logger::crash(&format!(
+                        "[设置] settings.json 解析失败({e}), 已整份回默认; 原文件留底 {}",
+                        bak.display()
+                    ));
+                    apply(SettingsFile::default());
+                }
+            }
+        }
         // 全新安装：首启落一份全键位空模板，"固定位置 + 固定 schema"从第一次运行起成立。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = save();
+            save_logged();
         }
         Err(_) => {}
     }
@@ -585,6 +599,8 @@ pub fn load() {
     }
 }
 
+/// 测试与诊断用的小解析器（load 已内联带留底的解析流程）。
+#[cfg(test)]
 fn parse(raw: &str) -> SettingsFile {
     // 记事本可能写入 UTF-8 BOM，serde_json 不认
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
@@ -611,6 +627,14 @@ fn apply(v: SettingsFile) {
 
 /// 保存互斥：快照与写盘全程持锁，防旧快照覆写丢更新（保存罕见，临界区短）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 带留痕的落盘：内存态已改、界面显示成功，写盘失败无声吞掉 = 改动重启即丢且查无痕迹。
+/// crash.log 常驻、追加式，落盘失败罕见（磁盘满/只读），留一行正当其用。
+fn save_logged() {
+    if let Err(e) = save() {
+        crate::logger::crash(&format!("[设置] settings.json 落盘失败: {e}"));
+    }
+}
 
 fn save() -> Result<(), String> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -800,7 +824,7 @@ fn remove_git_proxy() -> String {
         }
     }
     *state().git_proxy_backup.lock().unwrap() = String::new();
-    let _ = save();
+    save_logged();
     if touched {
         "git 代理已还原".to_string()
     } else {
@@ -822,7 +846,7 @@ pub fn set_last_ips(marks: Vec<(String, String)>) {
         }
         *st = next;
     }
-    let _ = save();
+    save_logged();
 }
 
 pub fn autostart_enabled() -> bool {
@@ -885,7 +909,7 @@ pub fn worker_mirrors() -> Vec<WorkerMirror> {
 /// 收编保存：只落盘注册表不动镜像链，顺序按调用方给的。
 pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     *state().worker_mirrors.lock().unwrap() = list;
-    let _ = save();
+    save_logged();
 }
 
 /// 整表保存：规范化校验并与旧表求差集；删除即彻底消失，前端须先 GET 合并，链对齐由调用方用 removed 触发。
@@ -905,7 +929,7 @@ pub fn set_worker_mirrors(
         if norm.iter().any(|x| x.url == u) {
             continue; // 去重
         }
-        // 同 URL 的旧条目已探测过：编辑 on/trusted 不许把模板与探测结论弄丢。
+        // 同 URL 的旧条目已探测过：编辑 on 不许把模板与探测结论弄丢。
         let old = worker_mirrors()
             .into_iter()
             .find(|x| x.url == u);
@@ -915,7 +939,6 @@ pub fn set_worker_mirrors(
         norm.push(WorkerMirror {
             url: u,
             on: w.on,
-            trusted: w.trusted,
             template: if w.template.is_empty() { old_tpl } else { w.template },
             invalid: w.invalid || old_bad,
         });
@@ -973,20 +996,8 @@ fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {
     if let Some(w) = list.iter_mut().find(|w| w.url == u) {
         f(w);
         *state().worker_mirrors.lock().unwrap() = list;
-        let _ = save();
+        save_logged();
     }
-}
-
-/// 凭据串放行名单：用户标记为可信的已启用镜像 URL 集合。
-pub fn trusted_mirrors() -> std::collections::HashSet<String> {
-    state()
-        .worker_mirrors
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|w| w.on && w.trusted)
-        .map(|w| w.url.clone())
-        .collect()
 }
 
 #[cfg(test)]

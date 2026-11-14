@@ -206,7 +206,12 @@ impl Authority {
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
-        let _ = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy());
+        if let Err(e) = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy()) {
+            // 收紧失败 = 根私钥可能被同机其他账户读走（可伪造叶子证书解密流量）：
+            // 删钥让 MITM 起不来，绝不带病上岗。load_or_generate 把错误往上传。
+            let _ = std::fs::remove_file(key_path);
+            return Err(format!("ca.key 权限收紧失败, 已删除该文件(禁用 MITM): {e}"));
+        }
         Ok(())
     }
 }

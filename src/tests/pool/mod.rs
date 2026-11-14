@@ -565,14 +565,12 @@ fn toggle_gates_big_file_chains_only() {
         crate::settings::WorkerMirror {
             url: "https://on.example".into(),
             on: true,
-            trusted: false,
             template: String::new(),
             invalid: false,
         },
         crate::settings::WorkerMirror {
             url: "https://off.example".into(),
             on: false,
-            trusted: false,
             template: String::new(),
             invalid: false,
         },
@@ -667,7 +665,6 @@ fn fresh_install_mirror_lands_in_all_chains() {
     apply_worker_mirrors(vec![crate::settings::WorkerMirror {
         url: "https://my-worker.example.com".to_string(),
         on: true,
-        trusted: false,
         template: String::new(),
         invalid: false,
     }])

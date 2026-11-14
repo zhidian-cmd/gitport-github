@@ -161,7 +161,7 @@ async fn chain_fetch_cred_locks_to_direct() {
     assert!(err.contains("仅直连"), "凭据串应剥空镜像仅直连: {err}");
     let got = lines.lock().unwrap();
     assert!(
-        got.iter().any(|l| l.contains("仅直连(防外泄")),
+        got.iter().any(|l| l.contains("私有下载不走镜像")),
         "应记录剥空镜像决策: {got:?}"
     );
     assert!(
@@ -170,45 +170,14 @@ async fn chain_fetch_cred_locks_to_direct() {
     );
 }
 
-/// 可信镜像白名单：用户标记 trusted 的镜像，凭据串请求放行给它(知情授权)；未标记的镜像仍被剥除。放行名单为空时行为与旧版一致(仅直连)。
+/// 凭据查询键的百分号/分号变体同样认账：`?%73ig=` 与 `?a=1;sig=x` 都按凭据处理。
 #[test]
-fn cred_authorized_trusted_mirrors_only() {
-    // settings 全局态无法按测隔离——直接验证放行集合的过滤逻辑: trusted_mirrors() 返回 on && trusted 的 URL, 镜像 URL 前缀匹配放行。
-    use crate::settings::WorkerMirror;
-    let mirrors = [
-        WorkerMirror {
-            url: "https://my-worker.example.com".into(),
-            on: true,
-            trusted: true,
-            template: String::new(),
-            invalid: false,
-        },
-        WorkerMirror {
-            url: "https://public-proxy.example.org".into(),
-            on: true,
-            trusted: false,
-            template: String::new(),
-            invalid: false,
-        },
-    ];
-    let trusted: std::collections::HashSet<String> = mirrors
-        .iter()
-        .filter(|w| w.on && w.trusted)
-        .map(|w| w.url.clone())
-        .collect();
-    let chain = [
-        "https://my-worker.example.com/".to_string(), // 可信(带尾斜杠变体)
-        "https://public-proxy.example.org".to_string(), // 不可信
-    ];
-    let passed: Vec<&String> = chain
-        .iter()
-        .filter(|m| trusted.iter().any(|t| m.starts_with(t.as_str())))
-        .collect();
-    assert_eq!(passed.len(), 1, "只有可信镜像应被放行: {passed:?}");
-    assert!(
-        passed[0].starts_with("https://my-worker.example.com"),
-        "放行的应是可信那家: {passed:?}"
-    );
+fn has_credential_query_decodes_and_splits() {
+    use crate::server::mitm::mirror::has_credential_query;
+    assert!(has_credential_query("%73ig=abc"), "百分号编码的 sig 应认出");
+    assert!(has_credential_query("a=1;sig=abc"), "分号分隔应认出");
+    assert!(has_credential_query("x-goog-signature=abc"), "goog 签名应认出");
+    assert!(!has_credential_query("path=/a%2Fb&zoom=100"), "普通参数不得误伤");
 }
 
 /// 纯直连耗尽(零镜像/凭据串剥空)不给镜像链上熔断——链没参与，别连坐。

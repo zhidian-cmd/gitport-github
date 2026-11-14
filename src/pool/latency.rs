@@ -55,3 +55,41 @@ pub(crate) fn seed(ip: &str, ms: u64) {
         .get_or_insert_with(HashMap::new)
         .insert(ip.to_string(), ms);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::pool::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// note 合并取均值：单次 GFW 抖动（4 秒抽签）不会一棍子打死，连续慢才沉底。
+    #[test]
+    fn note_merges_as_average() {
+        let _g = guard();
+        install(HashMap::new());
+        note("1.1.1.1", 500);
+        note("1.1.1.1", 900);
+        assert_eq!(get("1.1.1.1"), Some(700), "(500+900)/2");
+        note("1.1.1.1", 100);
+        assert_eq!(get("1.1.1.1"), Some(400), "(700+100)/2");
+    }
+
+    /// sink 降权钳在 [3s, 10s]：一次误判不把 IP 沉到未测候选之下（未测恒垫底）。
+    #[test]
+    fn sink_clamps_between_3s_and_10s() {
+        let _g = guard();
+        install(HashMap::new());
+        sink("2.2.2.2");
+        assert_eq!(get("2.2.2.2"), Some(3000), "未测 IP 一刀进 3s 档");
+        seed("3.3.3.3", 100);
+        sink("3.3.3.3");
+        assert_eq!(get("3.3.3.3"), Some(3000), "100ms 翻倍也只到下限");
+        seed("4.4.4.4", 9000);
+        sink("4.4.4.4");
+        assert_eq!(get("4.4.4.4"), Some(10000), "封顶 10s");
+    }
+}

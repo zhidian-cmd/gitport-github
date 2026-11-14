@@ -52,3 +52,4 @@ diag*.txt
 .zread
 deliverables
 /dist/*.exe.old*
+*.tmp

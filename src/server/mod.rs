@@ -123,6 +123,17 @@ impl ProxyServer {
 
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
+        // 开放代理闸：本进程只加速 GitHub 系域名。非受管目标一律 502——
+        // 否则任何能连到 7810 的进程都能借它扫内网、读云元数据、摸自家管理端口。
+        if !pool::route::is_managed(&host) {
+            (self.log)(&format!(
+                "[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"
+            ));
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
         // MITM 只拦 443；非 443 是明文协议，交普通 TCP 隧道，端口照用。
         if port == 443 && mitm::mitm_scope(self.authority.as_ref(), &host) {
             mitm::handle_connect_mitm(self, client, &host).await;
@@ -197,6 +208,16 @@ impl ProxyServer {
         if host.is_empty() {
             let _ = client
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+        // 开放代理闸（与 CONNECT 同款）：非受管目标一律 502。
+        if !pool::route::is_managed(&host) {
+            (self.log)(&format!(
+                "[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"
+            ));
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
             return;
         }

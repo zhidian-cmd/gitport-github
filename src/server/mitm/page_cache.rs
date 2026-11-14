@@ -572,28 +572,13 @@ fn session_value(cookies: Option<&str>) -> Option<&str> {
     })
 }
 
-/// 账号名（GitHub 稳定下发的 dotcom_user）；只认干净的值，脏值当没有。
-fn account_name(cookies: Option<&str>) -> Option<&str> {
-    cookies?.split(';').map(str::trim).find_map(|kv| {
-        let u = kv.strip_prefix("dotcom_user=")?;
-        let sane = !u.is_empty()
-            && u.len() <= 64
-            && u.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
-        sane.then_some(u)
-    })
-}
-
-/// 身份标签：未登录 -cloggedout，登录 -c<账号>；取不到账号就哈希 session 值，不能哈希整条 Cookie。
+/// 身份标签：未登录 -cloggedout，登录 = 会话号稳定摘要。
+/// 不用账号名（dotcom_user 是客户端自报的明文，伪造它就能撞出别人的键）——
+/// 会话号散列进标签（复用 page_file_name），读取侧按 key 校验；轮换 user_session 只损失一次命中。
 fn session_fingerprint(cookies: Option<&str>) -> String {
-    let Some(sess) = session_value(cookies) else {
-        return "-cloggedout".into();
-    };
-    match account_name(cookies) {
-        Some(u) => format!("-c{u}"),
-        // 会话号散列进标签：稳定摘要即可，读取侧按 key 校验，无碰撞风险。
-        // 会话号散列进标签（复用 page_file_name 的稳定摘要），读取侧按 key 校验。
-        None => format!("-cs{}", page_file_name(sess)),
+    match session_value(cookies) {
+        Some(sess) => format!("-cs{}", page_file_name(sess)),
+        None => "-cloggedout".into(),
     }
 }
 
@@ -774,7 +759,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
             .ok()
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .unwrap_or(u64::MAX); // 取不到间隔（含 mtime 在未来：系统时间回拨过）按过期处理，交旧+后台重拉
         swr_expired = age > KEEP_MAX_AGE_MS;
     }
     if raw.len() < 4 {
@@ -840,7 +825,13 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
             return Err("快照条目截断(无</html>)");
         }
         let mut h = hdrs;
-        h.retain(|(k, _)| k.as_str() != "content-length");
+        h.retain(|(k, _)| k.as_str() != "content-length" && k.as_str() != "content-encoding");
+        // 交出去的是重压的 gzip 体，头必须跟着写 gzip——存侧头的 content-encoding 是原体
+        // (br/无)的，直交会让浏览器按错编码解码、仓库页白屏。
+        h.push((
+            hyper::header::CONTENT_ENCODING,
+            hyper::header::HeaderValue::from_static("gzip"),
+        ));
         (h, Bytes::from(gz_compress(full.as_slice())))
     } else {
         let p = plain_prefix(body, enc);
@@ -1285,6 +1276,15 @@ fn persist_repo_snapshot(
     write_entry_file(dir, key, &delta, &header)
 }
 
+/// 服务器明说别存的（no-store）一律不落盘。private 不在列——GitHub 用它表达
+/// "浏览器别共享"，代理侧缓存已按会话号哈希分钥匙，语义等价；全拒会把页面缓存整个干掉。
+fn resp_no_store(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("no-store"))
+}
+
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
 async fn collect_and_submit(
     log: &LogFn,
@@ -1353,6 +1353,7 @@ async fn collect_and_submit(
             let plain = plain_prefix(&bytes, enc);
             // 首页骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
             let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
+                && !resp_no_store(&parts.headers)
                 && (!key.ends_with("-k") || html_complete(&bytes, enc))
                 && !(has_session && is_logged_out_body(&plain))
                 && !is_gate_page(&plain)

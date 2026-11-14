@@ -4,7 +4,7 @@
 use super::protocol::{self, BoxBody};
 use bytes::Bytes;
 use hyper::body::{Body as _, Frame};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// 单段缓冲上限：快段先到先存，超过就暂时不读它，等交付线推进再读。
@@ -144,6 +144,8 @@ struct Seg {
     stalled_since: Option<Instant>,
     /// 上次被让位的时刻，冷却用。
     last_cut: Option<Instant>,
+    /// 被让位缩过边界：下载越过刀口即掐流（正常段要 poll 到 EOF，不在此列）。
+    cut: bool,
     /// 上游已结束（正常收尾、出错、或被停滞收割）。
     done: bool,
     /// 结束原因（仅 done 时有意义）。
@@ -167,6 +169,7 @@ impl Seg {
             last_poll: at,
             stalled_since: None,
             last_cut: None,
+            cut: false,
             done: false,
             err: None,
             frozen_rate: None,
@@ -225,6 +228,9 @@ pub(super) struct MergeBody {
     total: u64,
     /// 待发请求的区间：缺口、被让位的尾巴。
     fill: VecDeque<(u64, u64)>,
+    /// 已派出未回话的区间：去重的另一半——只查 fill 队列会漏掉在途的，
+    /// 同一区间派两条流会在交付线错位重复吐字节（下载整体偏移）。
+    inflight: HashSet<(u64, u64)>,
     /// 干净收尾的段数 = 闲下来的连接数，让位得有活才干。
     idle_credit: u32,
     /// 连续"补发一个字节都没下到"的次数，有进展清零。
@@ -249,6 +255,7 @@ impl MergeBody {
             sent: 0,
             total,
             fill: VecDeque::new(),
+            inflight: HashSet::new(),
             idle_credit: 0,
             dead_fills: 0,
             last_tick: Instant::now(),
@@ -286,25 +293,32 @@ impl MergeBody {
         true
     }
 
-    /// 取一个待发区间（缺口 / 让位尾巴）。
+    /// 取一个待发区间（缺口 / 让位尾巴）。派出即登记在途，回来（feed/retry_fill）才清。
     pub(super) fn take_fill(&mut self) -> Option<(u64, u64)> {
-        self.fill.pop_front()
+        let iv = self.fill.pop_front()?;
+        self.inflight.insert(iv);
+        Some(iv)
     }
 
     /// 起流失败后把这段塞回队尾重试——不塞回去就再也没人管这个洞了。
     /// 补发失败 = 记一次空手（dead_fills），下次换家再来。
     pub(super) fn retry_fill(&mut self, from: u64, to: u64) {
         self.dead_fills += 1;
+        self.inflight.remove(&(from, to));
         self.queue_fill(from, to);
     }
 
     /// 接管一条流：把 [start, end) 交给它。
     pub(super) fn feed(&mut self, start: u64, end: u64, at: Instant, body: BoxBody) {
+        self.inflight.remove(&(start, end));
         self.segs.insert(start, Seg::new(start, end, at, body));
     }
 
     pub(super) fn queue_fill(&mut self, from: u64, to: u64) {
-        if to <= from || self.fill.iter().any(|&(f, t)| f == from && t == to) {
+        if to <= from
+            || self.fill.iter().any(|&(f, t)| f == from && t == to)
+            || self.inflight.contains(&(from, to))
+        {
             return;
         }
         self.fill.push_back((from, to));
@@ -318,6 +332,12 @@ impl MergeBody {
         for seg in self.segs.values_mut() {
             if seg.done || seg.buffered >= SEG_BUFFER_MAX {
                 continue;
+            }
+            // 让位后的父段：下载已越过刀口——刀口外的字节是要丢的，掐掉上游流停止白下载；
+            // 换上的空体下一轮即 EOF 收尾，缓冲里已到的照常交付，段在交付线越过新边界时移除。
+            // （只对被让位的段生效；正常段必须 poll 到 EOF，那是收尾记账的一部分。）
+            if seg.cut && seg.pos() >= seg.end {
+                seg.body = protocol::empty_body();
             }
             // 轮询断档（我们在忙队首）：这段没被看着的时间不算停滞。
             if now.saturating_duration_since(seg.last_poll) > POLL_GAP {
@@ -370,6 +390,7 @@ impl MergeBody {
     /// 收尸真停滞的段：已收到的留下、没收到的那截排进补发——是"缩边界"不是"整段重下"，缓冲里的字节一个都不丢。
     pub(super) fn reap_stalled(&mut self, now: Instant) -> bool {
         let mut any = false;
+        let mut tails: Vec<(u64, u64)> = Vec::new();
         for seg in self.segs.values_mut() {
             if seg.done {
                 continue;
@@ -393,10 +414,12 @@ impl MergeBody {
                 std::io::ErrorKind::TimedOut,
                 "段停滞，尾巴转补发",
             ));
-            if self.fill.iter().all(|&(f, t)| f != pos || t != old_end) {
-                self.fill.push_back((pos, old_end));
-            }
+            tails.push((pos, old_end));
             any = true;
+        }
+        // 迭代借用结束后再排队——queue_fill 借整个 self，不能在 values_mut() 循环里调。
+        for (pos, old_end) in tails {
+            self.queue_fill(pos, old_end);
         }
         any
     }
@@ -479,7 +502,8 @@ impl MergeBody {
         out
     }
 
-    /// 把某段的边界缩到 cut，尾巴排进补发。父流不必断，交到新边界自然放手。
+    /// 把某段的边界缩到 cut，尾巴排进补发。父流跑到刀口即被掐流（fill_all 越界换空体），
+    /// 刀口外是要丢的字节，继续灌缓冲纯属白下载；缓冲里已到的照常交付。
     fn cut(&mut self, start: u64, cut: u64, now: Instant) -> Option<(u64, u64)> {
         let seg = self.segs.get_mut(&start)?;
         let old_end = seg.end;
@@ -488,8 +512,9 @@ impl MergeBody {
         }
         seg.end = cut;
         seg.last_cut = Some(now);
+        seg.cut = true;
         self.idle_credit = self.idle_credit.saturating_sub(1);
-        self.fill.push_back((cut, old_end));
+        self.queue_fill(cut, old_end);
         Some((cut, old_end))
     }
 }

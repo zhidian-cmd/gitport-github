@@ -195,7 +195,6 @@ fn save_emits_full_schema_in_canonical_order() {
         worker_mirrors: vec![WorkerMirror {
             url: "https://my.worker".to_string(),
             on: true,
-            trusted: false,
             template: String::new(),
             invalid: false,
         }],
@@ -267,7 +266,6 @@ fn worker_mirrors_accepts_handwritten_forms() {
     assert_eq!(v.worker_mirrors.len(), 1);
     assert_eq!(v.worker_mirrors[0].url, "https://only-url.example");
     assert!(v.worker_mirrors[0].on, "只写 URL 应默认启用");
-    assert!(!v.worker_mirrors[0].trusted);
 
     let v = parse(r#"{"worker_mirrors":["https://snake.example"]}"#);
     assert_eq!(

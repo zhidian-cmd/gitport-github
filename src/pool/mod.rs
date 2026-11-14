@@ -630,7 +630,11 @@ fn json_of<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("JSON 序列化不会失败")
 }
 
+/// routes.json 写盘互斥：退出落盘与后台改镜像链可能同时写，撞在一起会把两份配置搅成一份。
+static ROUTES_SAVE_LOCK: Mutex<()> = Mutex::new(());
+
 fn write_routes_file(path: &Path, mirrors: &HashMap<String, Vec<String>>) {
+    let _guard = ROUTES_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let data = encode_routes(mirrors);
     if let Err(e) = crate::fsx::write_atomic(path, data.as_bytes()) {
         // 写盘失败无声 = 镜像链/表变更重启即丢且查无痕迹，必须留一行。
@@ -808,7 +812,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                 registry.push(crate::settings::WorkerMirror {
                     url: u.clone(),
                     on: true,
-                    trusted: false,
                     template: String::new(),
                     invalid: false,
                 });
@@ -1343,6 +1346,16 @@ pub async fn serial_dial_skip(
 static BUILD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     std::sync::OnceLock::new();
 
+/// 建造在途的等待上界：必须盖过内容域竞速全程（RACE_WINDOW_SECS 8s + H2 握手 5s）+ 余量。
+/// 等待界小于建造耗时 = 冷启动一页并发请求在通道建成前集体超时、全部摔给兜底。
+const BUILD_WAIT_SECS: u64 = 15;
+
+/// 测试专用：读游标驻留（游标本身内存态、零写盘，没有别的读出口）。
+#[cfg(test)]
+pub(crate) fn cursor_of(route_key: &str) -> Option<String> {
+    lock(&SERIAL).as_ref()?.cursor.get(route_key).cloned()
+}
+
 fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
     BUILD_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1388,20 +1401,21 @@ pub async fn get_or_build(
 
     // 3) 池空 → 排队等在途建造：建造锁的等待队列就是「host 正在建造」登记簿。
     // 被唤醒后双检（轮到我时前一位可能刚建成）；前一位失败则自己顶上重建，重试链天然形成。
-    // 每个等待者自己的 3s 界：建造迟迟不回就交 Err 走兜底。
+    // 每个等待者自己的界：必须盖过内容域竞速全程（RACE_WINDOW_SECS 8s + 握手 5s），
+    // 否则冷启动一页并发请求集体在建造完成前超时，全部摔给镜像/DNS（实测就是 3 < 8 的数值越界）。
     let gate = build_lock(host);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(BUILD_WAIT_SECS);
     loop {
         if let Some(up) = pick_channel(host, &ips, session) {
             return Ok((up, false)); // 排队期间被喂饱了
         }
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() {
-            return Err(format!("{host} 建造在途等待超时(3s), 走兜底"));
+            return Err(format!("{host} 建造在途等待超时({BUILD_WAIT_SECS}s), 走兜底"));
         }
         let _guard = match tokio::time::timeout(wait, gate.lock()).await {
             Ok(g) => g,
-            Err(_) => return Err(format!("{host} 建造在途等待超时(3s), 走兜底")),
+            Err(_) => return Err(format!("{host} 建造在途等待超时({BUILD_WAIT_SECS}s), 走兜底")),
         };
         // 双检：轮到我时前一位可能刚建成。
         if let Some(up) = pick_channel(host, &ips, session) {
@@ -1410,7 +1424,7 @@ pub async fn get_or_build(
         // 建造：内容域竞速、其他/会话域串发，全在 dial_upstream 内。
         match chan::dial_upstream(host, probe_path, log).await {
             Err(e) if e == chan::ERR_ALL_CLAIMED => {
-                // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（3s 界照旧）。
+                // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（界照旧）。
                 drop(_guard);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -1454,8 +1468,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
             (log)(&format!(
                 "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
             ));
-            if speed::may_rebuild(host) {
-                speed::begin_rebuild(host);
+            if speed::try_begin_rebuild(host) {
                 ensure_coverage(host, path, log.clone());
             }
         }
@@ -1480,19 +1493,30 @@ fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
             }
             let host2 = host.clone();
             let log2 = log.clone();
-            let built_ip = t.ip.clone();
             let dial_job = async move {
-                let conn = dial::dial_one(&t.ip, &t.sni, &t.verify, true).await.ok()?;
-                let up = chan::h2_from_dialed(&host2, conn, &t.ip, &log2)
-                    .await
-                    .ok()?;
+                // 拨号/握手失败各落一行：吞掉的话坏 IP 每 60 秒白付一次完整握手还查无痕迹。
+                let conn = match dial::dial_one(&t.ip, &t.sni, &t.verify, true).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        (log2)(&format!("[池] {host2} {} 拨号失败({e}), 本轮跳过", t.ip));
+                        return;
+                    }
+                };
+                let up = match chan::h2_from_dialed(&host2, conn, &t.ip, &log2).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        (log2)(&format!("[池] {host2} {} h2 握手失败({e}), 本轮跳过", t.ip));
+                        return;
+                    }
+                };
                 let _ = chan::store_h2(&t.ip, up);
-                Some(built_ip)
+                (log2)(&format!("[池] {host2} 新通道 {} 入池", t.ip));
             };
             tokio::spawn(dial_job);
             built += 1;
         }
-        (log)(&format!("[池] {host} 补齐完成: 新拨 {built} 条"));
+        // 派发数不是建成数——成没成由各腿自己的回执行说话，这里只报派了几条。
+        (log)(&format!("[池] {host} 换血: 派发 {built} 腿"));
     });
 }
 
@@ -1672,7 +1696,7 @@ pub async fn gather_channels(
     got
 }
 
-/// 通道失败上报：摘通道 + 记账。新拨的（IP 真试过了）罚边冷却 + 游标前移；
+/// 通道失败上报：摘通道 + 记账。新拨的（IP 真试过了）游标前移 + 罚边冷却；
 /// 骑来的旧通道只摘不罚——IP 没被试过，罚了会把直连逼进镜像链。
 pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fresh: bool) {
     use crate::server::upstream as chan;
@@ -1680,10 +1704,12 @@ pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fres
     if !fresh {
         return;
     }
+    // 先挪游标再拉黑，顺序不能反：候选圈会滤掉已在边冷却的 IP，先拉黑的话
+    // 圈里就找不到这个 IP，游标永远挪不动——冷却一过又优先拨刚失败的它。
+    cursor_note(host, &up.ip, false);
     if let Some(row) = route::route_for(host) {
         edges::mark_stall(&up.ip, &row.key);
     }
-    cursor_note(host, &up.ip, false);
 }
 
 /// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。
