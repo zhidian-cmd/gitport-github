@@ -26,7 +26,7 @@
 上面为节选，实际落盘是 `cursor_keys()` 派生的**全量键位**（当前种子表全部非 direct、非 content 行各一把，示例只列了 3 把），未驻留的一律写 `""`。首次启动时 `settings::load()` 早于路由表装载，落盘其实是 `"lastIp": {}`，要等第一次成功拨号 `set_last_ips` 才铺开成全量键。
 
 - `lastPac`：上次写进系统的 PAC 地址，用来区分“自己的残留”和别家同形态；手改无意义
-- `workerMirrors`：镜像注册表，工作台里增删镜像时维护；**全新安装内置 8 家公共镜像**（可删可关）。手改也认，三种写法都收：`["https://反代地址"]`（只写地址 = 默认启用）、`[{"url":"https://反代地址","on":true}]`、单个字符串/对象（忘写数组括号也收）；键名写成 `worker_mirrors` 同样识别。只收 `https://` 开头且不含空格的地址，其余忽略；整段写坏只丢这一段，不影响其他开关。手写的启用镜像启动时会对齐进内存镜像链（**不重写 routes.json**）；此后任何一次 `save()` 都会按内存状态整份重写 settings.json，不限于界面保存
+- `workerMirrors`：镜像注册表，工作台里增删镜像时维护；**全新安装内置 8 家公共镜像**（可删可关，克隆模板已出厂实测）。手改也认，三种写法都收：`["https://反代地址"]`（只写地址 = 默认启用）、`[{"url":"https://反代地址","on":true}]`、单个字符串/对象（忘写数组括号也收）；键名写成 `worker_mirrors` 同样识别。每条镜像另有 `cloneTpl`（克隆模板，探测命中才填，有值才进克隆链）与 `cloneBad`（克隆探测测过但不支持，不再重复探测）两个字段——手改可不写，启动补测会自动跑。只收 `https://` 开头且不含空格的地址，其余忽略；整段写坏只丢这一段，不影响其他开关。手写的启用镜像启动时会对齐进内存镜像链（**不重写 routes.json**）；此后任何一次 `save()` 都会按内存状态整份重写 settings.json，不限于界面保存
 
 - `lastIp` 的键由 `pool::cursor_keys()` 派生：**只记串发域（会话域 + 其他低频域）的主键**；内容域（`*.githubusercontent.com` / `githubassets.com`）竞速选路、游标无人读，不占键位。键序由派生顺序决定、数量随路由表变，不是写死的固定表；写盘恒为全量键位，未驻留的写 `""`
 - 表外旧键（含双通道时代的 `~2` / `_vice` 副键）读入时一律丢弃、不进落盘——手写无效
@@ -58,12 +58,11 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
   "hosts": {
     "*.githubusercontent.com": {"content": true, "fallback": "mirror"}
   },
-  "mirrors_big": {
-    "release-assets.githubusercontent.com": ["https://gh-proxy.com"]
-  },
+  "mirrors_big": ["https://gh-proxy.com"],
   "mirrors_small": {
     "raw.githubusercontent.com": ["https://gh-proxy.com", "https://ghfast.top"]
-  }
+  },
+  "mirrors_clone": ["https://gh-proxy.com"]
 }
 ```
 
@@ -79,9 +78,9 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 - **边状态机**（运行时实测，不落盘，**只在响应处理层写边，拨号层一次都不写**）：某 (IP, 路由键) 被服务端回 421 → 该边长冷却（4 小时）；**新拨连接**发送超时/断连 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。TCP 连不上不写边、走 60/300/1800 秒死亡退避；**复用旧连接失败也不写边、不熔断、不转镜像**，只按 id 摘掉那条连接。成功只清短冷却。全黑时该 host 走 fallback
   - TLS 握手失败（锚点选错）**不记边、不冷却**，只把游标前移，并打一行 `证书校验失败` 提示——那是本地校验没过，不是对端拒绝；换个 SAN 内任意域名即可，不必等于目标域名
 - 旧格式仍能读（启动自动折算，原文件留 `.bak`）：**0.5.3 及以前（v2 之前）**的 `routes` 域名字典（`plans`/`realPlans`）、`routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）。当前 0.5.4 已经是 v2 二部图格式，别把当前版本当成旧格式
-- 镜像链分两个字典：`mirrors_big` = 大文件域（objects / release-assets，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
+- 镜像链分三条：`mirrors_big` = 大文件域单链（objects / release-assets 共用一条，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media，1 host 1 条）；`mirrors_clone` = 克隆链（git clone 竞速，成员=注册表 cloneTpl 探测命中者），与大文件链互不混。分类权在域名，条目放错字典启动时也会被归位；旧版 mirrors_big 的 per-host map 格式启动时自动合并为单链
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 routes.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
-- 默认安装 routes.json **双字典为空**（`seeds.json` 顶层只有 `hosts` / `ips`，`builtin_mirror_urls()` 也返回空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**；要镜像得自己在工作台填
+- 默认安装 routes.json **镜像链为空**（`seeds.json` 顶层只有 `hosts` / `ips` / `mirrorClones`（出厂 8 家的克隆模板，启动合入注册表、零探测），`builtin_mirror_urls()` 也返回空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**；要镜像得自己在工作台填
 - **出厂镜像在 settings.rs**（`default_worker_mirrors`）：全新安装首启内置 8 家复测精选的公共镜像（2026-11-14 双轮拨测排序，落进 workerMirrors）；仅首启生效，已有 settings.json 的清单不动。README 里「默认镜像链来自 gh-proxy.org 等公益服务」是历史文案，routes.json 里没有硬编码默认镜像
 - 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
 - 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT 时间槽）；链序只决定失败时的顺延次序

@@ -61,7 +61,8 @@
 | 底稿 / 分段增量 | 仓库页快照的存储格式：第一份仓库页原文冻结为底稿（`base-repo.html`），之后每仓库只存与底稿的差异段（≥32 字节相同段引用底稿，更短差异存字面量）。底稿冻结不随发版更新；增量超全量 gzip 体积时自动改存全量 |
 | 快照 SWR | 仓库页快照满 7 天过期不判死：照常交旧壳（浏览器缓存直出，秒开）+ 后台带 cookie 静默重拉最新壳，200+完整+会话存活才覆盖，失败旧壳继续。前台全程零感知 |
 | 资产直连 | githubassets 的 JS/CSS 一律直连（通道池单流），不切片不缓存——实测 48 分钟 132 个资产请求缓存 0 命中后机制物理删除（资产 URL 是内容哈希，浏览器 immutable 缓存就是资产缓存） |
-| 诊断头 | 响应带 `x-gitport-route`，取值 `cache` / `302memo` / `direct-split` / `dns` / `direct` / `stream` / `mirror`；缓存命中另带 `x-gitport-cache: hit` |
+| 诊断头 | 响应带 `x-gitport-route`，取值 `cache` / `302memo` / `direct-split` / `dns` / `direct` / `stream` / `mirror` / `clone`；缓存命中另带 `x-gitport-cache: hit` |
+| 克隆竞速 | git clone(https) 的独立加速路线：克隆链(routes.json `mirrors_clone`，独立一条)+ 直连同台并发起跑，每腿先交「200+git 协议 Content-Type + 1KB 体」者独占整条流、其余掐断——克隆不可切分，与 ECT 分段竞速是两回事，且与能加速 release 的大文件链互不混（会反代的镜像未必会转发 git 协议）。链成员=注册表 `cloneTpl` 探测命中者；出厂 8 家的克隆模板已实测写进 `seeds.json` `mirrorClones`，启动零探测即就位 |
 
 ## 边界数字（与代码常量对齐）
 

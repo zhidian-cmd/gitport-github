@@ -103,17 +103,20 @@ fn telemetry_paths_intercepted_only() {
 #[test]
 fn stream_decision_contract() {
     use upstream::MAX_REPLAY_BODY;
+    // push 数据流保持流式直通；取包方向(upload-pack)改为缓冲回放交给克隆竞速，
+    // 超过回放上限照旧降级流式。
     assert_eq!(
         stream_decision(
             &Method::POST,
             "/fastgh/fgit.git/git-receive-pack",
             Some(100)
         ),
-        Some("git 智能协议")
+        Some("git push 数据流")
     );
     assert_eq!(
         stream_decision(&Method::POST, "/fastgh/fgit.git/git-upload-pack", None),
-        Some("git 智能协议")
+        None,
+        "取包体小可缓冲，交给克隆竞速"
     );
     assert_eq!(
         stream_decision(

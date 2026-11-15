@@ -96,6 +96,19 @@ fn run() {
 
     server::mitm::mirror::start_ect_ticker();
     server::status::start_ticker(log_fn.clone());
+    {
+        // 克隆能力补测：存量注册表里 cloneTpl 为空的镜像后台补一轮探测
+        // （兼容升级：老 settings.json 没有 clone 字段；新填镜像走工作台探测）。
+        let rt = rt.clone();
+        let logs = logs.clone();
+        logger::spawn("clone-backfill", move || {
+            let log_fn: util::LogFn = {
+                let l = logs.clone();
+                Arc::new(move |msg: &str| l.log(msg))
+            };
+            rt.block_on(server::mitm::mirror::backfill_clone_templates(&log_fn));
+        });
+    }
 
     let srv = Arc::new(server::ProxyServer {
         log: log_fn.clone(),

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
  mod merge;
  mod page_cache;
  mod switchboard;
+pub(crate) mod clone_race;
 pub(crate) mod quiet;
 mod redirect_memo;
 
@@ -221,6 +222,14 @@ async fn mitm_http(
         Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
+    // git clone 独立科室：智能协议请求走克隆竞速（镜像链+直连同台 1KB 竞速），
+    // 绕开页面缓存/风控重试/切片。push 方向(receive-pack)不认，原路不动。
+    if host == "github.com" {
+        if let Some(kind) = clone_race::classify(out_body.method(), &path, out_body.uri().query()) {
+            return clone_race::handle(&log, &req, &out_body, &host, &path, kind, &replay, &info)
+                .await;
+        }
+    }
     // 总机分诊：镜像回落/切片/直连/风控重试的科室级联全在 switchboard，政策单点。
     let resp = match switchboard::dispatch(&log, &req, &out_body, &host, &path, &info, &replay)
         .await
@@ -272,10 +281,10 @@ fn stream_decision(method: &Method, path: &str, declared_len: Option<u64>) -> Op
     if *method == Method::GET || *method == Method::HEAD {
         return None;
     }
-    if *method == Method::POST
-        && (path.ends_with("/git-receive-pack") || path.ends_with("/git-upload-pack"))
-    {
-        return Some("git 智能协议");
+    if *method == Method::POST && path.ends_with("/git-receive-pack") {
+        // push 数据流保持流式直通；取包方向(git-upload-pack)不在此列——
+        // 体小可缓冲回放，交给克隆竞速科室（超 1MB 上限走下方"实际超限"降级）。
+        return Some("git push 数据流");
     }
     if declared_len.is_some_and(|n| n as usize > upstream::MAX_REPLAY_BODY) {
         return Some("声明超限");

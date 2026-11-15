@@ -197,6 +197,7 @@ fn save_emits_full_schema_in_canonical_order() {
             on: true,
             template: String::new(),
             invalid: false,
+            ..Default::default()
         }],
     };
     let json = serde_json::to_string_pretty(&f).unwrap();

@@ -49,6 +49,13 @@ pub struct WorkerMirror {
     /// 用法试探没过：标红给用户看，且不进镜像链（试探是 best-effort，不删条目）。
     #[serde(default)]
     pub invalid: bool,
+    /// 克隆模板（git 智能协议用法，占位符同 template）：探测命中才填，
+    /// 有值的镜像才进克隆链（routes.json cloneMirrors）。
+    #[serde(default)]
+    pub clone_tpl: String,
+    /// 克隆探测测过但不支持：不再重复探测；false = 还没测过（启动补测会跑它）。
+    #[serde(default)]
+    pub clone_bad: bool,
 }
 
 fn on_by_default() -> bool {
@@ -59,16 +66,18 @@ fn on_by_default() -> bool {
 /// 原 29 家全测（raw README 200+内容校验，5 种用法家族，双轮计时），1 家死亡
 /// （git.yylx.win 全模板超时），按耗时排序收录最优 8 家。公共镜像随时可能失效，
 /// 运行期探针/熔断自动淘汰；用户删掉后落盘即不再出现——默认值只在首启生效。
+/// 克隆模板单一事实源在 seeds.json `mirrorClones`（2026-11-15 出厂实测 8/8 支持克隆），
+/// 启动装载时合入注册表——这里不填，零探测即就位（tools/probe_clone.ps1 可复测）。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
     [
-        "https://gh-proxy.org",       // 788ms
-        "https://gh-proxy.com",       // 822ms
-        "https://ghgo.de5.net",       // 950ms
+        "https://gh-proxy.org", // 788ms
+        "https://gh-proxy.com", // 822ms
+        "https://ghgo.de5.net", // 950ms
         "https://ghfile.geekertao.top", // 972ms
-        "https://gh.meali.top",       // 1011ms
-        "https://github.chenc.dev",   // 1050ms
-        "https://gh.dpik.top",        // 1064ms
-        "https://ghproxy.icu",        // 1070ms
+        "https://gh.meali.top", // 1011ms
+        "https://github.chenc.dev", // 1050ms
+        "https://gh.dpik.top",  // 1064ms
+        "https://ghproxy.icu",  // 1070ms
     ]
     .iter()
     .map(|u| WorkerMirror {
@@ -76,6 +85,8 @@ fn default_worker_mirrors() -> Vec<WorkerMirror> {
         on: true,
         template: String::new(), // 前缀型用法不需要模板
         invalid: false,
+        clone_tpl: String::new(),
+        clone_bad: false,
     })
     .collect()
 }
@@ -512,6 +523,7 @@ where
                     on: true,
                     template: String::new(),
                     invalid: false,
+                    ..Default::default()
                 },
                 One::Full(m) => m,
             };
@@ -525,6 +537,7 @@ where
                 on: m.on,
                 template: m.template,
                 invalid: m.invalid,
+                ..m
             })
         })
         .collect())
@@ -966,17 +979,25 @@ pub fn set_worker_mirrors(
             continue; // 去重
         }
         // 同 URL 的旧条目已探测过：编辑 on 不许把模板与探测结论弄丢。
-        let old = worker_mirrors()
-            .into_iter()
-            .find(|x| x.url == u);
+        let old = worker_mirrors().into_iter().find(|x| x.url == u);
         let (old_tpl, old_bad) = old
-            .map(|x| (x.template, x.invalid))
+            .as_ref()
+            .map(|x| (x.template.clone(), x.invalid))
             .unwrap_or_default();
         norm.push(WorkerMirror {
             url: u,
             on: w.on,
             template: if w.template.is_empty() { old_tpl } else { w.template },
             invalid: w.invalid || old_bad,
+            // 克隆探测结论跟条目走：界面提交不带 clone 字段，编辑开关不许把探测结果弄丢。
+            clone_tpl: if w.clone_tpl.is_empty() {
+                old.as_ref()
+                    .map(|x| x.clone_tpl.clone())
+                    .unwrap_or_default()
+            } else {
+                w.clone_tpl.clone()
+            },
+            clone_bad: w.clone_bad || old.as_ref().is_some_and(|x| x.clone_bad),
         });
     }
     let old = worker_mirrors();
@@ -1001,6 +1022,16 @@ pub fn set_worker_mirrors(
 }
 
 /// 镜像用法模板：注册表里查该 URL；查不到/未探测 = 空（按老拼法前缀拼接用）。
+/// 克隆模板读取（clone_race 拼克隆 URL 用）；空 = 未探测/不支持。
+pub fn mirror_clone_tpl(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
+    worker_mirrors()
+        .into_iter()
+        .find(|w| w.url == u)
+        .map(|w| w.clone_tpl)
+        .unwrap_or_default()
+}
+
 pub fn mirror_template(url: &str) -> String {
     let u = url.trim().trim_end_matches('/');
     state()
@@ -1024,6 +1055,19 @@ pub fn set_mirror_template(url: &str, template: String) {
 /// 探测失败：标红（不改模板），UI 据此显示红框，且该条不进镜像链。
 pub fn set_mirror_invalid(url: &str, bad: bool) {
     update_mirror(url, |w| w.invalid = bad);
+}
+
+/// 保存克隆模板探测结果（空串 = 清除）。
+pub fn set_mirror_clone_template(url: &str, tpl: String) {
+    update_mirror(url, |w| {
+        w.clone_tpl = tpl;
+        w.clone_bad = false;
+    });
+}
+
+/// 克隆探测测过但不支持：标记后不再重复探测。
+pub fn set_mirror_clone_bad(url: &str, bad: bool) {
+    update_mirror(url, |w| w.clone_bad = bad);
 }
 
 fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {

@@ -51,6 +51,7 @@ fn mirror_request_strips_identity_and_hop_by_hop() {
         &out,
         "https://gh-proxy.com",
         "https://raw.githubusercontent.com/a/b",
+        protocol::empty_body(),
     )
     .unwrap();
     let h = req.headers();
