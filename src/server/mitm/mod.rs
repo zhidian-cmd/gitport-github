@@ -815,7 +815,7 @@ async fn dns_direct_fetch(
     let budget = request_budget(host);
     for addr in addrs.iter().take(4) {
         let ip = addr.ip().to_string();
-        // 这个 IP 已经有通道就直接用：兜底路径也绝不为了再发一次请求而并存两条。
+        // 这个 IP 已经有通道就直接用——一 IP 一通道，不为一次请求再建。
         let up = if let Some(up) = upstream::cached_h2_in(std::slice::from_ref(&ip)) {
             up
         } else {

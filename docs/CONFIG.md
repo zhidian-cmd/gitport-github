@@ -68,7 +68,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 **落盘顺序是 `ips` → `hosts` → `mirrors_*`**：先看出口，再看域名策略。`hosts` 块只写带属性的行——全是默认配置的域名（`{}`）不落盘，它们的域名由节点的 `hosts` 声明推出来，启动时自动补回。所以文件里只有一两行 `hosts` 是正常的，不代表其他域名没被代理。
 
 - **hosts 行**（域名键）：`github.com` = 自己 + 任意级子域；`*.github.com` = 只认子域（裸域不命中）；多条同时命中取**最长的键**，不用操心书写顺序
-  - `action: "direct"` 不进代理（缺省即进）；`content: true` 走内容域熔断与短响应预算；`fallback`：省略 = `dns`，`mirror` = 全灭后走镜像链
+  - `action: "direct"` 不进代理（缺省即进）；`content: true` 走内容域短响应预算（直连全灭后按 `fallback` 转镜像）；`fallback`：省略 = `dns`，`mirror` = 全灭后走镜像链
   - **PAC 名单 = 非 direct 行的路由键去 `*.` 的裸域名**，运行时派生、不落盘。`pac` 字段已从 `HostSpec` 数据结构里删掉，写进 JSON 也不会被读取（无 `deny_unknown_fields`，静默忽略），落盘时也不会写出；想让某行不进 PAC，用 `action: "direct"`。注意内置种子 `src/pool/seeds.json` 的 hosts 行**仍带着 `pac` 键**（删 `pac` 字段那次提交没动种子），只是读表时被忽略，不影响行为
 - **ips 节点**：伪装身份与目标 host 解耦——`sni` 只骗墙（写放行域，如 baidu.com），`verify` 是证书校验锚点（只求证明"对面是真 GitHub"，写节点实际返回证书 SAN 内的域；留空 = 按目标 host 校验，兼容旧写法）。**业务路由全靠 h2 的 `:authority`，与 TLS 身份无关**——所以一条连接能服务多个 host，加域名 = 往某节点的 `hosts` 里添个键
   - `ip` 末段支持范围展开：`140.82.112-114.5-6` = 6 个 IP（多段范围做笛卡尔积，上限 64）
@@ -76,7 +76,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
   - 节点的 `hosts` 列表里写的是 **hosts 行的路由键**（不是逐个子域）
 - **边状态机**（运行时实测，不落盘，**只在响应处理层写边，拨号层一次都不写**）：某 (IP, 路由键) 被服务端回 421 → 该边长冷却（4 小时）；**新拨连接**发送超时/断连 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。TCP 连不上不写边、走 60/300/1800 秒死亡退避；**复用旧连接失败也不写边、不熔断、不转镜像**，只按 id 摘掉那条连接。成功只清短冷却。全黑时该 host 走 fallback
   - TLS 握手失败（锚点选错）**不记边、不冷却**，只把游标前移，并打一行 `证书校验失败` 提示——那是本地校验没过，不是对端拒绝；换个 SAN 内任意域名即可，不必等于目标域名
-- 旧格式仍能读（启动自动折算，原文件留 `.bak`）：**0.5.3 及以前（v2 之前）**的 `routes` 域名字典（`plans`/`realPlans`）、`routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）。当前 0.5.4 已经是 v2 二部图格式，别把当前版本当成旧格式
+- 旧格式仍能读（启动自动折算，原文件留 `.bak`）：**0.5.3 及以前（v2 之前）**的 `routes` 域名字典（`plans`/`realPlans`）、`routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）。当前 0.5.8 是 v2 二部图格式，别把当前版本当成旧格式
 - 镜像链是**一列表 + 一字典**：`mirrors_big`（列表）= 大文件域（objects / release-assets，分片竞速），所有 big host 共用这一条；`mirrors_small`（字典）= 图片与文本资源域（raw / gist / avatars / user-images / media），每 host 一条；分类权在域名。把 big host 的链写进 `mirrors_small`（放错字典）启动时会被归位到单链；旧 `mirrors` 字典里的同名残留优先级最低，新版已声明时不覆盖，只留一行日志
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 routes.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
 - 全新安装时**不预写手改表**：`seeds.json` 顶层只有 `hosts` / `ips`，`routes.json` 在首启时按内存链生成一次；镜像清单来自 `settings.rs::default_worker_mirrors()` 的**内置 8 家**，首启落进 `workerMirrors` 并对齐进两条链（落盘后 `mirrors_big` 列表与 `mirrors_small` 字典都非空）。只有把镜像删光、链全空时，候选才只剩直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**
@@ -123,8 +123,8 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 | uploads.github.com | 池伪装（alambic .161，锚点 `githubusercontent.com`） |
 | viewscreen / objects-origin / api.mcp | GLB 池伪装（140.82.x.21/.22，锚点 `actions…`） |
 | githubapp.com、githubassets、github.io | 池伪装串发 |
-| avatars/camo/gist/raw 等内容域 | 池伪装 → 熔断后镜像链；README 大图先走纯直连多段（不进镜像链，见 ARCHITECTURE.md） |
-| objects / release-assets | 镜像 + 直连分片竞速（整包请求直连入列两次、主/副两条通道各一份，镜像一家一份；ECT 时间槽派发） |
+| avatars/camo/gist/raw 等内容域 | 池伪装 → 直连全灭（30s 冷却）后转镜像链；README 大图先走纯直连多段（不进镜像链，见 ARCHITECTURE.md） |
+| objects / release-assets | 镜像 + 直连分片竞速（直连以 `direct/{host}` 身份只入列 1 次；带 Range 时段位数 = 镜像数 × 3 + 1，镜像一家 3 份细切、直连 1 份；整包按空闲段位数平均分；ECT 时间槽派发） |
 | github.com 的 `/releases/download`（含 latest） | release-assets 专属镜像链，全灭 502 |
 | docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com | 池伪装（Fastly 段锚点制，原真名分片腿退役） |
 | copilot-proxy.githubusercontent.com | 池伪装（Azure `4.249.131.160`） |

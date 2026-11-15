@@ -69,7 +69,7 @@ pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Op
     Some(loc)
 }
 
-/// 从上游响应学习 302 目标：拨号后与复用快路径两个分支共用，只挂一处会漏学（头像几乎都走复用）。
+/// 从上游响应学习跳转目标：唯一学习点在 get_direct 成功路径——新拨与复用都经过它。
 pub(super) fn observe_response(
     host: &str,
     uri: &http::Uri,
@@ -92,7 +92,7 @@ pub(super) fn observe_response(
     }
 }
 
-/// 上游回了 302 就记一笔（只认头像入口形态 + 头像域落点；其余一律不记）。
+/// 记一笔跳转（301/302/307/308；只认头像入口形态 + 头像域落点，其余不记）。
 pub(super) fn observe(host: &str, path: &str, query: Option<&str>, location: &str) {
     if host != "github.com"
         || !is_avatar_entry(path)

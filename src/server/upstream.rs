@@ -1,6 +1,6 @@
 //! 上游 HTTP 客户端：直连腿 = boring 指纹自管 h2 连接（fresh 语义）；镜像腿 = 标准 TLS + h1 共享池。
 //! 通道的记账、挑选、开流全在本文件；取用统一入口是 `pool::get_or_build`
-//! （取 → 溢出 → 建，一层管完），请求路径不再各管一段。
+//! （取 → 建 → 溢出，一层管完），请求路径不再各管一段。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
 use crate::util::{lock, now_ms, LogFn};
@@ -61,9 +61,9 @@ pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
 const DIAL_SLOW_MS: u64 = 1500;
 
 /// host 三类：
-/// - 内容域：多通道并存，池里按"空闲且快"选。
-/// - 会话域：单通道单 IP，建连优先自己拨一条，不蹭公共通道（带会话，跨 IP 是风控特征）。
-/// - 其他（大文件、docs/agent）：单通道，批窗临时通道。
+/// - 内容域：竞速拨号取最速一条，短响应预算。
+/// - 会话域：单通道单 IP，建连优先自己拨一条（带会话，跨 IP 是风控特征）。
+/// - 其他（大文件、docs/agent）：单通道，即用即建。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HostClass {
     Content,
@@ -72,10 +72,10 @@ pub(crate) enum HostClass {
 }
 
 /// host 三类全部由 routes.json/seeds.json 的 hosts 标志决定（数据，改类别不用重编译）：
-/// - content 标记：内容域（双通道，池里按"空闲且快"选）。
-/// - big 标记：大文件域（单通道——一条长流占满槽位，两条互相抢带宽；大镜像链）。
-/// - session 标记：会话域（单通道单 IP 单通道单 IP，只标实测出拦截页的主站族）。
-/// - 三个都不标：「其他」——单通道、批窗临时通道，不值得养专属资产。
+/// - content：内容域（竞速拨号、短预算）。
+/// - big：大文件域（单通道——一条长流占满槽位；大镜像链）。
+/// - session：会话域（单通道单 IP，只标实测出拦截页的主站族）。
+/// - 都不标：「其他」——单通道，不值得养专属资产。
 pub(crate) fn host_class(host: &str) -> HostClass {
     if pool::route::is_big_file_host(host) {
         return HostClass::Other;
@@ -87,8 +87,7 @@ pub(crate) fn host_class(host: &str) -> HostClass {
     // 类别是数据：routes.json/seeds.json 的 hosts 标志 `session` 决定，改类别不用重编译。
     // 内容型的子域不做通配排除——写进 ips 节点的 hosts（写完整即豁免，具体键最长匹配
     // 天然压过通配）。githubassets/github.io/githubapp/codeload 等不标 session——
-    // 数据不是主站，批窗内容域语义；否则 githubassets 的长寿命通道会把
-    // 185.199.154/215 这 8 个三类横跨的共享 IP 占走。
+    // 数据不是主站；标了会把 185.199.154/215 这 8 个跨类共享 IP 的通道占走。
     let on_risk_surface = pool::route::route_for(host).is_some_and(|row| row.flags.session);
     if on_risk_surface {
         HostClass::Session
@@ -324,8 +323,7 @@ pub(crate) fn channels_snapshot() -> Vec<(String, Vec<(String, u32, u32, u64)>)>
     out
 }
 
-/// 池中该组 IP 里**已经有活连接**的地址(供拨号 skip:同一个 IP 不再拨第二次)。
-/// 全仓"这个 IP 有没有通道"的唯一口径：拨号预检与双通道 skip 都从这里取。
+/// 池中这些 IP 里已有活连接的（拨号 skip 用）——全仓"这个 IP 有没有通道"的唯一口径。
 pub(crate) fn occupied_ips(ips: &[String]) -> Vec<String> {
     let g = lock(conn_pool());
     ips.iter()
@@ -786,7 +784,7 @@ pub async fn dial_upstream(host: &str, probe_path: &str, log: &LogFn) -> Result<
     } else {
         Vec::new()
     };
-    // 内容域：多路竞速 + 首包排名，取最快两条（机器人交付最快那条）。
+    // 内容域：多路竞速 + 首包排名，只留最快一条入池。
     if host_class(host) == HostClass::Content {
         return race_build(host, probe_path, log).await;
     }

@@ -1548,12 +1548,11 @@ fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(stream))
 }
 
-/// 镜像请求模板：URL = {镜像}/{原始URL}（前缀拼接惯例），剥凭据头、统一注入镜像 UA。
-/// 直连切片的镜像救援（direct_split）也走这里，与链条镜像同一套凭据/UA 语义。
-/// 按注册表里该镜像的用法模板拼出镜像 URL；无模板（旧条目/未探测）= 前缀拼接。
+/// 镜像请求模板：URL = {镜像}/{原始URL}（前缀拼接惯例），剥凭据头、统一注入镜像 UA；
+/// 直连切片的镜像救援（direct_split）也走这里，同一套凭据/UA 语义。
 /// 模板占位符：{mirror} {url} {url_enc} {owner} {repo} {ref} {path}。
-/// 用法是镜像服务自己定的约定，光给两条 URL 推不出来——由添加时的用法试探
-/// 自动试出并保存（settings.json 的 template 字段），此后不再重试。
+/// 用法是镜像服务自定的约定——由添加时的试探自动试出并保存（settings.json 的
+/// template 字段），此后不再重试；无模板（旧条目/未探测）走前缀拼接。
 fn mirror_url(mirror: &str, orig_url: &str) -> String {
     let tpl = crate::settings::mirror_template(mirror);
     if tpl.is_empty() {

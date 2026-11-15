@@ -1,6 +1,7 @@
-//! README 大图/视频的纯直连多段：字节拆成多个 Range 摊到池内多条直连通道并发拉，
-//! 按字节边界合成一条 200 流。自己从不拨号（通道不够经池子溢出补临时通道），
-//! 也不进 get_direct 的兜底——段失败不会被误判成「直连全灭」而转镜像。
+//! README 大图/视频的纯直连多段：字节拆成多个 Range，在池内**同一条**直连通道上并发拉
+//! （并行 stream，不是并行连接），按字节边界合成一条 200 流。自己从不拨号
+//! （`gather_channels(host, 1)`，池冷时借建造等一拍），也不进 get_direct 的兜底——
+//! 段失败不会被误判成「直连全灭」而转镜像。
 use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};

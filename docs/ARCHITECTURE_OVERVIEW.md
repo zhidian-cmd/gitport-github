@@ -59,8 +59,8 @@ flowchart LR
 ## Component responsibilities
 
 - **System proxy integration** directs selected GitHub traffic to the loopback proxy; unrelated traffic is not handled by GitPort. The application restores proxy settings when it exits.
-- **Loopback proxy** accepts client requests and selects a tunnel, streaming, or managed inspection path according to the request and current settings.
-- **Routing and connection pool** use the local route configuration to select upstream connections and, where configured and appropriate, a content mirror fallback.
+- **Loopback proxy** accepts client requests and selects a tunnel, streaming, or managed inspection path according to the request and current settings. Unmanaged domains are only allowed through on port 443 as a plain HTTPS tunnel (target checked against private/loopback ranges); other ports get 502. The proxy caps concurrency at 256 connections.
+- **Routing and connection pool** use the local route configuration to select upstream connections and, where configured and appropriate, a content mirror fallback. Connections are one-per-IP, reused briefly then retired after 10s idle; there is no proactive health probing.
 - **Management UI and desktop shell** expose configuration, status, logs, and desktop/tray controls.
 - **Optional TLS inspection** is disabled unless enabled by the user. The local certificate authority is used for managed GitHub-related hosts only.
 - **Configuration and logs** are local application state. Mirror use is user-managed; download URLs (including signed ones) are forwarded verbatim to configured mirrors — an explicit informed trade-off, not a code-level guard.

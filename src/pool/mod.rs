@@ -1,4 +1,5 @@
-//! 串发拨号：二部图（`ips` 节点 × `hosts` 行）唯一权威。成功驻留游标、失败前移；SNI 骗墙、证书按锚点校验。
+//! 拨号与连接池：二部图（`ips` 节点 × `hosts` 行）唯一权威。内容域竞速取最速一条、
+//! 会话/低频域串发（游标记上次驻留、失败前移）；取用统一入口是 `get_or_build`。
 pub mod dial;
 pub mod edges;
 pub mod latency;
@@ -1240,7 +1241,7 @@ fn brief_err(msg: &str) -> String {
 }
 
 /// 圈式串发：从游标起步逐个试，成功驻留、失败前移、整圈全灭冷却 30s；skip_ips 是已占用 IP 的硬排除，重拨不撞旧通道。
-/// 同 IP 并发拨不设仲裁：两条都建成，入库时 store_h2 按每 IP 一条去重，输家的握手是接受的代价。
+/// 同 IP 不设仲裁：后来的建成了也在 store_h2 按「一 IP 一通道」作废，输家的握手是接受的代价。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
     log: Option<&LogFn>,
@@ -1549,9 +1550,8 @@ pub async fn get_or_build(
 
 /* ---------- 黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
 
-/// 通道黑洞（真实请求响应头后 BLACKHOLE_FIRST_BYTE_MS=30s 数据窗零字节）：按域分流处置。
-/// 30s 才判黑：更短的窗把"服务端慢渲染/排队"误判成黑（数据最终都到，纯慢）。
-/// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没有意义，
+/// 通道黑洞（响应头后 BLACKHOLE_FIRST_BYTE_MS 数据窗零字节）：按域分流处置。
+/// - 会话域：摘黑通道 + 游标挪到下一候选 + 立即预建——死磕黑 IP 没意义，
 ///   顺序故障转移（旧死新立、单活）不算跨 IP 并发，不破风控。
 /// - 内容域：**软禁黑 IP 60s**（不进 pick，在途流不杀）+ 全量换血补缺。
 /// - 其他（低频单通道）：暂缓即可，不折腾。
@@ -1787,7 +1787,7 @@ pub async fn gather_channels(
         got.truncate(want);
         return got;
     }
-    // 池空先建（双腿可能直接带回两条），一并收进来。
+    // 池空先建，再把池里现成的（可能不止这条）一并收进来。
     if got.is_empty() {
         match get_or_build(host, "", log).await {
             Ok((up, _)) => got.push(up),

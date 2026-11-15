@@ -20,7 +20,7 @@ pub enum Route {
 pub struct Flags {
     /// 本机直连，不进代理。
     pub direct: bool,
-    /// 内容域：走熔断与短响应预算。
+    /// 内容域：短响应头预算（2s）、竞速拨号、游标不记。
     pub content: bool,
     /// 会话域：带用户会话、跨 IP 是风控特征——own 过滤（只认自建通道）。
     /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
