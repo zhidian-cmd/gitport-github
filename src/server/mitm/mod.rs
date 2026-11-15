@@ -797,12 +797,15 @@ async fn dns_direct_fetch(
     info: &UpstreamInfo,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
+    // 与 connect_upstream 兜底腿同一份地址保险：hosts 把受管域名指进环回/私网/CGNAT
+    // 时，这条腿不能带着会话头直拨本机 443（另一侧已修，这里别留后门）。
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
         .await
         .map_err(|e| format!("系统 DNS 解析失败: {e}"))?
+        .filter(|a| !crate::server::bogon_addr(a.ip()))
         .collect();
     if addrs.is_empty() {
-        return Err(format!("{host} 系统 DNS 无解析记录"));
+        return Err(format!("{host} 系统 DNS 无可用解析记录(内网/保留地址已拒)"));
     }
     (log)(&format!(
         "[DNS直连] {host} 系统解析 {} 个候选, 真名 SNI 逐个尝试",

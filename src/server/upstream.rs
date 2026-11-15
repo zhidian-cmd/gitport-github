@@ -236,23 +236,35 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         // 常编满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
         // 若只是丢弃，驱动任务会在池外养到对端回收（泄漏）。Notify 无等待者也存许可，必达。
         up.close.notify_one();
-        // 列表头可能是溢出通道（正编被摘、溢出排前）：与下方溢出分支同口径找正编，
+        // 列表头可能是溢出通道（正编被摘、溢出排前）：同口径找正编，
         // 否则请求拿到不外发的溢出句柄——驱动在途归零即焚，失败还误罚这条边冷却。
-        return h
-            .iter()
-            .find(|c| !c.up.overflow)
-            .map(|c| c.up.clone())
-            .unwrap_or_else(|| h[0].up.clone());
+        if let Some(c) = h.iter().find(|c| !c.up.overflow) {
+            return c.up.clone();
+        }
+        // 理论不可达（normal_cnt >= cap 就说明有正编）：真到了就把这条新拨的
+        // 正编直接入库，交出去的至少不会是溢出临时工。
+        let keep = up.clone();
+        h.push(ConnSlot { up, last_used: now_secs() });
+        return keep;
     }
     if up.overflow && h.iter().any(|c| c.up.overflow) {
         // 每 IP 至多一条溢出：再来的关掉，把正编（若有）递回去——溢出通道本身
         // 还在驮上一个请求时，后来的拥挤请求骑它排队，总好过再拨。
-        up.close.notify_one();
-        return h
-            .iter()
-            .find(|c| !c.up.overflow)
-            .map(|c| c.up.clone())
-            .unwrap_or_else(|| h[0].up.clone());
+        if let Some(c) = h.iter().find(|c| !c.up.overflow) {
+            up.close.notify_one();
+            return c.up.clone();
+        }
+        // 正编已被 drop_h2_id 摘光、池里只剩溢出：把这条新连接扶正顶上，
+        // 旧溢出当场关掉。旧写法兜底递 h[0]（溢出句柄），请求在途归零即被掐断。
+        for c in h.iter().filter(|c| c.up.overflow) {
+            c.up.close.notify_one();
+        }
+        h.retain(|c| !c.up.overflow);
+        let mut normal = up.clone();
+        normal.overflow = false;
+        let keep = normal.clone();
+        h.push(ConnSlot { up: normal, last_used: now_secs() });
+        return keep;
     }
     let keep = up.clone();
     h.push(ConnSlot {

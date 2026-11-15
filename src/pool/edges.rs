@@ -11,7 +11,8 @@ const REJECT_SECS: u64 = 4 * 3600;
 const STALL_SECS: u64 = 120;
 /// 风控拦截页：IP 对该域暂时不干净，冷却到窗口过期（GitHub 的限流窗通常几分钟）。
 const RISK_SECS: u64 = 600;
-/// 容量硬顶：超限惰性清过期，再超就整表清（极端场景宁可重新试探）。
+/// 容量硬顶：超限先清过期，仍满只淘汰最早到期的短冷却；风控冷却一律留着自愈。
+/// 整表 clear() 会把还活着的 10 分钟风控冷却一起抹掉，风暴里刚拉黑的边当场复活。
 const CAP: usize = 8192;
 
 /// 值 = (到期时刻, 是否风控冷却)。风控项免疫 clear()，只能到期自愈。
@@ -27,7 +28,16 @@ fn set(ip: &str, key: &str, secs: u64, risk: bool) {
         let now = Instant::now();
         m.retain(|_, v| now < v.0);
         if m.len() >= CAP {
-            m.clear();
+            // 还满：只按到期时刻淘汰最早的一批短冷却，风控项免疫。
+            let mut victims: Vec<((String, String), Instant)> = m
+                .iter()
+                .filter(|(_, (_, risk))| !*risk)
+                .map(|(k, (until, _))| (k.clone(), *until))
+                .collect();
+            victims.sort_by_key(|(_, until)| *until);
+            for (k, _) in victims.into_iter().take(m.len() - CAP + 1) {
+                m.remove(&k);
+            }
         }
     }
     let now = Instant::now();
@@ -87,4 +97,28 @@ pub fn clear(ip: &str, key: &str) {
 #[cfg(test)]
 pub(crate) fn clear_all() {
     *lock(&EDGES) = Some(HashMap::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 表顶到 CAP 时只淘汰短冷却：整表 clear() 会把还活着的 10 分钟风控冷却抹掉，
+    /// 风暴里刚拉黑的边当场复活。
+    #[test]
+    fn full_table_keeps_live_risk_cooling() {
+        let _g = crate::pool::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear_all();
+        mark_risk("198.51.100.7", "risk-key");
+        for i in 0..CAP {
+            mark_stall("198.51.100.8", &format!("stall-{i}"));
+        }
+        assert!(
+            is_bad("198.51.100.7", "risk-key"),
+            "满顶清理后活的风控冷却必须还在"
+        );
+        clear_all();
+    }
 }

@@ -47,6 +47,11 @@ pub const MAX_CONNS_SESSION: usize = 1;
 pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
+/// 透明隧道总时长上限：异常连接不发数据也不关，不能让 task + 两条 fd 永久挂着。
+/// 1 小时足够跑完最慢的大仓库 clone，只兜"僵死"不误杀正常长下载。
+pub const TUNNEL_MAX_LIFETIME_SECS: u64 = 3600;
+/// 代理并发连接上限：本机进程狂开 CONNECT 也不把常驻托盘进程拖垮。
+pub const PROXY_MAX_CONNS: usize = 256;
 /// MITM 响应体黑洞判定：响应头到了但这个秒数内第一个数据字节没来 = 黑洞。
 /// 8s 与隧道首字节看门狗统一（实战值）。500ms 实测是灾难：tree-commit-info 这类
 /// git 数据端点总耗时可达 1.1s，线路抖一下头体间隔就过 500ms，看门狗把会话通道

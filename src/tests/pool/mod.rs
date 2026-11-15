@@ -358,7 +358,16 @@ fn encode_routes_roundtrip() {
     );
     latency::install(HashMap::new());
     latency::seed("1.2.3.4", 111);
-    let b = encode_routes(&mirrors, &[]);
+    let big = vec![
+        "https://big-a.example".to_string(),
+        "https://big-b.example".to_string(),
+    ];
+    let b = encode_routes(&mirrors, &big);
+    // 大文件单链必须按列表落盘，且回读逐项相等（删掉落盘段/写成对象都会红）。
+    assert!(
+        b.contains("\"mirrors_big\": ["),
+        "大文件单链应按列表落盘: {b}"
+    );
     // 节点条目必须单行
     for line in b.lines() {
         let t = line.trim();
@@ -373,6 +382,7 @@ fn encode_routes_roundtrip() {
         "测速值应挂在节点条目里: {b}"
     );
     let (doc, _) = parse_routes_tolerant(&b, None).expect("编码结果应可解析");
+    assert_eq!(doc.big, big, "大文件单链落盘后必须能逐项回读");
     assert_eq!(doc.latency.get("1.2.3.4"), Some(&111), "测速值应可回读");
     let _row = route::RouteRow::new(
         serde_json::from_str::<route::HostSpec>(r#"{"key":"github.com"}"#).unwrap(),
@@ -641,6 +651,66 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     );
     // 清场：正规路径删除自建镜像（注册表 + 全部链），不给后续测试留全局残留。
     apply_worker_mirrors(Vec::new()).ok();
+}
+
+/// 手改进 mirrors_big 的镜像必须被收编进注册表：否则工作台看不到、开关管不到、删不掉，
+/// 界面和文件变成两套真相。
+#[test]
+fn hand_written_big_mirror_is_adopted_into_registry() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    crate::settings::save_worker_mirrors(Vec::new());
+    let dir = tmpdir();
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{
+  "core": [],
+  "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
+  "mirrors_big": ["https://big-self.example"]
+}"#,
+    )
+    .unwrap();
+    serial_load(&dir, Vec::new(), None);
+    let registry = crate::settings::worker_mirrors();
+    assert!(
+        registry
+            .iter()
+            .any(|w| w.url == "https://big-self.example" && w.on),
+        "手改的 big 镜像必须进注册表: {registry:?}"
+    );
+    crate::settings::save_worker_mirrors(Vec::new());
+}
+
+/// 混合格式：mirrors_big 已是新版非空列表时，旧 per-host 里 big host 的链不得静默丢弃。
+#[test]
+fn legacy_big_host_chains_are_merged_not_dropped() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    edges::clear_all();
+    crate::settings::save_worker_mirrors(Vec::new());
+    let dir = tmpdir();
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{
+  "core": [],
+  "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
+  "mirrors_big": ["https://new.example"],
+  "mirrors_small": {"objects.githubusercontent.com": ["https://legacy.example"]}
+}"#,
+    )
+    .unwrap();
+    serial_load(&dir, Vec::new(), None);
+    let big = mirror_chain("objects.githubusercontent.com");
+    assert_eq!(
+        big.first(),
+        Some(&"https://new.example".to_string()),
+        "新版列表链序优先: {big:?}"
+    );
+    assert!(
+        big.contains(&"https://legacy.example".to_string()),
+        "列表非空时旧 big host 链不得静默丢弃: {big:?}"
+    );
+    assert_eq!(big.len(), 2, "合并应去重: {big:?}");
+    crate::settings::save_worker_mirrors(Vec::new());
 }
 
 /// 全新安装+添加镜像 → 启用镜像必须落进全部内容域链（v0.5.0 回归：空表遍历不到，镜像只进注册表）。
@@ -1116,10 +1186,12 @@ fn media_rescue_chains_roundtrip_and_align_skip() {
         "raw.githubusercontent.com".to_string(),
         vec!["https://a.example.com".to_string()],
     );
-    let encoded = encode_routes(&mirrors, &[]);
+    let big = vec!["https://big-media.example".to_string()];
+    let encoded = encode_routes(&mirrors, &big);
     assert!(encoded.contains("\"图片\""), "图片链必须回写落盘");
     assert!(encoded.contains("\"视频\""), "视频链必须回写落盘");
     let (doc2, _) = parse_routes_tolerant(&encoded, None).expect("回写后必须还能解析");
+    assert_eq!(doc2.big, big, "大文件单链与媒体链必须同时可回读");
     assert_eq!(
         doc2.chains.get(crate::pool::MEDIA_IMAGE_CHAIN).map(|c| c.len()),
         Some(1)

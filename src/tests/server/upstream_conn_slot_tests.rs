@@ -152,6 +152,45 @@ async fn content_ip_keeps_single_channel() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
+/// 正编被摘光、池里只剩溢出时，不能把溢出句柄递给请求（在途归零即被掐断）。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn overflow_only_pool_never_hands_out_overflow_handle() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let ip = "9.9.9.7";
+    let mut lone = mk_up(ip).await;
+    lone.overflow = true;
+    let lone_id = lone.id;
+    {
+        let mut g = lock(conn_pool());
+        let h = g.entry(ip.to_string()).or_default();
+        h.push(ConnSlot {
+            up: lone,
+            last_used: now_secs(),
+        });
+    }
+    let mut incoming = mk_up(ip).await;
+    incoming.overflow = true;
+    let incoming_id = incoming.id;
+    let kept = store_h2(ip, incoming);
+    assert!(
+        !kept.overflow,
+        "交出去的必须是正编, 不能是溢出临时工: id={}",
+        kept.id
+    );
+    assert_ne!(kept.id, lone_id, "旧溢出不能作为返回值");
+    assert_eq!(kept.id, incoming_id, "新连接应被扶正入库");
+    {
+        let g = lock(conn_pool());
+        let h = g.get(ip).unwrap();
+        assert_eq!(h.len(), 1, "旧溢出应被清掉, 不留两条");
+        assert!(!h[0].up.overflow, "池里那条应是正编");
+    }
+    let _ = lock(conn_pool()).remove(ip);
+}
+
 /// 只有真连接才算"已有通道"；空壳条目不算占用（防的是"候选全被占住"的误判，
 /// 实测 api.github.com 曾连刷 24 行同样的失败）。
 #[tokio::test]

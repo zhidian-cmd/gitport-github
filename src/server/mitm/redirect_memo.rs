@@ -76,7 +76,15 @@ pub(super) fn observe_response(
     status: http::StatusCode,
     headers: &http::HeaderMap,
 ) {
-    if status != http::StatusCode::FOUND {
+    // 头像入口偶尔走 301/307/308（CDN 换域、缓存策略变化），只认 302 会漏学。
+    // 落点仍由 is_avatar_target 严格校验，放宽状态码不会把登录跳转/风控页记进来。
+    if !matches!(
+        status,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    ) {
         return;
     }
     if let Some(loc) = headers.get("location").and_then(|v| v.to_str().ok()) {

@@ -47,6 +47,40 @@ fn ttl_expiry() {
     );
 }
 
+/// 301/307/308 也是头像入口的合法跳转；只认 302 会漏学，每次渲染都要重问一遍。
+#[test]
+fn other_redirect_statuses_are_learned() {
+    for (i, st) in [
+        http::StatusCode::MOVED_PERMANENTLY,
+        http::StatusCode::TEMPORARY_REDIRECT,
+        http::StatusCode::PERMANENT_REDIRECT,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("/status{i}.png");
+        let target = format!("https://avatars.githubusercontent.com/u/{i}");
+        let uri: http::Uri = path.parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("location", target.parse().unwrap());
+        observe_response("github.com", &uri, st, &headers);
+        assert_eq!(
+            cached_location("github.com", &path, None),
+            Some(target),
+            "{st} 应被记下"
+        );
+    }
+    // 非重定向状态码仍不记。
+    let uri: http::Uri = "/status-ok.png".parse().unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "location",
+        "https://avatars.githubusercontent.com/u/9".parse().unwrap(),
+    );
+    observe_response("github.com", &uri, http::StatusCode::OK, &headers);
+    assert!(cached_location("github.com", "/status-ok.png", None).is_none());
+}
+
 /// 异常落点（登录跳转/风控页/污染回包）不记仇：存不进、命中前也会被清。
 #[test]
 fn non_avatar_target_is_never_memoized() {

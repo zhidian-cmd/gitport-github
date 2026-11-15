@@ -78,6 +78,9 @@ struct TopoDoc {
     hosts: Vec<route::HostSpec>,
     ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
+    /// 来自新版 `mirrors_small` 的 host 键：区分"用户把 big host 放错字典"（要归位）
+    /// 和"旧 `mirrors` 字典残留"（优先级最低，不得污染新版声明的链）。
+    small_hosts: Vec<String>,
     latency: HashMap<String, u64>,
     /// 大文件域单链（所有 big host 共用一条，不再每 host 一条）。
     big: Vec<String>,
@@ -232,7 +235,13 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
                     }
                 }
                 serde_json::Value::Object(m) => {
-                    for (_, chain) in m {
+                    // 旧 per-host map：按域名序把所有 host 的链去重合并成一条（不丢镜像）。
+                    // 排序只为确定性：不同 host 原本配不同镜像时，合并后链序按字典序，
+                    // 这是升级迁移路径，不是日常写法（当前格式是列表）。
+                    let mut keys: Vec<String> = m.keys().cloned().collect();
+                    keys.sort();
+                    for h in keys {
+                        let Some(chain) = m.get(&h) else { continue };
                         if let Ok(c) = serde_json::from_value::<Vec<String>>(chain.clone()) {
                             for s in c {
                                 if s.starts_with("https://")
@@ -242,6 +251,11 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
                                     doc.big.push(s);
                                 }
                             }
+                        }
+                    }
+                    if !m.is_empty() {
+                        if let Some(l) = log {
+                            l("[串发] routes.json mirrors_big 是旧 per-host 字典, 已按域名序合并为单链");
                         }
                     }
                 }
@@ -284,6 +298,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     doc.chains = merged_chains(&small, &legacy);
+    doc.small_hosts = small.keys().cloned().collect();
     // 测速键：顶层旧布局（{ip: ms}）先读，节点条目内的同键覆盖（新布局）。
     if let Some(v) = obj.get("latency") {
         if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
@@ -756,6 +771,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         hosts: seeds.hosts.clone(),
         ips: seeds.ips.clone(),
         chains: seeds.chains.clone(),
+        small_hosts: Vec::new(),
         latency: HashMap::new(),
         big: Vec::new(),
     });
@@ -811,6 +827,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.cursor.insert(key.clone(), ip.clone());
         }
     }
+    let small_hosts = std::mem::take(&mut doc.small_hosts);
     for (host, chain) in doc.chains {
         if !is_chain_key(&host) {
             if let Some(l) = log.as_ref() {
@@ -828,10 +845,22 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         if vc.is_empty() {
             continue;
         }
-        // 大文件域单链：per-host 链（旧格式/legacy 迁移残留）合并进同一条。
         if route::is_big_file_host(&host) {
-            if tab.big_mirrors.is_empty() {
-                tab.big_mirrors = vc;
+            if small_hosts.contains(&host) {
+                // 新版 typed 字典里的 big host = 用户把链放错字典：归位合并，不静默丢。
+                for u in vc {
+                    if !tab.big_mirrors.contains(&u) {
+                        tab.big_mirrors.push(u);
+                    }
+                }
+            } else {
+                // 旧 `mirrors` 字典残留优先级最低：新版列表已声明时不覆盖，但必须留痕，
+                // 过去是静默丢弃，用户查不到"我配的镜像怎么没生效"。
+                if let Some(l) = log.as_ref() {
+                    l(&format!(
+                        "[串发] routes.json 旧 mirrors 的 {host} 链已被 mirrors_big 单链取代, 该段忽略"
+                    ));
+                }
             }
         } else {
             tab.mirrors.insert(host, vc);
@@ -861,6 +890,20 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                 });
                 adopted = true;
             }
+        }
+        // 大文件单链也是手改入口：不收编的话，routes.json 里手填的 big 镜像
+        // 工作台看不到、开关管不到、删也删不掉——界面与文件两套真相。
+        for u in &tab.big_mirrors {
+            if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
+                continue;
+            }
+            registry.push(crate::settings::WorkerMirror {
+                url: u.clone(),
+                on: true,
+                template: String::new(),
+                invalid: false,
+            });
+            adopted = true;
         }
         if adopted {
             crate::settings::save_worker_mirrors(registry);
@@ -1407,12 +1450,19 @@ pub(crate) fn cursor_of(route_key: &str) -> Option<String> {
     lock(&SERIAL).as_ref()?.cursor.get(route_key).cloned()
 }
 
+/// 建造锁表容量：按 host 建键，常驻进程访问过上千子域后不能只涨不降。
+const BUILD_LOCK_CAP: usize = 1024;
+
 fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
-    BUILD_LOCKS
+    let mut g = BUILD_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entry(host.to_string())
+        .unwrap_or_else(|p| p.into_inner());
+    if g.len() >= BUILD_LOCK_CAP {
+        // 只留还有调用方持有的锁：Arc 计数 > 1 说明有人正在等/在建，删了会拆掉雷群去重。
+        g.retain(|_, l| Arc::strong_count(l) > 1);
+    }
+    g.entry(host.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }

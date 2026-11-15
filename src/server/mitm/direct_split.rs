@@ -311,7 +311,7 @@ pub(super) async fn try_direct_split(
         Some(hit) => (hit.0, hit.1, None),
         None => {
             let tpl = Tpl::of(out);
-            // 探片要一条通道：池冷就借池子的建造（等在途建造最多 3s），建不出退单流。
+            // 探片要一条通道：池冷就借池子的建造（等在途建造最多 15s），建不出退单流。
             let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
                 log_skip(log, host, &path, "池冷且建连失败");
                 return None;

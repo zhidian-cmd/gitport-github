@@ -67,7 +67,20 @@ pub fn stop_proxy(rt: &tokio::runtime::Runtime) {
 pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToken) {
     // 启动成功不出声：端口和工作台地址在概览页，日志只留事故。
     set_running(true);
+    // 每连接占一个许可，满了就等；否则狂开 CONNECT 能把常驻进程堆死。
+    let gate = Arc::new(tokio::sync::Semaphore::new(config::PROXY_MAX_CONNS));
     loop {
+        let permit = tokio::select! {
+            _ = ctx.cancelled() => {
+                (srv.log)("代理已停止");
+                set_running(false);
+                return;
+            }
+            p = gate.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+        };
         let (conn, _) = tokio::select! {
             _ = ctx.cancelled() => {
                 (srv.log)("代理已停止");
@@ -89,14 +102,21 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
             },
         };
         let srv = srv.clone();
+        let cancel = ctx.clone();
         tokio::spawn(async move {
-            let _ = srv.handle(conn).await;
+            let _permit = permit; // 连接活着期间占坑，drop 时归还
+            // 停止代理要连已 spawn 的隧道一起收：select 一取消，conn 被 drop 即关 socket，
+            // MITM 分支不接 cancel 也覆盖得到。
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = srv.handle(conn, cancel.clone()) => {}
+            }
         });
     }
 }
 
 impl ProxyServer {
-    async fn handle(&self, mut client: TcpStream) -> std::io::Result<()> {
+    async fn handle(&self, mut client: TcpStream, cancel: CancellationToken) -> std::io::Result<()> {
         let _ = client.set_nodelay(true);
         let head = read_head(&mut client).await?;
         // 头块以空行收尾，之后的字节是同包到达的体首段，必须原样续传。
@@ -113,19 +133,19 @@ impl ProxyServer {
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
         if method == "CONNECT" {
-            self.handle_connect(client, &target).await;
+            self.handle_connect(client, &target, cancel).await;
         } else {
-            self.handle_http(client, &method, &target, headers, body_prefix)
+            self.handle_http(client, &method, &target, headers, body_prefix, cancel)
                 .await;
         }
         Ok(())
     }
 
-    async fn handle_connect(&self, mut client: TcpStream, target: &str) {
+    async fn handle_connect(&self, mut client: TcpStream, target: &str, cancel: CancellationToken) {
         let (host, port) = split_target(target, 443);
         // 开放代理闸：受管域名(GitHub 系)全速加速；其它域名只放行 443 的 HTTPS 透明
-        // 隧道——用户拼接的镜像 clone URL(域名=镜像站)靠它才能用。内网/环回/链路本地
-        // 由 connect_upstream 兜底腿的 bogon 过滤拒绝，非 443 端口一律 502——
+        // 隧道——用户拼接的镜像 clone URL(域名=镜像站)靠它才能用。环回/私网/CGNAT/
+        // 链路本地/组播/保留段由 connect_upstream 兜底腿的 bogon 过滤拒绝，非 443 一律 502——
         // 借代理扫内网、打云元数据、摸非 HTTPS 服务的路仍然全堵（审计 #7）。
         if !pool::route::is_managed(&host) && port != 443 {
             (self.log)(&format!(
@@ -143,8 +163,8 @@ impl ProxyServer {
         }
         let (mut upstream, ip) = match connect_upstream(&host, port).await {
             Ok(v) => v,
-            Err(_) => {
-                reject(&mut client, &self.log, &host).await;
+            Err(why) => {
+                reject(&mut client, &self.log, &host, &why).await;
                 return;
             }
         };
@@ -166,6 +186,7 @@ impl ProxyServer {
                 config::TUNNEL_FIRST_BYTE_TIMEOUT_SECS,
             )),
             true,
+            cancel,
         )
         .await;
         // 字节数每 host 只留首条：每连接两行会刷满日志环，异常(零回包)另有专门记录。
@@ -195,6 +216,7 @@ impl ProxyServer {
         target: &str,
         headers: &[u8],
         body_prefix: &[u8],
+        cancel: CancellationToken,
     ) {
         let Some(rest_target) = target.strip_prefix("http://") else {
             let _ = client
@@ -233,8 +255,8 @@ impl ProxyServer {
         }
         let (mut upstream, ip) = match connect_upstream(&host, port).await {
             Ok(v) => v,
-            Err(_) => {
-                reject(&mut client, &self.log, &host).await;
+            Err(why) => {
+                reject(&mut client, &self.log, &host, &why).await;
                 return;
             }
         };
@@ -263,7 +285,9 @@ impl ProxyServer {
             head_sent = upstream.write_all(body_prefix).await.is_ok();
         }
         let recv = if head_sent {
-            bidir_copy(&mut client, &mut upstream, None, false).await.1
+            bidir_copy(&mut client, &mut upstream, None, false, cancel)
+                .await
+                .1
         } else {
             0
         };
@@ -273,12 +297,13 @@ impl ProxyServer {
     }
 }
 
-/// 无可用上游：502 + 一行日志（CONNECT 与明文 HTTP 共用出口）。
-async fn reject(client: &mut TcpStream, log: &LogFn, host: &str) {
+/// 无可用上游：502 + 一行带原因的日志（CONNECT 与明文 HTTP 共用出口）。
+/// 带上原因才能区分"内网地址被保险拦了"和"恰好拨不通"，排障不用猜。
+async fn reject(client: &mut TcpStream, log: &LogFn, host: &str, why: &str) {
     let _ = client
         .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         .await;
-    log(&format!("[拒绝] {host} 无可用上游"));
+    log(&format!("[拒绝] {host} 无可用上游({why})"));
 }
 
 async fn read_head(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -416,36 +441,74 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     Ok((Dialed::Plain(tcp), "system-dns".to_string()))
 }
 
-/// 兜底腿的地址保险：环回/私网/链路本地/ULA/组播一律拒拨（v4-mapped 先折回 v4 判）。
-fn bogon_addr(ip: std::net::IpAddr) -> bool {
+/// 兜底腿的地址保险：环回/私网/链路本地/CGNAT/组播/保留段一律拒拨。
+/// 内嵌 v4 的 v6（v4-mapped、v4-compatible、6to4、Teredo）先折回 v4 再判，
+/// 不能因为"换了个 v6 形状"就绕过同一份保险。MITM 的 DNS 直拨腿也用它。
+pub(crate) fn bogon_addr(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    fn v4_from(hi: u16, lo: u16) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(
+            (hi >> 8) as u8,
+            hi as u8,
+            (lo >> 8) as u8,
+            lo as u8,
+        ))
+    }
     match ip {
-        std::net::IpAddr::V4(v4) => {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_unspecified()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
+                || o[0] == 0 // 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT（企业/运营商内网常用）
+                || (o[0] & 0xf0) == 224 // 224.0.0.0/4 组播
+                || (o[0] & 0xf0) == 240 // 240.0.0.0/4 保留
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 任播
+                || (o[0] == 198 && matches!(o[1], 18 | 19)) // 198.18.0.0/15
         }
-        std::net::IpAddr::V6(v6) => {
+        IpAddr::V6(v6) => {
             if let Some(m) = v6.to_ipv4_mapped() {
-                return bogon_addr(std::net::IpAddr::V4(m));
+                return bogon_addr(IpAddr::V4(m));
             }
             let s = v6.segments();
-            v6.is_loopback()
+            if v6.is_loopback()
                 || v6.is_unspecified()
                 || s[0] & 0xffc0 == 0xfe80 // fe80::/10 链路本地
                 || s[0] & 0xfe00 == 0xfc00 // fc00::/7 ULA
                 || s[0] & 0xff00 == 0xff00 // ff00::/8 组播
+            {
+                return true;
+            }
+            // IPv4-compatible ::a.b.c.d（:: 与 ::1 已在上一步拦掉）
+            if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 {
+                return bogon_addr(v4_from(s[6], s[7]));
+            }
+            // 6to4 2002:<v4>::/48
+            if s[0] == 0x2002 {
+                return bogon_addr(v4_from(s[1], s[2]));
+            }
+            // Teredo 2001:0000::/32：服务端 v4 在 s[2],s[3]，客户端 v4 在后 32 位（取反）
+            if s[0] == 0x2001 && s[1] == 0 {
+                return bogon_addr(v4_from(s[2], s[3])) || bogon_addr(v4_from(!s[6], !s[7]));
+            }
+            false
         }
     }
 }
 
 /// 双向透传，任一方向结束即关两侧；可选首字节看门狗与握手首包分片。
+/// `cancel` 是进程级停止信号；首字节判死也会掐断另一路——只 shutdown 写半部时，
+/// 客户端不关自己写半部会让 join! 永远 pending，task + 上游 TCP + 两条 fd 全留着。
 async fn bidir_copy<A, B>(
     a: &mut A,
     b: &mut B,
     first_byte: Option<std::time::Duration>,
     split_hello: bool,
+    cancel: CancellationToken,
 ) -> (u64, u64)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -453,12 +516,41 @@ where
 {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    // 同一任务内交替轮询两拷贝循环；任一方向 EOF/错误即收尾。
-    let (up, down) = tokio::join!(
-        copy_with_first_byte_timeout(&mut ar, &mut bw, None, split_hello),
-        copy_with_first_byte_timeout(&mut br, &mut aw, first_byte, false),
-    );
-    (up, down)
+    // 两路共用 gate：超时/停止一起收；正常 EOF 不取消，保留 TCP 半关闭语义
+    // （客户端先 shutdown(Write) 时，上游→客户端那一半仍要把响应传完）。
+    let gate = CancellationToken::new();
+    let pair = async {
+        tokio::join!(
+            copy_with_first_byte_timeout(&mut ar, &mut bw, None, split_hello, gate.clone()),
+            copy_with_first_byte_timeout(&mut br, &mut aw, first_byte, false, gate.clone()),
+        )
+    };
+    let flow = async {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                gate.cancel();
+                (0, 0)
+            }
+            v = pair => v,
+        }
+    };
+    if first_byte.is_some() {
+        // 透明隧道再给一条总时长上限；明文 HTTP 可能传大文件，不限。
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(config::TUNNEL_MAX_LIFETIME_SECS),
+            flow,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                gate.cancel();
+                (0, 0)
+            }
+        }
+    } else {
+        flow.await
+    }
 }
 
 /// 轻量随机（stdlib RandomState 技巧，避免引入 rand 依赖）：每次调用值不同。
@@ -503,6 +595,7 @@ async fn copy_with_first_byte_timeout<R, W>(
     w: &mut W,
     first_byte: Option<std::time::Duration>,
     split_tls_hello: bool,
+    gate: CancellationToken,
 ) -> u64
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -512,7 +605,14 @@ where
     let mut total = 0u64;
     let mut first = true;
     if let Some(dur) = first_byte {
-        match tokio::time::timeout(dur, r.read(&mut buf)).await {
+        let read = tokio::select! {
+            v = tokio::time::timeout(dur, r.read(&mut buf)) => v,
+            _ = gate.cancelled() => {
+                let _ = w.shutdown().await;
+                return total;
+            }
+        };
+        match read {
             Ok(Ok(n)) if n > 0 => {
                 if w.write_all(&buf[..n]).await.is_err() {
                     return total;
@@ -521,13 +621,19 @@ where
                 first = false;
             }
             _ => {
+                // 黑洞判死：两路一起收，别只关半条连接留僵尸
+                gate.cancel();
                 let _ = w.shutdown().await;
                 return total;
             }
         }
     }
     loop {
-        let n = match r.read(&mut buf).await {
+        let n = tokio::select! {
+            v = r.read(&mut buf) => v,
+            _ = gate.cancelled() => break,
+        };
+        let n = match n {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };

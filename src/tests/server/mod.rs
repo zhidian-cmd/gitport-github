@@ -242,6 +242,126 @@ fn bogon_filter_blocks_loopback_and_private_ranges() {
     }
 }
 
+/// 地址保险的补段：CGNAT / 0/8 / 组播 / 240/4 / IETF 保留段 / 内嵌 v4 的 v6。
+/// README 承诺"内网地址仍 502"，只靠 is_private() 会漏掉企业/运营商内网段。
+#[test]
+fn bogon_filter_blocks_cgnat_and_reserved_ranges() {
+    let p = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for bad in [
+        "100.64.0.1",
+        "100.127.255.254", // 100.64.0.0/10 CGNAT
+        "0.0.0.1",
+        "224.0.0.1",
+        "239.255.255.255",
+        "240.0.0.1",
+        "192.0.0.1",
+        "192.88.99.1",
+        "198.18.0.1",
+        "198.19.255.1",
+        "::7f00:1",                    // IPv4-compatible 内嵌 127.0.0.1
+        "2002:0a00:0001::1",           // 6to4 内嵌 10.0.0.1
+        "2001:0:808:808:0:0:80ff:fffe", // Teredo 客户端内嵌 127.0.0.1
+    ] {
+        assert!(super::bogon_addr(p(bad)), "{bad} 必须判为内网/保留地址");
+    }
+    for ok in [
+        "8.8.8.8",
+        "140.82.121.3",
+        "185.199.110.133",
+        "2606:50c0:8000::153",
+    ] {
+        assert!(!super::bogon_addr(p(ok)), "{ok} 是合法公网地址");
+    }
+}
+
+/// 非受管域名的 443 不再被闸一刀切：要走到系统 DNS 兜底腿，由地址保险拒拨本机。
+/// 删掉 `&& port != 443` 会退回闸处拒绝日志；删掉 bogon 过滤会变成拨号超时/连上本机。
+#[tokio::test]
+async fn unmanaged_443_reaches_dns_fallback_and_bogon() {
+    let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let proxy_port = ln.local_addr().unwrap().port();
+    let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    let srv = Arc::new(ProxyServer {
+        log,
+        authority: None,
+    });
+    let ctx = CancellationToken::new();
+    let serve_task = tokio::spawn(serve(srv, ln, ctx.clone()));
+
+    let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .unwrap();
+    cli.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout_at(deadline, cli.read(&mut chunk))
+            .await
+            .expect("读超时: 兜底腿未回包")
+            .unwrap();
+        assert!(n > 0, "连接被静默关闭");
+        resp.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        resp.starts_with(b"HTTP/1.1 502"),
+        "本机 443 必须被地址保险拒拨: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    let snapshot = logs.lock().unwrap().clone();
+    assert!(
+        !snapshot.iter().any(|m| m.contains("非受管域名且非 443")),
+        "443 不该被闸拦(放行条件被删?): {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .any(|m| m.contains("解析到内网/保留地址")),
+        "必须留下地址保险的拒绝原因(bogon 过滤被删?): {snapshot:?}"
+    );
+    ctx.cancel();
+    let _ = serve_task.await;
+}
+
+/// 首字节判死后两路必须一起收：只 shutdown 写半部时，客户端不关自己写半部会让
+/// join! 永远 pending，隧道 task + 上游 TCP + 两条 fd 永久挂着。
+#[tokio::test]
+async fn first_byte_timeout_closes_both_directions() {
+    let (mut client, mut relay_a) = tokio::io::duplex(4096);
+    let (mut relay_b, upstream) = tokio::io::duplex(4096);
+    // 客户端发一点数据后故意不关写半部；上游侧也保持连接但不发任何字节。
+    let holder = tokio::spawn(async move {
+        client.write_all(b"hello").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let hold_upstream = tokio::spawn(async move {
+        let _keep = upstream;
+        std::future::pending::<()>().await;
+    });
+    let (sent, recv) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        bidir_copy(
+            &mut relay_a,
+            &mut relay_b,
+            Some(std::time::Duration::from_millis(120)),
+            false,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("首字节超时后 bidir_copy 必须返回，不能等另一路 EOF");
+    assert_eq!(sent, 5, "客户端那 5 字节应在判死前转发出去");
+    assert_eq!(recv, 0, "上游一个字节都没发");
+    holder.abort();
+    hold_upstream.abort();
+}
+
 /// 明文 HTTP 分块体：识别出来就走 501，不把块长度行当正文喂给上游。
 #[test]
 fn chunked_request_body_is_refused() {
@@ -324,7 +444,14 @@ async fn tunnel_hello_split_relays_all_bytes() {
         })
     };
     let copier = tokio::spawn(async move {
-        copy_with_first_byte_timeout(&mut relay_in, &mut relay_out, None, true).await
+        copy_with_first_byte_timeout(
+            &mut relay_in,
+            &mut relay_out,
+            None,
+            true,
+            CancellationToken::new(),
+        )
+        .await
     });
 
     writer.await.unwrap();

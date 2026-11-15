@@ -58,9 +58,7 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
   "hosts": {
     "*.githubusercontent.com": {"content": true, "fallback": "mirror"}
   },
-  "mirrors_big": {
-    "release-assets.githubusercontent.com": ["https://gh-proxy.com"]
-  },
+  "mirrors_big": ["https://gh-proxy.com"],
   "mirrors_small": {
     "raw.githubusercontent.com": ["https://gh-proxy.com", "https://ghfast.top"]
   }
@@ -79,11 +77,11 @@ v2 起是**二部图**：`hosts`（域名 → 开关位）× `ips`（IP 节点 �
 - **边状态机**（运行时实测，不落盘，**只在响应处理层写边，拨号层一次都不写**）：某 (IP, 路由键) 被服务端回 421 → 该边长冷却（4 小时）；**新拨连接**发送超时/断连 → 短冷却（2 分钟）；风控拦截页 → 10 分钟且**免疫清黑**（风控页本身就是一次"成功"的 HTTP 交换，可清就会被并发回写洗掉）。TCP 连不上不写边、走 60/300/1800 秒死亡退避；**复用旧连接失败也不写边、不熔断、不转镜像**，只按 id 摘掉那条连接。成功只清短冷却。全黑时该 host 走 fallback
   - TLS 握手失败（锚点选错）**不记边、不冷却**，只把游标前移，并打一行 `证书校验失败` 提示——那是本地校验没过，不是对端拒绝；换个 SAN 内任意域名即可，不必等于目标域名
 - 旧格式仍能读（启动自动折算，原文件留 `.bak`）：**0.5.3 及以前（v2 之前）**的 `routes` 域名字典（`plans`/`realPlans`）、`routes` 数组 + `match` 正则、更早的三池 `core/api/edge`；`real`/`donor` 标志按 v2 语义处置（丢弃，原 real 域走伪装锚点）。当前 0.5.4 已经是 v2 二部图格式，别把当前版本当成旧格式
-- 镜像链分两个字典：`mirrors_big` = 大文件域（objects / release-assets，分片竞速），`mirrors_small` = 图片与文本资源域（raw / gist / avatars / user-images / media）；分类权在域名，条目放错字典启动时也会被归位
+- 镜像链是**一列表 + 一字典**：`mirrors_big`（列表）= 大文件域（objects / release-assets，分片竞速），所有 big host 共用这一条；`mirrors_small`（字典）= 图片与文本资源域（raw / gist / avatars / user-images / media），每 host 一条；分类权在域名。把 big host 的链写进 `mirrors_small`（放错字典）启动时会被归位到单链；旧 `mirrors` 字典里的同名残留优先级最低，新版已声明时不覆盖，只留一行日志
 - **「自定义镜像」列表 = 镜像链的全部内容**（不是追加项）：手改进 routes.json 的条目重启后会被收编进列表，此后以列表为准；界面保存前会自动合并服务端最新清单，旧页面不会覆盖新收编条目
-- 默认安装 routes.json **双字典为空**（`seeds.json` 顶层只有 `hosts` / `ips`，`builtin_mirror_urls()` 也返回空）：小文件走直连兜底；大文件域无链时候选仅直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**；镜像默认在工作台里就有（首启内置 8 家落链），删光了才需要自己填
-- **出厂镜像在 settings.rs**（`default_worker_mirrors`）：全新安装首启内置 8 家复测精选的公共镜像（2026-11-14 双轮拨测排序，落进 workerMirrors）；仅首启生效，已有 settings.json 的清单不动。README 里「默认镜像链来自 gh-proxy.org 等公益服务」是历史文案，routes.json 里没有硬编码默认镜像
-- 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为双字典
+- 全新安装时**不预写手改表**：`seeds.json` 顶层只有 `hosts` / `ips`，`routes.json` 在首启时按内存链生成一次；镜像清单来自 `settings.rs::default_worker_mirrors()` 的**内置 8 家**，首启落进 `workerMirrors` 并对齐进两条链（落盘后 `mirrors_big` 列表与 `mirrors_small` 字典都非空）。只有把镜像删光、链全空时，候选才只剩直连（伪装 SNI 直拨），直连也被阻断才 502。502 提示页只有「暂时不可用 / 代理正在按表自动重试」、8 秒自动刷新和工作台链接，**没有「补镜像」指引**
+- **出厂镜像在 settings.rs**（`default_worker_mirrors`）：全新安装首启内置 8 家复测精选的公共镜像（2026-11-14 双轮拨测排序，落进 workerMirrors）；仅首启生效，已有 settings.json 的清单不动。routes.json 本身不硬编码默认镜像，落盘的链来自注册表对齐；大文件单链里手填的自建镜像也会被收编进工作台列表（可关可删）
+- 旧版单字典 `"mirrors"` 仍可读（启动自动按域名归类），下次落盘转为 `mirrors_big` 列表 + `mirrors_small` 字典；旧版 `mirrors_big` 的 per-host 对象也会按域名序去重合并成单链
 - 大文件域选谁不按链序硬排：代理按「预计最早下完」在镜像与直连之间动态分流（ECT 时间槽）；链序只决定失败时的顺延次序
 - **物理顺序固定，拨号顺序不按表序**：文件里你怎么排就怎么存，程序不改你的顺序；但拨号时先从游标（上次驻留的 IP）起步，其余按 `latency` 实测升序试，没测过的垫底——想强制某条先试，把它写进游标
 - 手改**重启生效**；启动只在 routes.json 缺失时才生成，**不再重写手改表**。运行时会写盘只有两种：退出时落 `latency` 运行时基线、在工作台增删或启停镜像时同步镜像链——两种都会把表按内存状态整份重写（格式规范化）

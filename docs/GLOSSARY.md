@@ -49,7 +49,7 @@
 | 已有通道口径 | "这个 IP 有没有通道"全仓只有一个来源：连接池本身（`occupied_ips`）。没有第二本账，也就没有两账本漂移的竞态 |
 | 每连接驱动任务 / ConnDriver | 每条连接自带一个任务：持续 poll conn 让 h2 帧收发活着（协议硬要求，不是保活）、**按类探活**（内容域极小请求 / 会话域 PING，计时器驱动，只探闲置通道）、连接结束或探活判死按 id 自摘出池；没有补拨 |
 | 探活 | 通道持续存在（无批窗），健康由驱动探活保证：内容域/其他闲置超 30s 开 stream 发 `GET Range:bytes=0-0`（1 字节 Range 是正常 HTTP 请求，PING 帧探不了黑洞），2s 无响应头 = 黑洞 → 当场出池；会话域闲置超 30s 发 PING，PONG 超时判死。内容域/其他闲置（无真实流量）超 10 分钟主动放手，稳态不多养连接；会话域是长期资产不限 |
-| 建造锁 | per-host 建造锁（`pool::get_or_build` 内部）：同 host 取通道未命中只放一个进拨号（雷群去重），等锁者重查池子，等在途建造最多 3s（30ms 步进），超时交兜底 |
+| 建造锁 | per-host 建造锁（`pool::get_or_build` 内部）：同 host 取通道未命中只放一个进拨号（雷群去重），等锁者重查池子，等在途建造最多 15s（30ms 步进），超时交兜底 |
 | 双通道资格 | 拨号阶段按 host 类别决定开几条腿：内容域主副两条；会话域自建单条；大文件域与 docs/agent 等低频子域单条。内容域两条都顶满时由溢出在同 IP 补一条（上限 3 条/IP） |
 | 主副通道 | **拨号**阶段的分工：主腿只开新坑（本 host 候选里已有通道的 IP 一律跳过、按游标优先串发），副腿起跑前先查「本 host 候选 ∩ 已有通道」，捡到就用、不拨号，捡不到才跟主腿一样串发；两腿共享「谁试过哪个 IP」，绝不重复试。**这只是拨号分工，不限制取用**：连好后两条通道都承载并发 |
 | 拨号并发 | **无仲裁**：两个 host 同时抢拨同一个空 IP 就让它俩都拨，入库时 `store_h2` 按类别上限处置（会话域去重、内容域并存），输家的握手（300-700ms，连上即关）是接受的代价。独立仲裁器已退役（保护面只有每批省两三条白打握手，撑不起全局协调器，git 历史可寻回） |
@@ -81,8 +81,8 @@
 | 绕表全灭 / 镜像链全灭 | 30s / 60s | `pool/mod.rs` |
 | 内容域探活间隔 / 探活超时 / 闲置放手 | 30s / 2s / 10min | `config.rs::PROBE_INTERVAL_SECS`·`PROBE_TIMEOUT_SECS`·`CONN_IDLE_RETIRE_SECS` |
 | 会话域 PING 间隔 / PONG 超时 | 30s / 2s | `config.rs::SESSION_PROBE_INTERVAL_SECS`·`SESSION_PING_TIMEOUT_SECS` |
-| 同 IP 通道上限（内容域/会话域） | 3 条 / 1 条 | `config.rs::MAX_CONNS_CONTENT`·`MAX_CONNS_SESSION` |
-| 建造在途等待 | 3s（30ms 步进） | `pool/mod.rs::get_or_build` |
+| 同 IP 通道上限（内容域/会话域） | 1 条 / 1 条 | `config.rs::MAX_CONNS_CONTENT`·`MAX_CONNS_SESSION` |
+| 建造在途等待 | 15s（30ms 步进） | `pool/mod.rs::BUILD_WAIT_SECS` |
 | 直连切片 准入 / 目标段 / 段数 / 在途上限 / 救援等待 | ≥512KB / ≈192KB / 4~8 段 / 6 个 / 5s | `direct_split.rs`·`config.rs::MEDIA_RESCUE_WAIT_SECS` |
 | 单段缓冲 / 段头预算 / 探片记忆 | 2MiB / 8s / 10min | `direct_split.rs` |
 | 镜像 ECT 窗口 / 让位冷却 | 500ms / 1.5s、2.5s | `mirror.rs::ECT_WINDOW_MS`、`merge.rs::CUT_COOLDOWN` / `CUT_ANY_COOLDOWN` |
