@@ -15,9 +15,9 @@ let logSeq = 0;
 let S = { running: false, mitm: false, port: 7810 };
 
 const titles = {
-  overview: ['概览', '代理状态与 GitHub 连通性一览'],
-  logs:     ['运行日志', '实时运行日志 · 增量拉取'],
-  settings: ['设置', '应用行为偏好 · 分流接管 · MITM'],
+  overview: ['概览'],
+  logs:     ['日志'],
+  settings: ['设置'],
 };
 
 async function copyText(t) {
@@ -51,7 +51,6 @@ function route() {
   document.querySelectorAll('.item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
   const t = titles[view] || titles.overview;
   $('pageTitle').textContent = t[0];
-  $('pageSub').textContent = t[1];
 }
 window.onhashchange = route;
 
@@ -184,7 +183,7 @@ const escAttr = s => String(s).replace(/[&<>"']/g, c => ({'&':'\u0026amp;','<':'
 function renderMirrors() {
   $('mirrorRows').innerHTML = MIRRORS.length
     ? MIRRORS.map((m, i) => mirrorRow(m, i)).join('')
-    : '<div class="pool-empty">还没有自定义镜像——点下方「＋ 添加镜像」，填入地址后点「启动」</div>';
+    : '<div class="pool-empty">暂无镜像</div>';
 }
 
 function mirrorRow(m, i) {
@@ -194,9 +193,9 @@ function mirrorRow(m, i) {
   // 所以留着让用户改或删，不替他清掉。
   return '<div class="mirror-row">' +
     '<input type="text" class="text-input' + (m.invalid ? ' invalid' : '') + '" value="' + escAttr(m.url) + '" data-idx="' + i + '" placeholder="https://your-worker.example.com" spellcheck="false" autocomplete="off"' +
-    (m.invalid ? ' title="用法试探未通过：该镜像暂不参与下载"' : '') + '>' +
+    (m.invalid ? ' title="不可用"' : '') + '>' +
     '<button class="' + cls + '" data-act="toggle" data-idx="' + i + '">' + toggle + '</button>' +
-    '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="彻底删除（注册表与镜像链一并清除）">' + TRASH_SVG + '</button>' +
+    '<button class="icon-btn" data-act="del" data-idx="' + i + '" title="删除">' + TRASH_SVG + '</button>' +
     '</div>';
 }
 
@@ -274,7 +273,7 @@ async function runCal(btn) {
     const timer = setInterval(async () => {
       try {
         const st = await (await fetch('/api/calibrate')).json();
-        if (st.running) { box.textContent = '图片链校准中…（进度见「运行日志」页）'; return; }
+        if (st.running) { box.textContent = '校准中…'; return; }
         clearInterval(timer);
         box.textContent = st.report || '图片链校准完成（无可校准的链）';
         toast('图片链校准完成');

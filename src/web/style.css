@@ -110,8 +110,8 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 .btn{border:1px solid var(--line-strong);background:var(--panel-2);border-radius:8px;
      padding:7px 15px;font-size:13px;font-weight:500;cursor:pointer;color:var(--mid);
-     font-family:var(--sans);transition:background .15s,border-color .15s,transform .05s}
-.btn:hover{background:var(--panel-3);border-color:#344050;color:var(--txt)}
+     font-family:var(--sans);transition:background .15s,border-color .15s,transform .12s}
+.btn:hover{background:var(--panel-3);border-color:#344050;color:var(--txt);transform:translateY(-1px)}
 .btn:active{transform:translateY(1px)}
 .btn.primary{background:#238636;border-color:#2ea043;color:#fff}
 .btn.primary:hover{background:#2ea043;border-color:#3fb950;color:#fff}
@@ -136,7 +136,8 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 @media (max-width:980px){.grid3{grid-template-columns:1fr}}
 .statcard{display:flex;flex-direction:column;gap:7px;background:var(--panel);
           border:1px solid var(--line);border-radius:12px;padding:17px 19px;
-          color:var(--txt)}
+          color:var(--txt);transition:border-color .15s,transform .15s}
+.statcard:hover{border-color:var(--line-strong);transform:translateY(-2px)}
 .statcard .value{font-size:18px;font-weight:600}
 .statcard .meta{font:12px var(--mono);color:var(--faint)}
 .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
@@ -146,7 +147,9 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 /* ---------- 设置 ---------- */
 .feature-card{display:flex;align-items:center;gap:20px;background:var(--panel);
-              border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:14px}
+              border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:14px;
+              transition:border-color .15s,transform .15s}
+.feature-card:hover{border-color:var(--line-strong);transform:translateY(-2px)}
 .feature-info{flex:1;min-width:0}
 .feature-info p{font-size:12.5px;color:var(--faint);line-height:1.75;margin-top:7px}
 .feature-card .btn{flex-shrink:0;min-width:96px}
@@ -170,6 +173,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 /* 自定义镜像行：地址 + 启停 + 垃圾桶 */
 .mirror-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
 .mirror-row .text-input{margin-top:0;flex:1;max-width:none}
+.mirror-row .btn:hover{transform:translateY(-1px)}
 .icon-btn{border:1px solid var(--line-strong);background:var(--panel-2);border-radius:8px;width:34px;height:34px;
           display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--sub);
           transition:color .15s,border-color .15s;flex-shrink:0}
