@@ -17,12 +17,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-/// 竞速预算：盖过镜像腿 5s 头预算 + 3s 测速窗 + 余量；超窗整体放弃回退直连。
-const RACE_BUDGET: Duration = Duration::from_secs(15);
+/// 竞速预算：单腿最坏 1s 建连 + 0.5s 测速，3s 是全腿收场的兜底线。
+const RACE_BUDGET: Duration = Duration::from_secs(3);
 /// 计速窗口：每腿交满 1KB 即计速（从响应头到达起算）。
 const WIN_BYTES: usize = 1024;
-/// 单腿测速上限：头到达后 3s 没交满 1KB 记"无速度"出局，不再等它。
-const SPEED_WINDOW: Duration = Duration::from_secs(3);
+/// 单腿测速上限：头到达后 0.5s 没交满 1KB 记"无速度"出局——
+/// 1024B/0.5s = 2KB/s，"0.5s 没速度"与"不足 2KB/s"是同一道门，慢腿没有留的价值。
+const SPEED_WINDOW: Duration = Duration::from_millis(500);
+/// 通道建立预算：每腿（镜像/直连）1s 内必须交出响应头，超时即弃。
+const HEAD_BUDGET: Duration = Duration::from_secs(1);
 
 /// git 智能协议请求类别（决定合法响应的 Content-Type）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -133,7 +136,10 @@ async fn leg_worker(
                     buf.push(d.clone());
                 }
                 if n >= WIN_BYTES {
-                    let speed = n as f64 / t0.elapsed().as_secs_f64();
+                    // 固定字节窗：速度 = 1024B ÷ 交满 1024B 的时刻−头时刻。
+                    // 用累计 n 当分子的话，各腿第一帧大小不同（1KB~16KB），
+                    // 帧大的虚高——比的不是吞吐是帧大小（实测 direct 跑出 505MB/s 的鬼数字）。
+                    let speed = WIN_BYTES as f64 / t0.elapsed().as_secs_f64();
                     let win = LegWin {
                         name: name.clone(),
                         head: parts,
@@ -331,7 +337,13 @@ pub(super) async fn handle(
         let m2 = m.clone();
         legs.push((
             m.clone(),
-            Box::pin(async move { mirror::mirror_do(req, &m2, &log2).await }),
+            Box::pin(async move {
+                // 通道建立预算 1s：镜像腿拨号+TLS+头超时即弃，不陪慢镜像干等。
+                match tokio::time::timeout(HEAD_BUDGET, mirror::mirror_do(req, &m2, &log2)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!("{m2} 通道建立超 1s")),
+                }
+            }),
         ));
     }
     // 直连腿永远在场：镜像全坏时它就是今天的行为；克隆链为空不会进到这里。
@@ -343,7 +355,12 @@ pub(super) async fn handle(
             let host2 = host.to_string();
             let info2 = info.clone();
             let replay2 = replay.clone();
-            async move { get_direct(&log2, &out, &host2, &info2, &replay2).await }
+            async move {
+                match tokio::time::timeout(HEAD_BUDGET, get_direct(&log2, &out, &host2, &info2, &replay2)).await {
+                    Ok(r) => r,
+                    Err(_) => Err("direct 通道建立超 1s".to_string()),
+                }
+            }
         }),
     ));
     (log)(&format!(
