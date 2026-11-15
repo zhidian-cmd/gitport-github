@@ -150,7 +150,9 @@ fn speed_outcome(
     LegOutcome::Speed { name, speed, win }
 }
 
-/// 腿 worker：等响应头 → 验头 → 整个测速窗累计字节 → 收口计速（1KB 门槛 + 体形状验）。
+/// 腿 worker：等响应头 → 验头 → 等**首个体字节**（GitHub 生成 pack 要 1~3s，头后干等
+/// 不算腿的错——头只是 HTTP 元数据，秒回；锚在头上会把"头快体慢"的全部腿判死，
+/// 实测 8 镜像全灭、慢拨号的直连唯一幸存）→ 首字节起 0.5s 测速窗累计字节 → 收口计速。
 async fn leg_worker(
     name: String,
     fut: LegFut,
@@ -178,35 +180,47 @@ async fn leg_worker(
         };
     }
     let (parts, mut body) = resp.into_parts();
-    // 计时基点 = 响应头到达（通道必然已建立）：拨号/TLS/头等待不计入速度，
-    // 热直连的"零握手"优势不再压人——这正是用户定版要剔除的不对称。
-    // 计速 = 整个窗口实际收到的字节 ÷ 窗口时长（真吞吐）。不能测"到 1KB 用了多久"：
-    // 下一帧常已在 socket 缓冲里，头帧间隔是微秒级调度噪声（实测跑出 390MB/s 的鬼数字）。
-    let t0 = Instant::now();
+    let mut t0: Option<Instant> = None; // 首个体字节 = 测速窗起点
     let mut buf: Vec<Bytes> = Vec::new();
     let mut n = 0usize;
     loop {
-        let left = speed_window.saturating_sub(t0.elapsed());
-        if left.is_zero() {
-            return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t0.elapsed());
-        }
-        match tokio::time::timeout(left, http_body_util::BodyExt::frame(&mut body)).await {
-            Err(_) => {
-                // 窗口收口兜底（timeout 与 left.is_zero 同一刻，可能被它先抢）。
-                return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t0.elapsed());
+        if let Some(t) = t0 {
+            if t.elapsed() >= speed_window {
+                return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed());
             }
-            Ok(Some(Ok(f))) => {
+        }
+        // 测速中必须用 timeout 包帧等待：窗口收口要靠它醒来——裸 await 的体 pending
+        // 永不唤醒，窗口检查永远没机会跑（本文件第三次踩这个坑，教训：任何 Pending
+        // 分支都得有定时器或外部唤醒源兜底）。首字节等待段不包：由竞速预算收口。
+        let got = match t0 {
+            Some(t) => {
+                let left = speed_window.saturating_sub(t.elapsed());
+                if left.is_zero() {
+                    return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed());
+                }
+                match tokio::time::timeout(left, http_body_util::BodyExt::frame(&mut body)).await {
+                    Err(_) => return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed()),
+                    Ok(v) => v,
+                }
+            }
+            None => http_body_util::BodyExt::frame(&mut body).await,
+        };
+        match got {
+            Some(Ok(f)) => {
                 if let Some(d) = f.data_ref() {
+                    if t0.is_none() {
+                        t0 = Some(Instant::now()); // 首个体字节：测速窗开始
+                    }
                     n += d.len();
                     buf.push(d.clone());
                 }
             }
-            Ok(Some(Err(e))) => {
+            Some(Err(e)) => {
                 return LegOutcome::Failed {
                     why: format!("{name}: 体流错误({e})"),
                 };
             }
-            Ok(None) => {
+            None => {
                 // 完整响应已收完（小响应常 <1KB）：直接赢，无比较意义——但 body 形状
                 // 必须先过验，坏镜像的"完整限流页"不得借 EOF 抢赢（审计 #5）。
                 if !body_looks_git(kind, &buf) {
@@ -236,7 +250,13 @@ fn concat_buf(buf: &[Bytes], n: usize) -> Bytes {
 /// 竞速判赢核心（网络无关，可注入假腿单测）：
 /// - 完整收完（EOF）的腿立即赢，其余掐断；
 /// - 全腿计速（或出局）后比速度，最快者赢；
-/// - 无任何速度（全灭/全太慢）= Err(各腿失败原因)。
+/// - 预算超窗时已计速的胜者不丢（有速度照样比），无任何速度 = Err(各腿失败原因)。
+fn ranked_first(speeds: &[(String, f64)]) -> Option<String> {
+    let mut ranked = speeds.to_vec();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.first().map(|(n, _)| n.clone())
+}
+
 async fn run_race(
     legs: Vec<(String, LegFut)>,
     kind: GitKind,
@@ -268,6 +288,18 @@ async fn run_race(
             Err(_) => {
                 for h in &handles {
                     h.abort();
+                }
+                // 预算收口不丢已计速的合法胜者（审计存疑项落地）：有速度就比出最快，
+                // 只有没有任何速度（全灭/全太慢）才回退重发。
+                if let Some(wname) = ranked_first(&speeds) {
+                    if let Some(pos) = wins.iter().position(|w| w.name == *wname) {
+                        let win = wins.swap_remove(pos);
+                        return Ok(RaceWin {
+                            win,
+                            speeds,
+                            complete: false,
+                        });
+                    }
                 }
                 fails.push(format!("竞速预算超窗({}s)", budget.as_secs()));
                 return Err(fails);
@@ -310,10 +342,8 @@ async fn run_race(
                         h.abort();
                     }
                     // 全腿计速/出局：比速度，最快者赢。
-                    let mut ranked: Vec<(String, f64)> = speeds.clone();
-                    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    if let Some((wname, _)) = ranked.first() {
-                        if let Some(pos) = wins.iter().position(|w| &w.name == wname) {
+                    if let Some(wname) = ranked_first(&speeds) {
+                        if let Some(pos) = wins.iter().position(|w| w.name == wname) {
                             let win = wins.swap_remove(pos);
                             return Ok(RaceWin {
                                 win,

@@ -243,7 +243,7 @@ async fn eof_complete_beats_earlier_1kb() {
     assert!(race.complete, "必须标记为 EOF 胜");
 }
 
-/// 单腿测速上限：静默腿 3s（测试 120ms）出局不拖场，有速度的腿照常赢。
+/// 单腿测速上限：静默腿（无首字节）由预算收口，已计速的 worker 不被丢、照常赢。
 #[tokio::test]
 async fn too_slow_leg_does_not_stall_the_race() {
     let t0 = std::time::Instant::now();
@@ -263,7 +263,7 @@ async fn too_slow_leg_does_not_stall_the_race() {
     let race = super::run_race(
         legs,
         GitKind::Result,
-        Duration::from_secs(10),
+        Duration::from_millis(500), // 预算压缩：静默腿由预算收口
         Duration::from_millis(120), // 测速窗压缩到 120ms
     )
     .await
