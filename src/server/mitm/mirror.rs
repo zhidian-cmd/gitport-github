@@ -1741,7 +1741,10 @@ pub(crate) async fn discover_clone_template(mirror: &str, log: &LogFn) -> Result
                             .to_lowercase();
                         if status != http::StatusCode::OK {
                             verdict = format!("状态 {status}");
-                        } else if !ct.contains("x-git-upload-pack-advertisement") {
+                        } else if ct.split(';').next().unwrap_or("").trim()
+                            != "application/x-git-upload-pack-advertisement"
+                        {
+                            // 与竞速侧 head_is_valid 同判据：挂名 CT（text/plain; note=...）不算（审计 #6）
                             verdict = format!("Content-Type 非 git 协议({})", ct);
                         } else {
                             // 读前 1KB（2s 上限，审计 #8：无超时的体读会永久挂死补测）：
@@ -1808,7 +1811,8 @@ pub(crate) async fn discover_clone_template(mirror: &str, log: &LogFn) -> Result
                                             .unwrap_or("")
                                             .to_lowercase();
                                         if st != 200
-                                            || !pct.contains("x-git-upload-pack-result")
+                                            || pct.split(';').next().unwrap_or("").trim()
+                                                != "application/x-git-upload-pack-result"
                                         {
                                             verdict =
                                                 format!("POST 转发不符(回 {st} {pct})");
@@ -1903,7 +1907,8 @@ pub(super) fn mirror_request(
 /// 与文件下载腿两处不同（审计 #4/#13）：
 /// - 头改**白名单**：只放行 git 智能协议必需的最小集合——企业 CI 用 `http.extraHeader`
 ///   注入的自定义 token（X-Git-Token/PRIVATE-TOKEN 等）不得随镜像腿外发；
-/// - 模板产物必须仍指向同一镜像主机，手改 cloneTpl 引去第三方主机时该腿弃用。
+/// - 模板产物必须仍指向同一镜像主机（scheme+host 按.Uri 解析、忽略大小写与端口，
+///   字符串前缀比较会被 `GH-Proxy.org:443` 这类同主机异写法误杀，审计 #10）。
 pub(super) fn clone_request(
     out: &hyper::Request<BoxBody>,
     mirror: &str,
@@ -1916,8 +1921,12 @@ pub(super) fn clone_request(
     } else {
         fill_template(tpl, mirror, orig_url)
     };
-    let prefix = format!("{mirror}/");
-    if !url.starts_with(&prefix) {
+    let mu: http::Uri = mirror.parse().map_err(|e| format!("镜像地址非法: {e}"))?;
+    let uu: http::Uri = url.parse().map_err(|e| format!("cloneTpl 产物 URL 非法: {e}"))?;
+    let host_eq = mu.host().map(|h| h.to_lowercase()) == uu.host().map(|h| h.to_lowercase());
+    let scheme_eq =
+        mu.scheme_str().map(|s| s.to_lowercase()) == uu.scheme_str().map(|s| s.to_lowercase());
+    if !host_eq || !scheme_eq {
         return Err(format!("cloneTpl 产物越出镜像主机({mirror}), 该腿弃用"));
     }
     let mut req = mirror_request_at(url, out, body)?;

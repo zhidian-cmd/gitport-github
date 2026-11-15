@@ -53,7 +53,8 @@ pub struct WorkerMirror {
     /// 有值的镜像才进克隆链（routes.json cloneMirrors）。
     #[serde(default)]
     pub clone_tpl: String,
-    /// 克隆探测测过但不支持：不再重复探测；false = 还没测过（启动补测会跑它）。
+    /// 克隆探测测过但不支持：每次启动会重测一次（一次 502 不至于永久出局）；
+    /// false = 还没测过（启动补测会跑它）。出厂 8 家因 seeds.json 已带模板不受影响。
     #[serde(default)]
     pub clone_bad: bool,
 }
@@ -1089,7 +1090,7 @@ pub fn set_mirror_clone_template(url: &str, tpl: String) {
     });
 }
 
-/// 克隆探测测过但不支持：标记后不再重复探测。
+/// 克隆探测测过但不支持：标记后每次启动重测一次（失败是暂时的就不该永久出局）。
 pub fn set_mirror_clone_bad(url: &str, bad: bool) {
     update_mirror(url, |w| w.clone_bad = bad);
 }

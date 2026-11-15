@@ -41,6 +41,13 @@ fn resp_with_silent_body(status: u16, ct: &str) -> hyper::Response<BoxBody> {
         .unwrap()
 }
 
+/// 合法 pack 流的首帧：NAK pkt + 任意填充（pkt-line 自洽校验只验首 pkt）。
+fn nak_frame(fill: &[u8]) -> Bytes {
+    let mut v = b"0008NAK\n".to_vec();
+    v.extend_from_slice(fill);
+    Bytes::from(v)
+}
+
 /// 假腿：head_ms 后交合法头，体帧按"头后偏移"依次到达（sleep 携带正确 waker），
 /// 帧后接永续 pending（不 EOF）——模拟 packfile 大流，逼腿走速度路径而非 EOF 胜。
 fn timed_leg(head_ms: u64, frames: Vec<(u64, Bytes)>) -> LegFut {
@@ -109,21 +116,36 @@ fn invalid_heads_never_count_as_valid() {
     assert!(!super::head_is_valid(GitKind::Advertisement, 404, ADV));
     assert!(!super::head_is_valid(GitKind::Advertisement, 200, "text/html"));
     assert!(!super::head_is_valid(GitKind::Result, 200, ADV));
+    // 挂名 CT（text/plain; note=git...）：精确比对 media type，不得蒙混（审计 #6）
+    assert!(!super::head_is_valid(
+        GitKind::Advertisement,
+        200,
+        "text/plain; note=application/x-git-upload-pack-advertisement"
+    ));
+    // pkt-line 形状：NAK 正例 / 伪造前缀负例（审计 #3）
+    assert!(super::body_looks_git(
+        GitKind::Result,
+        &[Bytes::from_static(b"0008NAK\n")]
+    ));
+    assert!(!super::body_looks_git(
+        GitKind::Result,
+        &[Bytes::from_static(b"0000<html>")]
+    ));
 }
 
 /// 全腿计速后比速度：0.5s 窗口内实际收到的字节多者赢（真吞吐比较）。
 #[tokio::test]
 async fn fastest_speed_wins() {
     let legs = vec![
-        // slow：窗口内只到 1KB → 5KB/s（填充必须是十六进制，pkt-line 校验要过）
+        // slow：窗口内只到 1KB → 5KB/s（首帧必须是自洽 pkt-line，校验要过）
         (
             "slow".to_string(),
-            timed_leg(10, vec![(50, Bytes::from(vec![b'a'; 1024]))]),
+            timed_leg(10, vec![(50, nak_frame(&[b'a'; 1016]))]),
         ),
         // fast：窗口内到 4KB → 20KB/s
         (
             "fast".to_string(),
-            timed_leg(10, vec![(50, Bytes::from(vec![b'a'; 4096]))]),
+            timed_leg(10, vec![(50, nak_frame(&[b'a'; 4088]))]),
         ),
     ];
     let race = super::run_race(
@@ -140,8 +162,9 @@ async fn fastest_speed_wins() {
     // 赢家窗口内缓冲的字节全量随流交付，且逐字节正确（审计 #12：不能只看长度）
     assert_eq!(race.win.prefix.len(), 4096);
     assert!(
-        race.win.prefix.iter().all(|b| *b == b'a'),
-        "赢家缓冲字节必须逐字节正确"
+        race.win.prefix.starts_with(b"0008NAK\n")
+            && race.win.prefix[8..].iter().all(|b| *b == b'a'),
+        "赢家缓冲字节必须逐字节正确(NAK 头 + 填充)"
     );
 }
 
@@ -256,7 +279,7 @@ async fn too_slow_leg_does_not_stall_the_race() {
             "worker".to_string(),
             timed_leg(
                 10,
-                vec![(80, Bytes::from(vec![b'a'; 1024])), (160, Bytes::from(vec![b'b'; 3072]))],
+                vec![(80, nak_frame(&[b'a'; 1016])), (160, Bytes::from(vec![b'b'; 3072]))],
             ),
         ),
     ];
@@ -287,5 +310,99 @@ fn noscheme_placeholder_strips_scheme() {
     assert_eq!(
         url,
         "https://m.example/github.com/o/r.git/info/refs?service=git-upload-pack"
+    );
+}
+
+/// 伪造 pkt 前缀负例：`0000<html>限流页` 撞 4 位十六进制门槛不得判胜（审计 #3）——
+/// 旧校验只看前 4 字节是否十六进制，这份响应会借 EOF 抢赢、把限流页当 packfile 交给 git。
+#[tokio::test]
+async fn fake_pkt_prefix_limit_page_is_rejected() {
+    let legs = vec![(
+        "poison".to_string(),
+        leg(
+            10,
+            Ok(git_resp(200, RESULT, b"0000<html>rate limited</html>")),
+        ),
+    )];
+    let errs = match super::run_race(
+        legs,
+        GitKind::Result,
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("伪造 pkt 前缀必须判负"),
+    };
+    assert!(errs.iter().any(|e| e.contains("响应体不是 git 协议")));
+}
+
+/// 计速判据钉死：A 先交满 1KB，但 B 窗口内实收更多——比的是窗口吞吐，B 赢。
+#[tokio::test]
+async fn more_bytes_in_window_beats_earlier_1kb() {
+    let legs = vec![
+        // A：首字节早（+20ms），窗口内只收 1KB → 5KB/s
+        (
+            "early-1kb".to_string(),
+            timed_leg(10, vec![(10, nak_frame(&[b'a'; 1016]))]),
+        ),
+        // B：首字节晚（+150ms），但窗口内收 4KB → 20KB/s
+        (
+            "late-4kb".to_string(),
+            timed_leg(10, vec![(140, nak_frame(&[b'b'; 4088]))]),
+        ),
+    ];
+    let race = super::run_race(
+        legs,
+        GitKind::Result,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect("两条腿都应有计速");
+    assert_eq!(
+        race.win.name, "late-4kb",
+        "窗口吞吐高者赢, 不是先到 1KB 者赢: {:?}",
+        race.speeds
+    );
+}
+
+/// 克隆腿头白名单：git 必需头保留，`http.extraHeader` 注入的自定义凭据头与
+/// cookie 不得随镜像腿外发（审计 #4——README「不携带任何身份头」的承诺）。
+#[test]
+fn clone_request_whitelist_strips_custom_credentials() {
+    let out = hyper::Request::builder()
+        .method(Method::POST)
+        .uri("https://github.com/o/r.git/git-upload-pack")
+        .header("content-type", "application/x-git-upload-pack-request")
+        .header("content-length", "10")
+        .header("accept", "application/x-git-upload-pack-result")
+        .header("git-protocol", "version=2")
+        .header("x-git-token", "ghp_secret")
+        .header("cookie", "logged_in=yes")
+        .body(protocol::empty_body())
+        .unwrap();
+    let req = crate::server::mitm::mirror::clone_request(
+        &out,
+        "https://m.example",
+        "https://github.com/o/r.git/git-upload-pack",
+        protocol::empty_body(),
+    )
+    .unwrap();
+    let h = req.headers();
+    assert!(h.get("x-git-token").is_none(), "自定义凭据头不得外发");
+    assert!(h.get("cookie").is_none(), "cookie 不得外发");
+    assert_eq!(
+        h.get("git-protocol").unwrap(),
+        "version=2",
+        "git 必需头保留"
+    );
+    assert!(h.get("content-type").is_some());
+    assert!(h.get("accept").is_some());
+    assert_eq!(
+        req.uri().host().unwrap(),
+        "m.example",
+        "模板产物必须仍指向镜像主机"
     );
 }

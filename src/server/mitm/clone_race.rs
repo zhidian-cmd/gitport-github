@@ -1,10 +1,11 @@
 //! git clone 独立加速科室：智能协议请求（协商 GET / 取包 POST）在克隆链 + 直连腿之间竞速。
-//! 计速语义（用户定版）：从连接建立（= 响应头到达，拨号/TLS 成本不计入）起微秒计时，
-//! 每腿交满 1KB 记速度；先交满者**不**掐别人——等全部腿有速度（或出局）后再比速度，
-//! 最快者独占整条流，其余掐断。完整收完（EOF）的腿直接赢——响应已全在手里，无比较意义。
-//! 单腿 3s 测速上限防装死；全灭/超窗回退现有直连单流——行为底线与未开竞速时逐字节一致。
-//! 克隆不可切分，与 ECT（为可切分下载选段派发）语义不同，故独立成科；
-//! 链数据在 routes.json mirrors_clone，与大小文件链互不读写。
+//! 计速语义（用户定版）：测速窗锚在**首个体字节**（头只是元数据秒回；取包 POST 的
+//! 首字节要等 GitHub 生成 pack 1~3s，头后干等不算腿的错），窗长 0.5s，
+//! 速度 = 窗口实收字节 ÷ 窗长；先交满者**不**掐别人——等全部腿有速度（或出局）后
+//! 再比速度，最快者独占整条流，其余掐断。完整收完（EOF）的腿直接赢——响应已全在
+//! 手里，无比较意义。窗口内不足 1KB（=2KB/s）出局；全灭/超窗回退现有直连单流
+//! （预算收口不丢已计速的胜者）。克隆不可切分，与 ECT（为可切分下载选段派发）
+//! 语义不同，故独立成科；链数据在 routes.json mirrors_clone，与大小文件链互不读写。
 
 use super::super::protocol::{self, BoxBody};
 use super::mirror;
@@ -20,11 +21,15 @@ use std::time::{Duration, Instant};
 /// 竞速预算：兜底线，必须盖过各腿内层头预算（镜像 5s / 直连 4s）+ 测速窗 0.5s——
 /// 外层预算小于内层 = 慢首字节腿全灭（审计 #2 的数值越界），全灭又引发回退重发（#3）。
 const RACE_BUDGET: Duration = Duration::from_secs(8);
-/// 计速窗口：每腿交满 1KB 即计速（从响应头到达起算）。
+/// 入选门槛：测速窗内收满 1KB 才算"有速度"（不足 = 不足 2KB/s，出局）；
+/// 速度分子 = 窗口内**实收字节**（不是到 1KB 的耗时——那是调度噪声）。
 const WIN_BYTES: usize = 1024;
 /// 单腿测速上限：头到达后 0.5s 没交满 1KB 记"无速度"出局——
 /// 1024B/0.5s = 2KB/s，"0.5s 没速度"与"不足 2KB/s"是同一道门，慢腿没有留的价值。
 const SPEED_WINDOW: Duration = Duration::from_millis(500);
+/// 单腿缓冲硬上限（审计 #1）：到顶停止消费，剩余字节留在 body 续传。
+/// 天花板 = 2MB/0.5s = 4MB/s——超出的镜像并列，但全部远超直连，胜负语义不受损。
+const BUF_CAP: usize = 2 * 1024 * 1024;
 
 /// git 智能协议请求类别（决定合法响应的 Content-Type）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,8 +75,10 @@ fn head_is_valid(kind: GitKind, status: u16, ct: &str) -> bool {
     media == want
 }
 
-/// 响应体形状校验（审计 #5：坏镜像缓存投毒/限流页不得借"最快"抢赢）：
-/// 协商通告 = 智能协议 banner；取包结果 = pkt-line 的 4 位十六进制长度前缀。
+/// 响应体形状校验（审计 #5/#3：坏镜像缓存投毒/限流页不得借"最快"抢赢）：
+/// 协商通告 = 智能协议 banner；取包结果 = pkt-line **自洽**——长度字段 ≤ 实收字节、
+/// payload 为 NAK/version/ack 之一，flush 后必须还有 pkt。
+/// `0000<html>限流页` 这类伪造前缀（4 位十六进制撞大运）过不了。
 fn body_looks_git(kind: GitKind, frames: &[Bytes]) -> bool {
     match kind {
         GitKind::Advertisement => {
@@ -84,13 +91,41 @@ fn body_looks_git(kind: GitKind, frames: &[Bytes]) -> bool {
             flat.windows(25).any(|w| w == b"# service=git-upload-pack")
         }
         GitKind::Result => {
-            let head: Vec<u8> = frames
+            let flat: Vec<u8> = frames
                 .iter()
                 .flat_map(|b| b.iter())
-                .take(4)
+                .take(1024)
                 .copied()
                 .collect();
-            head.len() == 4 && head.iter().all(|b| b.is_ascii_hexdigit())
+            if flat.len() < 4 {
+                return false;
+            }
+            let Some(l1) = std::str::from_utf8(&flat[..4])
+                .ok()
+                .and_then(|s| usize::from_str_radix(s, 16).ok())
+            else {
+                return false;
+            };
+            if l1 < 4 || l1 > flat.len() {
+                return false; // 长度字段必须自洽
+            }
+            if l1 > 4 {
+                let p = &flat[4..l1];
+                return p.starts_with(b"NAK")
+                    || p.starts_with(b"version")
+                    || p.starts_with(b"ack");
+            }
+            // flush（0000）：后面必须还有自洽 pkt，裸 flush + 非 pkt 内容 = 伪造
+            if flat.len() < 8 {
+                return false;
+            }
+            let Some(l2) = std::str::from_utf8(&flat[4..8])
+                .ok()
+                .and_then(|s| usize::from_str_radix(s, 16).ok())
+            else {
+                return false;
+            };
+            l2 > 4 && l2 <= flat.len() - 4
         }
     }
 }
@@ -116,13 +151,14 @@ enum LegOutcome {
     },
     /// 完整响应已收完：直接赢。
     Complete(LegWin),
-    /// 3s 没交满 1KB：无速度出局。
+    /// 测速窗内没交满 1KB（不足 2KB/s）：无速度出局。
     TooSlow { name: String },
     /// 头错误/非法/体流错误（why 已含腿名）。
     Failed { why: String },
 }
 
 /// 窗口收口：n < 1KB = 不足 2KB/s 出局；体形状不过验 = 坏镜像出局；否则带速度参选。
+/// 速度分母固定为窗长（实测经过时间带调度抖动 δ，会翻转同吞吐腿的排序，审计 #12）。
 fn speed_outcome(
     name: String,
     kind: GitKind,
@@ -130,7 +166,7 @@ fn speed_outcome(
     n: usize,
     parts: http::response::Parts,
     body: BoxBody,
-    elapsed: Duration,
+    window: Duration,
 ) -> LegOutcome {
     if n < WIN_BYTES {
         return LegOutcome::TooSlow { name };
@@ -146,7 +182,7 @@ fn speed_outcome(
         prefix: concat_buf(buf, n),
         body,
     };
-    let speed = n as f64 / elapsed.as_secs_f64();
+    let speed = n as f64 / window.as_secs_f64();
     LegOutcome::Speed { name, speed, win }
 }
 
@@ -186,8 +222,20 @@ async fn leg_worker(
     loop {
         if let Some(t) = t0 {
             if t.elapsed() >= speed_window {
-                return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed());
+                return speed_outcome(name, kind, buf.as_slice(), n, parts, body, speed_window);
             }
+        }
+        // 缓冲到顶（审计 #1）：停止消费——剩余字节留在 body 里由 prepend 续传，零丢失；
+        // 睡到窗口收口再计速。天花板 = BUF_CAP/窗长，超出的镜像并列（均远超直连，胜负已分）。
+        if n >= BUF_CAP {
+            let wait = match t0 {
+                Some(t) => speed_window.saturating_sub(t.elapsed()),
+                None => speed_window,
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            return speed_outcome(name, kind, buf.as_slice(), n, parts, body, speed_window);
         }
         // 测速中必须用 timeout 包帧等待：窗口收口要靠它醒来——裸 await 的体 pending
         // 永不唤醒，窗口检查永远没机会跑（本文件第三次踩这个坑，教训：任何 Pending
@@ -196,10 +244,10 @@ async fn leg_worker(
             Some(t) => {
                 let left = speed_window.saturating_sub(t.elapsed());
                 if left.is_zero() {
-                    return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed());
+                    return speed_outcome(name, kind, buf.as_slice(), n, parts, body, speed_window);
                 }
                 match tokio::time::timeout(left, http_body_util::BodyExt::frame(&mut body)).await {
-                    Err(_) => return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t.elapsed()),
+                    Err(_) => return speed_outcome(name, kind, buf.as_slice(), n, parts, body, speed_window),
                     Ok(v) => v,
                 }
             }
