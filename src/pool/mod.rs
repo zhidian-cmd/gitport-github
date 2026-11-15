@@ -57,8 +57,6 @@ struct SerialTab {
     mirrors: HashMap<String, Vec<String>>,
     /// 大文件域单链：所有 big host 共用一条（成员本就相同，per-host 是冗余）。
     big_mirrors: Vec<String>,
-    /// 克隆链（git clone 竞速）：独立一条，成员=探测命中者，与大文件链不混。
-    clone_mirrors: Vec<String>,
     /// 每条串发路由（会话域+其他低频域）一个游标记号；内容域竞速不记；表序冻结，不随游标重排。
     cursor: HashMap<String, String>,
 }
@@ -83,14 +81,9 @@ struct TopoDoc {
     latency: HashMap<String, u64>,
     /// 大文件域单链（所有 big host 共用一条，不再每 host 一条）。
     big: Vec<String>,
-    /// 克隆链（git clone 竞速）：独立一条，成员=探测命中者。
-    clone: Vec<String>,
-    /// 出厂镜像克隆模板（仅 seeds.json 携带）：url → 模板。
-    mirror_clones: HashMap<String, String>,
 }
 
-/// 合并为运行时单表（小文件/媒体链 per-host；旧键不覆盖新键已声明的 host）。
-/// 大文件域已单链化（doc.big），不再进 per-host 表。
+/// 合并为运行时单表（小文件/媒体链 per-host；大文件域已单链化不进此表）。
 fn merged_chains(
     small: &HashMap<String, Vec<String>>,
     legacy: &HashMap<String, Vec<String>>,
@@ -223,115 +216,74 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         if !k.starts_with("mirrors") {
             continue;
         }
-        match k.as_str() {
-            // 大文件域单链：新格式是列表；旧 per-host map 原地合并（各 host 链本就相同）。
-            "mirrors_big" => {
-                let urls: Vec<String> = match v {
-                    serde_json::Value::Array(list) => list
-                        .iter()
-                        .filter_map(|u| serde_json::from_value::<String>(u.clone()).ok())
-                        .collect(),
-                    serde_json::Value::Object(m) => {
-                        let mut out: Vec<String> = Vec::new();
-                        for (_, chain) in m {
-                            if let Ok(c) = serde_json::from_value::<Vec<String>>(chain.clone()) {
-                                for u in c {
-                                    if !out.contains(&u) {
-                                        out.push(u);
-                                    }
+        // 大文件域单链：新格式是列表；旧 per-host map 原地合并（各 host 链本就相同）。
+        if k == "mirrors_big" {
+            match v {
+                serde_json::Value::Array(list) => {
+                    for u in list {
+                        if let Ok(s) = serde_json::from_value::<String>(u.clone()) {
+                            if s.starts_with("https://")
+                                && !s.contains(' ')
+                                && !doc.big.contains(&s)
+                            {
+                                doc.big.push(s);
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Object(m) => {
+                    for (_, chain) in m {
+                        if let Ok(c) = serde_json::from_value::<Vec<String>>(chain.clone()) {
+                            for s in c {
+                                if s.starts_with("https://")
+                                    && !s.contains(' ')
+                                    && !doc.big.contains(&s)
+                                {
+                                    doc.big.push(s);
                                 }
                             }
                         }
-                        out
-                    }
-                    _ => {
-                        salvaged = true;
-                        if let Some(l) = log {
-                            l("[串发] routes.json mirrors_big 写坏, 该段丢弃");
-                        }
-                        Vec::new()
-                    }
-                };
-                doc.big = urls
-                    .into_iter()
-                    .filter(|m| m.starts_with("https://") && !m.contains(' '))
-                    .collect();
-            }
-            "mirrors_clone" => {
-                match serde_json::from_value::<Vec<String>>(v.clone()) {
-                    Ok(c) => {
-                        doc.clone = c
-                            .into_iter()
-                            .filter(|m| m.starts_with("https://") && !m.contains(' '))
-                            .collect();
-                    }
-                    Err(e) => {
-                        salvaged = true;
-                        if let Some(l) = log {
-                            l(&format!("[串发] routes.json mirrors_clone 写坏({e}), 该段丢弃"));
-                        }
                     }
                 }
-            }
-            "mirrors_small" => {
-                let Some(m) = v.as_object() else {
+                _ => {
                     salvaged = true;
                     if let Some(l) = log {
-                        l("[串发] routes.json mirrors_small 段不是对象, 该段丢弃");
-                    }
-                    continue;
-                };
-                for (host, chain) in m {
-                    match serde_json::from_value::<Vec<String>>(chain.clone()) {
-                        Ok(c) => {
-                            small.insert(host.clone(), c);
-                        }
-                        Err(e) => {
-                            salvaged = true;
-                            if let Some(l) = log {
-                                l(&format!(
-                                    "[串发] routes.json 镜像链 {host} 写坏({e}), 该链丢弃"
-                                ));
-                            }
-                        }
+                        l("[串发] routes.json mirrors_big 写坏, 该段丢弃");
                     }
                 }
             }
-            _ => {
-                let Some(m) = v.as_object() else {
-                    continue;
-                };
-                for (host, chain) in m {
-                    match serde_json::from_value::<Vec<String>>(chain.clone()) {
-                        Ok(c) => {
-                            legacy.insert(host.clone(), c);
-                        }
-                        Err(e) => {
-                            salvaged = true;
-                            if let Some(l) = log {
-                                l(&format!(
-                                    "[串发] routes.json 镜像链 {host} 写坏({e}), 该链丢弃"
-                                ));
-                            }
-                        }
+            continue;
+        }
+        let Some(m) = v.as_object() else {
+            salvaged = true;
+            if let Some(l) = log {
+                l(&format!(
+                    "[串发] routes.json {k} 段不是对象, 该段丢弃(镜像链按注册表重建)"
+                ));
+            }
+            continue;
+        };
+        let slot = match k.as_str() {
+            "mirrors_small" => &mut small,
+            _ => &mut legacy,
+        };
+        for (host, chain) in m {
+            match serde_json::from_value::<Vec<String>>(chain.clone()) {
+                Ok(c) => {
+                    slot.insert(host.clone(), c);
+                }
+                Err(e) => {
+                    salvaged = true;
+                    if let Some(l) = log {
+                        l(&format!(
+                            "[串发] routes.json 镜像链 {host} 写坏({e}), 该链丢弃"
+                        ));
                     }
                 }
             }
         }
     }
     doc.chains = merged_chains(&small, &legacy);
-    // 出厂镜像克隆模板（仅 seeds.json 携带）：url → 模板。
-    if let Some(v) = obj.get("mirrorClones") {
-        match serde_json::from_value::<HashMap<String, String>>(v.clone()) {
-            Ok(m) => doc.mirror_clones = m,
-            Err(e) => {
-                salvaged = true;
-                if let Some(l) = log {
-                    l(&format!("[串发] mirrorClones 段写坏({e}), 该段丢弃"));
-                }
-            }
-        }
-    }
     // 测速键：顶层旧布局（{ip: ms}）先读，节点条目内的同键覆盖（新布局）。
     if let Some(v) = obj.get("latency") {
         if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
@@ -605,12 +557,9 @@ fn verify_for(ip: &str) -> String {
 }
 
 /// 落盘：ips 在前、hosts 只写特殊行，镜像链按 CONTENT_HOSTS 序。
-fn encode_routes(
-    mirrors: &HashMap<String, Vec<String>>,
-    big: &[String],
-    clone: &[String],
-) -> String {
+fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
+
     // 测速值跟着节点走：只写该节点展开出的 IP，range 节点各 IP 各记各的。
     let lat = latency::snapshot_all();
     let snapshot = route::nodes_snapshot();
@@ -708,11 +657,6 @@ fn encode_routes(
             small_rows.join(",\n")
         ));
     }
-    // 克隆链独立一条（成员=探测命中者），与大小文件链互不读写。
-    if !clone.is_empty() {
-        let cs: Vec<String> = clone.iter().map(json_of).collect();
-        parts.push(format!("  \"mirrors_clone\": [{}]", cs.join(", ")));
-    }
     format!("{{\n{}\n}}\n", parts.join(",\n"))
 }
 
@@ -725,7 +669,7 @@ static ROUTES_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_routes_file(path: &Path, mirrors: &HashMap<String, Vec<String>>) {
     let _guard = ROUTES_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let data = encode_routes(mirrors, &big_chain(), &clone_chain());
+    let data = encode_routes(mirrors, &big_chain());
     if let Err(e) = crate::fsx::write_atomic(path, data.as_bytes()) {
         // 写盘失败无声 = 镜像链/表变更重启即丢且查无痕迹，必须留一行。
         if let Some(l) = lock(&SERIAL_LOG).as_ref() {
@@ -814,8 +758,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         chains: seeds.chains.clone(),
         latency: HashMap::new(),
         big: Vec::new(),
-        clone: Vec::new(),
-        mirror_clones: HashMap::new(),
     });
     latency::install(std::mem::take(&mut doc.latency));
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
@@ -858,7 +800,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         dead: HashMap::new(),
         mirrors: HashMap::new(),
         big_mirrors: doc.big,
-        clone_mirrors: doc.clone,
         cursor: HashMap::new(),
     };
     // 游标圈预写空记号；settings.last_ip 非空值覆盖（表外旧键直接丢）。
@@ -887,8 +828,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         if vc.is_empty() {
             continue;
         }
-        // 大文件域已单链化：per-host 链（旧格式/legacy 迁移残留）合并进同一条——
-        // 但 typed 单链（mirrors_big 列表）已声明时让位，旧 mirrors 不得覆盖新字典。
+        // 大文件域单链：per-host 链（旧格式/legacy 迁移残留）合并进同一条。
         if route::is_big_file_host(&host) {
             if tab.big_mirrors.is_empty() {
                 tab.big_mirrors = vc;
@@ -897,58 +837,34 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.mirrors.insert(host, vc);
         }
     }
-    // 出厂克隆模板合入注册表（seeds.json 是单一事实源）：只填空、不覆盖已探测值、
-    // 不收编缺失条目——用户删过的镜像不复活；零探测即就位，启动补测自动跳过它们。
-    {
-        let mut filled = false;
-        crate::settings::with_worker_mirrors(|mut registry| {
-            for (u, tpl) in &seeds.mirror_clones {
-                if let Some(w) = registry.iter_mut().find(|w| w.url == *u) {
-                    if w.clone_tpl.is_empty() {
-                        w.clone_tpl = tpl.clone();
-                        filled = true;
-                    }
-                }
-            }
-            filled.then_some(registry)
-        });
-    }
     // 非内置镜像收编进注册表(幂等)：手改塞进来的自建节点重启不丢。
-    // 克隆/大文件链同样收编——克隆进不进链由探测结果决定（cloneTpl 为空不进链，启动补测自动跑）。
     {
         let builtin = builtin_mirror_urls();
-        crate::settings::with_worker_mirrors(|mut registry| {
-            let mut adopted = false;
-            // host 排序仅为确定性。
-            let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
-            hosts.sort();
-            let mut push = |registry: &mut Vec<crate::settings::WorkerMirror>, u: &String| {
-                if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
-                    return;
+        let mut registry = crate::settings::worker_mirrors();
+        let mut adopted = false;
+        // host 排序仅为确定性。
+        let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
+        hosts.sort();
+        for h in hosts {
+            for u in &tab.mirrors[h] {
+                if builtin.contains(u) {
+                    continue;
+                }
+                if registry.iter().any(|w| w.url == *u) {
+                    continue;
                 }
                 registry.push(crate::settings::WorkerMirror {
                     url: u.clone(),
                     on: true,
                     template: String::new(),
                     invalid: false,
-                    clone_tpl: String::new(),
-                    clone_bad: false,
                 });
                 adopted = true;
-            };
-            for h in hosts {
-                for u in &tab.mirrors[h] {
-                    push(&mut registry, u);
-                }
             }
-            for u in &tab.clone_mirrors {
-                push(&mut registry, u);
-            }
-            for u in &tab.big_mirrors {
-                push(&mut registry, u);
-            }
-            adopted.then_some(registry)
-        });
+        }
+        if adopted {
+            crate::settings::save_worker_mirrors(registry);
+        }
     }
     *lock(&SERIAL) = Some(tab);
     // 注册表对齐只动内存：启动不写盘（routes.json 是手改入口，写盘只发生在运行时改链）。
@@ -1859,18 +1775,15 @@ pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fres
     }
 }
 
-/// 按清单对齐镜像链（幂等）：已有成员位置不动，缺的追加链尾；大文件链受开关控制，小文件链只摘已删除项。
-/// 单链对齐：移除停用/删除者、追加新启用者（链序稳定，新增垫尾）。
+/// 单链对齐（幂等）：已有成员位置不动，缺的追加链尾，停用的摘除。
 fn align_chain(chain: &mut Vec<String>, en: &[String], dis: &[String]) -> bool {
     let mut changed = false;
-    // 移除：该摘的且仍在链中的
     for u in dis {
         if chain.iter().any(|m| m == u) {
             chain.retain(|m| m != u);
             changed = true;
         }
     }
-    // 注入：该进的但链里还没有的 → 追加到链尾
     for u in en {
         if !chain.iter().any(|m| m == u) {
             chain.push(u.clone());
@@ -1900,7 +1813,7 @@ fn builtin_mirror_urls() -> std::collections::HashSet<String> {
     seed_db().chains.into_values().flatten().collect()
 }
 
-/// 按注册表对齐全部镜像链（幂等）；开关只管大文件链，小文件链全量保留、仅摘已删除地址。
+/// 按注册表对齐全部镜像链（幂等）；开关只管大文件单链，小文件链全量保留、仅摘已删除地址。
 /// persist=false：只对齐内存，不落盘（启动路径用，避免把手改的 routes.json 规范化重写）。
 pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     let registry = crate::settings::worker_mirrors();
@@ -1917,13 +1830,6 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
         .collect();
     disabled.extend(removed.iter().cloned());
     let all: Vec<String> = registry.iter().map(|w| w.url.clone()).collect();
-    // 克隆链：只有实测支持克隆（有 cloneTpl 且未标 cloneBad）的镜像才有资格——
-    // 整链按注册表顺序重排（探测结果即成员资格，无对齐增删可言）。
-    let clone_enabled: Vec<String> = registry
-        .iter()
-        .filter(|w| w.on && !w.invalid && !w.clone_bad && !w.clone_tpl.is_empty())
-        .map(|w| w.url.clone())
-        .collect();
     let mut g = lock(&SERIAL);
     let tab = match g.as_mut() {
         Some(t) => t,
@@ -1942,10 +1848,6 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     let mut changed = align_custom_mirrors(&mut tab.mirrors, &all, removed);
     // 大文件单链：开关只管它（启用者进链、停用者摘除）。
     if align_chain(&mut tab.big_mirrors, &enabled, &disabled) {
-        changed = true;
-    }
-    if tab.clone_mirrors != clone_enabled {
-        tab.clone_mirrors = clone_enabled;
         changed = true;
     }
     // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
@@ -1967,19 +1869,11 @@ pub fn mirror_chain(host: &str) -> Vec<String> {
     t.mirrors.get(host).cloned().unwrap_or_default()
 }
 
-/// 大文件域单链快照（落盘/克隆候选过滤用）。
-pub fn big_chain() -> Vec<String> {
+/// 大文件域单链快照（落盘用）。
+fn big_chain() -> Vec<String> {
     let g = lock(&SERIAL);
     g.as_ref()
         .map(|t| t.big_mirrors.clone())
-        .unwrap_or_default()
-}
-
-/// 克隆镜像链（git clone 竞速候选）；空链 = 克隆科室直接放行走原路。
-pub fn clone_chain() -> Vec<String> {
-    let g = lock(&SERIAL);
-    g.as_ref()
-        .map(|t| t.clone_mirrors.clone())
         .unwrap_or_default()
 }
 

@@ -241,9 +241,7 @@ async fn rescue_segment(
     let orig = tpl.uri.to_string();
     for m in chain {
         let Ok(seg_req) = tpl.build(start, e) else { return None };
-        let Ok(req) = mirror::mirror_request(&seg_req, m, &orig, protocol::empty_body()) else {
-            continue;
-        };
+        let Ok(req) = mirror::mirror_request(&seg_req, m, &orig) else { continue };
         match mirror::mirror_do(req, m, log).await {
             Ok(resp) => {
                 if resp.status() != StatusCode::PARTIAL_CONTENT {

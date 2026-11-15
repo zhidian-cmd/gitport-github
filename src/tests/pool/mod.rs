@@ -1,4 +1,4 @@
-﻿// TEST_LOCK 要在整个异步用例期间独占全局路由表/连接池，跨 await 持 std Mutex 是刻意的；
+// TEST_LOCK 要在整个异步用例期间独占全局路由表/连接池，跨 await 持 std Mutex 是刻意的；
 // 这些用例跑在 current_thread runtime 上，不会被别的任务抢锁。
 #![allow(clippy::await_holding_lock)]
 use super::*;
@@ -358,12 +358,7 @@ fn encode_routes_roundtrip() {
     );
     latency::install(HashMap::new());
     latency::seed("1.2.3.4", 111);
-    let clone = vec!["https://clone.example".to_string()];
-    let b = encode_routes(&mirrors, &[], &clone);
-    assert!(
-        b.contains("\"mirrors_clone\": [\"https://clone.example\"]"),
-        "克隆链应独立成段落盘: {b}"
-    );
+    let b = encode_routes(&mirrors, &[]);
     // 节点条目必须单行
     for line in b.lines() {
         let t = line.trim();
@@ -566,14 +561,12 @@ fn toggle_gates_big_file_chains_only() {
             on: true,
             template: String::new(),
             invalid: false,
-            ..Default::default()
         },
         crate::settings::WorkerMirror {
             url: "https://off.example".into(),
             on: false,
             template: String::new(),
             invalid: false,
-            ..Default::default()
         },
     ]);
     serial_load(&dir, Vec::new(), None);
@@ -669,7 +662,6 @@ fn fresh_install_mirror_lands_in_all_chains() {
         on: true,
         template: String::new(),
         invalid: false,
-        ..Default::default()
     }])
     .unwrap();
     for h in CONTENT_HOSTS {
@@ -755,98 +747,6 @@ fn mirror_chain_load_and_topup() {
         !set_mirror_chain("github.githubassets.com", &new_chain, "测试"),
         "非内容域 host 应拒收"
     );
-}
-
-/// 克隆链三段合同：手改收编进注册表 → 探测结论即成员资格（整链重排）→ 清空联动。
-#[test]
-fn clone_chain_load_sync_and_filter() {    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    crate::settings::save_worker_mirrors(Vec::new());
-    let dir = tmpdir();
-    std::fs::write(
-        dir.join("routes.json"),
-        r#"{
-  "mirrors_clone": ["https://hand-added.example.com"],
-  "mirrors": {
-    "raw.githubusercontent.com": ["https://v4.gh-proxy.org"]
-  }
-}"#,
-    )
-    .unwrap();
-    serial_load(&dir, Vec::new(), None);
-    let registry = crate::settings::worker_mirrors();
-    assert!(
-        registry
-            .iter()
-            .any(|w| w.url == "https://hand-added.example.com"),
-        "手改克隆镜像应收编进注册表(探测后才真正进链): {registry:?}"
-    );
-    crate::settings::save_worker_mirrors(vec![
-        crate::settings::WorkerMirror {
-            url: "https://a.example".into(),
-            on: true,
-            clone_tpl: "{mirror}/{url}".into(),
-            ..Default::default()
-        },
-        crate::settings::WorkerMirror {
-            url: "https://b.example".into(),
-            on: true,
-            clone_bad: true,
-            ..Default::default()
-        },
-        crate::settings::WorkerMirror {
-            url: "https://c.example".into(),
-            on: true,
-            ..Default::default()
-        },
-    ]);
-    sync_custom_mirrors(&[], false);
-    assert_eq!(
-        clone_chain(),
-        vec!["https://a.example".to_string()],
-        "克隆链只收探测命中者(cloneBad/未测都不进)"
-    );
-    crate::settings::save_worker_mirrors(Vec::new());
-    sync_custom_mirrors(&[], false);
-    assert!(clone_chain().is_empty(), "注册表清空克隆链应跟着清空");
-}
-
-/// 出厂克隆模板合入（seeds.json mirrorClones）：空模板零探测填上，已探测值不覆盖。
-#[test]
-fn seeds_mirror_clones_fill_registry_without_probe() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    let dir = tmpdir();
-    std::fs::write(dir.join("routes.json"), r#"{"core": []}"#).unwrap();
-    crate::settings::save_worker_mirrors(vec![
-        crate::settings::WorkerMirror {
-            url: "https://gh-proxy.org".into(),
-            on: true,
-            clone_tpl: "手填模板".into(),
-            ..Default::default()
-        },
-        crate::settings::WorkerMirror {
-            url: "https://gh-proxy.com".into(), // clone_tpl 空 → 应由 seeds 填上
-            on: true,
-            ..Default::default()
-        },
-    ]);
-    serial_load(&dir, Vec::new(), None);
-    let reg = crate::settings::worker_mirrors();
-    let a = reg
-        .iter()
-        .find(|w| w.url == "https://gh-proxy.org")
-        .expect("注册表应有 gh-proxy.org");
-    assert_eq!(a.clone_tpl, "手填模板", "已探测值不覆盖");
-    let b = reg
-        .iter()
-        .find(|w| w.url == "https://gh-proxy.com")
-        .expect("注册表应有 gh-proxy.com");
-    assert_eq!(
-        b.clone_tpl, "{mirror}/{url}",
-        "空模板由 seeds 零探测填充"
-    );
-    crate::settings::save_worker_mirrors(Vec::new());
 }
 
 #[test]
@@ -1216,7 +1116,7 @@ fn media_rescue_chains_roundtrip_and_align_skip() {
         "raw.githubusercontent.com".to_string(),
         vec!["https://a.example.com".to_string()],
     );
-    let encoded = encode_routes(&mirrors, &[], &[]);
+    let encoded = encode_routes(&mirrors, &[]);
     assert!(encoded.contains("\"图片\""), "图片链必须回写落盘");
     assert!(encoded.contains("\"视频\""), "视频链必须回写落盘");
     let (doc2, _) = parse_routes_tolerant(&encoded, None).expect("回写后必须还能解析");

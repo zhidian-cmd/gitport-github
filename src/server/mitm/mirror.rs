@@ -505,7 +505,7 @@ pub(super) async fn chain_fetch(
                 }
             }
         }
-        let req = match mirror_request(out, m, &orig_url, protocol::empty_body()) {
+        let req = match mirror_request(out, m, &orig_url) {
             Ok(r) => r,
             Err(e) => {
                 (log)(&format!("[镜像] {host} {m} 请求构造失败({e}), 链内下一个"));
@@ -674,7 +674,7 @@ async fn probe_total_one(
         )
         .await?
     } else {
-        let mut req = mirror_request(out, mirror, orig_url, protocol::empty_body())?;
+        let mut req = mirror_request(out, mirror, orig_url)?;
         req.headers_mut().insert(
             http::header::RANGE,
             http::HeaderValue::from_static("bytes=0-0"),
@@ -1061,7 +1061,7 @@ async fn split_download(
                 fetch_segment_direct(log, &tpl, &host, info, replay, m, s, e, has_mirror).await
             } else {
                 let guard = LoadGuard::charge(mirror_load(m), e - s, true);
-                let resp = match mirror_request(out, m, orig_url, protocol::empty_body()) {
+                let resp = match mirror_request(out, m, orig_url) {
                     Ok(mut req) => {
                         let hv = http::HeaderValue::from_str(&format!("bytes={s}-{}", e - 1))
                             .map_err(|err| err.to_string())?;
@@ -1551,7 +1551,7 @@ fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
 /// 镜像请求模板：URL = {镜像}/{原始URL}（前缀拼接惯例），剥凭据头、统一注入镜像 UA。
 /// 直连切片的镜像救援（direct_split）也走这里，与链条镜像同一套凭据/UA 语义。
 /// 按注册表里该镜像的用法模板拼出镜像 URL；无模板（旧条目/未探测）= 前缀拼接。
-/// 模板占位符：{mirror} {url} {url_enc} {noscheme} {owner} {repo} {ref} {path}。
+/// 模板占位符：{mirror} {url} {url_enc} {owner} {repo} {ref} {path}。
 /// 用法是镜像服务自己定的约定，光给两条 URL 推不出来——由添加时的用法试探
 /// 自动试出并保存（settings.json 的 template 字段），此后不再重试。
 fn mirror_url(mirror: &str, orig_url: &str) -> String {
@@ -1563,7 +1563,7 @@ fn mirror_url(mirror: &str, orig_url: &str) -> String {
 }
 
 /// 填模板：把原链接拆段（scheme://host/seg0/seg1/seg2/rest…）逐占位符替换。
-pub(super) fn fill_template(tpl: String, mirror: &str, orig_url: &str) -> String {
+fn fill_template(tpl: String, mirror: &str, orig_url: &str) -> String {
     let after_scheme = orig_url
         .split_once("://")
         .map(|(_, r)| r)
@@ -1581,7 +1581,6 @@ pub(super) fn fill_template(tpl: String, mirror: &str, orig_url: &str) -> String
     let mut out = tpl
         .replace("{mirror}", mirror)
         .replace("{url}", orig_url)
-        .replace("{noscheme}", after_scheme)
         .replace("{owner}", owner)
         .replace("{repo}", repo)
         .replace("{ref}", reference)
@@ -1699,261 +1698,12 @@ pub(crate) async fn discover_template(mirror: &str, log: &LogFn) -> Result<Strin
     Err("试遍已知用法都不匹配".to_string())
 }
 
-/// 克隆用法试探：git 智能协议协商端点逐家族套模板。命中判据比文件下载严一档——
-/// 200 + git 专属 Content-Type + 智能协议 banner + **POST 转发验证**，缺一个都不算支持克隆。
-/// GET 只证明会反代协商；取包 POST 能不能转发是另一回事（审计 #7）——用协商通告里
-/// 解析出的引用 sha 构造最小 v0 取包请求实测。命中的模板存注册表 cloneTpl，
-/// 有值的镜像才进克隆链（routes.json mirrors_clone）。
-pub(crate) async fn discover_clone_template(mirror: &str, log: &LogFn) -> Result<String, String> {
-    const SAMPLE: &str =
-        "https://github.com/zhidian-cmd/gitport-github.git/info/refs?service=git-upload-pack";
-    const CLONE_TEMPLATES: &[&str] = &[
-        "{mirror}/{url}",
-        "{mirror}/{url_enc}",
-        "{mirror}/?url={url}",
-        "{mirror}/?url={url_enc}",
-        "{mirror}/{noscheme}",
-    ];
-    (log)(&format!(
-        "[镜像] {mirror} 克隆试探开始({} 种已知用法, 并发)",
-        CLONE_TEMPLATES.len()
-    ));
-    let probes = CLONE_TEMPLATES.iter().map(|tpl| async move {
-        let url = fill_template((*tpl).to_string(), mirror, SAMPLE);
-        let mut verdict = String::new();
-        'probe: {
-            match hyper::Request::builder()
-                .method(http::Method::GET)
-                .uri(&url)
-                .header(http::header::USER_AGENT, MIRROR_UA)
-                .body(protocol::empty_body())
-            {
-                Err(e) => verdict = format!("请求构造失败: {e}"),
-                Ok(req) => match mirror_do(req, mirror, log).await {
-                    Err(e) => verdict = format!("拉取失败: {e}"),
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let ct = resp
-                            .headers()
-                            .get(http::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        if status != http::StatusCode::OK {
-                            verdict = format!("状态 {status}");
-                        } else if ct.split(';').next().unwrap_or("").trim()
-                            != "application/x-git-upload-pack-advertisement"
-                        {
-                            // 与竞速侧 head_is_valid 同判据：挂名 CT（text/plain; note=...）不算（审计 #6）
-                            verdict = format!("Content-Type 非 git 协议({})", ct);
-                        } else {
-                            // 读前 1KB（2s 上限，审计 #8：无超时的体读会永久挂死补测）：
-                            // 验 banner + 解析第一个引用 sha 供 POST 验证用。
-                            let mut body = resp.into_body();
-                            let mut head: Vec<u8> = Vec::new();
-                            let read = tokio::time::timeout(Duration::from_secs(2), async {
-                                while head.len() < 1024 {
-                                    match http_body_util::BodyExt::frame(&mut body).await {
-                                        Some(Ok(f)) => {
-                                            if let Some(d) = f.data_ref() {
-                                                head.extend_from_slice(d);
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            verdict = format!("体流错误: {e}");
-                                            break;
-                                        }
-                                        None => break,
-                                    }
-                                }
-                            })
-                            .await;
-                            if read.is_err() {
-                                verdict = "体读超时(2s)".to_string();
-                            }
-                            if verdict.is_empty()
-                                && !head.windows(25).any(|w| w == b"# service=git-upload-pack")
-                            {
-                                verdict = "响应缺智能协议 banner".to_string();
-                            }
-                            if !verdict.is_empty() {
-                                break 'probe;
-                            }
-                            // POST 转发验证：最小 v0 取包请求（want + flush + done）。
-                            let Some(sha) = first_ref_sha(&head) else {
-                                verdict = "通告解析不到引用 sha".to_string();
-                                break 'probe;
-                            };
-                            let post_url = url
-                                .split('?')
-                                .next()
-                                .unwrap_or(&url)
-                                .replace("/info/refs", "/git-upload-pack");
-                            let post_body =
-                                format!("0032want {sha}\n0000{}", "0009done\n");
-                            match hyper::Request::builder()
-                                .method(http::Method::POST)
-                                .uri(&post_url)
-                                .header(http::header::USER_AGENT, MIRROR_UA)
-                                .header("content-type", "application/x-git-upload-pack-request")
-                                .header("accept", "application/x-git-upload-pack-result")
-                                .body(protocol::full_body(Bytes::from(post_body)))
-                            {
-                                Err(e) => verdict = format!("POST 构造失败: {e}"),
-                                Ok(pre) => match mirror_do(pre, mirror, log).await {
-                                    Err(e) => verdict = format!("POST 拉取失败: {e}"),
-                                    Ok(presp) => {
-                                        let st = presp.status().as_u16();
-                                        let pct = presp
-                                            .headers()
-                                            .get(http::header::CONTENT_TYPE)
-                                            .and_then(|v| v.to_str().ok())
-                                            .unwrap_or("")
-                                            .to_lowercase();
-                                        if st != 200
-                                            || pct.split(';').next().unwrap_or("").trim()
-                                                != "application/x-git-upload-pack-result"
-                                        {
-                                            verdict =
-                                                format!("POST 转发不符(回 {st} {pct})");
-                                        }
-                                    }
-                                },
-                            }
-                        }
-                    }
-                },
-            }
-        }
-        (*tpl, verdict)
-    });
-    let results = futures_util::future::join_all(probes).await;
-    for (tpl, verdict) in &results {
-        if verdict.is_empty() {
-            (log)(&format!("[镜像] {mirror} 克隆试探命中: {tpl}"));
-            return Ok((*tpl).to_string());
-        }
-        (log)(&format!("[镜像] {mirror} 克隆模式 {tpl} 不符: {verdict}"));
-    }
-    Err("克隆试遍已知用法都不匹配".to_string())
-}
-
-/// 解析智能通告：跳过 banner pkt 与 flush，取第一个引用 pkt 的 40 位 sha。
-fn first_ref_sha(body: &[u8]) -> Option<String> {
-    let mut i = 0usize;
-    let mut past_banner = false;
-    loop {
-        if i + 4 > body.len() {
-            return None;
-        }
-        let len = usize::from_str_radix(std::str::from_utf8(&body[i..i + 4]).ok()?, 16).ok()?;
-        if len < 4 {
-            // flush pkt
-            i += 4;
-            continue;
-        }
-        let payload = body.get(i + 4..i + len)?;
-        if !past_banner {
-            if payload.starts_with(b"# service") {
-                past_banner = true;
-            }
-        } else {
-            // 引用 pkt：payload 前 40 字节 = sha
-            return payload.get(..40).map(|x| String::from_utf8_lossy(x).to_string());
-        }
-        i += len;
-    }
-}
-
-/// 启动补测：注册表里 cloneTpl 为空的存量镜像补一轮克隆探测。逐家串行，幂等。
-/// cloneBad 的条目**每次启动都重测**（一次 502 不该永久出局，审计 #7）；
-/// 出厂 8 家因 seeds.json mirrorClones 已带模板，天然跳过（零探测）。
-pub async fn backfill_clone_templates(log: &LogFn) {
-    let pending: Vec<String> = crate::settings::worker_mirrors()
-        .into_iter()
-        .filter(|w| w.on && !w.invalid && w.clone_tpl.is_empty())
-        .map(|w| w.url)
-        .collect();
-    if pending.is_empty() {
-        return;
-    }
-    (log)(&format!("[镜像] 克隆能力补测 {} 家(后台)", pending.len()));
-    for m in pending {
-        match discover_clone_template(&m, log).await {
-            Ok(tpl) => {
-                crate::settings::set_mirror_clone_template(&m, tpl);
-                (log)(&format!("[镜像] {m} 支持克隆, 进克隆链"));
-            }
-            Err(e) => {
-                crate::settings::set_mirror_clone_bad(&m, true);
-                (log)(&format!("[镜像] {m} 克隆仍不支持({e}), 下次启动再试"));
-            }
-        }
-    }
-    // persist=false：启动不写盘（CONFIG/测试承诺"手改表原样生效"），写盘交给运行时改链。
-    crate::pool::sync_custom_mirrors(&[], false);
-}
-
 pub(super) fn mirror_request(
     out: &hyper::Request<BoxBody>,
     mirror: &str,
     orig_url: &str,
-    body: BoxBody,
 ) -> Result<hyper::Request<BoxBody>, String> {
-    mirror_request_at(mirror_url(mirror, orig_url), out, body)
-}
-
-/// 克隆腿请求：按注册表的克隆模板拼 URL。
-/// 与文件下载腿两处不同（审计 #4/#13）：
-/// - 头改**白名单**：只放行 git 智能协议必需的最小集合——企业 CI 用 `http.extraHeader`
-///   注入的自定义 token（X-Git-Token/PRIVATE-TOKEN 等）不得随镜像腿外发；
-/// - 模板产物必须仍指向同一镜像主机（scheme+host 按.Uri 解析、忽略大小写与端口，
-///   字符串前缀比较会被 `GH-Proxy.org:443` 这类同主机异写法误杀，审计 #10）。
-pub(super) fn clone_request(
-    out: &hyper::Request<BoxBody>,
-    mirror: &str,
-    orig_url: &str,
-    body: BoxBody,
-) -> Result<hyper::Request<BoxBody>, String> {
-    let tpl = crate::settings::mirror_clone_tpl(mirror);
-    let url = if tpl.is_empty() {
-        format!("{mirror}/{orig_url}")
-    } else {
-        fill_template(tpl, mirror, orig_url)
-    };
-    let mu: http::Uri = mirror.parse().map_err(|e| format!("镜像地址非法: {e}"))?;
-    let uu: http::Uri = url.parse().map_err(|e| format!("cloneTpl 产物 URL 非法: {e}"))?;
-    let host_eq = mu.host().map(|h| h.to_lowercase()) == uu.host().map(|h| h.to_lowercase());
-    let scheme_eq =
-        mu.scheme_str().map(|s| s.to_lowercase()) == uu.scheme_str().map(|s| s.to_lowercase());
-    if !host_eq || !scheme_eq {
-        return Err(format!("cloneTpl 产物越出镜像主机({mirror}), 该腿弃用"));
-    }
-    let mut req = mirror_request_at(url, out, body)?;
-    let keep = [
-        "git-protocol",
-        "accept",
-        "content-type",
-        "content-length",
-        "user-agent", // mirror_request_at 刚注入的镜像 UA，保留
-    ];
-    let drop: Vec<http::HeaderName> = req
-        .headers()
-        .keys()
-        .filter(|k| !keep.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for k in drop {
-        req.headers_mut().remove(&k);
-    }
-    Ok(req)
-}
-
-fn mirror_request_at(
-    url: String,
-    out: &hyper::Request<BoxBody>,
-    body: BoxBody,
-) -> Result<hyper::Request<BoxBody>, String> {
+    let url = mirror_url(mirror, orig_url);
     let mut builder = hyper::Request::builder().method(out.method()).uri(url);
     for (k, v) in out.headers() {
         let low = k.as_str().to_lowercase();
@@ -1977,7 +1727,9 @@ fn mirror_request_at(
         http::header::USER_AGENT,
         http::HeaderValue::from_static(MIRROR_UA),
     );
-    builder.body(body).map_err(|e| e.to_string())
+    builder
+        .body(protocol::empty_body())
+        .map_err(|e| e.to_string())
 }
 /// 单镜像取响应（响应头预算 5s，体流式）。直连切片的镜像救援也走这里。
 pub(super) async fn mirror_do(

@@ -356,20 +356,6 @@ async fn api_worker_mirrors(
                         Ok(tpl) => {
                             settings::set_mirror_template(&url, tpl);
                             (log)(&format!("[镜像] {url} 用法已保存, 后续按模板使用"));
-                            // 克隆能力单独探测：命中才进克隆链，不连坐用法（文件下载照常）。
-                            match crate::server::mitm::mirror::discover_clone_template(&url, &log)
-                                .await
-                            {
-                                Ok(ctpl) => {
-                                    settings::set_mirror_clone_template(&url, ctpl);
-                                    (log)(&format!("[镜像] {url} 支持克隆, 进克隆链"));
-                                }
-                                Err(e) => {
-                                    settings::set_mirror_clone_bad(&url, true);
-                                    (log)(&format!("[镜像] {url} 不支持克隆({e}), 不进克隆链"));
-                                }
-                            }
-                            pool::sync_custom_mirrors(&[], true);
                         }
                         Err(e) => {
                             // 试探是 best-effort：不删条目，标红留给用户在界面上改或删。
