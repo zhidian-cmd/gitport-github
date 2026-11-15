@@ -222,12 +222,18 @@ async fn mitm_http(
         Some(b) => out.map(|_| protocol::full_body(b.clone())),
         None => out,
     };
-    // git clone 独立科室：智能协议请求走克隆竞速（镜像链+直连同台 1KB 竞速），
+    // git clone 独立科室：智能协议请求走克隆竞速（镜像链+直连同台计速竞速），
     // 绕开页面缓存/风控重试/切片。push 方向(receive-pack)不认，原路不动。
+    // classify 收完整 path_and_query（含 query），内部自己拆——调用方形状拼错也不会漏判。
     if host == "github.com" {
-        if let Some(kind) = clone_race::classify(out_body.method(), &path, out_body.uri().query()) {
-            return clone_race::handle(&log, &req, &out_body, &host, &path, kind, &replay, &info)
-                .await;
+        if let Some(kind) = clone_race::classify(out_body.method(), &path) {
+            if let Some(resp) =
+                clone_race::handle(&log, &req, &out_body, &host, &path, kind, &replay, &info)
+                    .await
+            {
+                return resp;
+            }
+            // None = 克隆链为空：落回普通分诊（等价于没这条科室）。
         }
     }
     // 总机分诊：镜像回落/切片/直连/风控重试的科室级联全在 switchboard，政策单点。

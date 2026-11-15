@@ -65,32 +65,35 @@ const RESULT: &str = "application/x-git-upload-pack-result";
 
 #[test]
 fn classify_recognizes_fetch_direction_only() {
+    // 入参 = path_and_query（生产真实形状，含 query）——形状拼接错了不得静默漏判（审计 #1）。
     assert_eq!(
         super::classify(
             &Method::GET,
-            "/o/r.git/info/refs",
-            Some("service=git-upload-pack")
+            "/o/r.git/info/refs?service=git-upload-pack"
         ),
         Some(GitKind::Advertisement)
     );
     assert_eq!(
-        super::classify(&Method::POST, "/o/r.git/git-upload-pack", None),
+        super::classify(&Method::POST, "/o/r.git/git-upload-pack"),
         Some(GitKind::Result)
     );
     // push 方向不认：走原路
     assert_eq!(
         super::classify(
             &Method::GET,
-            "/o/r.git/info/refs",
-            Some("service=git-receive-pack")
+            "/o/r.git/info/refs?service=git-receive-pack"
         ),
         None
     );
     assert_eq!(
-        super::classify(&Method::POST, "/o/r.git/git-receive-pack", None),
+        super::classify(&Method::POST, "/o/r.git/git-receive-pack"),
         None
     );
-    assert_eq!(super::classify(&Method::GET, "/o/r", Some("tab=x")), None);
+    assert_eq!(
+        super::classify(&Method::GET, "/o/r?tab=x"),
+        None,
+        "非 git 路径不进克隆科室"
+    );
 }
 
 #[test]
@@ -112,15 +115,15 @@ fn invalid_heads_never_count_as_valid() {
 #[tokio::test]
 async fn fastest_speed_wins() {
     let legs = vec![
-        // slow：窗口内只到 1KB → 5KB/s
+        // slow：窗口内只到 1KB → 5KB/s（填充必须是十六进制，pkt-line 校验要过）
         (
             "slow".to_string(),
-            timed_leg(10, vec![(50, Bytes::from(vec![b'x'; 1024]))]),
+            timed_leg(10, vec![(50, Bytes::from(vec![b'a'; 1024]))]),
         ),
         // fast：窗口内到 4KB → 20KB/s
         (
             "fast".to_string(),
-            timed_leg(10, vec![(50, Bytes::from(vec![b'x'; 4096]))]),
+            timed_leg(10, vec![(50, Bytes::from(vec![b'a'; 4096]))]),
         ),
     ];
     let race = super::run_race(
@@ -134,11 +137,11 @@ async fn fastest_speed_wins() {
     assert_eq!(race.win.name, "fast", "speeds={:?}", race.speeds);
     assert!(!race.complete, "大响应路径不是 EOF 胜");
     assert_eq!(race.speeds.len(), 2, "两条腿都要有计速");
-    // 赢家窗口内缓冲的字节全量随流交付（4KB 帧已在 prefix 里）
-    assert_eq!(
-        race.win.prefix.len(),
-        4096,
-        "赢家窗口内收到的字节必须全量保留"
+    // 赢家窗口内缓冲的字节全量随流交付，且逐字节正确（审计 #12：不能只看长度）
+    assert_eq!(race.win.prefix.len(), 4096);
+    assert!(
+        race.win.prefix.iter().all(|b| *b == b'a'),
+        "赢家缓冲字节必须逐字节正确"
     );
 }
 
@@ -253,7 +256,7 @@ async fn too_slow_leg_does_not_stall_the_race() {
             "worker".to_string(),
             timed_leg(
                 10,
-                vec![(80, Bytes::from(vec![b'x'; 1024])), (160, Bytes::from(vec![b'y'; 3072]))],
+                vec![(80, Bytes::from(vec![b'a'; 1024])), (160, Bytes::from(vec![b'b'; 3072]))],
             ),
         ),
     ];

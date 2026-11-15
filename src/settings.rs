@@ -950,13 +950,36 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 注册表读改写互斥：工作台整表保存 / 单字段更新 / 启动收编与 seeds 合入 / 补测回写
+/// 都是"读旧表→改→写回"，无锁的话并发写互相覆盖（审计 #11：补测期间用户删镜像会复活）。
+/// 粒度到整段 RMW；内部落盘再走 SAVE_LOCK，两层锁不反向嵌套。
+pub static MIRRORS_LOCK: Mutex<()> = Mutex::new(());
+
 /// 自定义镜像注册表（settings.json 永久记录；启停只增删 routes.json 链成员）。
 pub fn worker_mirrors() -> Vec<WorkerMirror> {
     state().worker_mirrors.lock().unwrap().clone()
 }
 
-/// 收编保存：只落盘注册表不动镜像链，顺序按调用方给的。
+/// 收编保存：只落盘注册表不动镜像链，顺序按调用方给的。（现仅测试用：生产路径走 with_worker_mirrors）
+#[cfg(test)]
 pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
+    let _g = MIRRORS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    *state().worker_mirrors.lock().unwrap() = list;
+    save_logged();
+}
+
+/// 注册表原子读改写：持锁把当前表交给调用方改，返回 Some(新表) 才落盘。
+/// 外部模块（pool 的收编/seeds 合入）的"读→改→写"必须走这里，不许裸读裸写。
+pub fn with_worker_mirrors(
+    f: impl FnOnce(Vec<WorkerMirror>) -> Option<Vec<WorkerMirror>>,
+) -> Option<Vec<WorkerMirror>> {
+    let _g = MIRRORS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let next = f(worker_mirrors())?;
+    save_worker_mirrors_inner(next.clone());
+    Some(next)
+}
+
+fn save_worker_mirrors_inner(list: Vec<WorkerMirror>) {
     *state().worker_mirrors.lock().unwrap() = list;
     save_logged();
 }
@@ -966,6 +989,7 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
 pub fn set_worker_mirrors(
     list: Vec<WorkerMirror>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    let _g = MIRRORS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut norm: Vec<WorkerMirror> = Vec::new();
     for w in list {
         let u = w.url.trim().trim_end_matches('/').to_string();
@@ -1072,6 +1096,7 @@ pub fn set_mirror_clone_bad(url: &str, bad: bool) {
 
 fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {
     let u = url.trim().trim_end_matches('/');
+    let _g = MIRRORS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut list = worker_mirrors();
     if let Some(w) = list.iter_mut().find(|w| w.url == u) {
         f(w);

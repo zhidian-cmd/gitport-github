@@ -900,36 +900,31 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     // 出厂克隆模板合入注册表（seeds.json 是单一事实源）：只填空、不覆盖已探测值、
     // 不收编缺失条目——用户删过的镜像不复活；零探测即就位，启动补测自动跳过它们。
     {
-        let mut registry = crate::settings::worker_mirrors();
         let mut filled = false;
-        for (u, tpl) in &seeds.mirror_clones {
-            if let Some(w) = registry.iter_mut().find(|w| w.url == *u) {
-                if w.clone_tpl.is_empty() {
-                    w.clone_tpl = tpl.clone();
-                    filled = true;
+        crate::settings::with_worker_mirrors(|mut registry| {
+            for (u, tpl) in &seeds.mirror_clones {
+                if let Some(w) = registry.iter_mut().find(|w| w.url == *u) {
+                    if w.clone_tpl.is_empty() {
+                        w.clone_tpl = tpl.clone();
+                        filled = true;
+                    }
                 }
             }
-        }
-        if filled {
-            crate::settings::save_worker_mirrors(registry);
-        }
+            filled.then_some(registry)
+        });
     }
     // 非内置镜像收编进注册表(幂等)：手改塞进来的自建节点重启不丢。
-    // 克隆链同样收编——但进不进克隆链由探测结果决定（cloneTpl 为空不进链，启动补测自动跑）。
+    // 克隆/大文件链同样收编——克隆进不进链由探测结果决定（cloneTpl 为空不进链，启动补测自动跑）。
     {
         let builtin = builtin_mirror_urls();
-        let mut registry = crate::settings::worker_mirrors();
-        let mut adopted = false;
-        // host 排序仅为确定性。
-        let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
-        hosts.sort();
-        for h in hosts {
-            for u in &tab.mirrors[h] {
-                if builtin.contains(u) {
-                    continue;
-                }
-                if registry.iter().any(|w| w.url == *u) {
-                    continue;
+        crate::settings::with_worker_mirrors(|mut registry| {
+            let mut adopted = false;
+            // host 排序仅为确定性。
+            let mut hosts: Vec<&String> = tab.mirrors.keys().collect();
+            hosts.sort();
+            let mut push = |registry: &mut Vec<crate::settings::WorkerMirror>, u: &String| {
+                if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
+                    return;
                 }
                 registry.push(crate::settings::WorkerMirror {
                     url: u.clone(),
@@ -940,39 +935,20 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                     clone_bad: false,
                 });
                 adopted = true;
+            };
+            for h in hosts {
+                for u in &tab.mirrors[h] {
+                    push(&mut registry, u);
+                }
             }
-        }
-        for u in &tab.clone_mirrors {
-            if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
-                continue;
+            for u in &tab.clone_mirrors {
+                push(&mut registry, u);
             }
-            registry.push(crate::settings::WorkerMirror {
-                url: u.clone(),
-                on: true,
-                template: String::new(),
-                invalid: false,
-                clone_tpl: String::new(),
-                clone_bad: false,
-            });
-            adopted = true;
-        }
-        for u in &tab.big_mirrors {
-            if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
-                continue;
+            for u in &tab.big_mirrors {
+                push(&mut registry, u);
             }
-            registry.push(crate::settings::WorkerMirror {
-                url: u.clone(),
-                on: true,
-                template: String::new(),
-                invalid: false,
-                clone_tpl: String::new(),
-                clone_bad: false,
-            });
-            adopted = true;
-        }
-        if adopted {
-            crate::settings::save_worker_mirrors(registry);
-        }
+            adopted.then_some(registry)
+        });
     }
     *lock(&SERIAL) = Some(tab);
     // 注册表对齐只动内存：启动不写盘（routes.json 是手改入口，写盘只发生在运行时改链）。

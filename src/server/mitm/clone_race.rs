@@ -17,15 +17,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-/// 竞速预算：单腿最坏 1s 建连 + 0.5s 测速，3s 是全腿收场的兜底线。
-const RACE_BUDGET: Duration = Duration::from_secs(3);
+/// 竞速预算：兜底线，必须盖过各腿内层头预算（镜像 5s / 直连 4s）+ 测速窗 0.5s——
+/// 外层预算小于内层 = 慢首字节腿全灭（审计 #2 的数值越界），全灭又引发回退重发（#3）。
+const RACE_BUDGET: Duration = Duration::from_secs(8);
 /// 计速窗口：每腿交满 1KB 即计速（从响应头到达起算）。
 const WIN_BYTES: usize = 1024;
 /// 单腿测速上限：头到达后 0.5s 没交满 1KB 记"无速度"出局——
 /// 1024B/0.5s = 2KB/s，"0.5s 没速度"与"不足 2KB/s"是同一道门，慢腿没有留的价值。
 const SPEED_WINDOW: Duration = Duration::from_millis(500);
-/// 通道建立预算：每腿（镜像/直连）1s 内必须交出响应头，超时即弃。
-const HEAD_BUDGET: Duration = Duration::from_secs(1);
 
 /// git 智能协议请求类别（决定合法响应的 Content-Type）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,7 +36,13 @@ pub(super) enum GitKind {
 }
 
 /// 认 git 克隆流量：只认 fetch 方向（push 的 receive-pack 原路不动）。
-pub(super) fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<GitKind> {
+/// 入参 = 完整 path_and_query（含 query）——生产入参就是这个形状，内部自己拆，
+/// 调用方拼错形状也不会静默漏判（审计 #1：曾用 ends_with 认带 query 的串，GET 全漏）。
+pub(super) fn classify(method: &Method, path_and_query: &str) -> Option<GitKind> {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
     if method == Method::GET
         && path.ends_with("/info/refs")
         && query.is_some_and(|q| q.contains("service=git-upload-pack"))
@@ -50,17 +55,44 @@ pub(super) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     None
 }
 
-/// 合法头：200 + git 协议专属 Content-Type。错误页/限流页/HTML 一律判负——
-/// 否则回得最快的坏镜像会抢赢竞速，把 404 当克隆结果交出去。
+/// 合法头：200 + git 协议专属 Content-Type。CT 按 `;` 切开精确比 media type——
+/// `text/plain; note=application/x-git-...` 这类挂名响应不得蒙混（审计 #5）；
+/// 错误页/限流页/HTML 一律判负——否则回得最快的坏镜像会抢赢竞速，把 404 当克隆结果交出去。
 fn head_is_valid(kind: GitKind, status: u16, ct: &str) -> bool {
     if status != 200 {
         return false;
     }
+    let media = ct.split(';').next().unwrap_or("").trim().to_lowercase();
     let want = match kind {
         GitKind::Advertisement => "application/x-git-upload-pack-advertisement",
         GitKind::Result => "application/x-git-upload-pack-result",
     };
-    ct.to_lowercase().contains(want)
+    media == want
+}
+
+/// 响应体形状校验（审计 #5：坏镜像缓存投毒/限流页不得借"最快"抢赢）：
+/// 协商通告 = 智能协议 banner；取包结果 = pkt-line 的 4 位十六进制长度前缀。
+fn body_looks_git(kind: GitKind, frames: &[Bytes]) -> bool {
+    match kind {
+        GitKind::Advertisement => {
+            let flat: Vec<u8> = frames
+                .iter()
+                .flat_map(|b| b.iter())
+                .take(256)
+                .copied()
+                .collect();
+            flat.windows(25).any(|w| w == b"# service=git-upload-pack")
+        }
+        GitKind::Result => {
+            let head: Vec<u8> = frames
+                .iter()
+                .flat_map(|b| b.iter())
+                .take(4)
+                .copied()
+                .collect();
+            head.len() == 4 && head.iter().all(|b| b.is_ascii_hexdigit())
+        }
+    }
 }
 
 /// 单腿的未来：交响应头 + 体流（由竞速核心统一验头、计速）。
@@ -90,7 +122,35 @@ enum LegOutcome {
     Failed { why: String },
 }
 
-/// 腿 worker：等响应头 → 验头 → 计速（1KB 窗口，speed_window 上限）→ 出局别。
+/// 窗口收口：n < 1KB = 不足 2KB/s 出局；体形状不过验 = 坏镜像出局；否则带速度参选。
+fn speed_outcome(
+    name: String,
+    kind: GitKind,
+    buf: &[Bytes],
+    n: usize,
+    parts: http::response::Parts,
+    body: BoxBody,
+    elapsed: Duration,
+) -> LegOutcome {
+    if n < WIN_BYTES {
+        return LegOutcome::TooSlow { name };
+    }
+    if !body_looks_git(kind, buf) {
+        return LegOutcome::Failed {
+            why: format!("{name}: 响应体不是 git 协议"),
+        };
+    }
+    let win = LegWin {
+        name: name.clone(),
+        head: parts,
+        prefix: concat_buf(buf, n),
+        body,
+    };
+    let speed = n as f64 / elapsed.as_secs_f64();
+    LegOutcome::Speed { name, speed, win }
+}
+
+/// 腿 worker：等响应头 → 验头 → 整个测速窗累计字节 → 收口计速（1KB 门槛 + 体形状验）。
 async fn leg_worker(
     name: String,
     fut: LegFut,
@@ -128,33 +188,12 @@ async fn leg_worker(
     loop {
         let left = speed_window.saturating_sub(t0.elapsed());
         if left.is_zero() {
-            // 窗口收口：n < 1KB = 不足 2KB/s，慢腿没有留的价值。
-            if n < WIN_BYTES {
-                return LegOutcome::TooSlow { name };
-            }
-            let win = LegWin {
-                name: name.clone(),
-                head: parts,
-                prefix: concat_buf(&buf, n),
-                body,
-            };
-            let speed = n as f64 / t0.elapsed().as_secs_f64();
-            return LegOutcome::Speed { name, speed, win };
+            return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t0.elapsed());
         }
         match tokio::time::timeout(left, http_body_util::BodyExt::frame(&mut body)).await {
             Err(_) => {
                 // 窗口收口兜底（timeout 与 left.is_zero 同一刻，可能被它先抢）。
-                if n < WIN_BYTES {
-                    return LegOutcome::TooSlow { name };
-                }
-                let win = LegWin {
-                    name: name.clone(),
-                    head: parts,
-                    prefix: concat_buf(&buf, n),
-                    body,
-                };
-                let speed = n as f64 / t0.elapsed().as_secs_f64();
-                return LegOutcome::Speed { name, speed, win };
+                return speed_outcome(name, kind, buf.as_slice(), n, parts, body, t0.elapsed());
             }
             Ok(Some(Ok(f))) => {
                 if let Some(d) = f.data_ref() {
@@ -168,7 +207,13 @@ async fn leg_worker(
                 };
             }
             Ok(None) => {
-                // 完整响应已收完（小响应常 <1KB）：直接赢，无比较意义。
+                // 完整响应已收完（小响应常 <1KB）：直接赢，无比较意义——但 body 形状
+                // 必须先过验，坏镜像的"完整限流页"不得借 EOF 抢赢（审计 #5）。
+                if !body_looks_git(kind, &buf) {
+                    return LegOutcome::Failed {
+                        why: format!("{name}: 响应体不是 git 协议"),
+                    };
+                }
                 return LegOutcome::Complete(LegWin {
                     name,
                     head: parts,
@@ -317,6 +362,7 @@ fn fmt_speed(s: f64) -> String {
 }
 
 /// 克隆科室入口：镜像链 + 直连同台计速竞速；赢家续流交付，全灭回退现有直连单流。
+/// 返回 None = 克隆链为空，调用方落回普通分诊（无竞速框架、无回退请求的额外成本）。
 #[allow(clippy::too_many_arguments)] // 与 mirror.rs 探测/切片函数同款：参数都是同链路借用，拆结构体只是搬运
 pub(super) async fn handle(
     log: &LogFn,
@@ -327,12 +373,16 @@ pub(super) async fn handle(
     kind: GitKind,
     replay: &Option<Bytes>,
     info: &UpstreamInfo,
-) -> axum::response::Response<BoxBody> {
-    let orig_url = match out.uri().query() {
-        Some(q) => format!("https://{host}{}?{q}", path_of(out.uri())),
-        None => format!("https://{host}{}", path_of(out.uri())),
-    };
+) -> Option<axum::response::Response<BoxBody>> {
+    // orig_url 一次性拼接：path_of 返回的已是 path_and_query（含 query），
+    // 再拼一遍 ?{q} 会产出双 query 的畸形镜像 URL（审计 #1 的连环雷）。
+    let orig_url = format!("https://{host}{}", path_of(out.uri()));
     let chain = pool::clone_chain();
+    // 克隆链空 = 用户关光了镜像：退回原路（无竞速框架、无回退请求的额外成本）。
+    if chain.is_empty() {
+        (log)(&format!("[克隆] {host}{path} 克隆链为空, 走原路"));
+        return None;
+    }
     let mut legs: Vec<(String, LegFut)> = Vec::new();
     for m in &chain {
         let leg_body = match replay {
@@ -348,15 +398,11 @@ pub(super) async fn handle(
         };
         let log2 = log.clone();
         let m2 = m.clone();
+        // 头预算归各腿内层（镜像 5s / 直连 4s）——服务端生成 pack 首字节本就要 1~3s，
+        // 外层再掐 1s 会把全部腿判死（审计 #2）；死镜像的拨号由内层 TCP 超时自然出局。
         legs.push((
             m.clone(),
-            Box::pin(async move {
-                // 通道建立预算 1s：镜像腿拨号+TLS+头超时即弃，不陪慢镜像干等。
-                match tokio::time::timeout(HEAD_BUDGET, mirror::mirror_do(req, &m2, &log2)).await {
-                    Ok(r) => r,
-                    Err(_) => Err(format!("{m2} 通道建立超 1s")),
-                }
-            }),
+            Box::pin(async move { mirror::mirror_do(req, &m2, &log2).await }),
         ));
     }
     // 直连腿永远在场：镜像全坏时它就是今天的行为；克隆链为空不会进到这里。
@@ -368,12 +414,7 @@ pub(super) async fn handle(
             let host2 = host.to_string();
             let info2 = info.clone();
             let replay2 = replay.clone();
-            async move {
-                match tokio::time::timeout(HEAD_BUDGET, get_direct(&log2, &out, &host2, &info2, &replay2)).await {
-                    Ok(r) => r,
-                    Err(_) => Err("direct 通道建立超 1s".to_string()),
-                }
-            }
+            async move { get_direct(&log2, &out, &host2, &info2, &replay2).await }
         }),
     ));
     (log)(&format!(
@@ -402,12 +443,17 @@ pub(super) async fn handle(
             ));
             let mut parts = race.win.head;
             // 体被重拼（前缀+剩余），content-length 剥掉交给 hyper 按实际分块；
-            // 逐跳头照剥，其余原样转交（含 content-encoding——我们只是字节管道）。
+            // 逐跳头照剥；镜像回的 set-cookie/location 不得往 github.com 域种状态（审计 #5）；
+            // 其余原样转交（含 content-encoding——我们只是字节管道）。
             let drop: Vec<http::HeaderName> = parts
                 .headers
                 .keys()
                 .filter(|k| {
-                    upstream::is_hop_by_hop(k.as_str()) || k.as_str() == "content-length"
+                    upstream::is_hop_by_hop(k.as_str())
+                        || matches!(
+                            k.as_str(),
+                            "content-length" | "set-cookie" | "location"
+                        )
                 })
                 .cloned()
                 .collect();
@@ -418,7 +464,7 @@ pub(super) async fn handle(
                 parts,
                 upstream::prepend_body(vec![race.win.prefix], race.win.body),
             );
-            write_upstream(log, resp, "clone", info, host, path)
+            Some(write_upstream(log, resp, "clone", info, host, path))
         }
         Err(fails) => {
             (log)(&format!(
@@ -426,16 +472,16 @@ pub(super) async fn handle(
                 fails.join("; ")
             ));
             match get_direct(log, out, host, info, replay).await {
-                Ok(r) => write_upstream(log, r, "direct", info, host, path),
+                Ok(r) => Some(write_upstream(log, r, "direct", info, host, path)),
                 Err(e) => {
                     (log)(&format!(
                         "[MITM] {host}{path} 克隆竞速后直连也失败({e})"
                     ));
-                    mitm_unavailable(
+                    Some(mitm_unavailable(
                         req,
                         host,
                         "克隆镜像与直连均不可用, 代理正在按表自动重试。",
-                    )
+                    ))
                 }
             }
         }
