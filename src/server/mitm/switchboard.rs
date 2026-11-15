@@ -42,7 +42,7 @@ pub(super) async fn dispatch(
             mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
         match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay).await {
             Ok(resp) => return Ok(resp),
-            // 原因落日志：熔断中/凭据串仅直连/链全灭，一眼可辨，不再吞。
+            // 原因落日志：熔断中/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
         }
         return Err(mitm_unavailable(

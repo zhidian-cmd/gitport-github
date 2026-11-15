@@ -102,31 +102,6 @@ fn calibrate_templates_cover_small_hosts_only() {
 }
 
 #[test]
-fn credential_query_detection() {
-    for q in [
-        "token=abc",
-        "sig=1",
-        "signature=1",
-        "jwt=1",
-        "auth=1",
-        "access_token=x",
-        "session_token=1",
-        "AWSAccessKeyId=k",
-        "X-Amz-Signature=abc",
-        "x-amz-credential=1",
-        "a=1&access_token=x",
-    ] {
-        assert!(has_credential_query(q), "{q} 应判含凭据");
-    }
-    for q in ["", "foo=token", "page=2&q=tokenize", "tokens=1"] {
-        assert!(
-            !has_credential_query(q),
-            "{q} 不该误判（名字才参与，值不算）"
-        );
-    }
-}
-
-#[test]
 fn ttfb_rank_fastest_first_failures_last() {
     let mut rows = vec![
         ("slow".to_string(), 900),
@@ -139,55 +114,14 @@ fn ttfb_rank_fastest_first_failures_last() {
     assert_eq!(order, ["fast", "mid", "slow", "dead"], "{rows:?}");
 }
 
-#[tokio::test]
-async fn chain_fetch_cred_locks_to_direct() {
-    let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let log: LogFn = Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string()));
-    let req = hyper::Request::builder()
-        .uri("https://raw.githubusercontent.com/o/r/f?sig=abc")
-        .body(protocol::empty_body())
-        .unwrap();
-    let err = chain_fetch(
-        &log,
-        &req,
-        "raw.githubusercontent.com",
-        mirror_test_direct_leg(),
-        &Default::default(),
-        &None,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.contains("仅直连"), "凭据串应剥空镜像仅直连: {err}");
-    let got = lines.lock().unwrap();
-    assert!(
-        got.iter().any(|l| l.contains("私有下载不走镜像")),
-        "应记录剥空镜像决策: {got:?}"
-    );
-    assert!(
-        !got.iter().any(|l| l.contains(" via ")),
-        "签名 URL 不得交给第三方镜像: {got:?}"
-    );
-}
-
-/// 凭据查询键的百分号/分号变体同样认账：`?%73ig=` 与 `?a=1;sig=x` 都按凭据处理。
-#[test]
-fn has_credential_query_decodes_and_splits() {
-    use crate::server::mitm::mirror::has_credential_query;
-    assert!(has_credential_query("%73ig=abc"), "百分号编码的 sig 应认出");
-    assert!(has_credential_query("a=1;sig=abc"), "分号分隔应认出");
-    assert!(has_credential_query("x-goog-signature=abc"), "goog 签名应认出");
-    assert!(!has_credential_query("path=/a%2Fb&zoom=100"), "普通参数不得误伤");
-}
-
-/// 纯直连耗尽(零镜像/凭据串剥空)不给镜像链上熔断——链没参与，别连坐。
+/// 纯直连耗尽(零镜像)不给镜像链上熔断——链没参与，别连坐。
 #[tokio::test]
 async fn direct_only_exhaustion_spares_chain_breaker() {
     let log: LogFn = Arc::new(|_: &str| {});
     let host = "cred-brk.test";
     pool::MIRROR_BREAKER.clear(host);
     let req = hyper::Request::builder()
-        .uri("https://cred-brk.test/f?sig=abc")
+        .uri("https://cred-brk.test/f")
         .body(protocol::empty_body())
         .unwrap();
     let err = chain_fetch(
@@ -200,14 +134,14 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
     )
     .await
     .unwrap_err();
-    assert!(err.contains("仅直连"), "凭据串请求应仅派直连: {err}");
+    assert!(err.contains("镜像链全灭"), "零镜像耗尽应报链全灭: {err}");
     assert!(
         !pool::MIRROR_BREAKER.open(host),
         "直连独走耗尽不得触发镜像链熔断"
     );
 }
 
-/// 审计 #3 回归: 熔断只拦有镜像候选的请求——凭据串剥空镜像后直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
+/// 审计 #3 回归: 熔断只拦有镜像候选的请求——零镜像时直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
 #[tokio::test]
 async fn breaker_spares_direct_only_requests() {
     let log: LogFn = Arc::new(|_: &str| {});
@@ -229,7 +163,7 @@ async fn breaker_spares_direct_only_requests() {
     .await
     .unwrap_err();
     assert!(!err.contains("熔断"), "直连独走不得撞镜像熔断: {err}");
-    assert!(err.contains("仅直连"), "应照常仅派直连: {err}");
+    assert!(err.contains("镜像链全灭"), "零镜像应报链全灭: {err}");
     pool::MIRROR_BREAKER.clear(host);
 }
 

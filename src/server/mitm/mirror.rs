@@ -1,7 +1,7 @@
 //! 镜像加速模块（总机的镜像科室）：
 //! - **ECT 同台**：镜像链 + 直连腿一起参赛，按实测速率切块配额、慢段让位、补发挑最快家；
 //! - **串发兜底**：直连腿全败后按链序逐个试——只在前者失败时出场，不是独立加速路径；
-//! - 旁带：图片链 TTFB 校准 + 凭据串防护。
+//! - 旁带：图片链 TTFB 校准。镜像请求不携带任何身份头（Cookie/Authorization 剥除）。
 use super::merge::{self, MergeBody};
 use super::direct_split::Tpl;
 use super::path_of;
@@ -397,8 +397,6 @@ pub(super) async fn chain_fetch(
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 凭据查询串等价 bearer，交第三方镜像即外泄——标记后剥空镜像，仅派直连。
-    let cred_locked = out.uri().query().is_some_and(has_credential_query);
     let orig_url = format!(
         "https://{host}{}",
         out.uri()
@@ -426,21 +424,13 @@ pub(super) async fn chain_fetch(
     if let Some(c) = cond {
         (log)(&format!("[镜像] {host}{path} 客户端条件请求: {c}"));
     }
-    // 凭据串请求 = 私库下载的替身信号：剥空镜像仅直连，签名 URL 不落任何第三方。
-    // 其余下载全部镜像照常参与（302 落点签名随 URL 交给镜像，属既定取舍）。
-    let chain = if cred_locked {
-        (log)(&format!(
-            "[镜像] {host}{path} 凭据查询串, 剥空镜像仅直连(私有下载不走镜像)"
-        ));
-        Vec::new()
-    } else {
-        pool::mirror_chain(&chain_host)
-    };
+    // 全部下载照常走镜像（含带 token/签名 URL——用户知情取舍）；镜像请求不携带任何身份头。
+    let chain = pool::mirror_chain(&chain_host);
     // 直连同台：直连以 direct/{host} 的身份参与 ECT；502 只在镜像与直连全灭时发生。
         let direct_key = direct_load_key(&chain_host);
     let mut candidates: Vec<String> = chain.clone();
     candidates.push(direct_key.clone());
-    // 熔断只拦有镜像候选的请求: 凭据串剥空/零镜像时直连独走, 别连坐。
+    // 熔断只拦有镜像候选的请求: 零镜像时直连独走, 别连坐。
     if !chain.is_empty() && pool::MIRROR_BREAKER.open(&chain_host) {
         return Err(format!("{host} 镜像链熔断中(60s 内快速失败)"));
     }
@@ -589,16 +579,11 @@ pub(super) async fn chain_fetch(
             }
         }
     }
-    // 纯直连耗尽(零镜像/凭据串剥空)不给链上熔断——镜像没参与，别连坐。
+    // 纯直连耗尽(零镜像)不给链上熔断——镜像没参与，别连坐。
     if !chain.is_empty() {
         pool::MIRROR_BREAKER.set(&chain_host);
     }
-    let why = if cred_locked {
-        "凭据串仅直连, 直连失败"
-    } else {
-        "镜像链全灭"
-    };
-    Err(format!("{host} {why}({chain_host} 候选 {limit} 个)"))
+    Err(format!("{host} 镜像链全灭({chain_host} 候选 {limit} 个)"))
 }
 /// 总长记忆：探测是真实请求，结果记 10 分钟——同 URL 下一条无 Range 请求不必再白跑探测；只存 206 Content-Range 的权威总长。
 static TOTAL_MEMO: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
@@ -1766,48 +1751,6 @@ fn calib_fail_label(e: &str) -> &'static str {
     } else {
         "失败"
     }
-}
-
-/// 查询键名百分号解码：`?%73ig=x` 也得认成 sig。
-fn decode_query_key(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
-            if let Ok(v) = u8::from_str_radix(hex, 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn has_credential_query(query: &str) -> bool {
-    query.split(['&', ';']).any(|kv| {
-        let name = decode_query_key(kv.split('=').next().unwrap_or("")).to_lowercase();
-        name == "token"
-            || name == "sig"
-            || name == "signature"
-            || name == "jwt"
-            || name == "auth"
-            || name == "access_token"
-            || name == "session_token"
-            || name == "awsaccesskeyid"
-            || name == "key"
-            || name == "api_key"
-            || name == "apikey"
-            || name == "secret"
-            || name == "password"
-            || name.starts_with("x-amz-")
-            || name.starts_with("x-goog-")
-            || name.starts_with("x-ms-")
-    })
 }
 
 /// 仅小文件域。模板失效会让镜像全判"不支持"，改前先手测直连 200。
