@@ -447,6 +447,29 @@ fn mirror_response_validation() {
     assert!(validate_mirror_response(false, 200, "text/html; charset=utf-8", false).is_err());
 }
 
+/// 整包 GET(没带 Range)收到 206 分片：按这家失败处理，绝不当完整文件交出去（静默截断）。
+#[test]
+fn stream_start_rejects_206_without_range() {
+    let resp = |status: u16, cr: &str| {
+        hyper::Response::builder()
+            .status(status)
+            .header("content-range", cr)
+            .body(protocol::empty_body())
+            .unwrap()
+    };
+    assert_eq!(
+        stream_start_mismatch(None, &resp(206, "bytes 0-99/1000")),
+        Some("未请求 Range 却回 206".to_string()),
+        "没要 Range 却回 206 必须判失败"
+    );
+    assert_eq!(stream_start_mismatch(None, &resp(200, "")), None, "200 全量照旧放行");
+    assert_eq!(
+        stream_start_mismatch(Some("bytes=0-99"), &resp(206, "bytes 0-99/1000")),
+        None,
+        "带 Range 且起点对齐照旧放行"
+    );
+}
+
 /// 派发加、逐帧归还、Drop 清残余；超额交付封顶不下溢。
 #[test]
 fn byte_accounting_lifecycle() {

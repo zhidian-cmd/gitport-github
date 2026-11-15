@@ -236,7 +236,13 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
         // 常编满员：落选连接当场关闭。调用方拿到的是池里现成那条，新拨的这条
         // 若只是丢弃，驱动任务会在池外养到对端回收（泄漏）。Notify 无等待者也存许可，必达。
         up.close.notify_one();
-        return h[0].up.clone();
+        // 列表头可能是溢出通道（正编被摘、溢出排前）：与下方溢出分支同口径找正编，
+        // 否则请求拿到不外发的溢出句柄——驱动在途归零即焚，失败还误罚这条边冷却。
+        return h
+            .iter()
+            .find(|c| !c.up.overflow)
+            .map(|c| c.up.clone())
+            .unwrap_or_else(|| h[0].up.clone());
     }
     if up.overflow && h.iter().any(|c| c.up.overflow) {
         // 每 IP 至多一条溢出：再来的关掉，把正编（若有）递回去——溢出通道本身
@@ -732,13 +738,18 @@ async fn dial_h2_race(
         "[建连] {host} 单通道({})",
         single_channel_reason(host_class(host), distinct, free)
     ));
-    // 等串发结果
+    // 等串发结果：绝对截止线硬窗（与池内 BUILD_WAIT_SECS 同一把尺）——recv 无界等
+    // 会让本请求既不返回也不兜底。串发任务独立在跑，窗耗尽只影响这一条请求。
+    let dl = tokio::time::Instant::now() + Duration::from_secs(pool::BUILD_WAIT_SECS);
     let mut last: Option<String> = None;
     let won = loop {
-        match rx.recv().await {
-            Some(Ok(up)) => break up,
-            Some(Err(e)) => last = Some(e),
-            None => return Err(last.unwrap_or_else(|| "串发建连全败".into())),
+        match tokio::time::timeout_at(dl, rx.recv()).await {
+            Err(_) => {
+                return Err(format!("串发建连硬窗({}s)耗尽, 走兜底", pool::BUILD_WAIT_SECS))
+            }
+            Ok(Some(Ok(up))) => break up,
+            Ok(Some(Err(e))) => last = Some(e),
+            Ok(None) => return Err(last.unwrap_or_else(|| "串发建连全败".into())),
         }
     };
     // 晚成腿已自入库，不等不补——重建是下一个请求自己的事。

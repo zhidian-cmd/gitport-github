@@ -17,7 +17,10 @@ static BENCH: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 pub fn bench(ip: &str) {
     let mut g = lock(&BENCH);
     let t = g.get_or_insert_with(HashMap::new);
-    let until = Instant::now() + Duration::from_secs(BENCH_SECS);
+    // 过期清理在这里做（写入是低频事件）：usable 是每请求热路径，不在它身上全表扫。
+    let now = Instant::now();
+    t.retain(|_, u| now < *u);
+    let until = now + Duration::from_secs(BENCH_SECS);
     if t.get(ip).is_none_or(|u| until > *u) {
         t.insert(ip.to_string(), until);
     }
@@ -25,25 +28,16 @@ pub fn bench(ip: &str) {
 
 /// 软排除：从候选里摘掉暂缓中的 IP。
 /// 全部暂缓时原样返回——「全慢才回来」就落在这里，绝不因为筛选把候选清空。
+/// 只查不过期（单键 O(1)），过期项由下一次 bench() 写入时顺手清。
 pub fn usable(ips: &[String]) -> Vec<String> {
-    let mut g = lock(&BENCH);
-    let Some(t) = g.as_mut() else {
+    let g = lock(&BENCH);
+    let Some(t) = g.as_ref() else {
         return ips.to_vec();
     };
     let now = Instant::now();
-    // 顺手清过期项：候选集有限但表键是全量 IP，不清的话过期项永远躺着。
-    let mut expired: Vec<String> = Vec::new();
-    for (ip, until) in t.iter() {
-        if now >= *until {
-            expired.push(ip.clone());
-        }
-    }
-    for ip in &expired {
-        t.remove(ip);
-    }
     let live: Vec<String> = ips
         .iter()
-        .filter(|ip| !t.contains_key(*ip))
+        .filter(|ip| !t.get(*ip).is_some_and(|u| now < *u))
         .cloned()
         .collect();
     if live.is_empty() {

@@ -974,3 +974,39 @@ async fn segs_snapshot_serves_gzip_header() {
     assert_eq!(out, plain, "按 gzip 解压应完整还原明文");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 交付编码跟键里的编码桶走：identity 桶(curl/CLI)没协商过编码，交明文不写编码头；
+/// gz/br 桶统一交 gzip。identity 桶收到没协商过的 gzip 就是乱码。
+#[tokio::test]
+async fn segs_snapshot_delivers_per_encoding_bucket() {
+    assert_eq!(key_enc_bucket("GET github.com/a/b?-id-rk"), "id");
+    assert_eq!(key_enc_bucket("GET github.com/a/b?-gz-rk"), "gz");
+    assert_eq!(key_enc_bucket("GET github.com/a/b?-br-rk"), "br");
+
+    let (dir, _guard) = own_dir("segs_id");
+    let base = format!("<html>{}<div>x</div></html>", "A".repeat(256)).into_bytes();
+    store_repo_base(&dir, &base);
+    let plain = format!("<html>{}<div>y</div></html>", "A".repeat(256)).into_bytes();
+    let delta = seg_encode(&base, &plain);
+    let key = "GET github.com/octocat/repo?-id-rk";
+    write_entry_file(
+        &dir,
+        key,
+        &delta,
+        &serde_json::json!({
+            "key": key,
+            "status": 200,
+            "headers": [["content-type", "text/html; charset=utf-8"]],
+            "stoenc": "segs",
+        }),
+    )
+    .unwrap();
+    let ((status, hdrs, body), _) = load_disk_entry_reason(key, false).expect("segs 条目应命中");
+    assert_eq!(status, 200);
+    assert!(
+        !hdrs.iter().any(|(k, _)| k.as_str() == "content-encoding"),
+        "identity 桶不得带编码头: {hdrs:?}"
+    );
+    assert_eq!(body.as_ref(), plain.as_slice(), "identity 桶交付的必须是明文");
+    let _ = std::fs::remove_dir_all(&dir);
+}

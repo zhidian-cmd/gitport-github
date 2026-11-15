@@ -1174,6 +1174,9 @@ pub async fn serial_dial_skip(
         return Err(format!("直连域不进拨号({host})"));
     }
     let key = row.key.clone();
+    // 与 cursor_note 同一道闸：内容域竞速选路、游标无人读，不记不写。
+    // （候选剩 1 条退回串发时也走这里——没有闸就会给内容域写一条永不持久化的孤儿游标。）
+    let track = !row.flags.content;
     let mut circle = route::dial_targets(host).unwrap_or_default();
     let total_candidates = circle.len();
     if !skip_ips.is_empty() {
@@ -1252,22 +1255,24 @@ pub async fn serial_dial_skip(
         match result {
             Ok(conn) => {
                 // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
-                let snap = {
-                    let mut g = lock(&SERIAL);
-                    let t = g.as_mut().unwrap();
-                    t.cursor.insert(key.clone(), p.ip.clone());
-                    t.cursor
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                };
-                crate::settings::set_last_ips(snap);
+                if track {
+                    let snap = {
+                        let mut g = lock(&SERIAL);
+                        let t = g.as_mut().unwrap();
+                        t.cursor.insert(key.clone(), p.ip.clone());
+                        t.cursor
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    };
+                    crate::settings::set_last_ips(snap);
+                }
                 return Ok((conn, p.ip.clone(), p.sni.clone()));
             }
             Err(e) => {
                 last_err = Some(e.to_string());
-                // 前移到下一候选；物理顺序不动，零写盘。
-                {
+                // 前移到下一候选；物理顺序不动，零写盘（内容域不记游标）。
+                if track {
                     let mut g = lock(&SERIAL);
                     let n = order.len();
                     let next = &circle[order[(oi + 1) % n]];
@@ -1348,7 +1353,9 @@ static BUILD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::M
 
 /// 建造在途的等待上界：必须盖过内容域竞速全程（RACE_WINDOW_SECS 8s + H2 握手 5s）+ 余量。
 /// 等待界小于建造耗时 = 冷启动一页并发请求在通道建成前集体超时、全部摔给兜底。
-const BUILD_WAIT_SECS: u64 = 15;
+/// 同一把尺子也量建造本身（upstream 串发 recv 的硬窗引用它）：等锁与建连一个待遇，
+/// 抢到锁的请求不再无限挂——串发是旁路任务，超窗只影响这一条请求。
+pub(crate) const BUILD_WAIT_SECS: u64 = 15;
 
 /// 测试专用：读游标驻留（游标本身内存态、零写盘，没有别的读出口）。
 #[cfg(test)]
@@ -1422,14 +1429,26 @@ pub async fn get_or_build(
             return Ok((up, false));
         }
         // 建造：内容域竞速、其他/会话域串发，全在 dial_upstream 内。
-        match chan::dial_upstream(host, probe_path, log).await {
-            Err(e) if e == chan::ERR_ALL_CLAIMED => {
+        // 建造也受同一硬窗约束：抢到锁就无限等，等于把"排队者集体超时"换成
+        // "有人挂几十秒既不返回也不兜底"。串发是旁路任务，超窗不掐它——
+        // 后台继续走完候选、游标照记、通道入池，下一条请求直接骑现成的。
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err(format!("{host} 建造在途等待超时({BUILD_WAIT_SECS}s), 走兜底"));
+        }
+        match tokio::time::timeout(remain, chan::dial_upstream(host, probe_path, log)).await {
+            Ok(Err(e)) if e == chan::ERR_ALL_CLAIMED => {
                 // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（界照旧）。
                 drop(_guard);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            r => return Ok((r?, true)),
+            Ok(r) => return Ok((r?, true)),
+            Err(_) => {
+                return Err(format!(
+                    "{host} 建造总窗超时({BUILD_WAIT_SECS}s), 走兜底(串发后台继续)"
+                ));
+            }
         }
     }
 }

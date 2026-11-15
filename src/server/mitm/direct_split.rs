@@ -617,6 +617,9 @@ pub(super) struct SegmentedBody {
     finished: bool,
     resume: Option<Resume>,
     resume_after: Duration,
+    /// 静默上游的闹钟：上游不发不关时没有任何东西会唤醒 waker，
+    /// 到点自醒重 poll——停滞救援判据才有机会过线。
+    tick: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl SegmentedBody {
@@ -661,6 +664,7 @@ impl SegmentedBody {
             finished: false,
             resume,
             resume_after,
+            tick: None,
         }
     }
 
@@ -822,6 +826,28 @@ impl hyper::body::Body for SegmentedBody {
                 continue;
             }
             // 所有段刚才都被 poll 过，waker 已注册；等任一段来数据再醒。
+            // 但"上游静默装死（不发数据也不关连接）"永远不会触发 waker：
+            // 挂一只 resume_after 的闹钟到点自醒重 poll，停滞救援判据才有机会
+            // 过线——否则整条下载挂死、ActiveGuard 不归还，攒满 MAX_ACTIVE
+            // 后本进程所有大图都不再切片（镜像路径的 500ms tick 兜的就是这个）。
+            match me.tick.as_mut() {
+                Some(t) => {
+                    if t.as_mut().poll(cx).is_ready() {
+                        me.tick = None;
+                        cx.waker().wake_by_ref();
+                    }
+                }
+                None => {
+                    let mut t = Box::pin(tokio::time::sleep(me.resume_after));
+                    // 布防即 poll：把当前 waker 注册进闹钟——只挂不 poll 的闹钟
+                    // 永远不响（这次修复差点自己复刻了要修的 bug）。
+                    if t.as_mut().poll(cx).is_ready() {
+                        cx.waker().wake_by_ref();
+                    } else {
+                        me.tick = Some(t);
+                    }
+                }
+            }
             return Poll::Pending;
         }
     }

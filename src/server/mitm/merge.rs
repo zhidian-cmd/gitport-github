@@ -330,14 +330,16 @@ impl MergeBody {
         let mut progressed = false;
         let mut freed = 0u32;
         for seg in self.segs.values_mut() {
-            if seg.done || seg.buffered >= SEG_BUFFER_MAX {
-                continue;
-            }
             // 让位后的父段：下载已越过刀口——刀口外的字节是要丢的，掐掉上游流停止白下载；
             // 换上的空体下一轮即 EOF 收尾，缓冲里已到的照常交付，段在交付线越过新边界时移除。
             // （只对被让位的段生效；正常段必须 poll 到 EOF，那是收尾记账的一部分。）
+            // 必须排在缓冲守卫【之前】：父段灌满 2MB 时守卫会 continue 跳过，
+            // 掐流/释放连接就永远轮不到——2MB 加一条上游连接常驻到缓冲抽干为止。
             if seg.cut && seg.pos() >= seg.end {
                 seg.body = protocol::empty_body();
+            }
+            if seg.done || seg.buffered >= SEG_BUFFER_MAX {
+                continue;
             }
             // 轮询断档（我们在忙队首）：这段没被看着的时间不算停滞。
             if now.saturating_duration_since(seg.last_poll) > POLL_GAP {

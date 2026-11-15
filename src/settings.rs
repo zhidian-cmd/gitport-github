@@ -564,6 +564,28 @@ fn settings_path() -> PathBuf {
     exe_dir().join("settings.json")
 }
 
+/// 坏 JSON 里的捞回：按字段名找 `"key":"value"` 形态的字符串值——字符串值自包含，
+/// 语法坏掉的多半是别的字段。值被截断/缺引号/转义解析失败一律 None（尽力而为）。
+fn salvage_str_field(raw: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let rest = &raw[raw.find(&pat)? + pat.len()..];
+    let colon = rest.find(':')?;
+    let val = rest[colon + 1..].trim_start().strip_prefix('"')?;
+    let mut end = None;
+    let mut esc = false;
+    for (i, c) in val.char_indices() {
+        if esc {
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            end = Some(i);
+            break;
+        }
+    }
+    serde_json::from_str::<String>(&format!("\"{}\"", &val[..end?])).ok()
+}
+
 pub fn load() {
     match std::fs::read_to_string(settings_path()) {
         Ok(raw) => {
@@ -576,12 +598,26 @@ pub fn load() {
                     // 只有这一份副本，断电/手滑写坏 JSON 不该让原配置无声蒸发。
                     // 留底后逐字段回默认；单字段容错只在语法合法时生效（见 lenient）。
                     let bak = settings_path().with_extension("json.bak");
-                    let _ = std::fs::write(&bak, raw.as_bytes());
+                    let bak_ok = std::fs::write(&bak, raw.as_bytes()).is_ok();
+                    // 尽力从坏 JSON 里捞回 gitProxyBackup：接管过 git 代理时，用户原值只活
+                    // 在这一字段里——捞回来，结尾的残留清理才会走"还原"而不是"删掉"。
+                    let v = SettingsFile {
+                        git_proxy_backup: salvage_str_field(raw, "gitProxyBackup")
+                            .or_else(|| salvage_str_field(raw, "git_proxy_backup"))
+                            .unwrap_or_default(),
+                        ..SettingsFile::default()
+                    };
                     crate::logger::crash(&format!(
-                        "[设置] settings.json 解析失败({e}), 已整份回默认; 原文件留底 {}",
-                        bak.display()
+                        "[设置] settings.json 解析失败({e}), 已整份回默认{}; 原文件留底 {}{}",
+                        if v.git_proxy_backup.is_empty() {
+                            ""
+                        } else {
+                            "(已捞回 git 代理备份)"
+                        },
+                        bak.display(),
+                        if bak_ok { "" } else { "(留底写失败!)" }
                     ));
-                    apply(SettingsFile::default());
+                    apply(v);
                 }
             }
         }

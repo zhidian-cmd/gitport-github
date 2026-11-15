@@ -63,6 +63,6 @@ flowchart LR
 - **Routing and connection pool** use the local route configuration to select upstream connections and, where configured and appropriate, a content mirror fallback.
 - **Management UI and desktop shell** expose configuration, status, logs, and desktop/tray controls.
 - **Optional TLS inspection** is disabled unless enabled by the user. The local certificate authority is used for managed GitHub-related hosts only.
-- **Configuration and logs** are local application state. Mirror use is configurable; requests containing signed download credentials are not sent to untrusted mirrors by default.
+- **Configuration and logs** are local application state. Mirror use is user-managed; download URLs (including signed ones) are forwarded verbatim to configured mirrors — an explicit informed trade-off, not a code-level guard.
 
 See [工作原理](ARCHITECTURE.md) for detailed request flows and routing behavior, and [高级配置](CONFIG.md) for configuration details.

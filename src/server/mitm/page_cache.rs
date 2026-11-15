@@ -646,6 +646,19 @@ fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str)
     format!("GET {host}{path}{q}{cookie_tag}{enc_tag}")
 }
 
+/// 从键尾解析编码桶（对应 page_cache_key 的 enc_tag；-rk 快照键尾为 `{enc_tag}-rk`）。
+/// 交付编码跟桶走：identity 桶交明文，gzip/brotli 桶交 gzip。
+fn key_enc_bucket(key: &str) -> &'static str {
+    let tail = key.strip_suffix("-rk").unwrap_or(key);
+    if tail.ends_with("-id") {
+        "id"
+    } else if tail.ends_with("-br") {
+        "br"
+    } else {
+        "gz"
+    }
+}
+
 /// /search 查询串归一化：默认页显式补 p=1（无 p 与 p=1 同键），参数按键名排序；
 /// 其他路径保持原样，个别接口参数顺序有语义。
 fn normalize_query(path: &str, q: &str) -> String {
@@ -826,13 +839,19 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
         }
         let mut h = hdrs;
         h.retain(|(k, _)| k.as_str() != "content-length" && k.as_str() != "content-encoding");
-        // 交出去的是重压的 gzip 体，头必须跟着写 gzip——存侧头的 content-encoding 是原体
-        // (br/无)的，直交会让浏览器按错编码解码、仓库页白屏。
-        h.push((
-            hyper::header::CONTENT_ENCODING,
-            hyper::header::HeaderValue::from_static("gzip"),
-        ));
-        (h, Bytes::from(gz_compress(full.as_slice())))
+        // 交出去的体必须与声明的 content-encoding 一致——存侧头是原体(br/无)的，两种桶都剥掉重写：
+        // identity 桶(curl/CLI)没协商过任何编码，交明文不写编码头；gzip/brotli 桶统一重压
+        // gzip(协商过 br 的浏览器都收 gzip)。直交原编码浏览器按错解码白屏，identity 桶收到
+        // 没协商过的 gzip 则按明文解析成乱码。
+        if key_enc_bucket(key) == "id" {
+            (h, Bytes::from(full))
+        } else {
+            h.push((
+                hyper::header::CONTENT_ENCODING,
+                hyper::header::HeaderValue::from_static("gzip"),
+            ));
+            (h, Bytes::from(gz_compress(full.as_slice())))
+        }
     } else {
         let p = plain_prefix(body, enc);
         if (logged_in && is_logged_out_body(&p)) || is_gate_page(&p) {

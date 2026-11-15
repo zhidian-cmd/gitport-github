@@ -388,12 +388,54 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
         }
     }
     let addr = format!("{host}:{port}");
-    let tcp = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
-        .await
-        .map_err(|_| format!("系统 DNS 拨号超时: {host}"))?
-        .map_err(|e| format!("系统 DNS 拨号失败: {host}: {e}"))?;
+    // 先解析再过保险：hosts 劫持把受管域名指进环回/私网时照连就是送信——
+    // 白名单只保证"名字像 GitHub"，不保证"地址不是内网"。
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host(&addr),
+    )
+    .await;
+    let addrs: Vec<std::net::SocketAddr> = match lookup {
+        Ok(Ok(it)) => it.filter(|a| !bogon_addr(a.ip())).collect(),
+        Ok(Err(e)) => return Err(format!("系统 DNS 解析失败: {host}: {e}")),
+        Err(_) => return Err(format!("系统 DNS 解析超时: {host}")),
+    };
+    if addrs.is_empty() {
+        return Err(format!("{host} 解析到内网/保留地址, 拒拨"));
+    }
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(&addrs[..]),
+    )
+    .await
+    .map_err(|_| format!("系统 DNS 拨号超时: {host}"))?
+    .map_err(|e| format!("系统 DNS 拨号失败: {host}: {e}"))?;
     let _ = tcp.set_nodelay(true);
     Ok((Dialed::Plain(tcp), "system-dns".to_string()))
+}
+
+/// 兜底腿的地址保险：环回/私网/链路本地/ULA/组播一律拒拨（v4-mapped 先折回 v4 判）。
+fn bogon_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(m) = v6.to_ipv4_mapped() {
+                return bogon_addr(std::net::IpAddr::V4(m));
+            }
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || s[0] & 0xffc0 == 0xfe80 // fe80::/10 链路本地
+                || s[0] & 0xfe00 == 0xfc00 // fc00::/7 ULA
+                || s[0] & 0xff00 == 0xff00 // ff00::/8 组播
+        }
+    }
 }
 
 /// 双向透传，任一方向结束即关两侧；可选首字节看门狗与握手首包分片。

@@ -137,7 +137,11 @@ async fn plain_http_post_body_forwarded_intact() {
 async fn unmanaged_targets_are_rejected() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = ln.local_addr().unwrap().port();
-    let log: LogFn = Arc::new(|_: &str| {});
+    // 日志要留底：拨不通的环境里删掉闸也会回 502（TCP 层失败同款），只有
+    // 「非受管域名」拒绝日志能区分"被闸拦"还是"恰好拨不通"。
+    let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
     let srv = Arc::new(ProxyServer {
         log,
         authority: None,
@@ -175,6 +179,14 @@ async fn unmanaged_targets_are_rejected() {
         "不得回隧道建立成功: {}",
         String::from_utf8_lossy(&resp)
     );
+    assert!(
+        logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("非受管域名")),
+        "闸必须留下「非受管域名」拒绝日志——is_managed 闸被删时这里要红"
+    );
 
     // 明文 HTTP 打内网地址：同样 502。
     let mut cli2 = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
@@ -201,6 +213,33 @@ async fn unmanaged_targets_are_rejected() {
 
     ctx.cancel();
     let _ = serve_task.await;
+}
+
+/// 兜底腿地址保险：hosts 劫持把受管域名指进环回/私网/链路本地时必须拒拨。
+#[test]
+fn bogon_filter_blocks_loopback_and_private_ranges() {
+    let p = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for bad in [
+        "127.0.0.1",
+        "10.0.0.5",
+        "172.16.0.9",
+        "192.168.1.1",
+        "169.254.169.254",
+        "0.0.0.0",
+        "255.255.255.255",
+        "::1",
+        "fe80::1",
+        "fd00::9",
+        "ff02::1",
+    ] {
+        assert!(super::bogon_addr(p(bad)), "{bad} 必须判为保留地址");
+    }
+    // v4-mapped 的内网地址折回 v4 判，不能因为"是 v6 形状"漏过
+    assert!(super::bogon_addr(p("::ffff:127.0.0.1")));
+    assert!(super::bogon_addr(p("::ffff:10.0.0.5")));
+    for ok in ["140.82.121.3", "185.199.110.133", "2606:50c0:8000::153"] {
+        assert!(!super::bogon_addr(p(ok)), "{ok} 是合法 GitHub 边缘地址");
+    }
 }
 
 /// 明文 HTTP 分块体：识别出来就走 501，不把块长度行当正文喂给上游。

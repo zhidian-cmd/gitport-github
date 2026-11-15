@@ -351,6 +351,48 @@ async fn rescue_swap_continues_byte_stream() {
     assert_eq!(got, whole, "前缀 + 续传必须逐字节还原整文件");
 }
 
+/// 静默上游（不发数据也不关连接）必须能触发停滞救援并错误上抛，而不是永久 Pending——
+/// waker 已注册进静默的上游，永远不触发；闹钟到点自醒是唯一唤醒源。
+/// 修复前 collect 在这里挂死：救援判据只在 re-poll 时求值，而没有任何东西再 poll 它。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // 与同文件既有测试同款：TEST_LOCK 护全局表，跨 await 有意为之
+async fn silent_stall_wakes_and_errors_instead_of_hanging() {
+    use super::Resume;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entries = vec![(
+        BoxBody::new(StallBody {
+            prefix: Bytes::from_static(b"abc"),
+            sent: false,
+        }),
+        10usize,
+        0u64,
+        false,
+    )];
+    let body = SegmentedBody::build(
+        entries,
+        10,
+        Some(Resume::Direct {
+            tpl: tpl(),
+            host: "no-such-host.invalid".to_string(), // 救援重拨必然快速失败，不碰网络
+            log: Arc::new(|_| {}),
+        }),
+        Duration::from_millis(30), // 停滞界：真实时钟 30ms，测试快
+    );
+    // 修复前：collect 永久 Pending（无唤醒源）；修复后：30ms 闹钟自醒 → 救援起跳 →
+    // get_or_build 失败 → 重试耗尽 → 段错误上抛。
+    let outcome = tokio::time::timeout(Duration::from_secs(5), BodyExt::collect(body)).await;
+    let collected = outcome.expect("静默停滞不许永久挂死: collect 5s 内必须收场");
+    assert!(
+        collected.is_err(),
+        "救援重试耗尽必须错误上抛, 而非无声挂起"
+    );
+}
+
 #[test]
 fn media_kind_routes_to_its_chain() {
     use super::MediaKind;

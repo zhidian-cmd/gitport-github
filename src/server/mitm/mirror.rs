@@ -322,7 +322,11 @@ fn stream_start_mismatch(req_range: Option<&str>, resp: &hyper::Response<BoxBody
     if resp.status() != http::StatusCode::PARTIAL_CONTENT {
         return None; // 200/304 等照旧走各自校验
     }
-    let range = req_range?;
+    // 第二类失败单独拦：客户端整包 GET(没带 Range)却收到 206 分片，当完整文件
+    // 交出去就是静默截断——按这家失败处理，换下一家或回直连。
+    let Some(range) = req_range else {
+        return Some("未请求 Range 却回 206".to_string());
+    };
     let want = merge::parse_range(Some(range)).map(|(a, _)| a)?;
     let cr = resp.headers().get("content-range").and_then(|v| v.to_str().ok());
     merge::check_segment_start(cr, want).err()
@@ -602,6 +606,11 @@ fn total_memo_get(key: &str) -> Option<u64> {
 fn total_memo_put(key: &str, total: u64) {
     let mut g = TOTAL_MEMO.lock().unwrap();
     g.insert(key.to_string(), (total, Instant::now()));
+}
+
+/// 记忆与段响应自报总长对不上时作废：错值躺满 600s 会把整窗下载都切短。
+fn total_memo_remove(key: &str) {
+    TOTAL_MEMO.lock().unwrap().remove(key);
 }
 
 /// 无 Range 时发 1 字节 Range 探测总长；头两家各试一次（真实请求），谁先给总长用谁。
@@ -924,7 +933,11 @@ async fn split_download(
     }
     let path = out.uri().path().to_string();
     // 刚探过、上游明确不给 Range 的 URL：10 分钟内不再探测，直接走单流。
-    let slice_key = format!("{host}{path}");
+    // 键带 query：同 path 不同签名对象(token=/sig=)是不同文件，总长记忆不能串键。
+    let slice_key = match out.uri().query() {
+        Some(q) => format!("{host}{path}?{q}"),
+        None => format!("{host}{path}"),
+    };
     if marked_unsliceable(&slice_key) {
         return Ok(None);
     }
@@ -1103,6 +1116,7 @@ async fn split_download(
     // 段响应除逐跳头/分段头外的头统一搬过来：content-disposition 定保存文件名，etag/last-modified 定缓存语义，少了客户端行为会变。
     let mut extra: Option<Vec<(http::HeaderName, http::HeaderValue)>> = None;
     let mut total = known_total;
+    let mut seg_reported_total: Option<u64> = None;
     let mut bodies: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len());
     let mut dead = 0usize;
     let mut failed: Vec<(u64, u64)> = Vec::new();
@@ -1122,13 +1136,12 @@ async fn split_download(
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect(),
                     );
-                    total = total.or_else(|| {
-                        merge::content_range_total(
-                            resp.headers()
-                                .get("content-range")
-                                .and_then(|v| v.to_str().ok()),
-                        )
-                    });
+                    seg_reported_total = merge::content_range_total(
+                        resp.headers()
+                            .get("content-range")
+                            .and_then(|v| v.to_str().ok()),
+                    );
+                    total = total.or(seg_reported_total);
                 }
                 let m = idle[i % idle.len()];
                 let body = account_seg(
@@ -1152,6 +1165,18 @@ async fn split_download(
     }
     if dead == segs.len() {
         return Ok(None); // 全灭：退回单流，别让一次切片失败毁掉整个请求
+    }
+    // 总长对账：记忆/探得的总长 vs 首段 206 自报总长，对不上 = 记忆已陈旧（对象换版/
+    // 镜像转码）——作废记忆整单回单流。按错总长切片/写 Content-Length 会静默截短真实
+    // 文件；此刻还没有任何字节交给客户端，回退与"全灭回单流"同一条安全口子。
+    if let (Some(known), Some(actual)) = (known_total, seg_reported_total) {
+        if known != actual {
+            total_memo_remove(&slice_key);
+            (log)(&format!(
+                "[切片] {host}{path} 总长对账不符(记忆 {known} vs 首段 {actual}), 作废记忆回单流"
+            ));
+            return Ok(None);
+        }
     }
     let total_hdr = total
         .map(|t| t.to_string())

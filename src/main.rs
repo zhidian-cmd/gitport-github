@@ -78,11 +78,14 @@ fn run() {
     };
     pool::serial_load(&exe_dir, settings::last_ips(), Some(log_fn.clone()));
     let t_routes = t0.elapsed();
-    let ca = certgen::load_or_generate(&exe_dir, Some(&log_fn)).ok();
+    let ca = match certgen::load_or_generate(&exe_dir, Some(&log_fn)) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            log_fn(&format!("CA 初始化失败, MITM 不可用: {e}"));
+            None
+        }
+    };
     let t_ca = t0.elapsed();
-    if ca.is_none() {
-        log_fn("CA 初始化失败, MITM 不可用");
-    }
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()

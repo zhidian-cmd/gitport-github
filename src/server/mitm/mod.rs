@@ -133,6 +133,12 @@ async fn mitm_http(
             from_uri
         }
     };
+    // 隧道内 host 是请求头自己说的：外层 CONNECT 闸只守入口，这里不复核的话，
+    // 换个 Host 头就能探测内网/把会话头带去任意站点。与两个外层入口同款。
+    if !crate::pool::route::is_managed(&host) {
+        (log)(&format!("[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"));
+        return plain_502();
+    }
     // 主站上 /owner/repo/zip/refs/... 是 codeload 被不对口 IP 用 301 踢回来的死路径，
     // GitHub 主站本身没有这个路由。那条 301 没带缓存头，浏览器会永久记住；此后即使把
     // codeload 的路由修对，浏览器也直接跳到这条 404 路径、根本不再问代理。这里内部按

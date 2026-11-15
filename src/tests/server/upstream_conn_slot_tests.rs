@@ -764,6 +764,13 @@ async fn report_failure_moves_cursor_before_blacklisting() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+    // 清场：游标表清零（跨测试残留会让"游标不动"的断言碰巧成立）、边冷却清空——
+    // 本测试断言的是顺序本身，不能依赖前一个测试留下的进程级状态。
+    let dir = std::env::temp_dir().join("gitport_cursor_order_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    crate::pool::serial_load(&dir, Vec::new(), None);
+    crate::pool::edges::clear_all();
     crate::pool::install_seed_routes();
     let targets = crate::pool::route::dial_targets("github.com").expect("种子表必有 github.com");
     assert!(targets.len() >= 2, "前提：github.com 至少两个候选");

@@ -284,3 +284,40 @@ fn worker_mirrors_accepts_handwritten_forms() {
     assert!(v.worker_mirrors.is_empty(), "类型不对只丢这一段");
     assert!(v.mitm);
 }
+
+/// 坏 JSON 里字符串值自包含：语法坏的是别的字段，gitProxyBackup 要能原样捞回。
+/// 夹具用 serde_json::to_string 生成（分隔符 U+0001 在盘上就是转义文本），与真实落盘一致。
+#[test]
+fn salvage_recovers_git_proxy_backup_from_broken_json() {
+    let sep = char::from_u32(1).unwrap();
+    let backup = format!("http://corp-proxy:8080{sep}http://corp2:3128");
+    let escaped = serde_json::to_string(&backup).unwrap();
+    let raw = format!(
+        r#"{{"closeToTray":true, "winRect": [1, 2, "坏" 3], "gitProxyBackup": {escaped}}}"#
+    );
+    assert_eq!(
+        super::salvage_str_field(&raw, "gitProxyBackup").as_deref(),
+        Some(backup.as_str()),
+        "键序在后/转义分隔符都要能捞"
+    );
+    assert_eq!(
+        super::salvage_str_field(r#"{"git_proxy_backup":"http://snake:1"}"#, "git_proxy_backup")
+            .as_deref(),
+        Some("http://snake:1"),
+        "snake_case 兼容写法也认"
+    );
+}
+
+/// 值本身被语法错误截断 / 缺引号 / 缺字段：捞不回就 None，绝不编造。
+#[test]
+fn salvage_gives_up_on_truncated_or_missing_value() {
+    assert_eq!(
+        super::salvage_str_field(r#"{"gitProxyBackup":"http://trunc"#, "gitProxyBackup"),
+        None
+    );
+    assert_eq!(
+        super::salvage_str_field(r#"{"gitProxyBackup":null}"#, "gitProxyBackup"),
+        None
+    );
+    assert_eq!(super::salvage_str_field(r#"{"mitm":true}"#, "gitProxyBackup"), None);
+}
