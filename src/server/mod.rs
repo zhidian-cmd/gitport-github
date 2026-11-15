@@ -123,11 +123,13 @@ impl ProxyServer {
 
     async fn handle_connect(&self, mut client: TcpStream, target: &str) {
         let (host, port) = split_target(target, 443);
-        // 开放代理闸：本进程只加速 GitHub 系域名。非受管目标一律 502——
-        // 否则任何能连到 7810 的进程都能借它扫内网、读云元数据、摸自家管理端口。
-        if !pool::route::is_managed(&host) {
+        // 开放代理闸：受管域名(GitHub 系)全速加速；其它域名只放行 443 的 HTTPS 透明
+        // 隧道——用户拼接的镜像 clone URL(域名=镜像站)靠它才能用。内网/环回/链路本地
+        // 由 connect_upstream 兜底腿的 bogon 过滤拒绝，非 443 端口一律 502——
+        // 借代理扫内网、打云元数据、摸非 HTTPS 服务的路仍然全堵（审计 #7）。
+        if !pool::route::is_managed(&host) && port != 443 {
             (self.log)(&format!(
-                "[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"
+                "[拒绝] {host}:{port} 非受管域名且非 443, 不做开放转发(仅加速 GitHub 系与 https 镜像隧道)"
             ));
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
