@@ -120,33 +120,46 @@ async fn leg_worker(
     let (parts, mut body) = resp.into_parts();
     // 计时基点 = 响应头到达（通道必然已建立）：拨号/TLS/头等待不计入速度，
     // 热直连的"零握手"优势不再压人——这正是用户定版要剔除的不对称。
+    // 计速 = 整个窗口实际收到的字节 ÷ 窗口时长（真吞吐）。不能测"到 1KB 用了多久"：
+    // 下一帧常已在 socket 缓冲里，头帧间隔是微秒级调度噪声（实测跑出 390MB/s 的鬼数字）。
     let t0 = Instant::now();
     let mut buf: Vec<Bytes> = Vec::new();
     let mut n = 0usize;
     loop {
         let left = speed_window.saturating_sub(t0.elapsed());
         if left.is_zero() {
-            return LegOutcome::TooSlow { name };
+            // 窗口收口：n < 1KB = 不足 2KB/s，慢腿没有留的价值。
+            if n < WIN_BYTES {
+                return LegOutcome::TooSlow { name };
+            }
+            let win = LegWin {
+                name: name.clone(),
+                head: parts,
+                prefix: concat_buf(&buf, n),
+                body,
+            };
+            let speed = n as f64 / t0.elapsed().as_secs_f64();
+            return LegOutcome::Speed { name, speed, win };
         }
         match tokio::time::timeout(left, http_body_util::BodyExt::frame(&mut body)).await {
-            Err(_) => return LegOutcome::TooSlow { name },
+            Err(_) => {
+                // 窗口收口兜底（timeout 与 left.is_zero 同一刻，可能被它先抢）。
+                if n < WIN_BYTES {
+                    return LegOutcome::TooSlow { name };
+                }
+                let win = LegWin {
+                    name: name.clone(),
+                    head: parts,
+                    prefix: concat_buf(&buf, n),
+                    body,
+                };
+                let speed = n as f64 / t0.elapsed().as_secs_f64();
+                return LegOutcome::Speed { name, speed, win };
+            }
             Ok(Some(Ok(f))) => {
                 if let Some(d) = f.data_ref() {
                     n += d.len();
                     buf.push(d.clone());
-                }
-                if n >= WIN_BYTES {
-                    // 固定字节窗：速度 = 1024B ÷ 交满 1024B 的时刻−头时刻。
-                    // 用累计 n 当分子的话，各腿第一帧大小不同（1KB~16KB），
-                    // 帧大的虚高——比的不是吞吐是帧大小（实测 direct 跑出 505MB/s 的鬼数字）。
-                    let speed = WIN_BYTES as f64 / t0.elapsed().as_secs_f64();
-                    let win = LegWin {
-                        name: name.clone(),
-                        head: parts,
-                        prefix: concat_buf(&buf, n),
-                        body,
-                    };
-                    return LegOutcome::Speed { name, speed, win };
                 }
             }
             Ok(Some(Err(e))) => {

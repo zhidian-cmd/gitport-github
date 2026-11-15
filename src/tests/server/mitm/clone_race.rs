@@ -41,14 +41,17 @@ fn resp_with_silent_body(status: u16, ct: &str) -> hyper::Response<BoxBody> {
         .unwrap()
 }
 
-/// 假腿：head_ms 后交合法头，体帧按"头后偏移"依次到达（sleep 携带正确 waker）。
+/// 假腿：head_ms 后交合法头，体帧按"头后偏移"依次到达（sleep 携带正确 waker），
+/// 帧后接永续 pending（不 EOF）——模拟 packfile 大流，逼腿走速度路径而非 EOF 胜。
 fn timed_leg(head_ms: u64, frames: Vec<(u64, Bytes)>) -> LegFut {
     Box::pin(async move {
         tokio::time::sleep(Duration::from_millis(head_ms)).await;
-        let seq = futures_util::stream::iter(frames).then(|(ms, b)| async move {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-            Ok::<_, std::io::Error>(hyper::body::Frame::data(b))
-        });
+        let seq = futures_util::stream::iter(frames)
+            .then(|(ms, b)| async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok::<_, std::io::Error>(hyper::body::Frame::data(b))
+            })
+            .chain(futures_util::stream::pending());
         hyper::Response::builder()
             .status(200)
             .header("content-type", RESULT)
@@ -105,42 +108,38 @@ fn invalid_heads_never_count_as_valid() {
     assert!(!super::head_is_valid(GitKind::Result, 200, ADV));
 }
 
-/// 全腿计速后比速度：同头延迟下，1KB 交付更快的腿速度更高、赢。
+/// 全腿计速后比速度：0.5s 窗口内实际收到的字节多者赢（真吞吐比较）。
 #[tokio::test]
 async fn fastest_speed_wins() {
-    let kb = Bytes::from(vec![b'x'; 1024]);
-    let rest3 = Bytes::from(vec![b'y'; 3072]);
     let legs = vec![
+        // slow：窗口内只到 1KB → 5KB/s
         (
             "slow".to_string(),
-            timed_leg(
-                50,
-                vec![(300, kb.clone()), (310, rest3.clone())],
-            ),
+            timed_leg(10, vec![(50, Bytes::from(vec![b'x'; 1024]))]),
         ),
+        // fast：窗口内到 4KB → 20KB/s
         (
             "fast".to_string(),
-            timed_leg(50, vec![(100, kb.clone()), (110, rest3.clone())]),
+            timed_leg(10, vec![(50, Bytes::from(vec![b'x'; 4096]))]),
         ),
     ];
     let race = super::run_race(
         legs,
         GitKind::Result,
         Duration::from_secs(5),
-        Duration::from_secs(3),
+        Duration::from_millis(200), // 测速窗压缩到 200ms
     )
     .await
     .expect("合法腿应判赢");
     assert_eq!(race.win.name, "fast", "speeds={:?}", race.speeds);
     assert!(!race.complete, "大响应路径不是 EOF 胜");
     assert_eq!(race.speeds.len(), 2, "两条腿都要有计速");
-    let rest = http_body_util::BodyExt::collect(race.win.body)
-        .await
-        .unwrap()
-        .to_bytes();
-    let mut got = race.win.prefix.to_vec();
-    got.extend_from_slice(&rest);
-    assert_eq!(got.len(), 4096, "前缀+剩余必须逐字节等于原体");
+    // 赢家窗口内缓冲的字节全量随流交付（4KB 帧已在 prefix 里）
+    assert_eq!(
+        race.win.prefix.len(),
+        4096,
+        "赢家窗口内收到的字节必须全量保留"
+    );
 }
 
 /// 回得最快的坏镜像回 404：判负不判赢，让唯一有速度的合法腿赢。
@@ -218,10 +217,10 @@ async fn race_budget_aborts_hanging_legs() {
 #[tokio::test]
 async fn eof_complete_beats_earlier_1kb() {
     let legs = vec![
-        // mid-stream：先交满 1KB 但响应远没完（旧语义会误选它）
+        // mid-stream：先交 1KB 但响应远没完（永续流，窗口后才有速度）
         (
             "mid-stream".to_string(),
-            leg(50, Ok(git_resp(200, RESULT, &[b'x'; 4096]))),
+            timed_leg(50, vec![(0, Bytes::from(vec![b'x'; 1024]))]),
         ),
         // complete：100ms 收完整份小响应
         (
