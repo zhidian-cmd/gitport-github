@@ -161,20 +161,24 @@ async fn repo_home_snapshot_cross_session() {
         load_disk_entry(&key, false).is_some(),
         "仓库页快照必须跨会话存活"
     );
-    // 写失效（深层写路径，父段 ≥2 个斜杠）必须扫进 keep/ 命中对应快照
+    // 写失效（深层写路径，父段 ≥2 个斜杠）：keep 快照不删，标数据过期（v6.12）
     let deep_key = "GET github.com/octocat/repo/issues/5-br-k";
     let deep_hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
     persist_page_entry_blocking(&dir, deep_key, b"<html>d</html>", 200, &deep_hdrs).unwrap();
     invalidate_prefix_blocking(&dir, "github.com", "/octocat/repo/issues/5/comment");
     assert!(
-        load_disk_entry(deep_key, false).is_none(),
-        "写失效必须覆盖 keep/ 里的快照"
+        load_disk_entry(deep_key, false).is_some(),
+        "v6.12 写失效不再删 keep 快照"
     );
+    let (_, expired) = load_disk_entry_reason(deep_key, false).unwrap();
+    assert!(expired, "keep 快照写失效后必须标过期(交旧+后台重拉)");
     // 深层写失效按前缀匹配，不得误伤仓库页快照本体
     assert!(
         load_disk_entry(&key, false).is_some(),
         "深层写不得误伤仓库页快照"
     );
+    let (_, expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(!expired, "未被前缀命中的快照不得被标过期");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -993,5 +997,222 @@ async fn segs_snapshot_delivers_per_encoding_bucket() {
         "identity 桶不得带编码头: {hdrs:?}"
     );
     assert_eq!(body.as_ref(), plain.as_slice(), "identity 桶交付的必须是明文");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v6.12 资产合成：同部署（底稿已有同名资产）零改写；跨部署（只换内容哈希）改回底稿旧引用；
+/// 底稿没有的新增资产保留新引用；数据区不动；连字哈希（CodeViewHeader-D4-FNQWQ）也要认得。
+#[test]
+fn rebake_asset_refs_rewrites_hashes_to_base() {
+    let base = b"<html><head>\
+        <script src=\"https://github.githubassets.com/assets/main-Ab12Cd34.js\"></script>\
+        <link href=\"https://github.githubassets.com/assets/global-B1u2V3w4.css\">\
+        <script src=\"https://github.githubassets.com/assets/CodeViewHeader-D4-FNQWQ.js\"></script>\
+        </head><body>repo A</body></html>";
+    // 同部署：新旧哈希一致 → 原样返回
+    let same =
+        b"<html><head><script src=\"https://github.githubassets.com/assets/main-Ab12Cd34.js\"></script></head><body>repo B</body></html>";
+    assert_eq!(
+        rebake_asset_refs(base, same),
+        same.to_vec(),
+        "同部署不得改写"
+    );
+    // 跨部署：三个旧资产换了哈希 → 全部改回底稿旧引用；新增资产保留
+    let fresh = b"<html><head>\
+        <script src=\"https://github.githubassets.com/assets/main-XY98wv65.js\"></script>\
+        <link href=\"https://github.githubassets.com/assets/global-Qr7StU2v.css\">\
+        <script src=\"https://github.githubassets.com/assets/CodeViewHeader-E5-GPQWQ.js\"></script>\
+        <script src=\"https://github.githubassets.com/assets/brandnew-Z1a2B3c4.js\"></script>\
+        </head><body>repo B data</body></html>";
+    let s = String::from_utf8(rebake_asset_refs(base, fresh)).unwrap();
+    assert!(s.contains("main-Ab12Cd34.js"), "main 应改回底稿旧哈希: {s}");
+    assert!(
+        s.contains("global-B1u2V3w4.css"),
+        "global 应改回底稿旧哈希: {s}"
+    );
+    assert!(
+        s.contains("CodeViewHeader-D4-FNQWQ.js"),
+        "连字哈希应改回底稿旧引用: {s}"
+    );
+    assert!(
+        s.contains("brandnew-Z1a2B3c4.js"),
+        "底稿没有的新资产保留新引用"
+    );
+    assert!(s.contains("repo B data"), "数据区不动");
+    assert!(!s.contains("main-XY98wv65"), "新哈希引用应被替换");
+}
+
+/// v6.12 合成安全线：仓库文件路径（/blob/main/assets/x）不是 CDN 引用，不得改写；
+/// 不同资产（剩余段不等长）不得互串；相对引用（src="/assets/..."）照常识别。
+#[test]
+fn rebake_asset_refs_skips_non_asset_contexts() {
+    let base = b"<html><script src=\"https://github.githubassets.com/assets/main-Ab12Cd34.js\"></script></html>";
+    // 仓库文件路径（前面是路径字母）与不同名资产都不该动；同名的相对引用该动
+    let fresh = b"<html>\
+        <a href=\"/octocat/repo/blob/main/assets/main.js\">main.js</a>\
+        <img src=\"/octocat/repo/raw/main/assets/logo-XY98wv65.png\">\
+        <script src=\"/assets/main-XY98wv65.js\"></script>\
+        </html>";
+    let s = String::from_utf8(rebake_asset_refs(base, fresh)).unwrap();
+    assert!(
+        s.contains("/blob/main/assets/main.js"),
+        "仓库文件路径不得被改写: {s}"
+    );
+    assert!(
+        s.contains("/raw/main/assets/logo-XY98wv65.png"),
+        "不同名仓库文件不得被改写: {s}"
+    );
+    assert!(
+        s.contains("src=\"/assets/main-Ab12Cd34.js\""),
+        "相对引用的同一资产应改回底稿旧哈希: {s}"
+    );
+    // 新增 chunk 与底稿资产词干前缀相同但剩余段不等长 → 不得互串
+    let fresh2 = b"<html><script src=\"https://github.githubassets.com/assets/mainx-W1Xy2Z34.js\"></script></html>";
+    assert_eq!(
+        rebake_asset_refs(base, fresh2),
+        fresh2.to_vec(),
+        "剩余段不等长的不同资产不得改写"
+    );
+}
+
+/// v6.12 交付侧合成：gzip 正文改写后仍标 gzip 且 content-length 剥除；同部署零改写返回 false；无底稿不动。
+#[tokio::test]
+async fn rebake_repo_html_rewrites_and_normalizes() {
+    let (dir, _g) = own_dir("rebake");
+    let mk = |asset: &str, fill: &str| {
+        format!(
+            "<html><head><script src=\"https://github.githubassets.com/assets/{asset}\"></script></head><body>{}{fill}</body></html>",
+            fill.chars().count()
+        )
+    };
+    let base = mk("main-Ab12Cd34.js", &"B".repeat(400)).into_bytes();
+    store_repo_base(&dir, &base);
+    // 跨部署：gzip 正文改写 → 编码头归一 gzip、content-length 剥除
+    let fresh = mk("main-XY98wv65.js", &"C".repeat(400));
+    let gz = {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut e, fresh.as_bytes()).unwrap();
+        e.finish().unwrap()
+    };
+    let mut hdrs: http::HeaderMap = hyper::HeaderMap::new();
+    hdrs.insert("content-encoding", "gzip".parse().unwrap());
+    hdrs.insert("content-length", "123".parse().unwrap());
+    let mut body = Bytes::from(gz.clone());
+    assert!(rebake_repo_html(&mut body, &mut hdrs), "跨部署合成应生效");
+    assert_eq!(
+        hdrs.get("content-encoding").unwrap(),
+        "gzip",
+        "合成后统一 gzip 交付"
+    );
+    assert!(
+        hdrs.get("content-length").is_none(),
+        "体变了 content-length 必须剥掉"
+    );
+    let mut out = Vec::new();
+    use std::io::Read as _;
+    flate2::read::GzDecoder::new(&body[..])
+        .read_to_end(&mut out)
+        .unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("main-Ab12Cd34.js"), "交付体应是底稿旧哈希: {s}");
+    // 同部署：零改写返回 false，体不动
+    let same_gz = {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut e, &base).unwrap();
+        e.finish().unwrap()
+    };
+    let mut hdrs2: http::HeaderMap = hyper::HeaderMap::new();
+    hdrs2.insert("content-encoding", "gzip".parse().unwrap());
+    let mut body2 = Bytes::from(same_gz);
+    assert!(!rebake_repo_html(&mut body2, &mut hdrs2), "同部署零改写");
+    // 无底稿：不动（删 base 文件模拟全局首仓）
+    std::fs::remove_file(dir.join("base-repo.html")).unwrap();
+    let mut hdrs3: http::HeaderMap = hyper::HeaderMap::new();
+    let mut body3 = Bytes::from(gz.clone());
+    assert!(!rebake_repo_html(&mut body3, &mut hdrs3), "无底稿不动");
+    assert_eq!(body3.as_ref(), gz.as_slice(), "无底稿正文原样");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v6.12 入库即合成：仓库 B 首访拉到的正文带新部署哈希，入库后快照应为底稿旧哈希 + B 的数据。
+#[test]
+fn persist_repo_snapshot_bakes_base_hashes() {
+    let (dir, _g) = own_dir("bake");
+    let shell = format!(
+        "<html><head><script src=\"https://github.githubassets.com/assets/main-Ab12Cd34.js\"></script>\
+         <script src=\"https://github.githubassets.com/assets/app-PqRs56Tu.js\"></script></head>\
+         <body><div id=\"data\">{{}}</div>{}</body></html>",
+        "x".repeat(600)
+    );
+    let hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
+    // 仓库 A 首访：无底稿 → 原样入库并立底稿
+    let ka = "GET github.com/octocat/repo-a-cloggedout-id-rk";
+    let page_a = shell.replace("{}", "repo A data");
+    persist_page_entry_blocking(&dir, ka, page_a.as_bytes(), 200, &hdrs).unwrap();
+    // 仓库 B：新拉的 html 带新部署哈希 + B 的数据 → 入库后应为旧哈希 + B 数据
+    let page_b_raw = shell
+        .replace("{}", "repo B data")
+        .replace("main-Ab12Cd34.js", "main-XY98wv65.js")
+        .replace("app-PqRs56Tu.js", "app-LmNo12Op.js");
+    let kb = "GET github.com/octocat/repo-b-cloggedout-id-rk";
+    persist_page_entry_blocking(&dir, kb, page_b_raw.as_bytes(), 200, &hdrs).unwrap();
+    let ((_, _, body), _) = load_disk_entry_reason(kb, false).unwrap();
+    let s = String::from_utf8_lossy(&body);
+    assert!(
+        s.contains("main-Ab12Cd34.js") && s.contains("app-PqRs56Tu.js"),
+        "B 的快照应合成出底稿旧哈希: {s}"
+    );
+    assert!(s.contains("repo B data"), "数据区保留新内容");
+    assert!(!s.contains("main-XY98wv65"), "新哈希引用不得留在快照里");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v6.12 失效改标不删：写失效不再删 keep 快照，改把 mtime 拨过期（交旧+后台重拉）；重拉覆盖后自动解除。
+#[test]
+fn write_invalidation_marks_keep_snapshot_expired() {
+    let (dir, _g) = own_dir("stalemark");
+    let uri: http::Uri = "https://github.com/octocat/repo/".parse().unwrap();
+    let key = live_cache_key(&uri, "github.com", None, "id", "");
+    assert!(key.ends_with("-rk"), "{key}");
+    let hdrs = vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]];
+    // 正文要过 SEG_MIN_MATCH（32B）：更小的正文底稿立不住，读侧按"底稿缺失"判 miss（既有语义）
+    persist_page_entry_blocking(
+        &dir,
+        &key,
+        b"<html>repo v1 body with some padding to pass seg minimum</html>",
+        200,
+        &hdrs,
+    )
+    .unwrap();
+    let (_, expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(!expired, "新快照不该标过期");
+    // 写失效（父路径匹配仓库页）：快照不删，标过期，交旧
+    invalidate_prefix_blocking(&dir, "github.com", "/octocat/repo/forks");
+    assert!(
+        load_disk_entry(&key, false).is_some(),
+        "keep 快照不得被写失效删除"
+    );
+    let ((_, _, body), expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(expired, "写失效后快照必须标过期(交旧+后台重拉)");
+    assert_eq!(
+        body.as_ref(),
+        &b"<html>repo v1 body with some padding to pass seg minimum</html>"[..],
+        "交旧的体必须完整"
+    );
+    // 模拟后台重拉覆盖入库：mtime 复新 → 过期解除
+    persist_page_entry_blocking(
+        &dir,
+        &key,
+        b"<html>repo v2 body with some padding to pass seg minimum</html>",
+        200,
+        &hdrs,
+    )
+    .unwrap();
+    let ((_, _, body), expired) = load_disk_entry_reason(&key, false).unwrap();
+    assert!(!expired, "重拉覆盖后过期必须解除");
+    assert_eq!(
+        body.as_ref(),
+        &b"<html>repo v2 body with some padding to pass seg minimum</html>"[..]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

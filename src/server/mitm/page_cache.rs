@@ -1,11 +1,12 @@
-//! 页面缓存：github.com 列表页/仓库页快照按会话分存（pages/<hash>），闸门页/未登录页/跨账号不缓存；资产一律直连不缓存（实测 0 命中，机制已物理删除）。
+//! 页面缓存：github.com 列表页/仓库页快照按会话分存（pages/<hash>），闸门页/未登录页/跨账号不缓存；
+//! 仓库页交付走底稿合成（资产哈希冻结在底稿时代，浏览器资产缓存全程命中，数据取新拉正文）；资产一律直连不缓存（实测 0 命中，机制已物理删除）。
 use super::BoxBody;
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
 use crate::util::{lock, now_ms, LogFn};
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -255,6 +256,11 @@ pub(super) fn cache_take(
             (log)(&format!("[缓存] 本地 301 {}", req.uri().path()));
             return Some(resp);
         }
+        // v6.12 补盲区：仓库页 miss 带原因落日志（此前只有搜索页落，"(direct) 之谜"就卡在这没日志）。
+        (log)(&format!(
+            "[缓存] 仓库页未命中 {} (无尾杠快照,回源)",
+            req.uri().path()
+        ));
         return None;
     }
     let xhr = is_xhr_nav(req, host);
@@ -294,14 +300,18 @@ pub(super) fn cache_take(
         {
             Ok(v) => v,
             Err(reason) => {
+                let path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| req.uri().path().to_string());
                 // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
                 if search_page && reason != "无此条目" {
-                    let path = req
-                        .uri()
-                        .path_and_query()
-                        .map(|p| p.as_str().to_string())
-                        .unwrap_or_else(|| req.uri().path().to_string());
                     (log)(&format!("[缓存] 命中失败 {path} ({reason})"));
+                }
+                // v6.12 补盲区：仓库页 miss 一律带原因落日志（首访/被删/读侧拒绝都要看得见）。
+                if is_repo_home(req.uri().path()) {
+                    (log)(&format!("[缓存] 仓库页未命中 {path} ({reason})"));
                 }
                 return None;
             }
@@ -466,6 +476,9 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
                 }
                 CacheMsg::Invalidate { host, path } => {
                     invalidate_prefix_blocking(dir, &host, &path);
+                    (log)(&format!(
+                        "[缓存] 写后失效 {host}{path} (会话条目删除, keep 快照标过期)"
+                    ));
                 }
                 CacheMsg::Purge => {
                     let n = wipe_pages(dir);
@@ -606,7 +619,7 @@ fn live_cache_key(
     if is_home_path(uri.path())
         || (is_repo_home(uri.path()) && !uri.path().starts_with("/settings"))
     {
-        // v6.11：仓库页快照跨会话存 keep/、7 天重同步（旧壳由 immutable 缓存直出，数据走 XHR）；/settings/* 保持会话键；-rk 走底稿+增量，-k 全量。
+        // v6.11：仓库页快照跨会话存 keep/、7 天重同步（旧壳由 immutable 缓存直出，数据走 XHR）；/settings/* 保持会话键；-rk 走底稿+增量+资产合成（v6.12），-k 全量。
         if is_repo_home(uri.path()) {
             format!("{base}-rk")
         } else {
@@ -934,10 +947,14 @@ fn spawn_page_refetch(
             };
             let st = resp.status();
             if st != http::StatusCode::OK {
-                // 404/410 = 页面在上游已不存在 → 永久放弃（旧壳继续顶）
+                // 404/410 = 页面在上游已不存在 → 删该仓库的快照（相对底稿的增量/全量副本），底稿全局共用不动；
+                // 下次访问 miss 直连见真实 404，上游误报时直连重拉自动重建
                 if st == http::StatusCode::NOT_FOUND || st == http::StatusCode::GONE {
+                    let _ = std::fs::remove_file(
+                        entry_dir(&page_cache_dir(), &key).join(page_file_name(&key)),
+                    );
                     (log)(&format!(
-                        "[缓存] 页面重拉确认上游 {st}(页面已不存在), 放弃重拉, 旧壳继续"
+                        "[缓存] 页面重拉确认上游 {st}(页面已不存在), 删除快照, 下次访问直连见真实 404"
                     ));
                     page_refresh_done(&key);
                     return;
@@ -990,13 +1007,25 @@ fn spawn_page_refetch(
                 page_refresh_done(&key);
                 return;
             }
-            // ④ 覆盖入库（全量格式，替换旧快照）
-            let header = serde_json::json!({
-                "key": key,
-                "status": http::StatusCode::OK.as_u16(),
-                "headers": hdrs,
-            });
-            match write_entry_file(&page_cache_dir(), &key, &bytes, &header) {
+            // ④ 覆盖入库：-rk 走统一快照管道（底稿增量 + v6.12 资产合成），其余全量；
+            // 覆盖后 mtime 复新，写失效/时间过期的标记自动解除。
+            let result = if key.ends_with("-rk") {
+                persist_repo_snapshot(
+                    &page_cache_dir(),
+                    &key,
+                    &bytes,
+                    http::StatusCode::OK.as_u16(),
+                    &hdrs,
+                )
+            } else {
+                let header = serde_json::json!({
+                    "key": key,
+                    "status": http::StatusCode::OK.as_u16(),
+                    "headers": hdrs,
+                });
+                write_entry_file(&page_cache_dir(), &key, &bytes, &header)
+            };
+            match result {
                 Ok(_) => (log)(&format!(
                     "[缓存] 页面重拉完成, 快照已更新 (尝试 {attempt} 次)"
                 )),
@@ -1251,6 +1280,8 @@ fn persist_repo_snapshot(
             plain.clone()
         }
     };
+    // v6.12：入库即合成——快照正文的资产引用统一改回底稿旧哈希（交付侧已合成过，这里幂等兜底）
+    let plain = rebake_asset_refs(&base, &plain);
     let delta = seg_encode(&base, &plain);
     // 自动兜底：增量不比全量 gzip 体小 → 存全量（自愈，永不亏损）
     if delta.len() >= bytes.len() {
@@ -1268,6 +1299,178 @@ fn persist_repo_snapshot(
         "stoenc": "segs",
     });
     write_entry_file(dir, key, &delta, &header)
+}
+
+// ---------- 仓库页合成（v6.12：资产哈希冻结在底稿时代，数据取新拉正文） ----------
+
+/// githubassets 资产扩展名白名单：只合成这些，其余 /assets/ 命中不碰。
+const ASSET_EXTS: &[&str] = &[
+    "js", "mjs", "css", "woff", "woff2", "ttf", "eot", "png", "svg", "webp", "gif", "jpg", "jpeg",
+    "ico",
+];
+
+/// 真资产引用的边界："/assets/" 前面要么是 githubassets.com 域名收尾，要么是引号/括号（相对引用）。
+/// 仓库文件路径（/blob/main/assets/x）前面是路径字母——那是仓库内容不是 CDN 引用，排除掉。
+fn asset_boundary(html: &[u8], pos: usize) -> bool {
+    if pos == 0 {
+        return true;
+    }
+    matches!(html[pos - 1], b'"' | b'\'' | b'(')
+        || (pos >= 16 && &html[pos - 16..pos] == b"githubassets.com")
+}
+
+/// 扫 html 中所有 "/assets/<file>" 引用段（URL 字符集即止），返回字节区间。
+fn scan_asset_refs(html: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 8 <= html.len() {
+        if &html[i..i + 8] != b"/assets/" || !asset_boundary(html, i) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 8;
+        while end < html.len()
+            && matches!(
+                html[end],
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~'
+            )
+        {
+            end += 1;
+        }
+        if end > i + 8 {
+            out.push((i, end));
+        }
+        i = end;
+    }
+    out
+}
+
+/// 文件名拆 (词干, 扩展名)："main-BMPrzqAR.js" → ("main-BMPrzqAR", "js")。非白名单扩展名 = None。
+fn asset_stem_ext(filename: &str) -> Option<(&str, &str)> {
+    let (stem, ext) = filename.rsplit_once('.')?;
+    (!stem.is_empty() && ASSET_EXTS.contains(&ext)).then_some((stem, ext))
+}
+
+/// 在底稿引用表里找同资产的旧引用：同扩展名 + 词干最长公共前缀 ≥4 + 剩余段等长（6..=12、URL 字符集）。
+/// 剩余段就是内容哈希（同一站点的哈希长度恒定），等长约束把不同资产的名字差异挡在外面；
+/// 最长前缀保证命中真同名资产（GitHub 发版只换哈希不换资产名）。
+fn find_base_ref(stem: &str, ext: &str, base: &[(String, String, String)]) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for (path, stem_b, ext_b) in base {
+        if !ext_b.eq_ignore_ascii_case(ext) || !stem.is_ascii() || !stem_b.is_ascii() {
+            continue;
+        }
+        let lcp = stem
+            .bytes()
+            .zip(stem_b.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if lcp < 4 {
+            continue;
+        }
+        let rf = &stem[lcp..];
+        let rb = &stem_b[lcp..];
+        if rf.len() != rb.len() || !(6..=12).contains(&rf.len()) {
+            continue;
+        }
+        if !rf
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(bl, _)| lcp > *bl) {
+            best = Some((lcp, path.clone()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 仓库页合成：fresh 正文中的 githubassets 引用，凡底稿有同一资产的（同扩展名、同资产名、只是内容哈希新旧），
+/// 一律改写为底稿的旧引用——交付 html 的资产哈希停在底稿时代，浏览器资产缓存全程命中；
+/// 底稿没有的（新增资产）保留新引用，首访拉一次即冻结。同部署新旧哈希相同 = 零改写原样返回。
+fn rebake_asset_refs(base: &[u8], fresh: &[u8]) -> Vec<u8> {
+    let base_refs: Vec<(String, String, String)> = scan_asset_refs(base)
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let text = std::str::from_utf8(&base[s..e]).ok()?;
+            let (stem, ext) = asset_stem_ext(&text[8..])?;
+            Some((text.to_string(), stem.to_string(), ext.to_ascii_lowercase()))
+        })
+        .collect();
+    if base_refs.is_empty() {
+        return fresh.to_vec();
+    }
+    let base_names: HashSet<&str> = base_refs.iter().map(|(p, _, _)| &p[8..]).collect();
+    let mut decided: HashMap<String, Option<String>> = HashMap::new();
+    let mut plan: Vec<(usize, usize, String)> = Vec::new();
+    for (s, e) in scan_asset_refs(fresh) {
+        let Ok(text) = std::str::from_utf8(&fresh[s..e]) else {
+            continue;
+        };
+        let repl = decided
+            .entry(text.to_string())
+            .or_insert_with(|| {
+                let filename = &text[8..];
+                if base_names.contains(filename) {
+                    return None; // 同部署同名资产：原样
+                }
+                let Some((stem, ext)) = asset_stem_ext(filename) else {
+                    return None;
+                };
+                find_base_ref(stem, ext, &base_refs)
+            })
+            .clone();
+        if let Some(newpath) = repl {
+            plan.push((s, e, newpath));
+        }
+    }
+    if plan.is_empty() {
+        return fresh.to_vec();
+    }
+    let mut out = Vec::with_capacity(fresh.len());
+    let mut last = 0usize;
+    for (s, e, newpath) in plan {
+        out.extend_from_slice(&fresh[last..s]);
+        out.extend_from_slice(newpath.as_bytes());
+        last = e;
+    }
+    out.extend_from_slice(&fresh[last..]);
+    out
+}
+
+/// 仓库页交付/入库前的合成入口：底稿存在时把资产引用改回底稿旧哈希；正文无变化返回 false（零开销直通）。
+/// 合成后编码归一：原 gzip/br 一律重压 gzip（br 无压缩器可回写，与分段快照交付同一约定），identity 保持明文；
+/// content-length 剥掉由 hyper 按实际体重设。
+fn rebake_repo_html(bytes: &mut Bytes, hdrs: &mut hyper::HeaderMap) -> bool {
+    let Some(base) = load_repo_base(&page_cache_dir()) else {
+        return false; // 无底稿（全局首仓）：本页原样交付并立底稿
+    };
+    let enc = hdrs
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(body_encoding)
+        .unwrap_or("identity");
+    let plain = super::defuse::decompress_partial(bytes, enc, 64 << 20);
+    if plain.is_empty() {
+        return false;
+    }
+    let rebaked = rebake_asset_refs(&base, &plain);
+    if rebaked == plain {
+        return false;
+    }
+    hdrs.remove(hyper::header::CONTENT_LENGTH);
+    hdrs.remove(hyper::header::CONTENT_ENCODING);
+    if enc == "identity" {
+        *bytes = Bytes::from(rebaked);
+    } else {
+        hdrs.insert(
+            hyper::header::CONTENT_ENCODING,
+            hyper::header::HeaderValue::from_static("gzip"),
+        );
+        *bytes = Bytes::from(gz_compress(&rebaked));
+    }
+    true
 }
 
 /// no-store 一律不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号哈希分钥匙语义等价，全拒会干掉页面缓存。
@@ -1319,20 +1522,6 @@ async fn collect_and_submit(
             peek.extend_from_slice(&b);
         }
     }
-    // 污染/闸门检测要先解压才看得见标记。
-    let enc = parts
-        .headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(body_encoding)
-        .unwrap_or("identity");
-    // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
-    let cache_hdrs: Vec<Vec<String>> = parts
-        .headers
-        .iter()
-        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
-        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
-        .collect();
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let mut bytes = collected.to_bytes();
@@ -1342,6 +1531,25 @@ async fn collect_and_submit(
                 full.extend_from_slice(&bytes);
                 bytes = Bytes::from(full);
             }
+            // v6.12 仓库页合成：底稿存在时把资产引用改回底稿旧哈希再交付/入库（数据区仍是新拉的正文）。
+            // 合成会重写编码（br 无压缩器可回写→统一 gzip）与体积，编码/缓存头必须在合成之后取。
+            if key.ends_with("-rk") && ct.starts_with("text/html") {
+                rebake_repo_html(&mut bytes, &mut parts.headers);
+            }
+            // 污染/闸门检测要先解压才看得见标记。
+            let enc = parts
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .map(body_encoding)
+                .unwrap_or("identity");
+            // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
+            let cache_hdrs: Vec<Vec<String>> = parts
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+                .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+                .collect();
             // 不缓存"顶替真实内容"的页：未登录页（会话已死）与各类闸门页。
             let plain = plain_prefix(&bytes, enc);
             // 首页骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
@@ -1402,6 +1610,17 @@ async fn collect_and_submit(
     }
 }
 
+/// keep 条目“改标过期”（v6.12）：mtime 拨到保质期线之外——读侧年龄判定自然按过期处理（交旧 + 后台重拉），
+/// 重拉覆盖入库后 mtime 复新，标记自动解除。set_times 让“只标不删”不需要任何额外状态。
+fn mark_entry_expired(p: &std::path::Path) {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) else {
+        return; // 文件已不在（并发自愈删除）：无需标记
+    };
+    let past =
+        std::time::SystemTime::now() - std::time::Duration::from_millis(KEEP_MAX_AGE_MS + 60_000);
+    let _ = f.set_times(std::fs::FileTimes::new().set_modified(past));
+}
+
 /// 写后失效：前缀匹配，父路径也匹配（写端点多是子路径；至少两级，免得 /o 扫全表）。
 fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
     let mut prefixes = vec![format!("GET {host}{path}")];
@@ -1411,14 +1630,23 @@ fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) {
             prefixes.push(format!("GET {host}{parent}"));
         }
     }
-    // 会话条目在 pages/，仓库页快照在 keep/（v6.11 起仓库页换 -k 键），两处都要扫。
+    // 会话条目在 pages/（照删）；仓库页快照/首页骨架在 keep/（v6.12 起不删——标数据过期：
+    // 旧壳照常可交，下次命中走既有 SWR 管道交旧 + 后台重拉，重拉覆盖后自动解除）。
     for sub in ["pages", "keep"] {
         let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
             continue;
         };
         for e in rd.flatten() {
             let p = e.path();
-            if read_page_key(&p).is_some_and(|k| prefixes.iter().any(|pre| k.starts_with(pre))) {
+            let Some(key) = read_page_key(&p) else {
+                continue;
+            };
+            if !prefixes.iter().any(|pre| key.starts_with(pre)) {
+                continue;
+            }
+            if sub == "keep" {
+                mark_entry_expired(&p);
+            } else {
                 let _ = std::fs::remove_file(&p);
             }
         }

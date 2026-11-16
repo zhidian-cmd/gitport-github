@@ -338,7 +338,7 @@ gitport-github/
    │       ├─ mirror.rs    镜像链、ECT 竞速、身份头剥除、失败降权
    │       ├─ direct_split.rs 直连多段（媒体白名单）
    │       ├─ merge.rs     段合并、让位、补发、偏移校验
-   │       ├─ page_cache.rs 页面缓存（github.com HTML 列表页 + 白名单 XHR）
+   │       ├─ page_cache.rs 页面缓存（列表页/仓库页快照 + 白名单 XHR；仓库页交底稿合成壳：资产哈希冻结在底稿时代，数据取新拉正文）
    │       ├─ defuse.rs    风控页识别（403 restricted / 400 Whoa）与换 IP
    │       ├─ redirect_memo.rs 头像 302 记忆（6 小时 TTL）
    │       └─ quiet.rs     日志降噪（同 host 只留首条 / 按分钟聚合）
@@ -365,6 +365,7 @@ gitport-github/
 6. CA 只为受管域名签发；ACL 收紧失败必须禁用 MITM。
 7. 代理只绑 `127.0.0.1`；非受管域名只放行 443。
 8. 风控冷却只能到期自愈，不能 `clear()`。
+9. 仓库页快照的资产引用永远取底稿（旧哈希），数据取新拉正文——改这条会重现"每次进仓库全量拉 githubassets"。
 
 ## 13. 改动影响面
 
