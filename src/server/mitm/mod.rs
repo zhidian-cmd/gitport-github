@@ -12,10 +12,12 @@ use hyper_util::rt::TokioExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+ mod asset_store;
  mod defuse;
  mod direct_split;
  mod merge;
  mod page_cache;
+ mod parse;
  mod switchboard;
 pub(crate) mod quiet;
 mod redirect_memo;
