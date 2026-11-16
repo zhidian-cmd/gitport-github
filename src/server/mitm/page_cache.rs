@@ -1,7 +1,7 @@
 //! 页面缓存：github.com 列表页/首页骨架按会话分存（pages/<hash>），闸门页/未登录页/跨账号不缓存；
-//! 仓库页走仓库胚管线（html 永不缓存：资产引用冻结在骨架胚里按位置换装，其余每次真拉真交付）；
-//! githubassets 资产按 URL 入库本地透明回放（immutable 一存永逸）。
-use super::{asset_store, parse, BoxBody};
+//! 仓库页不缓存（零转换直出——html 永远新鲜；跨发版冻结资产引用 = 旧 JS 配新数据，实测白屏）；
+//! githubassets 资产按 URL 入库本地透明回放（immutable 一存永逸，时代中立：URL 即内容指纹）。
+use super::{asset_store, BoxBody};
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
 use crate::util::{lock, now_ms, LogFn};
@@ -85,20 +85,6 @@ fn is_home_path(path: &str) -> bool {
 /// 搜索列表页：翻页走 React 软导航，必须按路径认而不是按导航形态认，否则翻页永远不入缓存。
 fn is_search_page(path: &str) -> bool {
     path == "/search"
-}
-
-/// 仓库首页：/owner/repo（两段，可带尾斜杠）。整页 HTML 列表语义。
-fn is_repo_home(path: &str) -> bool {
-    path.split('/').filter(|s| !s.is_empty()).count() == 2 && !path.is_empty()
-}
-
-/// 缓存键的路径归一：仓库首页补尾斜杠（/owner/repo 与 /owner/repo/ 同键）。
-fn canonical_path(path: &str) -> String {
-    if is_repo_home(path) && !path.ends_with('/') {
-        format!("{path}/")
-    } else {
-        path.to_string()
-    }
 }
 
 /// 键尾 -k 进跨会话 keep/，其余进会话目录 pages/（清盘只清后者）；v6.9 资产缓存已物理删除。
@@ -224,7 +210,7 @@ fn cache_eligible_rules(
             .unwrap_or(false)
         && (is_xhr_path(path)
             || is_search_page(path)
-            || (doc_nav && (is_list_path(path) || is_home_path(path) || is_repo_home(path))))
+            || (doc_nav && (is_list_path(path) || is_home_path(path))))
 }
 
 /// 取路由：命中 = 纯本地读；未命中/空闲后第一页 = None，走上游。
@@ -245,10 +231,6 @@ pub(super) fn cache_take<B>(
             }
             return Some(resp);
         }
-        return None;
-    }
-    // 仓库页：put 侧仓库胚管线接管（html 永不缓存），取侧永远无货。
-    if repo_embryo_eligible(req, host) {
         return None;
     }
     let xhr = is_xhr_nav(req, host);
@@ -343,11 +325,7 @@ pub(super) async fn cache_put(
     if host == asset_store::ASSET_HOST {
         return collect_asset(log, req, resp).await;
     }
-    // ② 仓库胚管线：github.com 两段页面（硬/软导航同管线），html 永不缓存。
-    if repo_embryo_eligible(req, host) {
-        return repo_embryo_pipeline(log, req, resp).await;
-    }
-    // ③ 其余页面：原有准入/收集/入库流程。
+    // ② 其余页面：原有准入/收集/入库流程（仓库页在准入里排除——html 永不缓存、零转换直出）。
     // 拒存日志只认主站 /search，全量打会淹没日志。
     let search_dbg = host == CACHE_HOST
         && req.method() == Method::GET
@@ -618,7 +596,7 @@ fn live_cache_key(
     let base = page_cache_key(uri, host, cookies, enc);
     if is_home_path(uri.path()) {
         // v6.11：首页骨架跨会话存 keep/、7 天重同步（旧壳 immutable 直出，数据走 XHR）。
-        // 仓库页不走缓存键：put 侧仓库胚管线接管（html 永不缓存）。
+        // 仓库页不缓存（html 零转换直出），其余带会话号。
         format!("{base}-k")
     } else {
         format!("{base}{variant}-s{}", SESSION_EPOCH.load(Ordering::Relaxed))
@@ -626,7 +604,7 @@ fn live_cache_key(
 }
 
 fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) -> String {
-    let path = canonical_path(uri.path());
+    let path = uri.path();
     let q = uri
         .query()
         .map(|q| normalize_query(uri.path(), q))
@@ -1013,56 +991,6 @@ fn maybe_wipe_on_growth(dir: &std::path::Path, written: usize) {
     }
 }
 
-// ---------- 仓库胚（资产骨架，全局唯一一份，只有解析管线能换胚） ----------
-
-/// 胚文件：冻结的外链资产引用 + importmap 指纹。
-const EMBRYO_FILE: &str = "embryo.json";
-/// 胚保质期：GitHub 改版后旧骨架引用的资产仍在 CDN（immutable），超期强制重剥换代。
-const EMBRYO_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
-fn embryo_path(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join(EMBRYO_FILE)
-}
-
-/// 读胚：骨架 + 文件年龄（毫秒）。取不到时刻（时钟回拨）按超期处理。
-fn load_embryo(dir: &std::path::Path) -> Option<(parse::Skeleton, u64)> {
-    let raw = std::fs::read(embryo_path(dir)).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let refs: Vec<String> = v
-        .get("refs")?
-        .as_array()?
-        .iter()
-        .map(|r| r.as_str().map(str::to_string))
-        .collect::<Option<Vec<_>>>()?;
-    let import_fp = v.get("import_fp")?.as_u64()?;
-    let age = std::fs::metadata(embryo_path(dir))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(u64::MAX);
-    Some((parse::Skeleton { refs, import_fp }, age))
-}
-
-/// 换胚：tmp+rename 原子覆盖，永远存不出半截胚。
-fn store_embryo(dir: &std::path::Path, sk: &parse::Skeleton) {
-    let json = serde_json::json!({"refs": sk.refs, "import_fp": sk.import_fp});
-    let tmp = dir.join("tmp");
-    let _ = std::fs::create_dir_all(&tmp);
-    let tmp_path = tmp.join(EMBRYO_FILE);
-    if std::fs::write(&tmp_path, json.to_string().as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp_path, embryo_path(dir));
-    }
-}
-
-/// 明文 → gzip（换装交付用：头里 content-encoding 与重压后的体保持一致）。
-fn gz_compress(plain: &[u8]) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let _ = e.write_all(plain);
-    e.finish().unwrap_or_default()
-}
-
 /// 条目落盘：tmp 写全量 + rename 原子覆盖，永远存不出半页。
 fn write_entry_file(
     dir: &std::path::Path,
@@ -1250,7 +1178,7 @@ async fn collect_and_submit(
     }
 }
 
-// ---------- 仓库胚管线（html 永不缓存：资产引用按位置换装，其余每次真拉真交付） ----------
+// ---------- 资产库入库（githubassets → 本地回放） ----------
 
 /// 资产库键：完整 URL（含查询串）。
 fn asset_request_url<B>(req: &hyper::Request<B>, host: &str) -> String {
@@ -1267,18 +1195,7 @@ fn asset_dbg_name(url: &str) -> &str {
     url.rsplit('/').next().unwrap_or(url)
 }
 
-/// 仓库胚管线准入门：github.com 的两段非 XHR 页面（含产品页——骨架按页面形状自校正：
-/// 形状不符即重剥）。/settings/* 与 XHR 名单不进管线。
-fn repo_embryo_eligible<B>(req: &hyper::Request<B>, host: &str) -> bool {
-    host == CACHE_HOST
-        && req.method() == Method::GET
-        && is_repo_home(req.uri().path())
-        && !is_xhr_path(req.uri().path())
-        && !req.uri().path().starts_with("/settings")
-}
-
-/// 资产入库分支：收集白名单内的 200 体投管家保存（响应原样交回浏览器，不等写盘）；
-/// 上游 404/410 = 冻结引用被上游判死 → 剔胚自愈，下次访问重剥新骨架。
+/// 资产入库分支：收集白名单内的 200 体投管家保存（响应原样交回浏览器，不等写盘）。
 async fn collect_asset<B>(
     log: &LogFn,
     req: &hyper::Request<B>,
@@ -1287,14 +1204,6 @@ async fn collect_asset<B>(
     let url = asset_request_url(req, asset_store::ASSET_HOST);
     let name = asset_dbg_name(&url).to_string();
     let (mut parts, body) = resp.into_parts();
-    if parts.status == StatusCode::NOT_FOUND || parts.status == StatusCode::GONE {
-        let _ = std::fs::remove_file(embryo_path(&page_cache_dir()));
-        (log)(&format!(
-            "[资产] 上游 {} {name} (冻结引用已死, 胚失效下次重剥)",
-            parts.status.as_u16()
-        ));
-        return hyper::Response::from_parts(parts, body);
-    }
     if parts.status != StatusCode::OK {
         return hyper::Response::from_parts(parts, body);
     }
@@ -1354,132 +1263,6 @@ async fn collect_asset<B>(
         }
     }
     hyper::Response::from_parts(parts, protocol::full_body(bytes))
-}
-
-/// 按请求编码桶交付换装后的明文：identity 桶交明文剥编码头，其余统一重压 gzip。
-fn deliver_per_bucket<B>(
-    req: &hyper::Request<B>,
-    mut parts: http::response::Parts,
-    plain: Bytes,
-) -> axum::response::Response<BoxBody> {
-    parts.headers.remove("content-length");
-    parts.headers.remove("content-encoding");
-    let body = if upstream::encoding_bucket(req) == "identity" {
-        plain
-    } else {
-        parts.headers.insert(
-            "content-encoding",
-            hyper::header::HeaderValue::from_static("gzip"),
-        );
-        Bytes::from(gz_compress(&plain))
-    };
-    hyper::Response::from_parts(parts, protocol::full_body(body))
-}
-
-/// 仓库胚管线：真拉 html → 抽骨架 → 该重剥重剥 → 同部署零改动直通 → 发版则按位置换装交付。
-/// html 本体永不落盘（数据每次都是新的）；任何一步失败都降级直出真页。
-async fn repo_embryo_pipeline<B>(
-    log: &LogFn,
-    req: &hyper::Request<B>,
-    resp: axum::response::Response<BoxBody>,
-) -> axum::response::Response<BoxBody> {
-    let (mut parts, body) = resp.into_parts();
-    let ct_ok = parts.status == StatusCode::OK
-        && parts
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .starts_with("text/html");
-    if !ct_ok {
-        return hyper::Response::from_parts(parts, body);
-    }
-    // 嗅探读走的前几帧要拼回，否则解析半页。
-    let mut peek: Vec<u8> = Vec::new();
-    if let Some(p) = parts.extensions.remove::<super::PeekRaw>() {
-        for b in p.0 {
-            peek.extend_from_slice(&b);
-        }
-    }
-    let bytes = match http_body_util::BodyExt::collect(body).await {
-        Ok(c) => {
-            let collected = c.to_bytes();
-            if peek.is_empty() {
-                collected
-            } else {
-                let mut full = Vec::with_capacity(peek.len() + collected.len());
-                full.extend_from_slice(&peek);
-                full.extend_from_slice(&collected);
-                Bytes::from(full)
-            }
-        }
-        Err(_) => {
-            return hyper::Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(protocol::full_body(Bytes::from_static(
-                    b"page collect failed",
-                )))
-                .unwrap();
-        }
-    };
-    let enc = parts
-        .headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(body_encoding)
-        .unwrap_or("identity");
-    let plain = super::defuse::decompress_partial(&bytes, enc, 64 << 20);
-    let Ok(html) = String::from_utf8(plain) else {
-        (log)("[解析] 失败 解码: 正文非 UTF-8, 直出");
-        return hyper::Response::from_parts(parts, protocol::full_body(bytes));
-    };
-    // 完整文档闸：软导航片段（无 </html>）不碰胚——片段形状与整页不同，混进来会让胚反复换形。
-    if !html_complete(html.as_bytes(), "identity") {
-        if super::quiet::first_time("parsefrag", req.uri().path()) {
-            (log)(&format!(
-                "[解析] 片段不立胚 {} 直出",
-                req.uri().path()
-            ));
-        }
-        return hyper::Response::from_parts(parts, protocol::full_body(bytes));
-    }
-    let fresh = match parse::extract_skeleton(&html) {
-        Some(s) => s,
-        None => {
-            (log)("[解析] 失败 抽取: 未找到资产引用, 直出");
-            return hyper::Response::from_parts(parts, protocol::full_body(bytes));
-        }
-    };
-    let dir = page_cache_dir();
-    let existing = load_embryo(&dir);
-    let rebuild_reason = match &existing {
-        None => Some("首次"),
-        Some((_, age)) if *age > EMBRYO_TTL_MS => Some("超期"),
-        Some((e, _)) if e.import_fp != fresh.import_fp => Some("importmap变更"),
-        Some((e, _)) if e.refs.len() != fresh.refs.len() => Some("结构变化"),
-        Some(_) => None,
-    };
-    if let Some(reason) = rebuild_reason {
-        store_embryo(&dir, &fresh);
-        (log)(&format!(
-            "[解析] 立胚 资产引用 {} 条 ({reason}), 本次直出",
-            fresh.refs.len()
-        ));
-        return hyper::Response::from_parts(parts, protocol::full_body(bytes));
-    }
-    let frozen = existing.expect("无重剥原因蕴含已有骨架");
-    match parse::swap_asset_refs(&html, &frozen.0.refs) {
-        Some((swapped, n)) if n > 0 => {
-            (log)(&format!("[解析] 资产引用换旧 {n} 处 (GitHub 已发版)"));
-            deliver_per_bucket(req, parts, Bytes::from(swapped))
-        }
-        Some((_, _)) => hyper::Response::from_parts(parts, protocol::full_body(bytes)),
-        None => {
-            (log)("[解析] 失败 换装: 引用数与胚不符, 直出");
-            hyper::Response::from_parts(parts, protocol::full_body(bytes))
-        }
-    }
 }
 
 /// keep 条目“改标过期”（v6.12）：mtime 拨到保质期线之外——读侧年龄判定自然按过期处理（交旧 + 后台重拉），

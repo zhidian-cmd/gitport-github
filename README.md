@@ -6,7 +6,7 @@ Windows 本地 GitHub 加速代理：按 `routes.json` 给 GitHub 系域名选 I
 
 - 不写系统 hosts，不写 `http.sslVerify=false`
 - 不做全局代理：非 GitHub 域名只放行 443 隧道，其余一律 `502`
-- 不缓存 `github.com` 的 html（仓库页走"骨架胚 + 每次真拉"，列表页按会话短存）；githubassets 的 js/css/字体入库一份本地透明回放
+- 不缓存 `github.com` 的 html（仓库页零转换直出，列表页/首页按会话或 7 天短存）；githubassets 的 js/css/字体入库一份本地透明回放
 - 不给镜像下载做内容校验（见下文"镜像"）
 - 不需要管理员权限
 

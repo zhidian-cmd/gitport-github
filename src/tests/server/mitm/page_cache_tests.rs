@@ -73,15 +73,15 @@ fn no_cache_header_bypasses_cache() {
         None,
         true
     ));
-    // 仓库首页（两段）现在准入：v6.2 起仓库页入缓存
-    assert!(cache_eligible_rules(
+    // 仓库首页（两段）不再缓存：v7 起仓库页零转换直出（html 永不缓存）
+    assert!(!cache_eligible_rules(
         "github.com",
         &Method::GET,
         "/octocat/repo",
         None,
         true
     ));
-    assert!(cache_eligible_rules(
+    assert!(!cache_eligible_rules(
         "github.com",
         &Method::GET,
         "/octocat/repo/",
@@ -131,17 +131,6 @@ fn search_query_normalization() {
     let p2 = mk("/search", Some("q=rust&type=repositories&p=2"));
     assert_ne!(p2, base, "p=2 与默认页必须不同键");
     assert!(p2.contains("p=2"));
-}
-
-/// v6.2：仓库首页键归一（/owner/repo 与 /owner/repo/ 同键）。
-#[test]
-fn repo_home_canonical() {
-    let mk = |path: &str| page_cache_key(&path.parse::<http::Uri>().unwrap(), "github.com", None, "br");
-    assert_eq!(
-        mk("/octocat/repo"),
-        mk("/octocat/repo/"),
-        "仓库首页无尾杠与有尾杠必须同键"
-    );
 }
 
 /// 软导航的 /search 翻页也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页永远不入缓存；非 /search 软导航照旧不收。
@@ -866,9 +855,9 @@ fn write_invalidation_marks_keep_snapshot_expired() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------- v7 仓库胚管线 + 资产库 ----------
+// ---------- v7 资产库 ----------
 
-/// 日志捕获：断言 [解析]/[资产] 行。
+/// 日志捕获：断言 [资产] 行。
 fn log_capture() -> (LogFn, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = cap.clone();
@@ -882,26 +871,6 @@ fn log_capture() -> (LogFn, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     )
 }
 
-/// 胚管线 fixture：同构页面只换外链资产哈希；importmap 与 nonce 恒定（nonce 代表 fresh 面）。
-fn embryo_html(css: &str, core: &str, nonce: &str) -> String {
-    format!(
-        "<html><head>\n\
-         <link rel=\"stylesheet\" href=\"https://github.githubassets.com/assets/primer-{css}.css\" />\n\
-         <script crossorigin=\"anonymous\" type=\"module\" src=\"https://github.githubassets.com/assets/core-{core}.js\" defer=\"defer\"></script>\n\
-         <script type=\"importmap\">{{\"imports\":{{\"react\":\"https://github.githubassets.com/assets/react-fixed000.js\"}}}}</script>\n\
-         <meta name=\"html-safe-nonce\" content=\"{nonce}\">\n\
-         </head><body><div data-target=\"react-app.reactRoot\"></div></body></html>"
-    )
-}
-
-fn plain_html_resp(html: &str) -> axum::response::Response<BoxBody> {
-    hyper::Response::builder()
-        .status(200)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(protocol::full_body(Bytes::from(html.to_string())))
-        .unwrap()
-}
-
 fn get_req(uri: &str) -> hyper::Request<BoxBody> {
     hyper::Request::builder()
         .method(hyper::Method::GET)
@@ -910,116 +879,9 @@ fn get_req(uri: &str) -> hyper::Request<BoxBody> {
         .unwrap()
 }
 
-async fn resp_body(resp: axum::response::Response<BoxBody>) -> String {
-    String::from_utf8_lossy(
-        &http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .unwrap()
-            .to_bytes(),
-    )
-    .into_owned()
-}
-
-/// v7 管线三连：首次立胚直出 → 同部署零换装 → GitHub 发版（新哈希）按位置换回旧引用，
-/// 且 nonce/数据面保持 fresh；胚只此一份、管线独占写。
+/// v7 资产分支：白名单 200 入库 → cache_take 本地回放。
 #[tokio::test]
-async fn repo_embryo_pipeline_establishes_then_swaps() {
-    let (dir, _g) = own_dir("embryo");
-    let (log, lines) = log_capture();
-    let req = get_req("https://github.com/octocat/repo/");
-
-    // ① 首次：立胚 + 直出
-    let out = repo_embryo_pipeline(
-        &log,
-        &req,
-        plain_html_resp(&embryo_html("aaaa1111", "cccc3333", "n1")),
-    )
-    .await;
-    let body = resp_body(out).await;
-    assert!(body.contains("primer-aaaa1111.css"), "首次直出: {body}");
-    assert!(
-        lines
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|l| l.contains("立胚") && l.contains("首次")),
-        "立胚必须落日志"
-    );
-    assert!(dir.join("embryo.json").exists(), "胚必须落盘");
-
-    // ② 同部署：零换装
-    let _ = repo_embryo_pipeline(
-        &log,
-        &req,
-        plain_html_resp(&embryo_html("aaaa1111", "cccc3333", "n2")),
-    )
-    .await;
-    assert!(
-        !lines
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|l| l.contains("换旧")),
-        "同部署不得换装"
-    );
-
-    // ③ 发版：fresh 全新哈希 → 按位置换回旧引用；nonce（fresh 面）不换
-    let out = repo_embryo_pipeline(
-        &log,
-        &req,
-        plain_html_resp(&embryo_html("ffff6666", "iiii9999", "n3")),
-    )
-    .await;
-    let body = resp_body(out).await;
-    let lines_now = lines.lock().unwrap_or_else(|p| p.into_inner()).join(" | ");
-    assert!(body.contains("primer-aaaa1111.css"), "换回旧引用: {body}");
-    assert!(body.contains("core-cccc3333.js"), "入口脚本换旧");
-    assert!(!body.contains("primer-ffff6666"), "新哈希不得残留");
-    assert!(
-        body.contains("content=\"n3\""),
-        "nonce/数据面保持 fresh: body={body} | logs={lines_now}"
-    );
-    assert!(
-        lines
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|l| l.contains("换旧") && l.contains("2 处")),
-        "换装计数必须落日志"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// v7 片段闸：软导航片段（无 </html>）不碰胚——形状混入会让胚反复换形（conduit 事件的教训）。
-#[tokio::test]
-async fn repo_embryo_pipeline_ignores_fragments() {
-    let (dir, _g) = own_dir("frag");
-    let (log, _lines) = log_capture();
-    let req = get_req("https://github.com/octocat/repo/");
-    // 先立一个正常胚
-    let _ = repo_embryo_pipeline(
-        &log,
-        &req,
-        plain_html_resp(&embryo_html("aaaa1111", "cccc3333", "n1")),
-    )
-    .await;
-    assert!(dir.join("embryo.json").exists(), "前提：胚已立");
-    // 片段（无 </html>，带资产引用）：原样直出且不换胚
-    let frag = "<link rel=\"stylesheet\" href=\"https://github.githubassets.com/assets/fragment-9999.css\" /><div>fragment body</div>";
-    let out = repo_embryo_pipeline(&log, &req, plain_html_resp(frag)).await;
-    let body = resp_body(out).await;
-    assert!(body.contains("fragment-9999.css"), "片段原样直出: {body}");
-    let e = std::fs::read_to_string(dir.join("embryo.json")).unwrap();
-    assert!(
-        !e.contains("fragment-9999"),
-        "片段不得换胚: {e}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// v7 资产分支：白名单 200 入库 → cache_take 本地回放；上游 404 剔胚自愈。
-#[tokio::test]
-async fn asset_branch_stores_replays_and_heals() {
+async fn asset_branch_stores_and_replays() {
     let (dir, _g) = own_dir("assets");
     let (log, _lines) = log_capture();
     let url = "https://github.githubassets.com/assets/core-cccc3333.js";
@@ -1052,24 +914,5 @@ async fn asset_branch_stores_replays_and_heals() {
     // 回放：cache_take 本地命中
     let hit = cache_take(&log, &req, asset_store::ASSET_HOST).expect("必须本地命中");
     assert_eq!(hit.status(), 200);
-
-    // 404 → 剔胚自愈（冻结引用被上游判死）
-    let repo_req = get_req("https://github.com/octocat/repo/");
-    let _ = repo_embryo_pipeline(
-        &log,
-        &repo_req,
-        plain_html_resp(&embryo_html("aaaa1111", "cccc3333", "n1")),
-    )
-    .await;
-    assert!(dir.join("embryo.json").exists(), "前提：胚已立");
-    let not_found = hyper::Response::builder()
-        .status(404)
-        .body(protocol::full_body(Bytes::new()))
-        .unwrap();
-    let _ = collect_asset(&log, &req, not_found).await;
-    assert!(
-        !dir.join("embryo.json").exists(),
-        "404 必须剔胚（冻结引用已死）"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }

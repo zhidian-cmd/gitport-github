@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
  mod direct_split;
  mod merge;
  mod page_cache;
- mod parse;
  mod switchboard;
 pub(crate) mod quiet;
 mod redirect_memo;

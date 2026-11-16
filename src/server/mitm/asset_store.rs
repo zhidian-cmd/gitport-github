@@ -1,13 +1,23 @@
 //! githubassets 资产库：immutable 资产按 URL 一存永逸，本地透明回放。
 //! 键 = 完整 URL；条目 = [4B 头长][头 json(key/status/headers)][体]，tmp+rename 原子覆盖。
 //! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量攒够整库清空（资产可再生）。
+//! 时代中立：URL 即内容指纹，同 URL 永远同字节，永不跨发版给错内容。
 
-use super::parse::fnv1a;
 use crate::server::protocol::{self, BoxBody};
 use bytes::Bytes;
 use http::StatusCode;
 
 pub(super) const ASSET_HOST: &str = "github.githubassets.com";
+
+/// FNV-1a 64：URL → 文件名，跨进程确定，零依赖。
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// 资产库容量上限：攒够整库清空（资产可再生，不做淘汰排序）。
 const ASSET_MAX_BYTES: u64 = 200 * 1024 * 1024;

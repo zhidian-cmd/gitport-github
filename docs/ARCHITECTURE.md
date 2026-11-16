@@ -33,7 +33,6 @@ flowchart LR
         DSP[server/mitm/direct_split.rs]
         MRG[server/mitm/merge.rs]
         PC[server/mitm/page_cache.rs]
-        PARSE[server/mitm/parse.rs]
         AST[server/mitm/asset_store.rs]
         DEF[server/mitm/defuse.rs]
         QUIET[server/mitm/quiet.rs]
@@ -64,7 +63,6 @@ flowchart LR
     SRV --> MITM
     MITM --> SWB
     MITM --> PC
-    PC --> PARSE
     PC --> AST
     SWB --> MIR
     SWB --> DSP
@@ -342,9 +340,8 @@ gitport-github/
    │       ├─ mirror.rs    镜像链、ECT 竞速、身份头剥除、失败降权
    │       ├─ direct_split.rs 直连多段（媒体白名单）
    │       ├─ merge.rs     段合并、让位、补发、偏移校验
-   │       ├─ page_cache.rs 页面缓存（列表页/首页骨架 + 白名单 XHR；仓库页走骨架胚管线，html 永不缓存）
-   │       ├─ parse.rs 仓库页解析：抽资产骨架 / 按位置换装（GitHub 改版只改这里的扫描规则）
-   │       ├─ asset_store.rs githubassets 资产库（immutable 资产一存永逸，本地透明回放）
+   │       ├─ page_cache.rs 页面缓存（列表页/首页骨架 + 白名单 XHR；仓库页零转换直出，html 永不缓存）
+   │       ├─ asset_store.rs githubassets 资产库（immutable 资产一存永逸，本地透明回放，时代中立）
    │       ├─ defuse.rs    风控页识别（403 restricted / 400 Whoa）与换 IP
    │       ├─ redirect_memo.rs 头像 302 记忆（6 小时 TTL）
    │       └─ quiet.rs     日志降噪（同 host 只留首条 / 按分钟聚合）
@@ -371,7 +368,7 @@ gitport-github/
 6. CA 只为受管域名签发；ACL 收紧失败必须禁用 MITM。
 7. 代理只绑 `127.0.0.1`；非受管域名只放行 443。
 8. 风控冷却只能到期自愈，不能 `clear()`。
-9. 仓库页 html 永不缓存：资产引用冻结在骨架胚（embryo.json）里按位置换装，其余每次真拉真交付；软导航片段（无结尾标记的响应）不进胚管线——改回"缓存 html"会重现快照自毁/数据过期那一整类问题。
+9. 仓库页 html 永不缓存且零转换直出；资产库逐 URL 回放、时代中立（URL 即内容指纹）——跨发版冻结/换装资产引用会让旧 JS 配新数据白屏（实测），禁止回加。
 
 ## 13. 改动影响面
 
@@ -380,6 +377,6 @@ gitport-github/
 | 路由语义 | `pool/route.rs`、`routes.json` 兼容、PAC 名单 | `HostMeta`/`IpNode` 回写格式 |
 | 通道策略 | `config.rs` 常量、`get_or_build`、`status.rs` | 常量是架构不是旋钮 |
 | 镜像 | `mirror.rs` 校验与降权、`merge.rs` 段边界 | 新增信任假设必须同时给校验手段 |
-| 缓存 | `page_cache.rs` 键与目录、清盘阈值；`parse.rs` 扫描规则；`asset_store.rs` 收录门 | 键含会话身份，跨账号串页是硬伤；GitHub 改版先看 CACHE.md 判读表 |
+| 缓存 | `page_cache.rs` 键与目录、清盘阈值；`asset_store.rs` 收录门 | 键含会话身份，跨账号串页是硬伤；禁止回加"html 缓存/引用冻结"（白屏教训，见 CACHE.md） |
 | 系统写入 | `settings.rs` 备份/还原判定 | "只还原自己写的"不能松 |
 | CA | `certgen.rs` 签发范围、`winsec.rs` ACL | ACL 失败必须禁用 MITM |
