@@ -336,8 +336,7 @@ struct WorkerMirrorsBody {
     mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），并回传规范化后的注册表。
-/// 新增的镜像在后台做用法试探：命中存模板（此后照模板用），全不中则摘出注册表。
+/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），新增的后台探测用法、命中存模板，全不中摘出注册表。
 async fn api_worker_mirrors(
     State(st): State<Arc<App>>,
     axum::Json(body): axum::Json<WorkerMirrorsBody>,
@@ -431,8 +430,7 @@ async fn api_calib_status() -> Response {
 }
 
 async fn api_show() -> Response {
-    // 界面已死的旧实例必须让位：它占着单实例锁会让所有新启动静默消失（实测踩到）。
-    // 回 ok:false 后自退，新实例等锁释放即接管。
+    // 界面已死的旧实例必须让位：它占着单实例锁会让新启动静默消失（实测踩到）；回 ok:false 后自退，新实例等锁接管。
     if crate::desktop::ui_dead() {
         crate::desktop::quit_via_proxy();
         write_json(&serde_json::json!({"ok": false, "error": "界面不可用, 旧实例退出中"}))

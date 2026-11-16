@@ -144,10 +144,7 @@ fn repo_home_canonical() {
     );
 }
 
-/// v6.11 仓库页快照跨会话：-k 进 keep/，空闲清盘/重启不丢（发版换哈希在窗口内
-/// 隐身——旧壳引用旧 chunk，浏览器 immutable 缓存直出；数据走 XHR 实时）。
-/// 写失效（star/评论等深层写路径）必须能扫进 keep/ 命中它。
-// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+/// v6.11 仓库页快照跨会话：-k 进 keep/ 不丢（旧壳 immutable 直出、数据走 XHR），写失效必须扫进 keep/ 命中；跨 await 持 own_dir 锁是本意。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn repo_home_snapshot_cross_session() {
@@ -181,8 +178,7 @@ async fn repo_home_snapshot_cross_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// v6.11 分段增量编解码：底稿+增量往返无损（同壳不同身份/长度变化/完全不同三档全测），
-/// 同壳页面的增量必须显著小于全量（体积断言）。
+/// v6.11 分段增量编解码：底稿+增量往返无损（同壳不同身份/长度/全不同三档），增量必须显著小于全量。
 #[test]
 fn seg_delta_roundtrip_and_volume() {
     let mut base = String::from("<html><head><title>shell</title>");
@@ -218,7 +214,7 @@ fn seg_delta_roundtrip_and_volume() {
     assert_eq!(back.as_slice(), alien.as_bytes(), "完全不同页面往返必须无损");
 }
 
-/// 搜索翻页页按软导航（sec-fetch-dest: empty → doc_nav=false）也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页页永远不入缓存；非 /search 软导航照旧不收（维持原有防杂收口）。
+/// 软导航的 /search 翻页也要能进缓存：GitHub 翻页是 React 软导航，按导航形态收会让翻页永远不入缓存；非 /search 软导航照旧不收。
 #[test]
 fn search_page_eligible_regardless_of_nav_kind() {
     assert!(
@@ -308,8 +304,7 @@ fn test_hdrs() -> Vec<Vec<String>> {
     ]
 }
 
-/// A. 读写往返、类型闸门、坏文件自愈、PeekRaw 拼回。
-// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+/// A. 读写往返、类型闸门、坏文件自愈、PeekRaw 拼回；跨 await 持 own_dir 锁是本意（目录清理守卫）。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn roundtrip_gates_and_self_heal() {
@@ -518,8 +513,7 @@ fn capacity_wipe_on_growth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// C. 键的语义（身份 / 编码 / 会话边界）、写后失效、未登录页防污染、闸门页。
-// own_dir 串行锁有意存活到测试结束(目录清理守卫), 跨 await 是本意。
+/// C. 键的语义（身份/编码/会话边界）、写后失效、未登录页防污染、闸门页；跨 await 持 own_dir 锁是本意（目录清理守卫）。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn keys_invalidation_and_pollution() {
@@ -820,9 +814,7 @@ fn list_path_gate() {
     assert!(!is_home_path("/o/r"));
 }
 
-/// 截断的 keep 骨架（无 </html>）必须读失败并删文件自愈：
-/// GitHub h2 响应无 content-length，上游中途断流时 collect 照样成功，
-/// 截断页落盘后 7 天寿命内每次后退都命中它 = 必现白屏。
+/// 截断的 keep 骨架（无 </html>）必须读失败并删文件自愈：h2 响应无 content-length，中途断流 collect 照样成功，截断页 7 天内每次后退都命中=必现白屏。
 #[test]
 fn truncated_keep_entry_self_destructs() {
     let (dir, _g) = own_dir("trunc");
@@ -850,8 +842,7 @@ fn truncated_keep_entry_self_destructs() {
     assert!(load_disk_entry_reason(ck, true).is_ok(), "完整骨架必须命中");
 }
 
-/// 大 Cookie 会被浏览器按 h2 拆成多行：user_session 落在第二行也必须认出登录态，
-/// 否则登录流量被记成 -cloggedout，与爬虫/无 cookie 流量混池互相污染。
+/// 大 Cookie 被 h2 拆多行：user_session 在第二行也必须认出登录态，否则登录流量记成 -cloggedout，与爬虫混池污染。
 #[test]
 fn split_cookie_headers_still_fingerprint_account() {
     let req = hyper::Request::builder()
@@ -874,13 +865,10 @@ fn split_cookie_headers_still_fingerprint_account() {
     );
 }
 
-/// v6.9 资产缓存已停用并物理删除：JS/CSS 一律直连（实测 48 分钟 132 个请求 0 命中）。
-/// 本测试的存在就是文档——如果将来想重启资产缓存，先读 git 历史里这套机制的教训：
-/// 逻辑键互踩、手捏条目缺 CORS 头、强制单 token br 协商收窄，三颗雷都踩过。
+/// v6.9 资产缓存已物理删除（实测 48 分钟 132 请求 0 命中）；本测试的存在就是文档——想重启先读 git 历史里三颗雷：逻辑键互踩、缺 CORS、单 token br 收窄。
 #[test]
 fn asset_cache_is_removed_by_design() {
-    // 没有可断言的函数了（is_asset_req/asset_cache_key 均已删除）。
-    // 这里只钉一个事实：页面缓存的键从不包含资产域。
+    // 没有可断言的函数了（is_asset_req/asset_cache_key 已删）；这里只钉页面缓存键从不含资产域。
     let mk = |p: &str| page_cache_key(&p.parse::<http::Uri>().unwrap(), "github.com", None, "br");
     assert!(
         !mk("/octocat/repo").contains("githubassets"),
@@ -914,8 +902,7 @@ fn repo_snapshot_swr_serves_stale() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// no-store 明说不许存的响应不落盘；private 不拒——GitHub 用它表达"浏览器别共享"，
-/// 代理侧缓存已按会话号哈希分钥匙语义等价，全拒会把页面缓存整个干掉。
+/// no-store 不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号分钥匙语义等价，全拒会干掉页面缓存。
 #[test]
 fn no_store_responses_are_never_saved() {
     let mk = |cc: &str| {
@@ -929,8 +916,7 @@ fn no_store_responses_are_never_saved() {
     assert!(!resp_no_store(&http::HeaderMap::new()));
 }
 
-/// v6.11 分段快照交付头红线：重压成 gzip 后头必须写 `content-encoding: gzip`——
-/// 存侧头是原体（br/无本编码）的，直交会让浏览器按错编码解码、仓库页白屏。
+/// v6.11 分段快照交付头红线：重压 gzip 后头必须写 content-encoding: gzip；存侧头是原体的，直交会让浏览器按错编码解码白屏。
 #[tokio::test]
 async fn segs_snapshot_serves_gzip_header() {
     let (dir, _guard) = own_dir("segs");
@@ -975,8 +961,7 @@ async fn segs_snapshot_serves_gzip_header() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 交付编码跟键里的编码桶走：identity 桶(curl/CLI)没协商过编码，交明文不写编码头；
-/// gz/br 桶统一交 gzip。identity 桶收到没协商过的 gzip 就是乱码。
+/// 交付编码跟键里的桶走：identity 桶(curl/CLI)交明文不写编码头，gz/br 桶交 gzip；identity 桶收到没协商的 gzip 就是乱码。
 #[tokio::test]
 async fn segs_snapshot_delivers_per_encoding_bucket() {
     assert_eq!(key_enc_bucket("GET github.com/a/b?-id-rk"), "id");

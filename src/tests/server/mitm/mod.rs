@@ -218,8 +218,7 @@ fn codeload_alias_rewrites_host_keeps_path() {
     );
 }
 
-/// 复用失败的两种病不能混成一句话：超时要写明"响应超时(Ns)"，真断链才叫"连接已断"。
-/// 线上曾把 4s 预算超时印成"复用连接已断"，看着像链路故障，实际是边缘不答。
+/// 复用失败两种病不能混：超时写明响应超时(Ns)，真断链才叫连接已断；线上曾把 4s 预算超时印成连接已断，看着像链路故障。
 #[test]
 fn reuse_failure_text_keeps_timeout_and_broken_conn_apart() {
     assert_eq!(

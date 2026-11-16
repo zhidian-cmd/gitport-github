@@ -1,5 +1,4 @@
-//! 切片合并：按段位切段并发拉，按边界泵成单条流；段是可缩的边界而非固定连接——慢段让尾、断点续拉，不整段判死。
-//! 交付线只认相对偏移，与边界同域。
+//! 切片合并：按段位并发拉、按边界泵成单流；段是可缩边界而非固定连接——慢段让尾、断点续拉，不整段判死；交付线只认相对偏移。
 
 use super::protocol::{self, BoxBody};
 use bytes::Bytes;
@@ -101,8 +100,7 @@ pub(super) fn content_range_end(v: Option<&str>) -> Option<u64> {
     range_span(v)?.split_once('-')?.1.trim().parse().ok()
 }
 
-/// 206 起点校验（直连切片与镜像竞速共用一条规则）：起点必须等于本段请求起点，
-/// 否则字节会错位拼进合并流——宁可当段失败走补发。
+/// 206 起点校验（两处共用）：起点必须等于本段请求起点，否则字节错位拼进合并流，宁可当失败走补发。
 pub(super) fn check_segment_start(v: Option<&str>, start: u64) -> Result<(), String> {
     match content_range_start(v) {
         Some(got) if got == start => Ok(()),
@@ -228,8 +226,7 @@ pub(super) struct MergeBody {
     total: u64,
     /// 待发请求的区间：缺口、被让位的尾巴。
     fill: VecDeque<(u64, u64)>,
-    /// 已派出未回话的区间：去重的另一半——只查 fill 队列会漏掉在途的，
-    /// 同一区间派两条流会在交付线错位重复吐字节（下载整体偏移）。
+    /// 已派出未回话的区间也要去重：只查 fill 队列会漏在途的，同一区间派两条流会错位重复吐字节。
     inflight: HashSet<(u64, u64)>,
     /// 干净收尾的段数 = 闲下来的连接数，让位得有活才干。
     idle_credit: u32,
@@ -300,8 +297,7 @@ impl MergeBody {
         Some(iv)
     }
 
-    /// 起流失败后把这段塞回队尾重试——不塞回去就再也没人管这个洞了。
-    /// 补发失败 = 记一次空手（dead_fills），下次换家再来。
+    /// 起流失败把这段塞回队尾重试，否则没人管这个洞；补发失败记一次空手，下次换家。
     pub(super) fn retry_fill(&mut self, from: u64, to: u64) {
         self.dead_fills += 1;
         self.inflight.remove(&(from, to));
@@ -330,11 +326,7 @@ impl MergeBody {
         let mut progressed = false;
         let mut freed = 0u32;
         for seg in self.segs.values_mut() {
-            // 让位后的父段：下载已越过刀口——刀口外的字节是要丢的，掐掉上游流停止白下载；
-            // 换上的空体下一轮即 EOF 收尾，缓冲里已到的照常交付，段在交付线越过新边界时移除。
-            // （只对被让位的段生效；正常段必须 poll 到 EOF，那是收尾记账的一部分。）
-            // 必须排在缓冲守卫【之前】：父段灌满 2MB 时守卫会 continue 跳过，
-            // 掐流/释放连接就永远轮不到——2MB 加一条上游连接常驻到缓冲抽干为止。
+            // 让位后的父段：掐掉上游流停止白下载（刀口外字节要丢），缓冲里已到的照常交付；这段必须排在缓冲守卫之前，否则父段灌满 2MB 时守卫 continue 会永远跳过掐流。
             if seg.cut && seg.pos() >= seg.end {
                 seg.body = protocol::empty_body();
             }
@@ -504,8 +496,7 @@ impl MergeBody {
         out
     }
 
-    /// 把某段的边界缩到 cut，尾巴排进补发。父流跑到刀口即被掐流（fill_all 越界换空体），
-    /// 刀口外是要丢的字节，继续灌缓冲纯属白下载；缓冲里已到的照常交付。
+    /// 把段边界缩到 cut：刀口外的字节继续下载纯属浪费，掐流；缓冲里已到的照常交付。
     fn cut(&mut self, start: u64, cut: u64, now: Instant) -> Option<(u64, u64)> {
         let seg = self.segs.get_mut(&start)?;
         let old_end = seg.end;

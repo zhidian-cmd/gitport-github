@@ -33,8 +33,7 @@ fn run() {
         if desktop::signal_show(config::webui_port()) {
             return;
         }
-        // ok:false = 旧实例界面已死（已开始自退）或连不上。等它让出单实例锁后接管；
-        // 一直不放锁才认"已在运行"。already_running() 在锁空闲时会顺手占住它。
+        // ok:false = 旧实例界面已死；等它让出单实例锁后接管，一直不放才认已在运行。
         for _ in 0..20 {
             if !desktop::already_running() {
                 break;

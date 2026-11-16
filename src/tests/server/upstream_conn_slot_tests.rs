@@ -125,8 +125,7 @@ async fn race_ranks_by_dial_ms() {
     assert_eq!(order, vec!["a", "b", "c"], "按拨号耗时升序");
 }
 
-/// 内容域：同 IP 只准一条通道——第二条拨出来当场作废，返回池里现成那条。
-/// 要多通道就换 IP 另起（竞速建连按这个前提展开）。
+/// 内容域同 IP 只准一条：第二条当场作废、返回池里现成那条；要多通道换 IP 另起。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn content_ip_keeps_single_channel() {
@@ -191,8 +190,7 @@ async fn overflow_only_pool_never_hands_out_overflow_handle() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 只有真连接才算"已有通道"；空壳条目不算占用（防的是"候选全被占住"的误判，
-/// 实测 api.github.com 曾连刷 24 行同样的失败）。
+/// 只有真连接算已有通道，空壳不算占用（防候选全被占的误判；api.github.com 曾连刷 24 行同样失败）。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn empty_entry_is_not_an_occupied_channel() {
@@ -299,8 +297,7 @@ async fn inflight_count_follows_response_body_lifecycle() {
     assert_eq!(up.inflight.load(order), 0, "body 丢弃后必须归还槽位");
 }
 
-/// 两个 host 并发入库同一 IP（内容域）：两条通道并存，不互斥。
-/// 会话域仍然恒单通道（见 one_ip_one_channel）。
+/// 两个 host 并发入库同一 IP（内容域）：两条通道并存不互斥；会话域仍恒单通道。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn concurrent_content_hosts_coexist_on_one_ip() {
@@ -375,9 +372,7 @@ async fn shared_conn_keeps_target_authority_across_hosts() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 一次性探针（手动跑，走真网络）：实测 185.199 段每个边缘 IP 对每个内容域名的服务支持。
-/// 每条边 = 用该节点自己的 verify 锚点建一条 h2 连接，再对它发 HEAD 看状态码。
-/// 用法：cargo test probe_content_edges -- --ignored --nocapture
+/// 一次性探针（手动跑真网）：每个边缘 IP 对每个内容域名建 h2 发 HEAD 看状态码；cargo test probe_content_edges -- --ignored --nocapture
 #[tokio::test]
 #[ignore]
 async fn probe_content_edges() {
@@ -460,8 +455,7 @@ async fn probe_content_edges() {
     }
 }
 
-/// 一次性探针（手动跑，走真网络）：为 4 个无边域名实测候选 IP 与证书锚点。
-/// 用法：cargo test probe_new_hosts -- --ignored --nocapture
+/// 一次性探针（手动跑真网）：为 4 个无边域名实测候选 IP 与证书锚点；cargo test probe_new_hosts -- --ignored --nocapture
 #[tokio::test]
 #[ignore]
 async fn probe_new_hosts() {
@@ -551,9 +545,7 @@ async fn probe_new_hosts() {
     }
 }
 
-/// 一次性探针：同一连接（SNI=api.mcp）改发其它 :authority，看服务端是否 421。
-/// 决定连接池能否按 IP 复用不同 SNI 的节点。
-/// 用法：cargo test probe_cross_sni_reuse -- --ignored --nocapture
+/// 一次性探针：同一连接（SNI=api.mcp）改发其它 :authority 看是否 421，决定池能否按 IP 复用不同 SNI 节点；cargo test probe_cross_sni_reuse -- --ignored --nocapture
 #[tokio::test]
 #[ignore]
 async fn probe_cross_sni_reuse() {
@@ -593,8 +585,7 @@ async fn probe_cross_sni_reuse() {
     }
 }
 
-/// 一次性探针：验证基线节点（SNI=baidu, verify=actions.githubusercontent.com）是否服务三个域名。
-/// 用法：cargo test probe_baseline_actions -- --ignored --nocapture
+/// 一次性探针：验证基线节点（SNI=baidu, verify=actions.githubusercontent.com）是否服务三个域名；cargo test probe_baseline_actions -- --ignored --nocapture
 #[tokio::test]
 #[ignore]
 async fn probe_baseline_actions() {
@@ -650,9 +641,7 @@ async fn probe_baseline_actions() {
     }
 }
 
-/// 通道自己断掉必须自己除名：池就是「这个 IP 已有通道」的唯一登记处，
-/// 留一条僵尸会让该 IP 一直占着名额——下次请求先撞一次死连接、白付一次发送，日志里还
-/// 多一行「复用连接已断」。对端回收空闲连接（边缘 50~65s 静默）天天发生，这条路必须静默收尾。
+/// 通道自己断掉必须自己除名：池是「这个 IP 已有通道」唯一登记处，僵尸会让该 IP 一直占名额、下次请求白撞一次发送；对端 50~65s 回收空闲连接天天发生，必须静默收尾。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn conn_end_removes_itself_from_pool() {
@@ -664,8 +653,7 @@ async fn conn_end_removes_itself_from_pool() {
 
     let ip = "9.9.9.5";
 
-    // 内存 duplex 对拉：server 端只完成握手就收摊 = 对端回收连接（客户端读到 EOF）。
-    // 握手没赶上也不要紧：任务一 abort 就连 socket 一起丢，客户端照样读到 EOF。
+    // 内存 duplex 对拉：server 端只完成握手就收摊（对端回收）；任务 abort 连 socket 一起丢，客户端照样读到 EOF。
     let (client_io, server_io) = tokio::io::duplex(4096);
     let mut server = tokio::spawn(async move {
         let _ = h2::server::handshake(server_io).await;
@@ -717,9 +705,7 @@ async fn conn_end_removes_itself_from_pool() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 溢出临时通道语义：同 IP 溢出是拥挤时的临时加班——正编 + 一条溢出并存，
-/// pick 与通道清单都不外发溢出句柄，第二条溢出拒收（递回正编），
-/// 驱动按"在途流归零即焚"回收（conn_probe_state 露出标记给清扫拍判）。
+/// 溢出临时通道：拥挤时正编+一条溢出并存，pick 与通道清单不外发溢出句柄，第二条溢出拒收（递回正编），在途归零即焚。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn overflow_channel_handle_is_never_handed_out_again() {
@@ -768,8 +754,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     let _ = lock(conn_pool()).remove(ip_normal);
 }
 
-/// get_or_build 步骤①：池里有闲通道就直接骑（fresh=false），绝不拨号。
-/// 建造路径要真网，单测不碰；这里的断言是"取到池里那条且来源不是新拨"。
+/// get_or_build 步骤①：池里有闲通道直接骑（fresh=false），绝不拨号；建造路径要真网，单测不碰。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn get_or_build_rides_pool_channel_without_dialing() {
@@ -795,16 +780,14 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let _ = lock(conn_pool()).remove(&ip);
 }
 
-/// 失败记账顺序（审计 #14 回归）：report_failure 必须先挪游标再拉黑——
-/// 反了的话候选圈已把刚拉黑的 IP 滤掉，游标永远挪不动，冷却一过又优先拨刚失败的它。
+/// 失败记账顺序（审计 #14）：report_failure 必须先挪游标再拉黑——反了候选圈滤掉该 IP，游标永远挪不动。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn report_failure_moves_cursor_before_blacklisting() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    // 清场：游标表清零（跨测试残留会让"游标不动"的断言碰巧成立）、边冷却清空——
-    // 本测试断言的是顺序本身，不能依赖前一个测试留下的进程级状态。
+    // 清场：游标清零（跨测试残留会让断言碰巧成立）、边冷却清空——断言的是顺序本身，不能依赖前一个测试的状态。
     let dir = std::env::temp_dir().join("gitport_cursor_order_seed");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
@@ -835,5 +818,4 @@ async fn report_failure_moves_cursor_before_blacklisting() {
     let _ = lock(conn_pool()).remove(&head);
 }
 
-// 看护任务不再做保活与补拨（即用即建取代），旧的隧道打点与补拨节流
-// 测试随之退役：连接死亡由请求结果发现，通道重建是下一个请求自己的事。
+// 看护任务不再保活/补拨（即用即建取代），旧隧道打点与补拨节流测试随之退役：连接死亡由请求结果发现，重建是下个请求的事。

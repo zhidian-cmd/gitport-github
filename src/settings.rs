@@ -25,8 +25,7 @@ struct SettingsState {
     proxy_backup: Mutex<String>,
     // 我们最后一次成功写进系统的 PAC URL：接管时区分"自己的残留"与别家同形态
     last_pac: Mutex<String>,
-    // git 全局代理的原值备份（http\u{1}https 两段，\u{1} 分隔；空段 = 原本没设）：
-    // 覆盖前抓一把，关开关/退出/自愈时按原样还回去，别家配置不动。
+    // git 代理原值备份（http/https 两段，U+0001 分隔；空段 = 原本没设）：覆盖前抓一把，关闭/退出/自愈时还回去。
     git_proxy_backup: Mutex<String>,
     // 串发游标（每池/族记号 = 上次驻留的 IP）：故障转移时更新并落盘。
     last_ip: Mutex<LastIpTable>,
@@ -34,9 +33,7 @@ struct SettingsState {
     worker_mirrors: Mutex<Vec<WorkerMirror>>,
 }
 
-/// 一条自定义镜像：url 为反代地址，on 为是否进链。
-/// template = 该镜像的用法模板（占位符 {mirror}/{url}/{url_enc}/{owner}/{repo}/{ref}/{path}），
-/// 添加时由后台探测自动试出并保存；空 = 未探测，按老拼法（前缀拼接）用。
+/// 自定义镜像：url 反代地址、on 是否进链；template = 用法模板（占位符见 mirror.rs），添加时探测试出并保存，空 = 前缀拼接。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct WorkerMirror {
@@ -55,10 +52,7 @@ fn on_by_default() -> bool {
     true
 }
 
-/// 初次使用（无 settings.json）时内置的镜像注册表：公共前缀型镜像。2026-11-14 复测：
-/// 原 29 家全测（raw README 200+内容校验，5 种用法家族，双轮计时），1 家死亡
-/// （git.yylx.win 全模板超时），按耗时排序收录最优 8 家。公共镜像随时可能失效，
-/// 下载时按实测吞吐选家、失败顺延；用户删掉后落盘即不再出现——默认值只在首启生效。
+/// 首启内置 8 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；下载按实测吞吐选家、失败顺延，删掉后不再出现。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
     [
         "https://gh-proxy.org",       // 788ms
@@ -183,8 +177,7 @@ fn should_backup_foreign(cur: &str, pac: &str, last_pac: &str) -> bool {
     !cur.is_empty() && cur != pac.trim() && cur != last_pac.trim()
 }
 
-/// 系统 PAC 是不是自家写入（当前值/备份值共用同一判据）：
-/// last_pac 非空按确切字符串比，为空（升级前）退回形状判定一次。
+/// PAC 是否自家写入：last_pac 非空按确切字符串比，空（升级前）退回形状判定一次。
 fn pac_is_ours(x: &str, last_pac: &str) -> bool {
     let last = last_pac.trim();
     if last.is_empty() {
@@ -315,8 +308,7 @@ pub fn ensure_system_proxy() -> Result<String, String> {
     Ok(format!("未开启分流, 已还原; {git_note}"))
 }
 
-/// 还原系统代理：只动我们上次写进去的那条 PAC（last_pac 精确比较），别家的不碰。
-/// git 全局代理同款待遇：优雅退出/开关关闭时随这里一起还原。
+/// 还原系统代理：只动上次写进去的那条 PAC（last_pac 精确比较），别家不碰；git 全局代理同款。
 pub fn remove_system_proxy() -> String {
     let git_note = remove_git_proxy();
     let Ok(key) = internet_settings_key() else {
@@ -412,8 +404,7 @@ pub fn set_mitm(on: bool) -> Result<(), String> {
 struct LastIpTable(Vec<(String, String)>);
 
 impl LastIpTable {
-    /// 按规范键序成表；路由表未装载时原样保留，否则会丢光上次游标。
-    /// 表外旧键（含双通道时代的 `_vice`/`~2`）一律丢弃，不进落盘。
+    /// 按规范键序成表；路由表未装载时原样保留，否则丢光上次游标；表外旧键（含 _vice/~2）丢弃。
     fn from_marks(marks: impl IntoIterator<Item = (String, String)>) -> Self {
         let keys = crate::pool::route::cursor_keys();
         if keys.is_empty() {
@@ -479,9 +470,7 @@ where
     Ok(T::deserialize(raw).unwrap_or_default())
 }
 
-/// 镜像注册表容错：`["https://x"]`、`[{"url":"https://x"}]`、单个对象都认，
-/// 只写 URL 的默认启用。整段写坏只丢这一段，不连坐其他开关。
-/// 单值/数组两形态用一个 untagged 枚举收下（OneOrMany），不再手写形状分派。
+/// 镜像注册表容错：字符串、对象、数组都认，只写 URL 默认启用；整段写坏只丢这一段。单值/数组用 untagged 枚举收。
 fn lenient_mirrors<'de, D>(d: D) -> Result<Vec<WorkerMirror>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -551,8 +540,7 @@ struct SettingsFile {
     last_pac: String, // 我们最后一次写进系统的 PAC URL——识别自己的残留
     #[serde(deserialize_with = "lenient")]
     last_ip: LastIpTable, // 串发游标(每池/族上次驻留的 IP),恒全量键位、恒规范序
-    /// 自定义镜像注册表：settings.json 永久记录；启停只增删 routes.json 链成员。
-    /// 同时认 camelCase 与 snake_case；元素可以只写 URL 字符串。
+    /// 自定义镜像注册表：settings.json 永久记录，启停只增删 routes.json 链成员；camelCase/snake_case 都认，元素可只写 URL。
     #[serde(
         alias = "worker_mirrors",
         deserialize_with = "lenient_mirrors"
@@ -564,8 +552,7 @@ fn settings_path() -> PathBuf {
     exe_dir().join("settings.json")
 }
 
-/// 坏 JSON 里的捞回：按字段名找 `"key":"value"` 形态的字符串值——字符串值自包含，
-/// 语法坏掉的多半是别的字段。值被截断/缺引号/转义解析失败一律 None（尽力而为）。
+/// 坏 JSON 捞回：按字段名找 key:value 形态的字符串值（自包含，坏的是别的字段）；截断/缺引号/转义失败一律 None。
 fn salvage_str_field(raw: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\"");
     let rest = &raw[raw.find(&pat)? + pat.len()..];
@@ -594,13 +581,10 @@ pub fn load() {
             match serde_json::from_str::<SettingsFile>(raw) {
                 Ok(v) => apply(v),
                 Err(e) => {
-                    // 整份回默认前先把坏文件原样留底：git_proxy_backup（用户的原 git 代理）
-                    // 只有这一份副本，断电/手滑写坏 JSON 不该让原配置无声蒸发。
-                    // 留底后逐字段回默认；单字段容错只在语法合法时生效（见 lenient）。
+                    // 回默认前把坏文件原样留底：gitProxyBackup 只有这一份副本，断电/手滑不该让原配置无声蒸发；留底后逐字段回默认。
                     let bak = settings_path().with_extension("json.bak");
                     let bak_ok = std::fs::write(&bak, raw.as_bytes()).is_ok();
-                    // 尽力从坏 JSON 里捞回 gitProxyBackup：接管过 git 代理时，用户原值只活
-                    // 在这一字段里——捞回来，结尾的残留清理才会走"还原"而不是"删掉"。
+                    // 从坏 JSON 捞回 gitProxyBackup：接管过 git 代理时用户原值只活在这个字段，捞回来才能走还原而非删掉。
                     let v = SettingsFile {
                         git_proxy_backup: salvage_str_field(raw, "gitProxyBackup")
                             .or_else(|| salvage_str_field(raw, "git_proxy_backup"))
@@ -628,8 +612,7 @@ pub fn load() {
         Err(_) => {}
     }
     heal_stale_proxy();
-    // git 残留自愈：故障退出留下的代理/CA 键在下次启动清掉（开关开着时
-    // ensure_system_proxy 马上会重新接管，这里先清是幂等的一来一回）。
+    // git 残留自愈：故障退出留下的代理/CA 键下次启动清掉（开关开着时 ensure_system_proxy 会重新接管，幂等）。
     if !github_pac() {
         remove_git_proxy();
     }
@@ -664,8 +647,7 @@ fn apply(v: SettingsFile) {
 /// 保存互斥：快照与写盘全程持锁，防旧快照覆写丢更新（保存罕见，临界区短）。
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-/// 带留痕的落盘：内存态已改、界面显示成功，写盘失败无声吞掉 = 改动重启即丢且查无痕迹。
-/// crash.log 常驻、追加式，落盘失败罕见（磁盘满/只读），留一行正当其用。
+/// 带留痕的落盘：写盘失败无声吞掉 = 改动重启即丢且查无痕迹；crash.log 常驻追加，留一行正当其用。
 fn save_logged() {
     if let Err(e) = save() {
         crate::logger::crash(&format!("[设置] settings.json 落盘失败: {e}"));
@@ -722,8 +704,7 @@ fn git_proxy_url() -> String {
     format!("http://127.0.0.1:{}", crate::config::proxy_port())
 }
 
-/// CA 信任键：按 URL 作用域只对 GitHub 系生效，不动全局 sslBackend、不碰别的域。
-/// git 默认不信任代理的自签证书，这组键让 clone/push 过 MITM 进通道池。
+/// CA 信任键：按 URL 作用域只对 GitHub 系生效，不动全局 sslBackend；让 clone/push 过 MITM 进池。
 const GIT_CA_KEYS: &[&str] = &[
     "http.https://github.com/.sslCAInfo",
     "http.https://codeload.github.com/.sslCAInfo",
@@ -948,8 +929,7 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
     save_logged();
 }
 
-/// 整表保存：规范化校验并与旧表求差集；删除即彻底消失，前端须先 GET 合并，链对齐由调用方用 removed 触发。
-/// 返回 (enabled, removed, added)——added 是新出现的镜像，调用方据此触发用法探测。
+/// 整表保存：规范化校验并与旧表求差集，删除即彻底消失（前端须先 GET 合并）；返回 (enabled, removed, added)，added 触发用法探测。
 pub fn set_worker_mirrors(
     list: Vec<WorkerMirror>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {

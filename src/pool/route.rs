@@ -1,5 +1,4 @@
-//! 路由表 v2：二部图。`ips` 节点（伪装身份与目标 host 无关）× `hosts` 行（开关位），
-//! 边 = 节点服务该路由键；`routes.json` 的 `ips`/`hosts` 两块 + 运行时反向索引。
+//! 路由表 v2：二部图，ips 节点 × hosts 行，边 = 节点服务该路由键；routes.json 两块 + 运行时反向索引。
 
 use super::edges;
 use crate::util::lock;
@@ -22,10 +21,7 @@ pub struct Flags {
     pub direct: bool,
     /// 内容域：短响应头预算（2s）、竞速拨号、游标不记。
     pub content: bool,
-    /// 会话域：带用户会话、跨 IP 是风控特征——own 过滤（只认自建通道）。
-    /// 只标实测出拦截页的主站族（github.com / *.github.com / api.github.com）。
-    /// 内容型的子域不做通配排除——直接写进 ips 节点的 hosts（写完整即豁免，
-    /// 具体键最长匹配天然压过通配）。
+    /// 会话域带用户会话、跨 IP 是风控特征，只标实测出拦截页的主站族，own 过滤只认自建通道；内容型子域写进 ips 节点的 hosts 即豁免通配。
     pub session: bool,
     /// 大文件域：单通道（一条长流占满槽位）+ 大镜像链。数据源自 mirrors_big 键集。
     pub big: bool,
@@ -67,8 +63,7 @@ pub struct IpSpec {
     /// ClientHello SNI：骗墙用，与目标 host 无关。
     #[serde(default)]
     pub sni: String,
-    /// 证书校验锚点：空 = 拿目标 host 当锚点。只有目标 host 不在该 IP 默认证书的 SAN 上时才需要填，
-    /// 填哪个都行（证明"对面持有 GitHub 证书"即可，域名由 h2 的 `:authority` 说了算）。
+    /// 证书校验锚点：空 = 按目标 host 校验；只有目标不在该 IP 默认证书 SAN 上才填，填哪个都行（域名由 :authority 定）。
     #[serde(default)]
     pub verify: String,
     /// 本节点服务的路由键列表。
@@ -167,8 +162,7 @@ impl RouteRow {
         })
     }
 
-    /// 这个 host（已小写）命中本行吗？`foo.github.com` 命中 `github.com`；
-    /// `evilgithub.com` 不命中（要求点分隔）。
+    /// host 命中要求点分隔：foo.github.com 命中 github.com，evilgithub.com 不命中。
     #[inline]
     fn hits(&self, host_lower: &str) -> bool {
         if host_lower.len() > self.bare.len() && host_lower.ends_with(&self.bare) {
@@ -304,8 +298,7 @@ pub fn route_for(host: &str) -> Option<Hit> {
                 if !r.hits(&lower) {
                     continue;
                 }
-                // 同 rank 时更具体的声明胜：`*.x`（仅子域）压过等长的裸键 `x`（自身+任意级子域）。
-                // 没有这条，`github.com` 与 `*.github.com` 就靠文件顺序决定谁赢。
+                // 同 rank 时更具体的声明胜，否则 github.com 与 *.github.com 谁赢靠文件顺序。
                 let better = match best {
                     None => true,
                     Some(b) => {
@@ -326,9 +319,7 @@ pub fn route_for(host: &str) -> Option<Hit> {
     Some(Hit { topo, idx })
 }
 
-/// 查询管线②③：host → 邻接节点展开成具体 IP → 滤黑边 → 去重。
-/// 节点 verify 留空 = 按目标 host 校验（迁移期安全默认，等价 v1 行为）。
-/// 返回 None = host 不在表（走 Tunnel）；Some(空) = 全黑（走 fallback）。
+/// 查询管线：host → 邻接节点展开 IP → 滤黑边 → 去重；verify 空 = 按目标校验；None = 不在表，Some(空) = 全黑。
 pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
     let topo = lock(&TABLE).as_ref()?.clone();
     let row_idx = route_for(host)?.idx;
@@ -370,8 +361,7 @@ pub fn fallback_for(host: &str) -> Fallback {
     route_for(host).map_or(Fallback::Dns, |r| r.fallback)
 }
 
-/// 游标键：只记串发域（会话域+其他低频域）的主键；内容域竞速选路，游标无人读，不占键位。
-/// 直连行不占键。settings.lastIp 的键位与顺序恒为此表。
+/// 游标键只记串发域主键；内容域竞速无人读、直连行不占键；settings.lastIp 键位顺序恒为此表。
 pub fn cursor_keys() -> Vec<String> {
     let g = lock(&TABLE);
     let Some(t) = g.as_ref() else {
@@ -452,8 +442,7 @@ pub fn ip_count() -> usize {
 
 // ---- 镜像链归属（与拨号路由正交，仍按 host 形状判定）----
 
-/// 大文件下载域（分片竞速）：objects/release-assets=附件 302 落点。
-/// 大文件域判定：routes.json/seeds.json 的 hosts 标志 `big: true`（数据，不再硬编码域名）。
+/// 大文件域：objects/release-assets 附件 302 落点，由 hosts 标志 big:true 判定（数据，不硬编码域名）。
 pub fn is_big_file_host(host: &str) -> bool {
     route_for(host).is_some_and(|r| r.flags.big)
 }
@@ -483,8 +472,7 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     }
 }
 
-/// 总路由：命中直连行 → System；未命中 → Tunnel；大文件域/附件路径 → Mirror；其余 Pool。
-/// （codeload 已迁池：命中 github.com 裸键走 Pool。）
+/// 总路由：直连行→System，未命中→Tunnel，大文件域/附件→Mirror，其余→Pool；codeload 已迁池。
 pub fn master_route(host: &str, method: &str, path: &str) -> Route {
     let Some(row) = route_for(host) else {
         return Route::Tunnel;

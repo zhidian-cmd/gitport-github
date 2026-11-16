@@ -56,8 +56,7 @@ impl Logger {
             now_str(format_description!("[hour]:[minute]:[second]")),
             msg
         );
-        // 启动打点不进 WebUI 环形缓冲：界面一律不显示，也不给开关。
-        // 仍写 .cache/tray.log 留开机慢的取证，headless 下照旧回显 stdout。
+        // 启动打点不进 WebUI 环形缓冲，但写 .cache/tray.log 留取证，headless 下仍回显 stdout。
         if msg.starts_with("[启动]") {
             tray_log(&line);            if self.inner.lock().unwrap().echo_stdout {
                 println!("{line}");
@@ -83,8 +82,7 @@ impl Logger {
         }
     }
 
-    /// 清空 WebUI 环形缓冲。seq 保持单调不清零——增量拉取的客户端按旧 after 查询
-    /// 只会得到空增量，不会把清空前后的日志序搅乱。
+    /// seq 不清零：按旧 after 查询的增量客户端只会得到空增量，不会把日志序搅乱。
     pub fn clear(&self) {
         self.inner.lock().unwrap().buf.clear();
     }

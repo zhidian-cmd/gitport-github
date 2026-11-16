@@ -372,8 +372,7 @@ fn dial_targets_empty_vs_none() {
     crate::pool::edges::clear_all();
 }
 
-/// 通配键子域：边冷却必须按路由键记账才能滤到子域查询。
-/// mark_stall 曾按子域 host 记账，内容域的超时冷却从来没滤到过（421 路径早改对了，超时路径漏了）。
+/// 通配键子域：边冷却必须按路由键记账才能滤到；老实现按子域 host 记，内容域超时冷却从来没滤到过。
 #[test]
 fn wildcard_key_stall_filters_subdomain_dial() {
     let _g = crate::pool::TEST_LOCK

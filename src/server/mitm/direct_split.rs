@@ -1,7 +1,4 @@
-//! README 大图/视频的纯直连多段：字节拆成多个 Range，在池内**同一条**直连通道上并发拉
-//! （并行 stream，不是并行连接），按字节边界合成一条 200 流。自己从不拨号
-//! （`gather_channels(host, 1)`，池冷时借建造等一拍），也不进 get_direct 的兜底——
-//! 段失败不会被误判成「直连全灭」而转镜像。
+//! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
 use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
@@ -36,9 +33,7 @@ use super::merge::SEG_BUFFER_MAX;
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// host 白名单：静态资源 CDN 才切（图片/视频为主）；会话域不在表内。
-/// v6.7 起 githubassets 的 JS/CSS 不再切：脚本分片直连独走无救援，一段卡死整文件
-/// 卡死（9MB 的 index.js 实测从未走通），改单流直连 + 缓存兜底。
+/// 白名单只认静态 CDN；v6.7 起 githubassets 的 JS/CSS 不切（脚本分片无救援、9MB index.js 实测从未走通），改单流直连+缓存兜底。
 pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -61,8 +56,7 @@ pub(super) fn seg_count(total: u64) -> usize {
     ((total / SEG_TARGET_BYTES) as usize).clamp(4, MAX_SEGS)
 }
 
-/// 段请求的模板：原请求的 method/uri/headers，每次重建一份干净的 GET。
-/// 直连切片与镜像竞速（mirror.rs 的 segment_direct）共用这一个模板。
+/// 段请求模板：原请求的 method/uri/headers，每次重建干净 GET；与镜像 segment_direct 共用。
 #[derive(Clone)]
 pub(super) struct Tpl {
     pub(super) method: Method,
@@ -97,9 +91,7 @@ impl Tpl {
     }
 }
 
-/// 段/探片请求头过滤：Range 语义头与逐跳头不透传；条件头剥掉（探片/段不该 304）。
-/// accept-encoding **透传**：上游压缩后传输量缩 3 倍（8.6MB→2.87MB 实测），切片按
-/// 压缩流字节切，段拼接仍是完整压缩流，content-encoding 原样交浏览器解压。
+/// 段请求头过滤：Range 语义头与逐跳头不透传、条件头剥掉（不该 304）；accept-encoding 透传（压缩后传输量缩 3 倍，切片按压缩流字节切）。
 fn skip_request_header(k: &str) -> bool {
     matches!(
         k,
@@ -131,11 +123,9 @@ pub(super) fn skip_response_header(k: &str) -> bool {
     )
 }
 
-// Content-Range 的解析统一走 merge::{content_range_total, content_range_start, content_range_end}，
-// 与镜像链的 206 校验用同一套标准，别再各写一份。
+// Content-Range 解析统一走 merge::{content_range_total/start/end}，与镜像链同一套标准。
 
-/// 媒体类别：救援链按它分流——图片段走 routes.json 的"图片"链，视频段走"视频"链，
-/// 脚本段链为空（公共镜像不收 githubassets，实测零字节）——直连独走不设救援。
+/// 媒体类别决定救援链：图片走图片链、视频走视频链；脚本段链为空——公共镜像不收 githubassets，直连独走不设救援。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MediaKind {
     Image,
@@ -212,8 +202,7 @@ async fn fetch_segment(
     Ok((body, parts.headers))
 }
 
-/// 206 段边界校验：起点规则共用 merge::check_segment_start，另加终点不越界——
-/// 越界字节会吃掉总长预算，尾段就发不完了。
+/// 206 段边界校验：起点规则共用 merge::check_segment_start，另加终点不越界——越界会吃掉总长预算，尾段发不完。
 fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), String> {
     merge::check_segment_start(cr, start)?;
     if merge::content_range_end(cr).is_some_and(|end| end >= e) {
@@ -222,8 +211,7 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// 段的镜像救援：从 start 续传到 e（直连已交付的不重拉），链序逐个试，全灭记熔断。
-/// 整段单流取回、不分段。chain 由调用方快照传入（构造时机已判空），这里只管逐个试。
+/// 段的镜像救援：从 start 续传到 e（已交付不重拉），链序逐个试、全灭记熔断；整段单流，链快照由调用方传入。
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
@@ -287,8 +275,7 @@ fn log_skip(log: &LogFn, host: &str, path: &str, why: &str) {
     }
 }
 
-/// 切片下载器主入口：总机下发片数，段级重试/续传内置，输出合并后的 200 流。
-/// 任一段最终失败仍返回 None 交回单流——头未发出，不会出现「头已发、体花掉」。
+/// 切片主入口：总机下发片数，段级重试/续传内置，输出合并 200 流；任一段最终失败仍返回 None 交回单流（头未发出不会花掉）。
 pub(super) async fn try_direct_split(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -387,8 +374,7 @@ pub(super) async fn try_direct_split(
         return None;
     };
     let tpl = Tpl::of(out);
-    // 恒 N 段直连切片：探片前缀有则段从 10KB 后接着排，无（memo 命中）则从头排。
-    // 长度按 [seg_start, total) 算——传 total 会切到文件尾外 10KB，严格 416 的 CDN 直接退单流。
+    // 恒 N 段：探片前缀存在则段从 10KB 后排，否则从头排；长度按 [seg_start,total)，传 total 会切到文件尾外 10KB 被严格 CDN 退单流。
     let seg_start = if prefix.is_some() { PROBE_BYTES } else { 0 };
     let segs = merge::split_even(
         seg_start,
@@ -398,8 +384,7 @@ pub(super) async fn try_direct_split(
     if segs.is_empty() {
         return None;
     }
-    // 单通道模型：全部段骑池给的这一条（切片是并行流，不是并行连接——
-    // 实测 185.199 段聚合水管恒定，多连接不加吞吐）。
+    // 单通道模型：全部段骑池给的这一条（并行 stream 不是并行连接——185.199 聚合水管恒定，多连接不加吞吐）。
     let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
         log_skip(log, host, &path, "池内无可用通道");
         return None;
@@ -429,8 +414,7 @@ pub(super) async fn try_direct_split(
                         if attempt >= 3 {
                             return Err("段拉取重试耗尽".to_string());
                         }
-                        // 同通道重试：段边界不变，整段重拉（共享通道不能中途摘——
-                        // 摘了会杀死同通道其他段的在途流）。
+                        // 同通道重试：段边界不变整段重拉（共享通道不能中途摘，会杀死同通道其他段的在途流）。
                     }
                 }
             }
@@ -478,8 +462,7 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
-    // 续传上下文：有救援链（已配镜像的图片/视频段）→ 镜像链救援；
-    // 无链（Script / 未配镜像）→ 停滞时直连同通道从剩余偏移重拉。
+    // 有救援链（图片/视频）→ 镜像续传；无链（脚本/未配镜像）→ 停滞时直连同通道从剩余偏移重拉。
     let chain = match kind {
         MediaKind::Script => Vec::new(),
         _ => pool::mirror_chain(kind.chain()),
@@ -546,8 +529,7 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// 段的镜像救援上下文：模板（按偏移重建 Range 请求）、媒体类别（选链）、
-/// 链快照（构造时机判空，运行期不再查全局）、host（缺链告警按它节流）、日志。
+/// 救援上下文：模板（按偏移重建 Range）、媒体类别（选链）、链快照、host（缺链告警节流）、日志。
 #[derive(Clone)]
 struct RescueCtx {
     tpl: Tpl,
@@ -585,8 +567,7 @@ struct Seg {
 }
 
 impl Seg {
-    /// 续传换体：直连残体与缓冲一并丢弃，期望字节从续传点重算——
-    /// 已交付的都是连续前缀，续传从同一偏移接着发，流内无重复无缺口。
+    /// 续传换体：直连残体与缓冲一并丢弃，从交付偏移重算——已交付都是连续前缀，流内无重复无缺口。
     fn install_rescue(&mut self, body: BoxBody, start: u64, no_rescue: bool) {
         self.buf.clear();
         self.buffered = 0;
@@ -607,8 +588,7 @@ enum Resume {
     Direct { tpl: Tpl, host: String, log: LogFn },
 }
 
-/// 按段序交付，但每轮把所有段都 poll 一次——只盯队首会让未读段占死连接级流控窗口。
-/// 每段挂停滞界：没拉完的段冻结直连侧，从已交付偏移续传。
+/// 按段序交付，但每轮 poll 所有段——只盯队首会让未读段占死连接级流控窗口；每段挂停滞界，没拉完的冻结直连侧。
 pub(super) struct SegmentedBody {
     segs: Vec<Seg>,
     idx: usize,
@@ -618,8 +598,7 @@ pub(super) struct SegmentedBody {
     finished: bool,
     resume: Option<Resume>,
     resume_after: Duration,
-    /// 静默上游的闹钟：上游不发不关时没有任何东西会唤醒 waker，
-    /// 到点自醒重 poll——停滞救援判据才有机会过线。
+    /// 静默上游闹钟：上游不发不关时没有东西唤醒 waker，到点自醒重 poll，停滞救援判据才有机会过线。
     tick: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -691,8 +670,7 @@ impl hyper::body::Body for SegmentedBody {
             if seg.done {
                 continue;
             }
-            // 停滞检测（5s 无新字节）：有救援链 → 镜像从已交付偏移续传；
-            // 无链（直连独走）→ 同通道从剩余偏移重拉（池自动重建死通道），每段至多 3 次。
+            // 停滞 5s 无新字节：有链→镜像从已交付偏移续传；无链→同通道从剩余偏移重拉，每段至多 3 次。
             if !seg.no_rescue
                 && seg.handle.is_none()
                 && seg.got < seg.expected
@@ -826,11 +804,7 @@ impl hyper::body::Body for SegmentedBody {
                 me.idx += 1;
                 continue;
             }
-            // 所有段刚才都被 poll 过，waker 已注册；等任一段来数据再醒。
-            // 但"上游静默装死（不发数据也不关连接）"永远不会触发 waker：
-            // 挂一只 resume_after 的闹钟到点自醒重 poll，停滞救援判据才有机会
-            // 过线——否则整条下载挂死、ActiveGuard 不归还，攒满 MAX_ACTIVE
-            // 后本进程所有大图都不再切片（镜像路径的 500ms tick 兜的就是这个）。
+            // 上游静默装死不触发 waker，挂闹钟到点自醒重 poll；否则下载挂死、ActiveGuard 不归还，攒满 MAX_ACTIVE 后全进程大图都不切片。
             match me.tick.as_mut() {
                 Some(t) => {
                     if t.as_mut().poll(cx).is_ready() {
@@ -840,8 +814,7 @@ impl hyper::body::Body for SegmentedBody {
                 }
                 None => {
                     let mut t = Box::pin(tokio::time::sleep(me.resume_after));
-                    // 布防即 poll：把当前 waker 注册进闹钟——只挂不 poll 的闹钟
-                    // 永远不响（这次修复差点自己复刻了要修的 bug）。
+                    // 布防即 poll：把当前 waker 注册进闹钟——只挂不 poll 的闹钟永远不响。
                     if t.as_mut().poll(cx).is_ready() {
                         cx.waker().wake_by_ref();
                     } else {

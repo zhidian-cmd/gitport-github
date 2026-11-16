@@ -1,5 +1,4 @@
-//! 通道池的暂缓/复测账本：判黑的通道先停车不发（60s 到期由真实流量复验），
-//! 换血按 host 限频（60s 冷却）。测速判定已拆除——失败信号（黑洞/超时/拨号失败）全权处置。
+//! 暂缓/复测账本：判黑通道先停车，60s 到期由真实流量复验；换血按 host 限频。测速判定已拆。
 use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,9 +25,7 @@ pub fn bench(ip: &str) {
     }
 }
 
-/// 软排除：从候选里摘掉暂缓中的 IP。
-/// 全部暂缓时原样返回——「全慢才回来」就落在这里，绝不因为筛选把候选清空。
-/// 只查不过期（单键 O(1)），过期项由下一次 bench() 写入时顺手清。
+/// 软排除只摘暂缓中的 IP；全暂缓则原样返回，绝不筛空候选；过期项由下次 bench 顺手清。
 pub fn usable(ips: &[String]) -> Vec<String> {
     let g = lock(&BENCH);
     let Some(t) = g.as_ref() else {
@@ -64,9 +61,7 @@ struct HostRace {
 
 static HOSTS: Mutex<Option<HashMap<String, HostRace>>> = Mutex::new(None);
 
-/// 能不能为这个 host 触发一轮重建：能 = 原子地记下这轮开始。
-/// 检查+写入必须一次持锁完成——分开写的话一页几十个并发报黑全都读到"可以重建"、
-/// 全都触发换血，同一批 IP 重复拨号占满拨号闸门（注释里"只触发一轮"靠的就是这里的原子性）。
+/// 检查+写入必须一次持锁完成，否则一页几十个并发报黑全触发换血，同一批 IP 重复拨满闸门。
 pub fn try_begin_rebuild(host: &str) -> bool {
     let mut g = lock(&HOSTS);
     let m = g.get_or_insert_with(HashMap::new);

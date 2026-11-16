@@ -22,16 +22,14 @@ fn split_target_parses_and_defaults() {
     );
 }
 
-/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发、真体丢失）。
-/// 走受管域名 + 种子表（拨号端口指到假上游）：非受管目标被开放代理闸 502，明文路径只剩受管域可达。
+/// 明文 HTTP 分发：与头同包到达的请求体必须原样续传（曾把体当头转发致真体丢失）；受管域名+种子表走假上游，非受管目标被开放代理闸 502。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn plain_http_post_body_forwarded_intact() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    // 自建路由表：github.com → 节点 IP 127.0.0.1（串发池 tls_handshake=false 纯 TCP 拨号，
-    // 拨号端口指到假上游）。种子表是真 GitHub IP 拨不进本进程。
+    // 自建路由表：github.com → 127.0.0.1（串发池 tls_handshake=false 纯 TCP，拨号端口指假上游）；种子表是真 GitHub IP 拨不进本进程。
     let dir = std::env::temp_dir().join(format!("gitport_srv_test_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(
@@ -106,8 +104,7 @@ async fn plain_http_post_body_forwarded_intact() {
     let mut cli = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .unwrap();
-    // 一次 write：头与体同包到达（当年被吞的形态）；明文代理用绝对 URI，并带 Connection/Keep-Alive 供假上游断言逐跳头被剥除。
-    // 目标用受管域 + 443 端口：进串发池（tls_handshake=false = 纯 TCP），拨号端口已指到假上游。
+    // 一次 write：头体同包（当年被吞的形态）；明文代理用绝对 URI，并带 Connection/Keep-Alive 供假上游断言逐跳头被剥。目标受管域+443 进串发池。
     let req = format!(
         "POST http://github.com:443/x HTTP/1.1\r\nHost: github.com\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
     );
@@ -137,8 +134,7 @@ async fn plain_http_post_body_forwarded_intact() {
 async fn unmanaged_targets_are_rejected() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = ln.local_addr().unwrap().port();
-    // 日志要留底：拨不通的环境里删掉闸也会回 502（TCP 层失败同款），只有
-    // 「非受管域名」拒绝日志能区分"被闸拦"还是"恰好拨不通"。
+    // 日志要留底：拨不通时删闸也回 502（TCP 层失败同款），只有非受管域名拒绝日志能区分被闸拦还是拨不通。
     let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = logs.clone();
     let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
@@ -242,8 +238,7 @@ fn bogon_filter_blocks_loopback_and_private_ranges() {
     }
 }
 
-/// 地址保险的补段：CGNAT / 0/8 / 组播 / 240/4 / IETF 保留段 / 内嵌 v4 的 v6。
-/// README 承诺"内网地址仍 502"，只靠 is_private() 会漏掉企业/运营商内网段。
+/// 地址保险补段：CGNAT / 0/8 / 组播 / 240/4 / IETF 保留段 / 内嵌 v4 的 v6；只靠 is_private() 会漏企业/运营商内网段。
 #[test]
 fn bogon_filter_blocks_cgnat_and_reserved_ranges() {
     let p = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
@@ -274,8 +269,7 @@ fn bogon_filter_blocks_cgnat_and_reserved_ranges() {
     }
 }
 
-/// 非受管域名的 443 不再被闸一刀切：要走到系统 DNS 兜底腿，由地址保险拒拨本机。
-/// 删掉 `&& port != 443` 会退回闸处拒绝日志；删掉 bogon 过滤会变成拨号超时/连上本机。
+/// 非受管域名的 443 不再一刀切：走到系统 DNS 兜底腿后由地址保险拒拨本机；删掉 && port != 443 会退回闸处拒绝日志，删掉 bogon 过滤会连上本机。
 #[tokio::test]
 async fn unmanaged_443_reaches_dns_fallback_and_bogon() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -329,8 +323,7 @@ async fn unmanaged_443_reaches_dns_fallback_and_bogon() {
     let _ = serve_task.await;
 }
 
-/// 首字节判死后两路必须一起收：只 shutdown 写半部时，客户端不关自己写半部会让
-/// join! 永远 pending，隧道 task + 上游 TCP + 两条 fd 永久挂着。
+/// 首字节判死后两路一起收：只 shutdown 写半部时客户端不关自己写半部会让 join! 永远 pending，task+TCP+fd 永久挂着。
 #[tokio::test]
 async fn first_byte_timeout_closes_both_directions() {
     let (mut client, mut relay_a) = tokio::io::duplex(4096);

@@ -1,9 +1,4 @@
-//! 总机：浏览器 ↔ GitHub 的第一接头人。URL 级分诊政策的单点——
-//! 缓存已在上游先行（page_cache）；这里按 URL 属性分科室：
-//! - 镜像回落域（big/附件）→ 镜像加速（mirror_or_direct：ECT 同台 + 串发兜底）；
-//! - 切片资格域（静态资源）→ 切片加速（direct_split：片数由本文件策略下发）；
-//! - 其余 → 直连线路优化（get_direct，通道池+建连机器人供血）。
-//! mitm_http 只管缓冲与响应善后（缓存失效/写路由），「谁去哪个科室」只看这里。
+//! 总机：浏览器↔GitHub 第一接头人，URL 级分诊单点（缓存已在上游先行）；镜像回落域→镜像加速，切片资格域→直连切片，其余→直连线路优化；mitm_http 只管缓冲与响应善后。
 use super::{
     direct_split, dns_direct_fetch, gh_defuse, get_direct, mirror, mirror_or_direct,
     mitm_unavailable, write_upstream, UpstreamInfo,
@@ -18,8 +13,7 @@ fn is_simple(method: &Method) -> bool {
     matches!(method, &Method::GET | &Method::HEAD)
 }
 
-/// 简单请求的全科室路由。Ok = 上游响应到手（调用方做缓存善后）；
-/// Err = 兜底也已失败或不可用的最终应答（调用方直接返回）。
+/// 简单请求全科室路由：Ok = 上游响应到手（调用方做缓存善后），Err = 兜底也失败的最终应答（调用方直接返回）。
 pub(super) async fn dispatch(
     log: &LogFn,
     req: &hyper::Request<hyper::body::Incoming>,
@@ -51,8 +45,7 @@ pub(super) async fn dispatch(
             "镜像与直连均不可用, 疑似封锁窗口期, 代理正在按表自动重试。",
         ));
     }
-    // 大文件切片：总机下发片数（策略单点），切片器内置重试/续传/br 协商。
-    // 不满足条件或段最终失败一律回单流；池冷/闸满同样回单流。
+    // 大文件切片：总机下发片数（策略单点），切片器内置重试/续传/br 协商；不满足或段最终失败回单流。
     if is_simple {
         if let Some(resp) = direct_split::try_direct_split(log, out_body, host, info, 8).await {
             return Ok(write_upstream(&log, resp, "direct-split", info, host, path));

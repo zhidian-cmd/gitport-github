@@ -54,7 +54,7 @@ const WIN_H: f64 = 795.0;
 const WIN_DY: f64 = 60.0;
 
 // ---- 托盘 ----
-// 不用 tray-icon（它丢掉 Shell_NotifyIcon 返回值，注册失败也报"成功"）：自做窗口+消息泵，每步记真实结果。
+// 不用 tray-icon：它丢掉 Shell_NotifyIcon 返回值，注册失败也报成功；自做窗口+消息泵记真实结果。
 
 const TRAY_CLASS: windows::core::PCWSTR = windows::core::w!("GitPortTrayWnd");
 const TRAY_UID: u32 = 1;
@@ -67,8 +67,7 @@ const ID_TRAY_QUIT: usize = 2;
 static TRAY_PROXY: Mutex<Option<tao::event_loop::EventLoopProxy<AppEvent>>> = Mutex::new(None);
 static TRAY_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static TRAY_ICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-/// WebView2 建失败过一次就别再自愈重建：窗口建出来立刻销毁会变成无限循环，
-/// 每圈刷两行日志，页面跟着一起抽（实测踩到）。
+/// WebView2 建失败不再自愈重建：立刻销毁会无限循环刷日志、页面跟着抽。
 static WV_FAILED: AtomicBool = AtomicBool::new(false);
 /// 窗口对象是否存在（含 WebView2 失败后保留的提示窗）。
 static WIN_ALIVE: AtomicBool = AtomicBool::new(false);
@@ -154,8 +153,7 @@ fn tray_delete(hwnd: windows::Win32::Foundation::HWND) {
     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
 }
 
-/// 自检：NIM_ADD 返回 TRUE 不代表图标真进了通知区（Explorer 未就绪时会"假成功"）。
-/// 反查 GetRect 才作数；查不到就删残留重挂，仍不行转后台定时重试。
+/// NIM_ADD 的 TRUE 可能是假成功（Explorer 未就绪）：反查 GetRect 才算数，失败删残留重挂再定时重试。
 fn tray_self_check(
     hwnd: windows::Win32::Foundation::HWND,
     hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
@@ -255,8 +253,7 @@ unsafe extern "system" fn tray_proc(
                 let _ = KillTimer(Some(hwnd), TRAY_RETRY_TIMER);
                 tray_log("[托盘] 重试成功, 已入通知区");
             } else if n >= 10 {
-                // 失败原因多半是 WebView2 已经起来、系统拒绝 Shell_NotifyIcon(err=5)。
-                // 再重试也是徒劳，停掉定时器，别把日志和磁盘刷爆。
+                // err=5 多半是 WebView2 已起来、系统拒绝注册；重试徒劳，停定时器免得刷爆日志磁盘。
                 let _ = KillTimer(Some(hwnd), TRAY_RETRY_TIMER);
                 tray_log(&format!(
                     "[托盘] 重试 {n} 次仍失败(err={err}), 停止重试; 重启程序或资源管理器可恢复"
@@ -386,8 +383,7 @@ fn spawn_tray(
                         err = err2; // 两次都失败时报后一次，才是当前真实原因
                     }
                 }
-                // 回执立即发：NIM_ADD 已有结果，主线程等的是"注册动作完成"好建窗；
-                // 落图标自检只影响日志与重试，放后台做，别让启动干等 200ms。
+                // 回执立即发（主线程要它建窗），图标自检放后台，别让启动干等 200ms。
                 let _ = tx.send((ok, err));
                 if ok {
                     // NIM_ADD 的 TRUE 不可信：给 shell 200ms 落图标，再反查真实位置。
@@ -403,12 +399,10 @@ fn spawn_tray(
                     note(format!(
                         "[启动] 托盘: 注册失败 err={err} (进程完整性 {}), 后台重试中{}",
                         current_il(),
-                        // err=5 实测根因：exe 所在目录被设了完整性标签（icacls 可见 Mandatory Label），
-                        // 托盘注册与 WebView2 孵化都会被拒。剥掉标签即恢复。
+                        // err=5 实测根因：exe 目录被设完整性标签（icacls 可见 Mandatory Label），剥掉即恢复。
                         if err == 5 { "；若 WebView2 也报拒绝访问, 检查 exe 目录是否被设了完整性标签(icacls 看 Mandatory Label)" } else { "" }
                     ));
-                    // 开机时 shell 未就绪是常态：交给消息循环里的定时器每 2s 重挂，
-                    // 不再 sleep 干等，也不依赖 Explorer 恰好广播 TaskbarCreated。
+                    // shell 未就绪是常态：交给消息循环定时器每 2s 重挂，不 sleep 干等、不依赖 TaskbarCreated。
                     SetTimer(Some(hwnd), TRAY_RETRY_TIMER, 2000, None);
                 }
                 TASKBAR_CREATED.store(
@@ -569,8 +563,7 @@ fn create_window(
         Ok(w) => w,
         Err(_) => return false,
     };
-    // 数据目录放 %LOCALAPPDATA%：exe 同目录可能带 ACL/策略限制，WebView2 的渲染进程
-    // （AppContainer）写不进去就报 0x80070005「拒绝访问」。
+    // 数据目录放 %LOCALAPPDATA%：exe 同目录的 ACL/策略会让 WebView2 渲染进程写不进去（0x80070005）。
     let data_dir = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -593,8 +586,7 @@ fn create_window(
     };
     let mut built = build_wv(&data_dir);
     if built.is_err() {
-        // 收托盘时刚释放的浏览器进程退出有延迟、profile 也可能被崩坏锁住：
-        // 先等一拍重试；仍失败且 profile 在，就挪走换新目录，最后才认输。
+        // 收托盘时浏览器退出有延迟、profile 可能被锁：先等一拍重试，再挪目录，最后认输。
         std::thread::sleep(std::time::Duration::from_millis(300));
         built = build_wv(&data_dir);
         if built.is_err() && data_dir.join("EBWebView").exists() {
@@ -631,8 +623,7 @@ fn create_window(
             true
         }
         Err(e) => {
-            // 留住窗口并写明原因：窗口对象在这里被 drop 会触发 Destroyed，
-            // 不记标志就会「销毁→自愈重建→再失败」的死循环。
+            // 留住窗口并记原因：这里 drop 会触发 Destroyed，不记标志就陷入销毁→重建→再失败死循环。
             WV_FAILED.store(true, Ordering::SeqCst);
             window.set_title("GitPort — WebView2 不可用，请安装或修复 WebView2 Runtime");
             g.win = Some(window);
@@ -725,9 +716,7 @@ pub fn run(args: DesktopArgs) -> ! {
     };
 
     let mut created_once = false;
-    // 不再删 WebView2 数据目录：删到一半（几百个小文件、句柄未释放）就让 WebView2
-    // 在残缺 profile 上初始化，直接 0x80070005「拒绝访问」。留着让运行时自己管。
-    // 托盘先挂、拿到回执再往下走：WebView2 起来后 Shell_NotifyIcon 会被系统拒（err=5），必须先托盘后窗口且等它真的注册上。
+    // 不删 WebView2 数据目录：删到一半的残缺 profile 直接 0x80070005；托盘先挂拿到回执再建窗，WebView2 起来后注册会被拒(err=5)。
     let t_desktop = std::time::Instant::now();
     let tray_rx = spawn_tray(proxy.clone(), log.clone());
     // 成功与否托盘线程已经记了，这里只兜"线程根本没回话"。

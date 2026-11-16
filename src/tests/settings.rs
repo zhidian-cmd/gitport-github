@@ -285,8 +285,7 @@ fn worker_mirrors_accepts_handwritten_forms() {
     assert!(v.mitm);
 }
 
-/// 坏 JSON 里字符串值自包含：语法坏的是别的字段，gitProxyBackup 要能原样捞回。
-/// 夹具用 serde_json::to_string 生成（分隔符 U+0001 在盘上就是转义文本），与真实落盘一致。
+/// 坏 JSON 里字符串值自包含：语法坏的是别的字段，gitProxyBackup 要原样捞回；夹具用 serde_json::to_string 生成，与真实落盘一致。
 #[test]
 fn salvage_recovers_git_proxy_backup_from_broken_json() {
     let sep = char::from_u32(1).unwrap();

@@ -187,8 +187,7 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     Box::pin(async { Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into()) })
 }
 
-/// ECT 时间槽：on_frame 只累计本窗实收，ect_sweep 快照进 window_prev；
-/// 有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——零 sleep，确定性验证。
+/// ECT 时间槽：on_frame 只累计本窗实收、ect_sweep 快照进 window_prev；有债零收清零，无债零收沿用——零 sleep 确定性验证。
 #[test]
 fn ect_window_slots_snapshot_stall_and_idle() {
     let ld = mirror_load("ect-slot.test");

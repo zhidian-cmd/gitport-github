@@ -26,20 +26,15 @@ pub fn set_webui_port(p: u16) {
 }
 
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
-/// 拨号单阶段上限，TCP 与 TLS 各自独立计时：TCP 1.15s、TLS 1.35s。
-/// 健康全流程实测 ~334ms，两项合计 2.5s 是 7 倍余量；合计仍 > DIAL_SLOW_MS(1500)，慢成功检测窗不变。
-/// 不设整轮总预算：候选逐个试完为止，慢总比失败好。
+/// 拨号单阶段上限：TCP 1.15s、TLS 1.35s（合计 2.5s，健康全流程 ~334ms 的 7 倍余量）；不设整轮总预算。
 pub const TCP_CONNECT_TIMEOUT_MS: u64 = 1150;
 pub const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 1350;
 /// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。
 pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// 即用即建、用完就丢：闲置（无在途流）超此秒数即焚毁通道。10s 远短于对端/中间
-/// 设备的静默掐死窗口（60~90s），「领到僵尸通道」在结构上不可能发生——探活机制
-/// 因此整体移除（探活只能验尸不能续命，且总有漏检窗口）。在途流不为零不算闲置。
+/// 闲置（无在途流）超此秒数即焚通道，远短于对端 60~90s 静默掐死窗口，探活机制因此整体移除。
 pub const CONN_IDLE_RETIRE_SECS: u64 = 10;
-/// 内容域/其他同 IP 通道上限：恒 1 条。同 IP 多通道实测是灾难（互相抢带宽、连接级窗口
-/// 被几条流摊薄），要多通道就换 IP 另起——竞速建连也只留最速一条入池。
+/// 同 IP 通道上限恒 1：多通道互抢带宽、摊薄窗口，要多条就换 IP。
 pub const MAX_CONNS_CONTENT: usize = 1;
 /// 会话域同 IP 通道上限：恒 1 条。
 pub const MAX_CONNS_SESSION: usize = 1;
@@ -47,15 +42,11 @@ pub const MAX_CONNS_SESSION: usize = 1;
 pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
 pub const TUNNEL_FIRST_BYTE_TIMEOUT_SECS: u64 = 8;
-/// 透明隧道总时长上限：异常连接不发数据也不关，不能让 task + 两条 fd 永久挂着。
-/// 1 小时足够跑完最慢的大仓库 clone，只兜"僵死"不误杀正常长下载。
+/// 透明隧道总时长上限：兜僵死连接，1 小时足够最慢的大仓库 clone。
 pub const TUNNEL_MAX_LIFETIME_SECS: u64 = 3600;
 /// 代理并发连接上限：本机进程狂开 CONNECT 也不把常驻托盘进程拖垮。
 pub const PROXY_MAX_CONNS: usize = 256;
-/// MITM 响应体黑洞判定：响应头到了但这么久没来第一个数据字节 = 黑洞。
-/// 500ms 会误杀 tree-commit-info 这类 1.1s 的 git 数据端点；8s 会误杀
-/// overview-files 等 20~80s 才回的慢渲染接口——取 30s，零字节满 30s 才判死。
-/// 误判由「暂缓 60s 自动过期 + 换血给出全部通道」兜底，不永久冤枉一条通道。
+/// 响应头到后 30s 无数据字节判黑洞：更短会误杀 1.1s 的 git 数据端点与 20~80s 的慢渲染接口；误判由 60s 暂缓过期兜底。
 pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 30_000;
 
 /// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。

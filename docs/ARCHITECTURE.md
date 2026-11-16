@@ -1,256 +1,378 @@
-# 工作原理
+# 技术文档
 
-从浏览器点开仓库到字节回到屏幕的完整链路:PAC 分流 → 代理入口 → 明文分流 → 查询管线(路由 v2 二部图) → 伪装统一建连 → 失败兜底 → 回传压缩。
+面向要读这份代码的人：先看结构，再看数据流，最后看每张文件表。
 
-> [ROUTING.md](ROUTING.md) 文末附录是 **v1 时代的历史实测存档**，判定逻辑已被 v2 取代，不要当现行依据；[CONFIG.md](CONFIG.md)「认 IP 速查」是 IP 段的实测标定，仍可参考 (原 POOL-V2.md 已随 v1 清理删除)。本文写运行时行为，以 `src/` 代码为准。
+> 行号会随代码漂移，文档里的引用以文件与函数名为准。
+
+---
+
+## 1. 模块关系
+
+```mermaid
+flowchart LR
+    subgraph 进程入口
+        MAIN[main.rs]
+    end
+    subgraph 配置与桌面
+        SET[settings.rs]
+        LOG[logger.rs]
+        WEB[webui.rs]
+        DESK[desktop.rs]
+        FSX[fsx.rs]
+    end
+    subgraph 代理服务
+        SRV[server/mod.rs]
+        PROTO[server/protocol.rs]
+        UP[server/upstream.rs]
+        ST[server/status.rs]
+    end
+    subgraph 解密与纠错
+        MITM[server/mitm/mod.rs]
+        SWB[server/mitm/switchboard.rs]
+        MIR[server/mitm/mirror.rs]
+        DSP[server/mitm/direct_split.rs]
+        MRG[server/mitm/merge.rs]
+        PC[server/mitm/page_cache.rs]
+        DEF[server/mitm/defuse.rs]
+        QUIET[server/mitm/quiet.rs]
+        RM[server/mitm/redirect_memo.rs]
+    end
+    subgraph 选路与通道
+        ROUTE[pool/route.rs]
+        EDGES[pool/edges.rs]
+        POOL[pool/mod.rs]
+        DIAL[pool/dial.rs]
+        LAT[pool/latency.rs]
+        SPD[pool/speed.rs]
+    end
+    subgraph 其他
+        CA[certgen.rs]
+        WIN[winsec.rs]
+        UTIL[util.rs]
+    end
+
+    MAIN --> SET
+    MAIN --> LOG
+    MAIN --> CA
+    MAIN --> SRV
+    MAIN --> WEB
+    MAIN --> DESK
+    SRV --> ROUTE
+    SRV --> UP
+    SRV --> MITM
+    MITM --> SWB
+    MITM --> PC
+    SWB --> MIR
+    SWB --> DSP
+    SWB --> DEF
+    MIR --> MRG
+    DSP --> MRG
+    UP --> POOL
+    POOL --> DIAL
+    POOL --> EDGES
+    POOL --> ROUTE
+    POOL --> LAT
+    POOL --> SPD
+    SET --> WIN
+    CA --> WIN
+    WEB --> SET
+    DESK --> SET
+```
+
+`util.rs` 是最底层（日志回调、毫秒时间、锁自愈），不依赖任何业务模块；`protocol.rs` 是两个子系统的公共类型（`BoxBody`、请求预算），让 `mitm` 与 `upstream` 不必互相引用实现。
+
+## 2. 启动时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户/系统
+    participant M as main
+    participant S as settings
+    participant P as pool
+    participant C as certgen
+    participant R as server
+    participant W as webui
+    participant D as desktop
+
+    U->>M: 启动（可选 -port/-webui/-tray/-headless）
+    M->>M: 单实例判定（已有实例则 POST /api/show 唤窗口）
+    M->>M: 切工作目录到 exe 目录，建 .cache
+    M->>S: load() 读 settings.json
+    M->>P: serial_load() 装 routes.json（旧 plans.json 迁移）
+    M->>C: load_or_generate() 载/建 CA（ACL 失败则禁用 MITM）
+    M->>R: start_proxy_with() 绑定 127.0.0.1:7810
+    M->>S: ensure_system_proxy()（开关全关时是 no-op）
+    M->>W: 起工作台 127.0.0.1:7811
+    alt -headless
+        M->>M: park 住，不起窗口
+    else 正常
+        M->>D: run() 起 tao 窗口 + wry WebView2 + 托盘
+    end
+    Note over M: 退出时：save_routes_now() → remove_system_proxy() → stop_proxy()
+```
+
+## 3. 一次请求怎么分流
 
 ```mermaid
 flowchart TB
-    subgraph L1["① 客户端"]
-        B["浏览器"]
-        G["git / curl / CLI"]
-    end
-    subgraph L2["② 系统代理接管（PAC，由路由键派生的裸域名名单生成）"]
-        P1{"hosts 行判定"}
-        DL["action=direct 的行 → DIRECT"]
-        PX["PROXY 127.0.0.1:7810"]
-        OD["其余站点：直连"]
-    end
-    B --> P1
-    G --> P1
-    P1 -->|"action=direct 行"| DL
-    P1 -->|"非 direct 行"| PX
-    P1 -->|"其余"| OD
-    subgraph L3["③ 本地代理 127.0.0.1:7810"]
-        C1["CONNECT / 明请求"]
-        M1{"MITM 开启 且 域名受管?"}
-        PASS["纯透传 CONNECT<br/>客户端自持 SNI<br/>ClientHello 首包分片(编译期开启)"]
-        MITM["MITM<br/>本地终结 TLS（boring）→ 明文请求"]
-    end
-    PX --> C1
-    C1 --> M1
-    M1 -->|"否"| PASS
-    M1 -->|"是(受管 + MITM 开)"| MITM
-    PASS -->|"非受管域名 + 443"| SD["系统 DNS 直拨(纯 HTTPS 隧道)<br/>目标过 bogon 过滤"]
-    PASS -->|"非受管域名 + 非 443"| B502["502 拒绝开放转发"]
-    PASS -->|"受管但 MITM 关"| SD2["按 routes.json 走池<br/>(内容域 TCP 竞速 / 其余串发,<br/>纯透传不解密,全灭落系统 DNS)"]
-    subgraph L4["④ 明文分流"]
-        Q{"路径判定"}
-        S1["流式直通<br/>git 智能协议 / 声明体积超 1MB"]
-        S2["大文件分片竞速<br/>objects · release-assets<br/>镜像 + 直连同台 ECT 派发"]
-        S3["其余 → 查询管线走池"]
-    end
-    MITM --> Q
-    Q --> S1
-    Q --> S2
-    Q --> S3
-    subgraph L5["⑤ 查询管线（二部图，route.rs）"]
-        R1["route_for：host → hosts 行<br/>最长键胜 · 点边界 · 大小写无关"]
-        R2["dial_targets：路由键 → 邻接 IP 节点展开<br/>→ 滤冷却中的黑边 → 去重"]
-        D1["串发：NodeIp{ip, sni, verify} 逐个试<br/>统一伪装建连：sni 骗墙 / verify 锚点验真<br/>业务路由全靠 h2 :authority"]
-    end
-    S3 --> R1
-    R1 --> R2
-    R2 --> D1
-    L6B["候选序按 routes.json 的 latency 键升序<br/>（真实拨号事件回流；无后台全量测速，无值排最后）"]
-    L6B -.-> D1
-    subgraph L6["⑥ 结果回写（边状态机）与兜底"]
-        OK["成功：清短冷却 + 游标驻留<br/>（风控冷却例外，免疫清黑）"]
-        REJ["响应 421 → mark_reject（4h）<br/>静态属性不会自愈"]
-        STL["新拨连接发送超时/断连<br/>→ mark_stall（2min）"]
-        CERT["TLS 证书校验失败：不写边<br/>只前移游标 + 打日志"]
-        RISK["风控拦截页 → mark_risk（600s）<br/>gh_defuse 换边重试"]
-        MK["大文件：ECT 同台竞速<br/>整链全灭 → 熔断 60s"]
-        FB["fallback：content 行 → 镜像链<br/>其余 → 系统 DNS 腿"]
-        E502["502 提示页<br/>GET 导航每 8s 自动刷新"]
-    end
-    D1 -->|"拿到真实数据"| OK
-    D1 -->|"响应 421"| REJ
-    D1 -->|"证书 SAN 不覆盖"| CERT
-    D1 -->|"新拨连接发送超时 / 零回包"| STL
-    MITM -->|"拦截页"| RISK
-    REJ -->|"换下一候选"| R2
-    CERT -->|"只前移游标，试下一条"| R2
-    STL -->|"换下一候选"| R2
-    RISK -->|"换下一候选"| R2
-    OK --> R7["回传"]
-    S1 -->|"响应头一到即回传<br/>不进镜像链/页面缓存"| R7
-    S2 --> MK
-    MK -->|"成功"| R7
-    MK -->|"全灭"| FB
-    FB -->|"失败"| E502
-    subgraph L7["⑦ 回传与旁路组件"]
-        R1b["回传压缩：github.com / api 且客户端声明接受 gzip 时才强制<br/>解压嗅探前 4KB 判拦截页 · 原始压缩帧原样转发<br/>其余域名放行浏览器 br / zstd"]
-        R2b["响应注入 x-gitport-route / x-gitport-upstream 诊断头"]
-        CA["本地 CA（certgen）→ Windows 证书库<br/>只签受管域名，拒绝为表外域名签发"]
-        WUI["WebUI 7811<br/>状态 · 日志 · 校准 · 开关<br/>（无建连测速按钮）"]
-        ROUTES["routes.json（二部图 + 镜像链）<br/>缺失时生成；真实拨号回流 latency 键"]
-        TRAY["托盘 + WebView2 桌面壳（-tray / -headless）"]
-        LOG["日志环形 2000 条 + 崩溃捕获"]
-    end
-    R7 --> R1b
-    R1b --> R2b
-    R2b --> B
-    MITM -.->|"按需现签叶子证书"| CA
-    WUI --> ROUTES
-    WUI --> LOG
-    TRAY --> WUI
+    A[客户端 CONNECT] --> B{命中 routes.json?}
+    B -- 否 --> C{端口 443?}
+    C -- 否 --> C1[502 拒绝]
+    C -- 是 --> C2[透明隧道<br/>真名 + 系统 DNS<br/>bogon 过滤]
+    B -- 是 --> D{MITM 开关?}
+    D -- 关 --> E[CONNECT 隧道<br/>按路由表选 IP<br/>会话域串发 / 内容域 TCP 竞速]
+    D -- 开 --> F[本地终结 TLS<br/>CA 签发叶子证书]
+    F --> G[switchboard 按 URL 分诊]
+    G -- big / 附件 --> H[mirror_or_direct<br/>直连腿 + 镜像腿 ECT 竞速]
+    G -- 静态资源白名单 --> I[direct_split<br/>多段 Range 并发]
+    G -- 其余 --> J[get_direct<br/>通道池 + 建连]
+    H --> K[merge 按偏移合成单条流]
+    I --> K
+    J --> K
+    K --> L[回写客户端]
+    L --> M[page_cache 落盘<br/>仅 github.com HTML 列表页]
 ```
 
-## 路由表 v2:二部图与边状态机
+分诊的"谁去哪个科室"只写在 `server/mitm/switchboard.rs`；`mitm/mod.rs` 只管缓冲与响应善后（缓存失效、写路由）。这是刻意的分层。
 
-v1 的池/族/对口规则已全部退役,替换为一张数据表(`routes.json`)+ 一台边状态机。手改指南见 [CONFIG.md](CONFIG.md)。
-
-- **hosts 行(策略侧)**:域名键 → `action:"direct"`(本机直连)/ `content`(内容域短预算,直连全灭后按 fallback 转镜像)/ `fallback`(dns 或 mirror)。**进不进 PAC 不需要单独字段**:非 direct 行自动进,运行时按路由键派生裸域名。最长键胜,`*.` 只认子域,点边界防误吞。
-- **ips 节点(身份侧)**:IP(末段支持 `a-b` 范围展开,笛卡尔积上限 64)→ `sni`(骗墙的伪装域)+ `verify`(证书校验锚点,空 = 按目标 host 校验)+ `hosts`(声明服务哪些路由键)。**伪装身份与目标 host 解耦**——业务路由全靠 h2 `:authority`,所以一条连接可以混发多个 host 的流。
-- **边状态机(运行时实测)**:表是预判,边是实测。`(IP, 路由键)` 三档坏态:响应 **421** → 拉黑 4 小时(静态属性);**新拨连接**发送超时/断连 → 降权 2 分钟(网络波动);风控拦截页 → 600 秒(对齐 GitHub 限流窗)。**写边只发生在响应处理层,拨号层一次都不写**:TLS 证书校验失败(SAN 不覆盖)不记边、不冷却,只前移游标并打一行 `证书校验失败` 日志;TCP 连不上也不写边,走 60/300/1800 秒的死亡退避。**成功只清短冷却(超时/421),风控冷却免疫清黑、只随时间过期**——风控页本身就是一次"成功"的 HTTP 交换,可清就会在风暴里被并发回写当场洗掉(实测:26 家候选 3 轮就回头的事件根因)。
-- 触发条件刻意收窄:**业务状态码 403/404/429 一律不碰边**——那是 GitHub 在回答请求内容,不是"这个 IP 不服务这个 host"。
-
-历史版本(v0.5.4 前)的直连白名单 4 域与真名分片白名单 10 域,已按 2026-11-03 的 openssl 实测全部入池:前者配 GLB / alambic 专节点 + 锚点,后者的 Fastly 组改走伪装锚点。`real` / `donor` / 借道记账整套退役。
-
-## 串发拨号与边轮换
-
-每个请求的拨号循环。**握手通不算完成,HTTP 交换完成(收到响应)才算**——这层看不见响应是不是风控页,所以风控冷却做成免疫清黑、只随时间过期;边状态(黑边滤网)在进循环前已经把冷却中的 (IP, 路由键) 剔除:
+## 4. 路由表是一张二部图
 
 ```mermaid
-flowchart TD
-    S["需要拨号 host"] --> A["route_for → hosts 行<br/>dial_targets:路由键 → 邻接节点展开 → 滤黑边"]
-    A -->|"None(不在表)"| TUN["Tunnel:系统 DNS 直拨"]
-    A -->|"Some(空)=全黑"| FB["fallback:content 行走镜像链<br/>其余走系统 DNS 腿"]
-    A -->|"Some(候选)"| X["内容域并发拨 / 其余从游标起点逐个试 NodeIp<br/>TCP 1.15s + TLS 1.35s(伪装 sni + verify 锚点)<br/>h2 SETTINGS 握手 5s"]
-    X -->|"TCP 连不上"| Y["不写边;按 60/300/1800s 死亡退避<br/>试下一条"]
-    X -->|"TLS 证书 SAN 不覆盖"| Z["不写边、不冷却<br/>只前移游标 + 打证书校验失败日志"]
-    X -->|"响应 421"| RJ["mark_reject(4h) · 试下一条"]
-    X -->|"新拨连接发送超时 / 零回包"| AB["mark_stall(2min) · POST 不重发直接报错"]
-    X -->|"复用旧连接发送失败"| RP["不写边、不熔断、不转镜像<br/>只按 id 摘掉这条连接,换新拨的"]
-    X -->|"403 restricted / 400 Whoa 拦截页"| AE["mark_risk(600s, 免疫清黑) · 拔该边复用连接<br/>gh_defuse 换边重试(至多 24 个记号)"]
-    X -->|"h2 握手完成"| ST["立即入库 + 登记已有通道(发请求之前)"]
-    ST -->|"HTTP 交换完成"| AC["清短冷却 + 游标驻留"]
-    AC --> DONE["返回响应"]
+graph LR
+    subgraph IP 节点
+        N1["140.82.112.3<br/>sni=空 verify=github.com"]
+        N2["185.199.108.154<br/>sni=空 verify=githubassets.com"]
+        N3["20.205.243.165<br/>sni=空"]
+    end
+    subgraph 路由键
+        H1["github.com"]
+        H2["*.github.com"]
+        H3["objects.githubusercontent.com<br/>content+big"]
+        H4["api.github.com<br/>session"]
+    end
+    N1 --> H1
+    N1 --> H2
+    N2 --> H3
+    N3 --> H3
+    N1 --> H4
 ```
 
-**轮换规则速查**:
+- 边 = 节点 `hosts` 列表里出现该键。**没有边就不能服务**，这是数据约束，不是运行时判断。
+- `session` 键（`github.com`、`*.github.com`、`api.github.com`）走"固定同一 IP、不开第二条通道"。
+- `content`/`big` 键可竞速、可切片、可挂镜像链。
+- `direct` 键不进代理，直接进 PAC 的 DIRECT 名单。
 
-| 触发事件 | 判定层 | 动作 |
-|---|---|---|
-| HTTP 交换成功拿到真实数据 | 响应层 | h2 握手完成即已入库;此处清短冷却 + 游标驻留(只记串发域主键;风控冷却例外) |
-| 响应 421 | 响应层 | mark_reject,4 小时长冷却 |
-| TLS 证书 SAN 不覆盖 | 拨号层 | **不写边、不冷却**,只前移游标 + 打日志;那是本地校验没过,不是对端拒绝 |
-| TCP 连不上 / 被拒 / RST | 拨号层 | **不写边**,按 60/300/1800 秒死亡退避 |
-| 新拨连接发送超时 / 断连 | 响应层 | mark_stall,2 分钟短冷却;POST 不重发不污账 |
-| 复用旧连接发送失败 | 响应层 | **不算直连失败**:只摘该连接、本次后续只走新拨连接;不记边、不熔断、不转镜像 |
-| 403 restricted / 400 Whoa 拦截页 | 风控 | mark_risk,600s 免疫成功清黑 + 拔该边复用连接(防乒乓);gh_defuse 换边重试至多 24 个记号 |
-| 全部候选黑 | — | fallback:content 行走镜像链,其余走 DNS 腿;冷却 30s |
-| 建造硬窗 15s 耗尽 | 预算层 | 本次请求交兜底,后台串发继续(落池供下一条骑);无镜像兜底才按 host 冷却 30s,不记黑不写边 |
-| 同 IP 重复驻留 | — | no-op:不写盘不打日志 |
+边还带状态：`pool/edges.rs` 存 `(ip, 域名键) → 冷却到期时刻`，三档冷却（421/证书不匹配 4 小时、超时 120 秒、风控页 600 秒），风控冷却只能到期自愈。
 
-与 v1 的对应关系:旧的"对口规则 / 池 / 族"由节点的 `hosts` 声明 + 边实测取代——**不对口不试不垫底**的语义还在,只是"对口"从代码里的族表变成了数据里的边。历史实测(白名单腿、真名分片)见 [ROUTING.md](ROUTING.md) 附录。
+## 5. 通道池与拨号
 
-## 连接复用
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Q as 请求
+    participant POOL as pool::get_or_build
+    participant CH as 通道池（按 IP）
+    participant D as dial/boring
+    participant H2 as h2 连接
 
-连接池的 key 是 **IP 节点**(伪装身份统一),**一条连接混发多个 host 的流**(h2 `:authority` 路由,业务身份与 TLS 身份解耦)。服务端视角"新建第一条"与"复用第一百条"不可区分——同 IP 同伪装身份同 `:authority`。**同 IP 恒 1 条**(会话域/内容域/其他一视同仁):`store_h2` 入库发现该 IP 已有正编,新拨的当场关闭、把池里现成那条交回调用方;要更多通道就换 IP 另起。同 IP 第二条实测只摊薄连接级窗口(185.199 段聚合水管约 36KB/s),不加吞吐,所以同 IP 溢出已废。
-
-**取用统一入口**:`pool::get_or_build(host, probe_path, log)` 一站式——① 选(会话域只认自己建的通道,内容域/其他谁闲用谁)→ ② 池空进建造(per-host 建造锁等待队列防雷群,等锁带 15s 总窗、唤醒后双检;候选全被别的 host 占用才松锁 50ms 重查;建造受同一硬窗约束,超时交兜底、串发后台继续)→ ③ 全部通道顶满才溢出。溢出只挑**零通道且不在冷却**的候选 IP 补建一条临时通道,pick 与通道清单都不外发它;补不出就骑现有连接给 h2 排队。会话域不溢出。请求路径不再各管一段查池/拨号/重试。
-
-**取用策略(门房打分)**:只有占用率——每条连接记在途流数和服务端 `SETTINGS_MAX_CONCURRENT_STREAMS` 下发的上限,分数 = (在途 + 1) ÷ 上限;没顶满的优先、分小者胜,全满时按分数最小者给 h2 自己排队。EWMA 延迟打分已随探活一起移除,代码里没有"挑最快那条"这回事。
-
-**拨号分工**(与上面的取用是两件事,别混):`dial_upstream` 按 host 类别分流——内容域走 `race_build`:候选 IP 并发拨,按拨号耗时取最速一条入池,落败腿当场关闭、迟到腿后台收尸;会话域/低频域走 `dial_h2_race` 单腿串发,全局认领保证同一 IP 同时只有一条腿在拨,会话域跳过已有通道的 IP。旧的 `plan_legs` 主副腿分工已不存在。大文件域(objects / release-assets)和 12 个不值得养专属通道的子域(只去 Fastly 边缘的 docs / support / resources / desktop / pages / skills / archiveprogram / socialimpact / raw.github.com / agent,加超低频的 uploads / api.mcp)也是单腿串发,优先用池里现有的、没有才自建。
-
-**同 IP 并发拨不设仲裁**:两个 host 的第一发同时落在同一个空 IP 上,就让它俩都拨——入库时 `store_h2` 按"一 IP 一通道"兜底,输家的握手(300-700ms,连上即关)是接受的代价,输家请求本身不受影响(拿到手里的是池里现成那条)。历史上有过按 **主站 > api > 一般内容 > avatars** 挑赢家的独立仲裁器,实测它的保护面只剩"每批省两三条白打的握手",撑不起一个全局协调器,已退役(git 历史可寻回);当年 27 条拨号风暴的真正防火墙是 per-host 建造锁,不是它。同 IP 的全局认领只防重复拨号,不争赢家。
-
-**"已有通道"只有一个口径**:连接池本身。"这个 IP 有没有通道"的查询全部走池(`occupied_ips`),没有第二本账,也就不存在「池里摘了、表里还挂着」的两账本漂移竞态。最后一条连接被摘除,该 IP 自然允许重拨——连接自己断掉也算摘除:驱动任务结束即按 id 自行从池中除名,不必等下一次请求撞见死连接。
-
-**通道失败上报**:通道上的请求失败(`pool::report_failure`)按来源分账——**本轮新拨的**通道首发即败,这个 IP 这会儿确实不行:摘通道 + 边级短冷却(2min) + 游标前移;**池里骑来的**旧通道失败只说明这条连接死了,IP 一点没试过:只摘不罚(实测复用超时后 1 秒同 IP 新建 334ms 就回 200,冤枉好 IP 会把直连逼进镜像链)。摘掉后 `get_or_build` 再取一条重试一次,再败才交镜像/DNS 兜底。
-
-**即用即建、用完就丢(探活已整体移除)**:连好之后不养着——每条连接自带的驱动任务每秒扫一次:溢出通道在途归零即刻焚;普通通道闲置(**在途流为零**)满 **10s** 即焚,长下载因为一直有在途流不会被误杀。下次请求自己重拨,不靠探活验尸,也不留没人管的尸体。会话域同样 10s 回收,断开记一行日志,游标钉着原 IP,下一个会话请求重拨落回原家。机器睡眠唤醒不需要专门机制:醒来后旧连接按闲置计时自清。
-
-**黑洞处置**:真实请求响应头到了但 **30s** 内第一个数据字节没来(`BLACKHOLE_FIRST_BYTE_MS`)判黑洞,由响应层上报 `on_channel_blackhole`:会话域摘通道 + 游标挪下一候选 + 拨号排序降权并立即预建(顺序故障转移、单活,不算跨 IP 并发);内容域软禁黑 IP 60s(不进 pick、在途流不杀)+ 全量换血补缺;其他低频域暂缓即可。不用等下次请求骑上去撞超时才发现。
-
-**TLS 会话恢复**:重拨不再从零握手——按 SNI 形态缓存最近一张 session ticket(伪装腿一张管全族),重拨注入后走 1-RTT PSK:不重传、不验整条证书链,服务器拒绝时自动回落完整握手,无副作用。仅存内存,进程重启自然失效;不启用 0-RTT(重放面大)。
-
-**起点记忆**(settings.json `lastIp`):只记串发域(会话域+其他低频域)一把主键;内容域竞速选路、游标无人读、不占键位。语义是**冷启动第一跳建议**——热路径不消费它(按占用率择优直接取用),且是排序建议不是直通卡:必须先过黑边滤网才准排最前,旧功臣不能绕过新实测的坏边。复用成功也回写,起点跟着"最近功臣"漂移。
-
-## 遥测拦截
-
-GitHub 前端往 `api.github.com/_private/browser/*`（Datadog RUM）报性能与错误数据，另有 `alive.github.com` 心跳、`collector.github.com` 埋点——实测一次会话里这些占 api.github.com 上游请求的 **75%**（325/436），把搜索历史等真 API 挤在后面。
-
-对策：这三类请求本地读掉请求体直接回 **204**，一个字节不发往 GitHub。拦截后 api.github.com 上游请求归零（只剩隧道解密记录），搜索 count 一批 300~450ms 完成。
-
-## 压缩传输
-
-`github.com` / `api.github.com` 按客户端声明**重写协商头**：接受 br 的客户端发 **"br, gzip" 双档**（v6.10 修复——此前单发 br，实测主站不吃 br，服务器无可接受编码只能回未压缩全文，每页 320KB 裸奔两天没人发现）；只接受 gzip 的发 "gzip"；没声明或明确 `q=0` 不强制（curl/git 无解压能力），其余域名放行浏览器原生 br/zstd。拦截页嗅探边收边解压判前 4KB，已消费的原始压缩帧原样转发（不重压缩、不改 content-length）。
-
-## 页面缓存三层
-
-仓库页的加载分三层，各层缓存策略独立（详见 [CACHE.md](CACHE.md)）：
-
-| 层 | 内容 | 策略 |
-|---|---|---|
-| 资产（JS/CSS） | 内容哈希 chunk，全站共享 | **浏览器 immutable 缓存直出，代理零参与**（实测资产缓存 0 命中，机制已删） |
-| 页面数据 | 文件列表/提交/侧栏（`overview-files`、`latest-commit` 等 XHR） | **实时直通不缓存** |
-| HTML（壳+初屏） | 每仓库一份（96% 全站骨架 + ~12KB 身份数据） | **按仓库快照跨会话**（底稿+分段增量存储，7 天过期交旧+后台重拉） |
-
-资产层不加机制的理由：资产 URL 是内容哈希（构建时烙进文件名），浏览器 immutable 缓存直出零请求；发版只换变更文件的哈希（增量）。HTML 层按仓库分键的理由：~12KB 身份数据（标题/描述/嵌入配置）每仓库不同，共享键会张冠李戴。
-
-## 镜像链
-
-覆盖 objects / release-assets 两族与 raw / gist / avatars / user-images / media 等图片文本域。github.com 的 `/releases/download` 路径归 release-assets 链；`/archive` 与 codeload 不进镜像，走主站池。CSS/JS 与 github.io 不过镜像（实测全 404）。
-
-- **大文件域分片竞速**（objects / release-assets，支持 Range 的域）：直连以 `direct/{chain_host}` 身份**只入列 1 次**，与镜像同台参与 ECT 派发；带 Range 时段位数 = **健康镜像数 × 3 + 1**（镜像一家 3 份细切、直连 1 份），把同一 URL 上在途区间的字节加总 ÷ 段位数得到每段字节，按区间从大到小依次占位，大区间先拿、每个区间保底 1 段，避免几条连接各自切满一份把镜像挤爆；整包请求（客户端无 Range）按空闲段位数平均分。**不设最小切片尺寸**，文件再小也按段位切（最多切到一字节一段）。每个区间播完或客户端断开即注销登记，段位马上还回去。谁快谁多拿，慢段的尾巴按「接手划算才抢」的算术让给最快者（让位），停滞段收尸补发，交付线零缺口；候选全灭才失败
-- **小文件域单请求单镜像**：avatars / raw / gist / media 串行逐家，单请求限前 5 家
-- **ECT 时间槽派发**：选家 = (在途字节 + 新请求) ÷ 上一窗(500ms)实收，即「还需几个槽跑完」，最小者胜、无容差；并列看在途流数、再并列轮转。零历史按 +∞ 垫底（档内闲者先试）；有债零收 = 卡死清零，无债零收 = 空闲沿用旧值——每面镜像 5 个原子量（在途字节/在途流数/本窗字节/上窗字节/失败截止）+ 1 个并列轮转计数，500ms 窗口由独立线程推进，无 EWMA、无时间戳
-- **链序**：首启内置 8 家（来自 `settings.rs::default_worker_mirrors`，`seeds.json` 不含镜像）→ 图片链 UI「校准」重排（TTFB）→ 手改 routes.json（`mirrors_big` 列表 / `mirrors_small` 字典）；大文件域链序只作失败顺延次序，选家由 ECT 动态调度
-- 校准只覆盖图片链：逐镜像响应头测速（TTFB），host 间严格串行防测量污染；后台任务，关窗进托盘继续跑完。objects / release-assets 不校准——吞吐由真实下载流量按时间槽持续学习，比合成测速更真且零额外流量。**codeload 已迁池**，校准模板里那条 codeload 链是迁池后的残留，镜像链只按内容域白名单建键、装载时丢弃，模板永不触发
-- 镜像请求走共享连接池（每镜像 4 条空闲、60s 回收），批量加载/Range 续传不再逐次握手
-- 整链全灭熔断 60s，窗口内同域毫秒级快速失败
-
-## README 大图：纯直连多段（与镜像链正交）
-
-`master_route` 判为 **Pool** 的静态图片域请求，在进 `get_direct` 之前先过一遍 `mitm/direct_split.rs`。它和上面的「大文件分片竞速」不是一回事：那边按镜像源分派段位、走 ECT 记账与跨源补发；这边**只认池子给的伪装 SNI 直连通道、且只用一条**（`gather_channels(host, 1)`：并行 stream，不是并行连接——185.199 段聚合水管恒定，多连接不加吞吐），自己从不拨号，一个字节都不经过 gh-proxy。
-
-- **准入**：GET、客户端没带 Range、host 在七个静态图片 CDN 白名单内（raw / user-images / private-user-images / media / camo / gist / avatars）。会话域 `github.com` / `api.github.com` 本就不在白名单里，README 的 `/owner/repo/raw/...` 第一跳是 302，天然不参与。**准入只看请求形状和 host，不看有没有凭据**——带签名或登录态的图也照切。
-- **探片**：发 `Range: bytes=0-10239`（10KB），拿 `Content-Range` 总长与 `Content-Type`，这 10KB 就是首段、交付时不重拉。≥512KB 且是 `image/*` 或 `video/*`（README 嵌的视频走同一套切片）才切；结果按 URL 记 10 分钟，上游忽略 Range 或非媒体记「不可切」不再白探。池冷时经 `gather_channels(host, 1)` 借池子的建造等一拍（≤15s），建不出退单流。
-- **段数与派发**：按总长 ≈192KB 一段，钳在 4~8 段（首段从 10KB 之后算）。每段一个 `Range`，**全部段骑池子给的同一条通道**（`gather_channels(host, 1)`：切片是并行 stream，不是并行连接——实测 185.199 段聚合水管恒定，多连接不加吞吐）；段级头失败同通道重试至多 3 次。**URL 查询串与 Cookie / Authorization / Proxy-Authorization 原样保留**——签名可能在 query 里、凭据可能在 Authorization 里，剥掉只会把请求改坏（403 / 签名校验失败）；段请求只换 Range，并剥掉会改变段语义的头（原始 Range、If-Range / If-None-Match / If-Modified-Since、Accept-Encoding、逐跳头与 body 相关头）。带 `jwt` / `sig` / `X-Amz-Credential` 的 URL 一个字不动地跟着 8 个段请求发出去。
-- **先直连后镜像（5s 救援界）**：每段从开流起算 5s——**成功的段一字节不重拉**；段失败（头超时/非 206/边界错/流断）立即换镜像，5s 到还没拉完的部分也交镜像：直连侧当场冻结（不再读、不再交付），已交付的字节是连续前缀，镜像从同一偏移续传剩余 Range，拼回流里无重复无缺口。镜像整段单流续取、不分段；链按探片类别分流——图片段走 routes.json `mirrors_small` 的保留键 **"图片"链**，视频段走 **"视频"链**（与小文件链同一套注册表对齐：工作台"我的镜像"启用的镜像自动进这两条链，手改成员位置照旧不动，落盘原样回写）；链序逐个试，全灭记 60s 熔断。救援也失败才整流报错交客户端重试，不会出现「头已发出、图却花掉」之外的字节错位。
-- **合并**：只有**所有**段都回 206、且 `Content-Range` **起点等于本段 `s`、终点不越过本段末端**，才组装 200 响应（`content-length` = 总长，搬 `content-type` / `etag` 等头、剥逐跳头），body 按段序交付；补发段用同一套校验。单段 body 读到的字节超出自己那份预算会直接报错，不让多出来的尾巴吃掉全局总长；响应体总长仍按 `content-length` 截断（设计内保护）。每轮 poll 所有段，避免未读的段把 h2 连接级流控窗口占死。任一段重试后仍失败就丢弃全部段响应、交回单流，不会出现「头已发出、图却花掉」。
-- **闸**：同时在途的多段响应最多 6 个（挂在响应体生命周期上自动归还），单段用户态缓冲 2MiB、段响应头预算 8s。
-
-实测依据（人工实测，非单元测试断言）：2026-11-05 同一文件、同样字节、只走代理直连腿，1MB 单流 73.8s / 8 段 45.0s，反序热连接 512KB 单流 48.6~56.5s / 8 段 20.9s。2026-11-06 带 `jwt` / `sig` / `X-Amz-Credential` 查询串的 1,608,296B 大图：8 段 41.17s、单流 69.21s，两者 sha256 一致，日志确认无镜像、无熔断、无新拨连接。单连接多 stream 实测约 1.6 倍；多连接方案实测聚合水管恒定、不加吞吐，故现行固定单通道并发 stream，倍率以实测为准；切片自己不拨号，风控暴露面不随段数增长。注意 raw CDN 不校验签名，实测证明的是「签名形态的 query 不会被丢、8 段能切、合并字节一致」，不等于「真 jwt 被服务端接受并发 Range」；凭据头与 query 的保留由单元测试钉住。
-
-## 大请求体与 git push（流式直通）
-
-| 请求形态 | 走法 |
-|---|---|
-| `POST …/git-receive-pack` / `…/git-upload-pack` | 必流式（无论大小） |
-| 声明 content-length > 1MB | 必流式 |
-| 声明未超限、实际超了 | 缓冲转流式：已读前缀作首块续泵 |
-| GET / HEAD / 小体 | 缓冲路径（可重放重试） |
-
-关键语义：响应头一到立即交付客户端（上游拒了也要让客户端拿到真实响应）；客户端断开时泵弃流不补 EOS（git pack 尾带校验和，截断包必须被服务端拒）；单次尝试不重发；流式响应头预算 1800 秒。
-
-## MITM 与纯隧道：能力边界
-
-`handle_connect`（`server/mod.rs:144`）三道闸，顺序固定：
-
-```rust
-if !is_managed(host) && port != 443 { 502; return; }   // 开放代理闸:非受管域名只放 443
-if port == 443 && mitm_scope(...) {
-    handle_connect_mitm(...).await; return;            // 受管 + MITM:命中即结束
-}
-connect_upstream(...);                                 // 纯隧道(受管 MITM 关 / 非受管 443)
+    Q->>POOL: 要一条能服务该域名的通道
+    POOL->>CH: cached_h2（会话域只认自己的，内容域可借共享）
+    alt 有可用通道
+        CH-->>POOL: 返回通道（按 在途/上限 占用率挑最闲）
+    else 无可用
+        POOL->>D: 串发选 IP（会话域）或 TCP 竞速（内容域）
+        D->>D: TCP 1.15s → TLS 1.35s → h2 SETTINGS 5s
+        D->>H2: 建连成功
+        H2->>CH: store_h2（同 IP 已有则丢弃新拨的）
+        CH-->>POOL: 返回通道
+    end
+    POOL-->>Q: 通道
+    Q->>H2: 开流（流窗 1MB / 连接窗 4MB）
+    H2-->>Q: 响应
 ```
 
-第一道闸是**开放代理防护**：非受管域名只放行 443 的 HTTPS 透明隧道（用户拼接的镜像 clone URL 靠它才通），非 443 一律 502；隧道目标再过 `connect_upstream` 兜底腿的 bogon 过滤（环回/私网/CGNAT/链路本地/组播/保留段拒），纯透传不进 MITM/池/缓存。所以「clone 走隧道」只在 MITM 关闭、未装 CA、或域名不在受管表时成立。**MITM 开着时，clone 与网页走同一条 MITM 路径**——此时 `stream_decision` 能识别 `git-upload-pack` / `git-receive-pack`，走流式直通。外加 serve 层 256 并发闸 + 隧道 1h 总时长上限，异常连接不把托盘进程拖垮。
+通道生命周期：
 
-| 能力 | MITM | 纯隧道 |
-|---|---|---|
-| 看到 method/path（`stream_decision` 识别 git 智能协议） | ✅ | ❌ |
-| 流式直通（1800s 预算） | ✅ | 字节直转，无预算概念 |
-| SNI 伪装（代理自己发 ClientHello，用节点配置的假 SNI） | ✅ | ❌ ClientHello 由客户端发出，SNI 即真实域名 |
-| 首包分片（`hello_split_ranges`，全仓仅 `server/mod.rs:642` 一处调用） | ❌ | ✅ |
-| 镜像链 / 页面缓存 / 直连切片 | ✅ | ❌ |
-| 客户端需信任本地 CA | 需要 | 不需要 |
+```mermaid
+stateDiagram-v2
+    [*] --> 拨号中
+    拨号中 --> 在池: 握手成功
+    拨号中 --> 死亡退避: TCP/TLS/h2 失败
+    在池 --> 在途: 开流
+    在途 --> 在池: 流结束（在途归零）
+    在池 --> 焚毁: 闲置 10 秒
+    在途 --> 焚毁: 连接断开
+    在池 --> 暂缓: 判黑（60 秒后由真实流量复验）
+    暂缓 --> 在池: 到期
+    焚毁 --> [*]
+```
 
-**SNI 伪装与首包分片互斥，不是互补**：ClientHello 只能由一方发出，代理发了就没有可拆的包，客户端发了代理就改不了里面的 SNI。伪装是强解（内容层面就是假域名，DPI 做流重组也还原不出真名），分片是弱解（流重组即可还原）。因此 MITM 路径不做分片，也不需要做。
+关键约束：**每 IP 恒 1 条通道**（会话域与内容域都是 1）；候选 IP 全占时不开溢出通道，骑在满载通道上排队，由 h2 服务端配额兜。
 
-MITM 的解密开销可忽略：BoringSSL 的 AES-GCM 走 AES-NI，单核 GB/s 级，而跨境链路只有 10~100 Mbps，差三个数量级。真正的成本是**客户端要信任本地 CA**（如 `git config --global http.sslCAInfo <ca.crt>`），不是 CPU。
+## 6. 镜像 + 切片 + 合并
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant SW as switchboard
+    participant M as mirror_or_direct
+    participant D as 直连腿（通道池）
+    participant X as 镜像腿（1..5 家）
+    participant G as merge
+
+    C->>SW: GET 大文件/Release（可带 Range）
+    SW->>M: 交给镜像科室
+    M->>M: 按候选数等分区间（零重叠）
+    M->>D: 段 1 直连
+    M->>X: 段 2..n 各家并发（剥 Cookie/Auth/Referer/UA）
+    D-->>G: 段数据 + 206 起点
+    X-->>G: 段数据 + 206 起点
+    G->>G: 校验 206 起点 == 请求起点、终点不越界
+    G->>G: 慢段缩边界让位、断点续拉（连续 6 次无进展才判死）
+    G-->>C: 按偏移拼成单条流
+```
+
+三条要说清的边界：
+
+1. 合并层**只按偏移校验**，不比内容。
+2. `split_even` 是等分零重叠，段可缩不可重叠。
+3. 镜像链上限 5 家，硬错误降权 45 秒、超时降权 15 秒；全败才回落直连。
+
+## 7. 失败分级
+
+```mermaid
+flowchart LR
+    F1[流失败] --> A1[重试同通道 / 换段]
+    F2[通道判黑] --> A2[暂缓 60s<br/>不杀在途流<br/>到期由真实流量复验]
+    F3[边失败<br/>421 / 证书 / 风控页] --> A3[边冷却<br/>4h / 120s / 600s<br/>风控只到期自愈]
+    F4[IP 失败<br/>TCP / TLS / h2] --> A4[死亡退避<br/>所有 host 串发跳过]
+```
+
+四层的区别在于"影响面"：流影响一次请求，通道影响一条 IP 上的所有键，边影响某个 (IP, 域名) 组合，IP 影响全部域名。混用会出两种事故——把抖动当死亡（永久踢掉好 IP），或把风控当成功（并发把冷却洗掉）。
+
+## 8. MITM 的 TLS 面
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as 浏览器
+    participant MI as 本地 MITM
+    participant CA as GitPort Root
+    participant GH as GitHub（按路由表选 IP）
+
+    B->>MI: CONNECT github.com:443
+    MI->>MI: 检查是否受管域名（否则 fatal alert）
+    MI->>CA: 按 SNI 取/签叶子证书（365 天，358 天重签）
+    MI-->>B: 出示叶子证书链（ALPN h2, http/1.1）
+    B->>MI: h2 请求
+    MI->>GH: boring 握手（伪装 SNI + verify 锚点）→ h2 开流
+    GH-->>MI: 响应
+    MI->>MI: 分诊 / 纠错 / 缓存
+    MI-->>B: 回写
+```
+
+- 只为受管域名签发；SNI 不在表内直接 `ALERT_FATAL`。
+- 会话票据与缓存禁用（schannel 的恢复票据与本服务端互操作会报 bad record MAC）。
+- `ca.key` 权限收紧失败 → 删私钥、禁用 MITM，不降级硬跑。
+
+## 9. 系统写入与还原
+
+```mermaid
+flowchart TB
+    A[打开分流接管] --> B{当前 AutoConfigURL 是谁的?}
+    B -- 用户自己的 --> C[备份原值到 settings.json]
+    B -- 上次自己写的残留 --> D[不备份，直接覆盖]
+    C --> E[写 PAC + 置 WinINet 标志位]
+    D --> E
+    E --> F[git: 备份 http.proxy/https.proxy<br/>写 6 个域的 sslCAInfo]
+    F --> G[关闭开关 / 退出程序]
+    G --> H{当前值 == 我们写的?}
+    H -- 是 --> I[有备份则还原，无备份则 unset]
+    H -- 否 --> J[不动（别家中途接管了）]
+```
+
+三条判定缺一不可：认出自己的（`lastPAC` 精确比较）、放过别人的（当前值不是自己写的就不动）、有备份优先还原。git 侧同理，只写 URL 作用域的键，不碰全局 `sslVerify`。
+
+## 10. 目录结构与各文件职责
+
+```
+gitport-github/
+├─ Cargo.toml              依赖与 release profile（fat LTO、strip）
+├─ build.rs                Windows 资源（图标、版本信息）
+├─ .cargo/config.toml      BoringSSL 构建约定（clang-cl / Ninja / nasm / 工具集路径）
+├─ assets/
+│   ├─ app.rc              资源脚本
+│   └─ icon.ico            托盘与窗口图标
+├─ tools/                  排障脚本（缓存检查、变体对比、计时探针），非基准测试
+├─ docs/
+│   └─ architecture.md     本文件
+└─ src/
+   ├─ main.rs              启动顺序、命令行参数、退出钩子
+   ├─ config.rs            端口与全部超时/阈值常量、内容域域名表
+   ├─ certgen.rs           本地 CA：生成/加载、叶子签发、装当前用户根
+   ├─ settings.rs          开关持久化、PAC 接管/还原、git 接管/还原、自启、镜像注册表
+   ├─ webui.rs             工作台：静态页、状态/日志接口、PAC 生成、开关接口
+   ├─ desktop.rs           tao 窗口 + wry(WebView2) + 托盘、单实例 mutex
+   ├─ logger.rs            环形日志（2000 条）+ crash.log / tray.log
+   ├─ fsx.rs               原子写盘（临时文件 + rename）
+   ├─ winsec.rs            ca.key / settings.json 的 DACL 收紧
+   ├─ util.rs              LogFn、now_ms、锁中毒自愈
+   ├─ pool/
+   │   ├─ route.rs         二部图装载与键匹配、PAC 名单、master_route 分诊
+   │   ├─ edges.rs         边状态机：(ip,键) 冷却
+   │   ├─ mod.rs           取通道入口 get_or_build、串发/竞速、死亡退避、种子表
+   │   ├─ dial.rs          TCP/TLS 握手执行器（boring：Chrome 指纹、SNI 与校验名解耦）
+   │   ├─ latency.rs       建连延迟表（实测回流，落 routes.json）
+   │   ├─ speed.rs         通道暂缓与换血账本（60s 复验、60s 重建冷却）
+   │   └─ seeds.json       内嵌最小路由表（只做首启引导与补边）
+   ├─ server/
+   │   ├─ mod.rs           监听、CONNECT 分流、明文 HTTP、bogon 过滤、隧道
+   │   ├─ protocol.rs      BoxBody/Incoming 类型与请求预算
+   │   ├─ upstream.rs      h2 通道：池、配额、选路、请求/响应
+   │   ├─ status.rs        30s 通道账本（在途/上限、暂缓剩余）
+   │   └─ mitm/
+   │       ├─ mod.rs       MITM 主流程：缓冲、善后、缓存失效、写路由
+   │       ├─ switchboard.rs  URL 级分诊（唯一政策点）
+   │       ├─ mirror.rs    镜像链、ECT 竞速、身份头剥除、失败降权
+   │       ├─ direct_split.rs 直连多段（媒体白名单）
+   │       ├─ merge.rs     段合并、让位、补发、偏移校验
+   │       ├─ page_cache.rs 页面缓存（github.com HTML 列表页 + 白名单 XHR）
+   │       ├─ defuse.rs    风控页识别（403 restricted / 400 Whoa）与换 IP
+   │       ├─ redirect_memo.rs 头像 302 记忆（6 小时 TTL）
+   │       └─ quiet.rs     日志降噪（同 host 只留首条 / 按分钟聚合）
+   └─ tests/               对齐各模块的单元与集成测试
+```
+
+## 11. 建议的读码顺序
+
+1. `main.rs` → `config.rs`：先知道进程起来了什么、有哪些硬阈值。
+2. `pool/route.rs` → `pool/mod.rs` → `server/upstream.rs`：路由图怎么变成一条连接。
+3. `server/mod.rs`：CONNECT 的四条出口。
+4. `server/mitm/mod.rs` → `switchboard.rs`：解密后按 URL 分诊。
+5. `mirror.rs` → `direct_split.rs` → `merge.rs`：内容域的三件套。
+6. `settings.rs`：系统写入与还原的判定（这里出错最容易被用户察觉）。
+7. `certgen.rs` + `winsec.rs`：安全边界。
+
+## 12. 改代码前必须知道的不变量
+
+1. 每 IP 恒 1 条通道；会话域固定同一 IP、不开第二条。
+2. 通道闲置 10 秒焚毁——这是替代探活的机制，不要加回探活。
+3. 段合并只按偏移校验，不按内容；任何"镜像内容可信"的假设都不成立。
+4. 镜像请求必须剥身份头（Cookie/Authorization/Referer/UA）。
+5. 系统写入必须能认出"是不是自己写的"，否则还原会改坏用户配置。
+6. CA 只为受管域名签发；ACL 收紧失败必须禁用 MITM。
+7. 代理只绑 `127.0.0.1`；非受管域名只放行 443。
+8. 风控冷却只能到期自愈，不能 `clear()`。
+
+## 13. 改动影响面
+
+| 想改 | 牵动 | 容易漏 |
+| --- | --- | --- |
+| 路由语义 | `pool/route.rs`、`routes.json` 兼容、PAC 名单 | `HostMeta`/`IpNode` 回写格式 |
+| 通道策略 | `config.rs` 常量、`get_or_build`、`status.rs` | 常量是架构不是旋钮 |
+| 镜像 | `mirror.rs` 校验与降权、`merge.rs` 段边界 | 新增信任假设必须同时给校验手段 |
+| 缓存 | `page_cache.rs` 键与目录、清盘阈值 | 键含会话身份，跨账号串页是硬伤 |
+| 系统写入 | `settings.rs` 备份/还原判定 | "只还原自己写的"不能松 |
+| CA | `certgen.rs` 签发范围、`winsec.rs` ACL | ACL 失败必须禁用 MITM |

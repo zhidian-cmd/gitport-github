@@ -1,6 +1,4 @@
-//! 页面缓存：github.com 列表页/仓库页快照按会话分存（存 pages/<hash>），闸门页/未登录页/
-//! 跨账号不缓存。资产（JS/CSS）一律直连不缓存——v6.9 实测 48 分钟 132 个资产请求 0 命中，
-//! 机制与开关已物理删除（要找回来翻 git 历史）。
+//! 页面缓存：github.com 列表页/仓库页快照按会话分存（pages/<hash>），闸门页/未登录页/跨账号不缓存；资产一律直连不缓存（实测 0 命中，机制已物理删除）。
 use super::BoxBody;
 use crate::server::protocol::{self, Incoming};
 use crate::server::upstream;
@@ -112,9 +110,7 @@ fn slash_uri(req: &hyper::Request<Incoming>, host: &str) -> http::Uri {
         .unwrap_or_else(|_| req.uri().clone())
 }
 
-/// 条目落点：键尾 `-k`/`-rk` 进跨会话目录 keep/，其余进会话目录 pages/（清盘只清后者）。
-/// v6.9 资产缓存整体停用并物理删除：实测 48 分钟 132 个 githubassets 请求 0 命中
-/// （没变的 URL 浏览器自己消化，换哈希的代理也没见过），机制与开关一并移除。
+/// 键尾 -k/-rk 进跨会话 keep/，其余进会话目录 pages/（清盘只清后者）；v6.9 资产缓存已物理删除。
 fn entry_dir(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     if key.ends_with("-k") || key.ends_with("-rk") {
         dir.join("keep")
@@ -240,8 +236,7 @@ pub(super) fn cache_take(
     req: &hyper::Request<Incoming>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
-    // 仓库首页无尾杠：尾杠版已在缓存 → 本地 301（省一次上游往返；
-    // 浏览器落到尾杠地址后相对链接才解析得对）。尾杠版没缓存则正常回源。
+    // 仓库首页无尾杠且尾杠版已缓存 → 本地 301（浏览器落到尾杠地址后相对链接才对）；尾杠版没缓存则回源。
     if is_repo_home(req.uri().path()) && !req.uri().path().ends_with('/') {
         let cookies = all_cookies(req.headers());
         let slash_key = live_cache_key(
@@ -550,8 +545,7 @@ fn ensure_cache_dir_with_acl(dir: &std::path::Path) -> bool {
     true
 }
 
-/// 全部 Cookie 头按出现序拼接：浏览器的大 Cookie 会被 h2 拆成多行，
-/// 只读第一行会漏掉排在后面的 user_session —— 登录流量就会被记成 -cloggedout。
+/// Cookie 按出现序全拼：大 Cookie 会被 h2 拆多行，只读第一行会漏掉后面的 user_session，把登录记成未登录。
 fn all_cookies(hdrs: &hyper::HeaderMap) -> Option<String> {
     let mut joined = String::new();
     for v in hdrs.get_all("cookie") {
@@ -572,9 +566,7 @@ fn session_value(cookies: Option<&str>) -> Option<&str> {
     })
 }
 
-/// 身份标签：未登录 -cloggedout，登录 = 会话号稳定摘要。
-/// 不用账号名（dotcom_user 是客户端自报的明文，伪造它就能撞出别人的键）——
-/// 会话号散列进标签（复用 page_file_name），读取侧按 key 校验；轮换 user_session 只损失一次命中。
+/// 身份标签：未登录 -cloggedout，登录 = 会话号稳定摘要；不用账号名（客户端自报明文可伪造），轮换会话只损失一次命中。
 fn session_fingerprint(cookies: Option<&str>) -> String {
     match session_value(cookies) {
         Some(sess) => format!("-cs{}", page_file_name(sess)),
@@ -587,8 +579,7 @@ fn dbg_path(key: &str) -> &str {
     key.split_once(' ').map(|(_, rest)| rest).unwrap_or(key)
 }
 
-/// 搜索页的内容分钥匙：存侧看实际 Content-Type，取侧按 Accept 预测，猜错只是 miss。
-/// GitHub 搜索页按 Accept 协商，同 URL 两种正文必须分钥匙。
+/// 搜索页内容分钥匙：存侧看 Content-Type、取侧按 Accept 预测，猜错只是 miss；同 URL 两种正文必须分开。
 fn search_variant(accept: Option<&str>) -> &'static str {
     let wants_json = accept
         .map(|a| {
@@ -615,11 +606,7 @@ fn live_cache_key(
     if is_home_path(uri.path())
         || (is_repo_home(uri.path()) && !uri.path().starts_with("/settings"))
     {
-        // v6.11：仓库页快照与首页骨架同待遇——跨会话存 keep/，7 天温和重同步。
-        // 发版换哈希在窗口内隐身：旧壳引用旧 chunk，浏览器 immutable 缓存直出。
-        // 页面数据（提交/文件列表）走独立 XHR 实时直通，壳旧不影响数据新。
-        // /settings/* 是账号敏感页（两段路径会被仓库页启发式误中），保持会话键。
-        // 仓库页用 -rk 标记：走底稿+分段增量存储（首页骨架 -k 保持全量存储）。
+        // v6.11：仓库页快照跨会话存 keep/、7 天重同步（旧壳由 immutable 缓存直出，数据走 XHR）；/settings/* 保持会话键；-rk 走底稿+增量，-k 全量。
         if is_repo_home(uri.path()) {
             format!("{base}-rk")
         } else {
@@ -646,8 +633,7 @@ fn page_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str)
     format!("GET {host}{path}{q}{cookie_tag}{enc_tag}")
 }
 
-/// 从键尾解析编码桶（对应 page_cache_key 的 enc_tag；-rk 快照键尾为 `{enc_tag}-rk`）。
-/// 交付编码跟桶走：identity 桶交明文，gzip/brotli 桶交 gzip。
+/// 从键尾解析编码桶（-rk 键尾为 {enc_tag}-rk）；交付编码跟桶走：identity 交明文，gzip/brotli 交 gzip。
 fn key_enc_bucket(key: &str) -> &'static str {
     let tail = key.strip_suffix("-rk").unwrap_or(key);
     if tail.ends_with("-id") {
@@ -659,8 +645,7 @@ fn key_enc_bucket(key: &str) -> &'static str {
     }
 }
 
-/// /search 查询串归一化：默认页显式补 p=1（无 p 与 p=1 同键），参数按键名排序；
-/// 其他路径保持原样，个别接口参数顺序有语义。
+/// /search 查询串归一化：默认页补 p=1、参数按键名排序；其他路径原样（个别接口参数顺序有语义）。
 fn normalize_query(path: &str, q: &str) -> String {
     if path != "/search" {
         return format!("?{q}");
@@ -711,9 +696,7 @@ fn is_logged_out_body(plain: &str) -> bool {
     plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
 }
 
-/// HTML 是否完整（末 2KB 内有 </html>）：GitHub 的 h2 响应没有 content-length，
-/// 上游流中途断掉时 collect 仍返回 Ok —— 截断页落进 keep/ 会被 7 天寿命内
-/// 的每次后退命中，等于必现白屏。读写两侧都用它把关。
+/// HTML 完整性（末 2KB 有 </html>）：h2 响应无 content-length，中途断流时 collect 仍 Ok，截断页进 keep/ 会 7 天内反复命中=必现白屏；读写两侧都查。
 fn html_complete(bytes: &[u8], enc: &str) -> bool {
     let full = super::defuse::decompress_partial(bytes, enc, 32 << 20);
     full.len() >= 7
@@ -821,8 +804,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
         .unwrap_or("identity");
     let body = &raw[end..];
     let segs = header.get("stoenc").and_then(|v| v.as_str()) == Some("segs");
-    // v6.11 分段快照：底稿+增量还原明文；门检跑明文；交付重压 gzip
-    //（头里 content-encoding: gzip 与重压后的体一致；content-length 剥掉由 hyper 按实际体重设）。
+    // v6.11 分段快照：底稿+增量还原明文、门检跑明文、交付重压 gzip（剥 content-length 由 hyper 按实际体重设）。
     let (hdrs, out_body) = if segs {
         let base = load_repo_base(&page_cache_dir()).ok_or("底稿缺失")?;
         let full = seg_decode(&base, body).ok_or("分段增量损坏")?;
@@ -839,10 +821,7 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
         }
         let mut h = hdrs;
         h.retain(|(k, _)| k.as_str() != "content-length" && k.as_str() != "content-encoding");
-        // 交出去的体必须与声明的 content-encoding 一致——存侧头是原体(br/无)的，两种桶都剥掉重写：
-        // identity 桶(curl/CLI)没协商过任何编码，交明文不写编码头；gzip/brotli 桶统一重压
-        // gzip(协商过 br 的浏览器都收 gzip)。直交原编码浏览器按错解码白屏，identity 桶收到
-        // 没协商过的 gzip 则按明文解析成乱码。
+        // 交付体必须与声明编码一致：identity 桶交明文不写编码头，gzip/brotli 桶统一重压 gzip；直交原编码浏览器按错解码白屏，identity 桶收到 gzip 则乱码。
         if key_enc_bucket(key) == "id" {
             (h, Bytes::from(full))
         } else {
@@ -885,9 +864,7 @@ fn page_refresh_done(key: &str) {
     lock(g).remove(key);
 }
 
-/// 过期页面快照的后台静默重拉：带 cookie 拉最新壳，200+完整+会话存活才覆盖。
-/// 重试循环：代理在跑就一直拉（失败 60s 后再试），直到成功入库或确认页面不存在；
-/// 全程前台零感知（旧壳继续服务）。
+/// 过期快照后台静默重拉：带 cookie 拉最新壳，200+完整+会话存活才覆盖；失败 60s 再试直到成功或确认页面不存在，前台零感知。
 fn spawn_page_refetch(
     log: &LogFn,
     host: &str,
@@ -1094,8 +1071,7 @@ fn store_repo_base(dir: &std::path::Path, plain: &[u8]) {
     }
 }
 
-/// 分段增量编码：底稿里找 ≥32 字节的相同段（贪心最长匹配，8 字节索引），
-/// 段间差异存字面量。序列化 = [4B op 数] + 每 op [4B 字面长][字面][4B 底稿位][4B 段长]。
+/// 分段增量编码：底稿里找 ≥32 字节相同段（贪心最长匹配，8 字节索引），差异存字面量；序列化 = [4B op 数] + 每 op [4B 字面长][字面][4B 底稿位][4B 段长]。
 fn seg_encode(base: &[u8], plain: &[u8]) -> Vec<u8> {
     let mut index: std::collections::HashMap<[u8; 8], Vec<u32>> = std::collections::HashMap::new();
     if base.len() >= 8 {
@@ -1251,8 +1227,7 @@ fn persist_page_entry_blocking(
     )
 }
 
-/// 仓库页快照入库：解压明文 → 底稿缺失则立底稿 → 分段增量编码 →
-/// 增量不比全量 gzip 体小时自动改存全量（自愈，永不亏损）。
+/// 仓库页入库：解压明文→底稿缺失则立→分段增量编码→增量不比全量 gzip 小时自动改存全量（自愈）。
 fn persist_repo_snapshot(
     dir: &std::path::Path,
     key: &str,
@@ -1295,8 +1270,7 @@ fn persist_repo_snapshot(
     write_entry_file(dir, key, &delta, &header)
 }
 
-/// 服务器明说别存的（no-store）一律不落盘。private 不在列——GitHub 用它表达
-/// "浏览器别共享"，代理侧缓存已按会话号哈希分钥匙，语义等价；全拒会把页面缓存整个干掉。
+/// no-store 一律不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号哈希分钥匙语义等价，全拒会干掉页面缓存。
 fn resp_no_store(headers: &http::HeaderMap) -> bool {
     headers
         .get("cache-control")

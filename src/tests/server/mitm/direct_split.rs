@@ -1,5 +1,4 @@
-//! 纯直连多段的不变量：准入只认静态 CDN、URL 与凭据头原样保留、段边界严格、
-//! 合并后的字节与单流逐字节一致。这些是「图会不会花 / 请求会不会被改坏」的底线。
+//! 纯直连多段不变量：准入只认静态 CDN、URL 与凭据头原样保留、段边界严格、合并字节与单流逐字节一致。
 use super::{
     is_split_host, seg_count, skip_request_header, skip_response_header, SegmentedBody, Tpl,
     MAX_SEGS, MIN_SPLIT_BYTES,
@@ -34,8 +33,7 @@ fn tpl() -> Tpl {
 
 #[test]
 fn session_hosts_never_enter_direct_split() {
-    // README 的 /o/r/raw/... 第一跳在 github.com 上，是 302；会话域本就不在静态
-    // 图片 CDN 白名单里，不会进纯直连切片。
+    // README /o/r/raw/... 第一跳在 github.com 是 302；会话域本就不在静态 CDN 白名单，不会进切片。
     for h in ["github.com", "api.github.com", "objects.githubusercontent.com"] {
         assert!(!is_split_host(h), "{h} 不该进纯直连切片");
     }
@@ -56,8 +54,7 @@ fn readme_image_cdns_are_allowed() {
     ] {
         assert!(is_split_host(h), "{h} 应该是静态资源落点");
     }
-    // v6.7：githubassets 的 JS/CSS 不再切片——脚本分片直连独走无救援，一段卡死
-    // 整文件卡死（9MB index.js 实测从未走通），改单流直连 + 缓存兜底。
+    // v6.7：githubassets 的 JS/CSS 不切片——脚本分片无救援、9MB index.js 实测从未走通，改单流直连+缓存兜底。
     assert!(
         !is_split_host("github.githubassets.com"),
         "githubassets 不得再进切片"
@@ -73,8 +70,7 @@ fn segment_request_keeps_credentials_and_sets_exact_range() {
         "bytes=262144-524287",
         "Range 是半开区间 [s,e) → s-(e-1)"
     );
-    // URL 与凭据头一字不改：签名可能在 query 里，Authorization 也可能是取图凭据，
-    // 剥掉只会把请求改坏（403 / 签名校验失败），不是更安全。
+    // URL 与凭据头一字不改：签名可能在 query、Authorization 可能是取图凭据，剥掉只会把请求改坏。
     assert_eq!(req.headers().get("cookie").unwrap(), "user_session=SECRET");
     assert_eq!(req.headers().get("authorization").unwrap(), "Bearer SECRET");
     assert_eq!(
@@ -250,8 +246,7 @@ impl hyper::body::Body for StallBody {
     }
 }
 
-/// 5s 界拨到 0、无救援上下文：直连段不得被判死——继续骑直连流
-/// （回归：冻结后救援必败曾把能自愈的停滞毁成整图错误）。
+/// 5s 界拨到 0、无救援上下文：直连段不得判死，继续骑直连流（回归：冻结后救援必败曾把能自愈的停滞毁成整图错误）。
 #[tokio::test]
 async fn empty_rescue_chain_never_kills_stalled_segment() {
     use std::time::Duration;
@@ -325,8 +320,7 @@ async fn rescue_swap_continues_byte_stream() {
         })),
         Duration::MAX, // 不自动冻结：换体由测试手动驱动
     );
-    // 先收直连的 6 字节前缀。StallBody 只吐这一帧、之后永久 Pending 且不注册唤醒，
-    // 所以只能取一次：连 poll 第二次会永远等下去（本测试曾因此挂死）。
+    // 先收直连 6 字节前缀：StallBody 只吐这一帧、之后永久 Pending 不注册唤醒，只能取一次（poll 第二次会挂死）。
     let mut got: Vec<u8> = Vec::new();
     match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
         Some(Ok(f)) => got.extend_from_slice(f.data_ref().unwrap()),
@@ -351,9 +345,7 @@ async fn rescue_swap_continues_byte_stream() {
     assert_eq!(got, whole, "前缀 + 续传必须逐字节还原整文件");
 }
 
-/// 静默上游（不发数据也不关连接）必须能触发停滞救援并错误上抛，而不是永久 Pending——
-/// waker 已注册进静默的上游，永远不触发；闹钟到点自醒是唯一唤醒源。
-/// 修复前 collect 在这里挂死：救援判据只在 re-poll 时求值，而没有任何东西再 poll 它。
+/// 静默上游必须触发停滞救援并错误上抛，而不是永久 Pending：waker 已注册进静默上游永不触发，闹钟到点自醒是唯一唤醒源。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // 与同文件既有测试同款：TEST_LOCK 护全局表，跨 await 有意为之
 async fn silent_stall_wakes_and_errors_instead_of_hanging() {
@@ -383,8 +375,7 @@ async fn silent_stall_wakes_and_errors_instead_of_hanging() {
         }),
         Duration::from_millis(30), // 停滞界：真实时钟 30ms，测试快
     );
-    // 修复前：collect 永久 Pending（无唤醒源）；修复后：30ms 闹钟自醒 → 救援起跳 →
-    // get_or_build 失败 → 重试耗尽 → 段错误上抛。
+    // 修复前 collect 永久 Pending；修复后 30ms 闹钟自醒→救援起跳→get_or_build 失败→重试耗尽→段错误上抛。
     let outcome = tokio::time::timeout(Duration::from_secs(5), BodyExt::collect(body)).await;
     let collected = outcome.expect("静默停滞不许永久挂死: collect 5s 内必须收场");
     assert!(

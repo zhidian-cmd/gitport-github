@@ -1,5 +1,4 @@
-// TEST_LOCK 要在整个异步用例期间独占全局路由表/连接池，跨 await 持 std Mutex 是刻意的；
-// 这些用例跑在 current_thread runtime 上，不会被别的任务抢锁。
+// TEST_LOCK 跨 await 独占全局路由表/连接池是刻意的：用例跑在 current_thread runtime 上，无人抢锁。
 #![allow(clippy::await_holding_lock)]
 use super::*;
 use std::path::PathBuf;
@@ -11,8 +10,7 @@ static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 fn tmpdir() -> PathBuf {
     let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("gitport_test_{}_{n}", std::process::id()));
-    // 进程号会被系统复用：上一轮同 pid 的残留目录里可能留着 routes.json / plans.json，
-    // 不清掉会让"全新安装"的测试读到旧表，间歇性失败（本地实测踩到过）。
+    // pid 会被系统复用：残留旧 routes/plans.json 会让"全新安装"测试读到旧表间歇性失败（实测踩到过）。
     let _ = std::fs::remove_dir_all(&d);
     if let Err(e) = std::fs::create_dir_all(&d) {
         panic!("测试临时目录创建失败 {d:?}: {e}");
@@ -65,7 +63,6 @@ fn breaker_expired_entry_lazily_removed() {
     b.set("expired.example");
     assert!(!b.open("expired.example"), "过期条目不得判熔断中");
     assert!(b.lock().is_empty(), "过期条目应被惰性清除");
-    // 活条目不受影响：open 通过且仍留在表里
     let live = Breaker::new(600);
     live.set("live.example");
     assert!(live.open("live.example"));
@@ -653,8 +650,7 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     apply_worker_mirrors(Vec::new()).ok();
 }
 
-/// 手改进 mirrors_big 的镜像必须被收编进注册表：否则工作台看不到、开关管不到、删不掉，
-/// 界面和文件变成两套真相。
+/// 手改进 mirrors_big 的镜像必须收编进注册表：否则工作台看不到、开关管不到、删不掉，界面和文件两套真相。
 #[test]
 fn hand_written_big_mirror_is_adopted_into_registry() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -902,8 +898,7 @@ fn content_host_success_never_parks_cursor_but_clears_edges() {
     assert!(!edges::is_bad(&ip, &key), "内容域成功仍要洗白 421 短冷却");
 }
 
-/// 风控冷却免疫"成功"回写：block 页本身也是一次成功的 HTTP 交换，可清就会在风暴里
-/// 被并发回写当场洗掉（实测 26 家候选 3 轮回头的事件根因）。
+/// 风控冷却免疫"成功"回写：block 页也算一次成功 HTTP 交换，可清就会在风暴中被并发回写洗掉（26 家候选 3 轮回头事件的根因）。
 #[test]
 fn risk_cooldown_survives_success_note() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -925,8 +920,7 @@ fn risk_cooldown_survives_success_note() {
     assert!(edges::is_bad(&ip, "github.com"), "短冷却不得降级活着的风控");
 }
 
-/// 串发重试引擎实机圈：TCP 拒 → 沿圈到活条 → 驻留 + 死亡退避。
-// 串行锁有意全程持有: 测试期间独占全局表, 跨 await 是本意。
+/// 串发重试引擎实机圈：TCP 拒→沿圈到活条→驻留+死亡退避；跨 await 持 TEST_LOCK 是本意（独占全局表，current_thread runtime）。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn serial_dial_rotates_on_failure_and_parks_on_success() {
@@ -1052,8 +1046,7 @@ fn codeload_route_isolated_to_verified_ips() {
     assert_eq!(declared.len(), 2, "codeload 只该挂两个实测可用的 IP");
     assert!(verified.iter().all(|ip| declared.contains(ip)));
 
-    // 生产加载路径要自己补出 codeload 行，别退回 github.com 那一整组 IP。
-    // 空目录 = 全新安装（吃种子）；写了 dist 内容的目录 = 现有用户表。
+    // 生产加载路径要自己补出 codeload 行，别退回 github.com 整组 IP；空目录=全新安装吃种子，dist 目录=现有用户表。
     let mut dirs = vec![tmpdir()];
     if let Ok(raw) = std::fs::read_to_string("dist/routes.json") {
         let d = tmpdir();
@@ -1113,9 +1106,7 @@ fn shared_ip_marks_come_from_topology() {
     );
 }
 
-/// dial_order 档位排序：指定 prefer_shared 时独占/共享分档，优先档整档在前、
-/// 档内游标优先 + 延迟升序；None 保持纯游标+延迟序。
-/// 断言依赖「延迟表为空」——必须持 TEST_LOCK 与 seed 延迟的用例串行，否则撞表。
+/// dial_order 分档排序：prefer_shared 时独占/共享分档、档内游标+延迟升序，None 纯游标+延迟序；断言依赖空延迟表，必须持 TEST_LOCK 串行。
 #[test]
 fn dial_order_partitions_exclusive_and_shared() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1143,8 +1134,7 @@ fn dial_order_partitions_exclusive_and_shared() {
     assert_eq!(o.len(), 3, "不分档 = 全体一个序");
 }
 
-/// 媒体救援链（图片/视频）是保留键：解析进表、落盘回写、注册表对齐三处都不能弄丢。
-/// 全程不碰磁盘与真网——parse/encode/align 都是纯函数，装种子表只为 encode 取节点快照。
+/// 媒体救援链（图片/视频）是保留键：解析、落盘回写、注册表对齐都不能弄丢；全程纯函数不碰磁盘真网。
 #[test]
 fn media_rescue_chains_roundtrip_and_align_skip() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

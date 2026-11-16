@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// tmp 文件的 RAII 守卫：接管后任何失败路径（`?` 早退等）都会把 tmp 删掉，
-/// 不留 `*.tmp` 垃圾。成功 rename 后守卫随作用域释放（文件已挪走，删除落空无害）。
+/// tmp 文件 RAII 守卫：任何失败路径都删 tmp，成功 rename 后删除落空无害。
 struct TmpGuard<'a>(&'a Path);
 
 impl Drop for TmpGuard<'_> {
@@ -17,8 +16,7 @@ impl Drop for TmpGuard<'_> {
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    // tmp 名带进程号+序号：固定名的话两个并发写者会往同一个 tmp 交错写，
-    // rename 出来是两份 JSON 的混合体，下次启动按种子重建、用户手改全丢还报"成功"。
+    // tmp 名带进程号+序号：固定名会让并发写者交错写同一个 tmp，rename 出混合 JSON。
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_file_name(format!(
         "{}.{}.{}.tmp",

@@ -150,8 +150,7 @@ fn forced_encoding_prefers_br_gzip_fallback() {
     );
 }
 
-/// 纯 CDN 域剥凭据：githubassets/github.io 全剥；githubusercontent 家族不剥
-/// ——私有仓库的 raw/头像/codeload 压缩包靠 Cookie 鉴权，剥了掐死私有内容。
+/// 纯 CDN 域剥凭据：githubassets/github.io 全剥；githubusercontent 家族靠 Cookie 鉴权私有 raw/头像/codeload，剥了掐死私有内容。
 #[test]
 fn credentials_stripped_only_on_pure_cdn_hosts() {
     assert!(strip_credentials("github.githubassets.com"));
@@ -201,9 +200,7 @@ fn host_classes_split_content_session_and_other() {
         HostClass::Session,
         "api 也是会话域"
     );
-    // 会话域按风控面划界(主站族之外的数据不是主站): githubassets/github.io/githubapp
-    // 不标 session——githubassets 的长寿命通道会占住 185.199.154/215 这 8 个三类横跨的
-    // 共享 IP。githubassets 是内容域：单流直连（v6.9 起资产不切片不缓存）。
+    // 只主站族标 session：githubassets 等不标——长寿命通道会占走 185.199 跨类共享 IP；githubassets 是内容域，单流直连。
     assert_eq!(host_class("githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.io"), HostClass::Other);

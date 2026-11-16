@@ -1,5 +1,4 @@
-//! 状态行：每 30s 把池内通道的暂缓/占用状态摊开一行，只打最近有活动的 host。
-//! 平时页面快慢在日志里看不见——这里有事没事都亮账本。
+//! 状态行：每 30s 摊开池内通道的暂缓/占用状态，只打最近有活动的 host。
 use crate::server::upstream;
 use crate::util::LogFn;
 use std::time::Duration;

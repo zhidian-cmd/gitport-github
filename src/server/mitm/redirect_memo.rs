@@ -29,8 +29,7 @@ fn memo_key(path: &str, query: Option<&str>) -> String {
     }
 }
 
-/// 302 落点必须是已知头像域：登录跳转/风控页/被污染的回包不记仇——
-/// 否则一次异常 302 会让该路径 6 小时内全部本地直答这个跳转。
+/// 302 落点必须是已知头像域：否则一次异常跳转会让该路径 6 小时内全部本地直答这个跳转。
 fn is_avatar_target(location: &str) -> bool {
     let host = location
         .strip_prefix("https://")
@@ -76,8 +75,7 @@ pub(super) fn observe_response(
     status: http::StatusCode,
     headers: &http::HeaderMap,
 ) {
-    // 头像入口偶尔走 301/307/308（CDN 换域、缓存策略变化），只认 302 会漏学。
-    // 落点仍由 is_avatar_target 严格校验，放宽状态码不会把登录跳转/风控页记进来。
+    // 头像入口偶尔走 301/307/308，只认 302 会漏学；落点仍由 is_avatar_target 严格校验。
     if !matches!(
         status,
         http::StatusCode::MOVED_PERMANENTLY

@@ -73,9 +73,7 @@ pub async fn handle_connect_mitm(
     });
     let result = if alpn == b"h2" {
         hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-            // 与上游侧同款（upstream.rs 4MB 连接窗）：h2 默认 64KB 连接窗会把整页
-            // 上百个流压成按 RTT 串行——当年只修了上游那一半，浏览器侧漏了，
-            // 页面资产再多通道也灌不进浏览器。
+            // h2 连接窗照 upstream 的 4MB 调：默认 64KB 会把上百个流压成按 RTT 串行，多通道也灌不进浏览器。
             .initial_stream_window_size(1024 * 1024) // 流级 1MB
             .initial_connection_window_size(4 * 1024 * 1024) // 连接级聚合 4MB
             .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
@@ -92,8 +90,7 @@ pub async fn handle_connect_mitm(
             || e.is_incomplete_message()
             || e.is_closed()
             || e.is_body_write_aborted();
-        // h1 侧写响应体失败不在 is_closed() 里，以前被印成「服务层错误」像真故障。
-        // 归回客户端断开，且同 host 只留首条（与隧道解密行共用 quiet 表）。
+        // h1 写体失败归回客户端断开（不在 is_closed() 里），同 host 只留首条，与隧道解密行共用 quiet 表。
         if client_gone_text(&msg) {
             if quiet::first_time("client-gone", host) {
                 (srv.log)(&format!("[MITM] {host} 客户端已断开"));
@@ -133,16 +130,12 @@ async fn mitm_http(
             from_uri
         }
     };
-    // 隧道内 host 是请求头自己说的：外层 CONNECT 闸只守入口，这里不复核的话，
-    // 换个 Host 头就能探测内网/把会话头带去任意站点。与两个外层入口同款。
+    // 隧道内 host 由请求头自报：外层 CONNECT 闸只守入口，这里不复核就能换 Host 探内网/把会话头带去任意站点。
     if !crate::pool::route::is_managed(&host) {
         (log)(&format!("[拒绝] {host} 非受管域名, 不做开放转发(仅加速 GitHub 系)"));
         return plain_502();
     }
-    // 主站上 /owner/repo/zip/refs/... 是 codeload 被不对口 IP 用 301 踢回来的死路径，
-    // GitHub 主站本身没有这个路由。那条 301 没带缓存头，浏览器会永久记住；此后即使把
-    // codeload 的路由修对，浏览器也直接跳到这条 404 路径、根本不再问代理。这里内部按
-    // codeload 转发（路径一字不改，codeload 用的就是同一串），不再回任何 3xx，旧缓存失效。
+    // 主站 /zip/refs/... 是错 IP 用无缓存头 301 踢回的死路径，浏览器会永久记住；这里内部按 codeload 转发、不回 3xx，旧缓存自然失效。
     if let Some(alias) = codeload_alias_host(&host, req.uri().path()) {
         host = alias.to_string();
         if let Some(v) = req.headers_mut().get_mut(http::header::HOST) {
@@ -246,8 +239,7 @@ async fn mitm_http(
     }
     // 存路由：可缓存性/元数据/索引判定都在 page_cache 模块内部
     let mut resp = page_cache::cache_put(&log, &req, &host, resp).await;
-    // 不对口 IP 回的 301 曾没带缓存头被浏览器永久记住；codeload 一旦出 3xx 就禁缓存，
-    // 免得换 IP 修好后旧重定向还赖在浏览器里。
+    // codeload 出 3xx 一律禁缓存：不对口 IP 的无缓存头 301 曾被浏览器永久记住，修好 IP 后旧跳转还赖着。
     if host == "codeload.github.com" && resp.status().is_redirection() {
         resp.headers_mut().insert(
             http::header::CACHE_CONTROL,
@@ -256,8 +248,7 @@ async fn mitm_http(
     }
     write_upstream(&log, resp, "direct", &info, &host, &path)
 }
-/// codeload 的规范路径：/owner/repo/(zip|tar.gz)/refs/... 只存在于 codeload.github.com。
-/// 出现在 github.com 上必然是那条被错 IP 踢回来的死路径，主站一律 404。
+/// codeload 规范路径 /owner/repo/(zip|tar.gz)/refs/... 只在 codeload 存在；出现在 github.com 必是被错 IP 踢回的死路径，主站一律 404。
 fn is_codeload_alias_path(path: &str) -> bool {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     segs.len() >= 4 && matches!(segs[2], "zip" | "tar.gz") && segs[3] == "refs"
@@ -409,8 +400,7 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// 响应头预算按 host 三类分开：黑洞必烧满预算，罩更久纯浪费。
-/// CDN 静态资源 2s 足够；会话域（动态页面/API）留 4s——GitHub 现场拼页面偶有 2~3s。
+/// 响应头预算按 host 分类：黑洞必烧满预算，罩更久纯浪费；CDN 静态 2s，会话域 4s（现场拼页面偶有 2~3s）。
 fn request_budget(host: &str) -> Duration {
     match upstream::host_class(host) {
         upstream::HostClass::Content => CONTENT_REQUEST_BUDGET,
@@ -419,9 +409,7 @@ fn request_budget(host: &str) -> Duration {
     }
 }
 
-/// 复用失败的文案：断链和超时是两种病，别用一句话糊过去。
-/// 断链 = 连接已经没了，发出去就报错（微秒级）；超时 = 请求发出去了、对端不答，烧满整个预算。
-/// 混成"连接已断"会让人把"边缘不答"误判成链路故障，排查方向直接跑偏。
+/// 复用失败分两种：断链 = 连接已没、发出去就报错（微秒级）；超时 = 请求发出对端不答、烧满整个预算。混成连接已断会把边缘不答误判成链路故障。
 fn reuse_failure_text(why: &str, budget: Duration) -> String {
     if why == ERR_BUDGET_TIMEOUT {
         format!("响应超时({}s) 放弃复用", budget.as_secs())
@@ -430,9 +418,7 @@ fn reuse_failure_text(why: &str, budget: Duration) -> String {
     }
 }
 
-/// 复用失败出声一次就够：一次页面加载会连着撞几条同 host 的连接，别拿同样的行刷屏。
-/// 复用失败记账：首条立刻留痕，之后每 60 秒汇总一行（次数 + 超时/断开分项 + 最近 IP）。
-/// 旧行为是每 host 每种失败只打第一条——反复发生的证据反而被抹掉了，排查时看不到。
+/// 复用失败首条立刻留痕，之后每 60s 汇总一行（次数+超时/断开+最近 IP）：一页加载会连撞几条同 host 连接，但反复发生的证据不能抹掉。
 fn note_reuse_failure(log: &LogFn, host: &str, ip: &str, why: &str, budget: Duration) {
     struct Acc {
         n: u32,
@@ -522,8 +508,7 @@ fn direct_leg<'a>(
     fetch
 }
 
-/// 镜像加速派发（两处共用）：组装直连腿 + chain_fetch + 按胜出者写诊断头。
-/// ECT 同台竞速为主，串发链序只在直连腿失败后兜底（mirror.rs 的 walk_order）。
+/// 镜像派发（两处共用）：组装直连腿 + chain_fetch + 按胜者写诊断头；ECT 同台为主，直连全败才按链序兜底。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
@@ -559,8 +544,7 @@ async fn mirror_or_direct(
     ))
 }
 
-/// 直连腿：通道获取一站式在 pool::get_or_build，这里只管发请求与记账。
-/// 通道失败摘掉换一条重试一次，再败交上层按 fallback 走镜像/DNS。
+/// 直连腿：通道获取走 pool::get_or_build，这里只管发请求与记账；失败摘通道换一条重试一次，再败交上层按 fallback 走镜像/DNS。
 pub(super) async fn get_direct(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -577,8 +561,7 @@ pub(super) async fn get_direct(
             Ok((resp, ms)) => {
                 let id = up.id;
                 let ip = up.ip.clone();
-                // 服务端回 421 = 这个 IP 服务不了这个 host：边级长冷却，换下一条。
-                // 边状态按路由键记（子域请求的 host ≠ 路由键，按 host 记永远对不上）。
+                // 421 = 这个 IP 服务不了这个 host，边级长冷却换下一条；边状态按路由键记（子域 host ≠ 路由键）。
                 if resp.status() == StatusCode::MISDIRECTED_REQUEST {
                     if let Some(row) = pool::route::route_for(host) {
                         pool::edges::mark_reject(&ip, &row.key);
@@ -639,10 +622,7 @@ fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
         == Some("0")
 }
 
-/// 响应体计量 + 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节
-/// 没来 = 黑洞——看门狗只标记不杀在途请求（也许回源后能完成），通道暂缓 + 触发换血；
-/// 会话域则当场弃旧通道并预建替代（浏览器对未收到响应的重置连接会自动重试，
-/// 重试落在预建的新通道上）。
+/// 响应体计量 + 黑洞看门狗：响应头到了但 30s 内第一个数据字节没来即判黑；只标记不杀在途请求（也许回源后能完成），通道暂缓+换血；会话域当场弃旧通道并预建替代（浏览器自动重试落在预建通道上）。
 fn meter_body(
     log: &LogFn,
     host: &str,
@@ -681,11 +661,7 @@ fn meter_body(
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
     });
-    // 黑洞看门狗：响应头到了但 BLACKHOLE_FIRST_BYTE_MS(30s) 内第一个数据字节没来 = 黑洞。
-    // 30s 而不是更短：8s 实测会把"服务端慢渲染/单连接排队"误判成黑洞——
-    // overview-files 等接口 20~80s 才回是常态，数据最终都到（纯慢，不是黑）。
-    // 看门狗持 **Weak** 引用：body 结束（重定向/空体/快速完成）即静默退出。
-    // 判黑只标记不杀在途请求——它也许回源后能完成；杀连接只会把部分数据变成断流。
+    // 黑洞看门狗：30s 而非更短（8s 会把 20~80s 的慢渲染误判）；持 Weak 引用，体结束即静默退出；判黑只标记不杀在途请求，杀连接只会把部分数据变断流。
     if !no_body {
         let w = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -797,8 +773,7 @@ async fn dns_direct_fetch(
     info: &UpstreamInfo,
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
-    // 与 connect_upstream 兜底腿同一份地址保险：hosts 把受管域名指进环回/私网/CGNAT
-    // 时，这条腿不能带着会话头直拨本机 443（另一侧已修，这里别留后门）。
+    // 与 connect_upstream 兜底腿同一份地址保险：hosts 把受管域名指进环回/私网时，这条腿不能带会话头直拨本机 443。
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
         .await
         .map_err(|e| format!("系统 DNS 解析失败: {e}"))?

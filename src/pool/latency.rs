@@ -1,6 +1,4 @@
-//! IP 建连延迟：真实拨号的实测用时（事件驱动回流——每次建连成功记一笔，无定时器、
-//! 无主动探测），退出时经 pool::save_routes_now 落进 routes.json 的 `latency` 键；
-//! 拨号候选按延迟升序挑。
+//! 建连延迟：真实拨号用时（事件回流、无主动探测），退出落 routes.json 的 latency 键，拨号按延迟升序。
 use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,9 +16,7 @@ pub fn get(ip: &str) -> Option<u64> {
     g.as_ref()?.get(ip).copied()
 }
 
-/// 运行时拨号延迟回流：每次真实建连都把实测用时写进排序表（内存态，重启回落
-/// routes.json 的测速基线）。有旧值时取均值——单次 GFW 抖动（4 秒抽签）不会把
-/// 一个 IP 一棍子打死，连续慢才会让它沉底。
+/// 每次真实建连写实测用时（内存态，重启回落盘基线）；有旧值取均值，单次 GFW 抖动不会一棍子打死。
 pub fn note(ip: &str, ms: u64) {
     let mut g = lock(&TABLE);
     let m = g.get_or_insert_with(HashMap::new);
@@ -31,9 +27,7 @@ pub fn note(ip: &str, ms: u64) {
     m.insert(ip.to_string(), merged);
 }
 
-/// 黑洞降权：实测值翻倍上探（下限 3s、封顶 10s），连续黑洞会把该 IP 沉到
-/// 已测候选的队尾——游标挪动只管下一次重拨，降权管排序不该再偏爱它。
-/// 不会沉过未测候选（未测恒垫底），一次误判 60s 内随正常样本稀释恢复。
+/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选，60s 内随正常样本稀释恢复。
 pub fn sink(ip: &str) {
     let mut g = lock(&TABLE);
     let m = g.get_or_insert_with(HashMap::new);

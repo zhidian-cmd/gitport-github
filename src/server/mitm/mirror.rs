@@ -1,7 +1,4 @@
-//! 镜像加速模块（总机的镜像科室）：
-//! - **ECT 同台**：镜像链 + 直连腿一起参赛，按实测速率切块配额、慢段让位、补发挑最快家；
-//! - **串发兜底**：直连腿全败后按链序逐个试——只在前者失败时出场，不是独立加速路径；
-//! - 旁带：图片链 TTFB 校准。镜像请求不携带任何身份头（Cookie/Authorization 剥除）。
+//! 镜像加速：镜像链+直连腿 ECT 同台竞速（按实测速率切块、慢段让位、补发挑最快），直连全败才按链序串发兜底；图片链 TTFB 校准旁带；请求剥身份头。
 use super::merge::{self, MergeBody};
 use super::direct_split::Tpl;
 use super::path_of;
@@ -39,8 +36,7 @@ pub(super) struct MirrorLoad {
     pub(super) in_flight_streams: AtomicU64,
     /// 本时间槽实收字节：on_frame 累加，ect_sweep 每 ECT_WINDOW_MS 快照进 window_prev 后清零。
     window_bytes: AtomicU64,
-    /// 上一时间槽实收（派发器的吞吐分母）；0=零历史，按 +∞ 垫底。
-    /// 快照：有字节换新值；零收有债=卡死清零；零收无债=空闲沿用。
+    /// 上一时间槽实收（派发分母）：零收有债=卡死清零，零收无债=空闲沿用，0 历史按 +∞ 垫底。
     pub(super) window_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
@@ -193,8 +189,7 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 派发：score=(在途+新增)÷上一窗实收，即还需几个时间槽，最小者胜、无容差。
-/// 零历史按 +∞ 垫底；失败窗内跳过，全在窗内则放开。
+/// ECT 派发：score=(在途+新增)÷上一窗实收，即还需几个时间槽；最小者胜、无容差。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
@@ -316,14 +311,12 @@ fn validate_mirror_response(
     Ok(())
 }
 
-/// 单流 206 必须对得上请求刀口：起点错位(要 A 给 B)/未带 Range 却回 206，
-/// 字节会整体错位、文件静默损坏——返回 Some(原因) 按这家失败处理。
+/// 单流 206 必须对得上请求刀口：起点错位或未带 Range 却回 206 会让字节整体错位、文件静默损坏。
 fn stream_start_mismatch(req_range: Option<&str>, resp: &hyper::Response<BoxBody>) -> Option<String> {
     if resp.status() != http::StatusCode::PARTIAL_CONTENT {
         return None; // 200/304 等照旧走各自校验
     }
-    // 第二类失败单独拦：客户端整包 GET(没带 Range)却收到 206 分片，当完整文件
-    // 交出去就是静默截断——按这家失败处理，换下一家或回直连。
+    // 整包 GET 收到 206 当完整文件交出去就是静默截断，按这家失败处理。
     let Some(range) = req_range else {
         return Some("未请求 Range 却回 206".to_string());
     };
@@ -719,8 +712,7 @@ fn mark_unsliceable(key: String) {
     g.insert(key, Instant::now());
 }
 
-/// 直连段请求：克隆模板头、换本段 Range；release 302 到 release-assets 时跟一跳并带 Range。
-/// 预算按跳记：有镜像兜底时每跳 2s 等响应头，无兜底不设预算。
+/// 直连段请求：克隆模板头、换本段 Range；release 302 跟一跳带 Range；预算按跳记（有镜像兜底每跳 2s）。
 async fn segment_direct(
     log: &LogFn,
     tpl: &Tpl,
@@ -807,9 +799,7 @@ fn strip_body_headers(req: &mut hyper::Request<BoxBody>) {
     }
 }
 
-/// 段请求的 Range 头：end 是闭区间末端（含）。
-/// 主切片的 (s,e) 是半开区间要传 e-1，补发的 e 已经是闭区间末端直接传 e——
-/// 统一走这里，免得再出现「末端又减一次 1」那种少一字节的笔误。
+/// Range 的 end 是闭区间末端：主切片传 e-1，补发的 e 已闭区间直接传 e，统一走这里免得再减一次少一字节。
 fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
     http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
 }
@@ -858,8 +848,7 @@ struct RangePlanOutcome {
     guard: RangePlanGuard,
 }
 
-/// 段位分配（纯函数，便于测试）：段大小 = 在途总字节 ÷ 段位总数；
-/// 按区间从大到小依次占位，每个请求至少留 1 段。返回本区间该切几段。
+/// 段位分配（纯函数）：段大小 = 在途总字节 ÷ 段位总数，按区间从大到小占位，每请求至少 1 段。
 fn plan_quota(
     pending: &[(u64, u64)],
     my_id: u64,
@@ -932,8 +921,7 @@ async fn split_download(
         return Ok(None); // HEAD/其他方法没有体可切
     }
     let path = out.uri().path().to_string();
-    // 刚探过、上游明确不给 Range 的 URL：10 分钟内不再探测，直接走单流。
-    // 键带 query：同 path 不同签名对象(token=/sig=)是不同文件，总长记忆不能串键。
+    // 上游明确不给 Range 的 URL 10 分钟内不再探测；键带 query：同 path 不同签名对象不能串总长记忆。
     let slice_key = match out.uri().query() {
         Some(q) => format!("{host}{path}?{q}"),
         None => format!("{host}{path}"),
@@ -956,8 +944,7 @@ async fn split_download(
     if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
-    // 段位分配：镜像一家 3 份（细切，慢段让位快段接），直连单通道 1 份——
-    // 实测 185.199 段聚合水管恒定，直连多段只摊薄窗口不加吞吐。
+    // 段位：镜像一家 3 份细切、直连单通道 1 份（直连多段只摊薄窗口不加吞吐）。
     let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 1);
     for m in &idle_src {
         if m.starts_with("direct/") {
@@ -1016,8 +1003,7 @@ async fn split_download(
             }
         },
     };
-    // 段数：非 Range 按空闲段位平均分；Range 按同 URL 在途总字节现算段大小，
-    // 大区间先占段位、小区间只拿 1 段——下载器开 N 条连接时不会每家各切满一份。
+    // 非 Range 按空闲段位平均分；Range 按同 URL 在途总字节现算段大小，大区间先占、小区间保底 1 段。
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
@@ -1054,8 +1040,7 @@ async fn split_download(
         let tpl = tpl.clone();
         async move {
             let is_direct = m.starts_with("direct/");
-            // 直连腿公共体在 fetch_segment_direct（与补发同路：预算按跳记、失败降权）；
-            // 镜像腿 charge 后直接打镜像请求。两腿统一回 (guard, resp) 再做 206 校验。
+            // 直连公共体在 fetch_segment_direct（与补发同路：预算按跳记、失败降权），镜像 charge 后直接打请求；两腿统一回 (guard, resp) 再校验。
             let got: Result<(LoadGuard, hyper::Response<BoxBody>), String> = if is_direct {
                 // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
                 fetch_segment_direct(log, &tpl, &host, info, replay, m, s, e, has_mirror).await
@@ -1166,9 +1151,7 @@ async fn split_download(
     if dead == segs.len() {
         return Ok(None); // 全灭：退回单流，别让一次切片失败毁掉整个请求
     }
-    // 总长对账：记忆/探得的总长 vs 首段 206 自报总长，对不上 = 记忆已陈旧（对象换版/
-    // 镜像转码）——作废记忆整单回单流。按错总长切片/写 Content-Length 会静默截短真实
-    // 文件；此刻还没有任何字节交给客户端，回退与"全灭回单流"同一条安全口子。
+    // 总长对账：记忆/探得的总长与首段 206 自报不符 = 记忆陈旧（对象换版/镜像转码），作废整单回单流——按错总长切片会静默截短文件。
     if let (Some(known), Some(actual)) = (known_total, seg_reported_total) {
         if known != actual {
             total_memo_remove(&slice_key);
@@ -1236,8 +1219,7 @@ async fn split_download(
     builder.body(body).map(Some).map_err(|e| e.to_string())
 }
 
-/// 为 [from,to) 起新流（发出时加 base）；候选=镜像+健康直连，ECT 挑最小，两边都记账采样。
-/// 旧实现补发不进 ECT，直连会被永久排除。
+/// 为 [from,to) 起新流：候选=镜像+健康直连，ECT 挑最小，两边都记账采样；旧实现补发不进 ECT 会永久排除直连。
 #[allow(clippy::too_many_arguments)]
 async fn split_fetch(
     chain: &[String],
@@ -1267,8 +1249,7 @@ async fn split_fetch(
     let (s, e) = (base + from, base + to - 1);
     if m.starts_with("direct/") {
         let has_mirror = cands.len() > 1;
-        // e 已经是闭区间末端（base+to-1）：fetch 收开区间末 base+to，别再减 1。
-        // 少一字节会让合并层为末字节反复补发，而 1 字节补发的 Range 会变成起点>终点。
+        // e 已是闭区间末端（base+to-1），fetch 收开区间末 base+to 别再减 1；少一字节会让末字节反复补发。
         let got = fetch_segment_direct(log, tpl, host, info, replay, &m, s, base + to, has_mirror)
             .await;
         finish_fill(got, &m, host, s, log).await
@@ -1287,9 +1268,7 @@ async fn split_fetch(
     }
 }
 
-/// 直连段获取（首切与补发共用）：charge → Range → 直拨 → 有镜像时设跳预算 → 失败降权。
-/// 返回 (guard, resp)——guard 随响应交还调用方接记账；mark_fail 只对直连腿
-/// （超时(慢)与硬错误(死)分开降权，慢腿别踢太久）。
+/// 直连段获取（首切与补发共用）：charge→Range→直拨→有镜像时设跳预算→失败降权；返回 (guard, resp) 接记账。
 #[allow(clippy::too_many_arguments)]
 async fn fetch_segment_direct(
     log: &LogFn,
@@ -1327,8 +1306,7 @@ async fn fetch_segment_direct(
     got.map(|resp| (guard, resp))
 }
 
-/// 补发响应收尾（直连/镜像两腿共用）：206 校验段起点并把 guard 接上记账流；
-/// 非 206 带状态码报错——两腿原先是逐字拷贝，改一处漏一处的隐患收掉。
+/// 补发响应收尾（两腿共用）：206 校验起点并把 guard 接上记账；非 206 报错——两腿原先逐字拷贝，改一处漏一处。
 async fn finish_fill(
     got: Result<(LoadGuard, hyper::Response<BoxBody>), String>,
     m: &str,
@@ -1422,8 +1400,7 @@ fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
     }
 }
 
-/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连再久也不挡泵数据与让位。
-/// 补发只受卡死上限约束。
+/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连再久不挡泵数据与让位。
 fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Fetched>(8);
     // tx 每个状态机实例克隆一份：unfold 的闭包是 FnMut，不能把 tx 移出去。
@@ -1548,11 +1525,7 @@ fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(stream))
 }
 
-/// 镜像请求模板：URL = {镜像}/{原始URL}（前缀拼接惯例），剥凭据头、统一注入镜像 UA；
-/// 直连切片的镜像救援（direct_split）也走这里，同一套凭据/UA 语义。
-/// 模板占位符：{mirror} {url} {url_enc} {owner} {repo} {ref} {path}。
-/// 用法是镜像服务自定的约定——由添加时的试探自动试出并保存（settings.json 的
-/// template 字段），此后不再重试；无模板（旧条目/未探测）走前缀拼接。
+/// 镜像 URL 模板：剥身份头、注入镜像 UA；占位符 {mirror}/{url}/{url_enc}/{owner}/{repo}/{ref}/{path}，由添加时试探保存，无模板走前缀拼接。
 fn mirror_url(mirror: &str, orig_url: &str) -> String {
     let tpl = crate::settings::mirror_template(mirror);
     if tpl.is_empty() {
@@ -1604,12 +1577,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// 用法试探：把样本链接逐个套进已知用法家族，**并发**真拉一次验货（状态 200/206、
-/// 非 HTML、非空），按声明序取第一个命中的模板交回调用方存进注册表——此后照模板用，
-/// 不再重试（删除重加才会重探）。每种不符模式都留一行原因，best-effort 也要能归因。
-/// 探针不带头 Range：样本只有几 KB，带 Range 会撞上镜像的 chunked 206 怪癖
-/// （Cloudflare 系实测头正常、体 0B），全量拉再丢体最简单可靠。
-/// 样本 = 本仓库 README（公开、恒在、小）；结构重写型按它拆段。
+/// 用法试探：样本套进已知用法家族并发真拉验货，首个命中的模板存档；样本是仓库 README，不带 Range（会撞 Cloudflare chunked 206 怪癖）。
 pub(crate) async fn discover_template(mirror: &str, log: &LogFn) -> Result<String, String> {
     const SAMPLE: &str =
         "https://raw.githubusercontent.com/zhidian-cmd/gitport-github/main/README.md";
@@ -1624,8 +1592,7 @@ pub(crate) async fn discover_template(mirror: &str, log: &LogFn) -> Result<Strin
         "[镜像] {mirror} 用法试探开始({} 种已知用法, 并发)",
         USAGE_TEMPLATES.len()
     ));
-    // 并发拉同一个极小样本，按模板声明序取第一个命中的——探测是独立请求，
-    // 没有"后发必须后到"的因果，串行只是白等。
+    // 并发拉极小样本按声明序取第一个命中：探测是独立请求，没有后发必须后到的因果。
     let probes = USAGE_TEMPLATES.iter().map(|tpl| async move {
         let url = fill_template((*tpl).to_string(), mirror, SAMPLE);
         let mut verdict = String::new();
@@ -1661,8 +1628,7 @@ pub(crate) async fn discover_template(mirror: &str, log: &LogFn) -> Result<Strin
                                     n += f.data_ref().map(|d| d.len()).unwrap_or(0);
                                 }
                                 Some(Err(e)) => {
-                                    // 体流报错与 EOF 必须分家：EOF 空 = 服务端真发了空体，
-                                    // 流错误 = 我们的客户端读不出它的响应。
+                                    // 体流报错与 EOF 分家：EOF 空 = 服务端真发空体，流错误 = 客户端读不出。
                                     verdict = format!("体流错误: {e}");
                                     break;
                                 }

@@ -105,8 +105,7 @@ pub async fn serve(srv: Arc<ProxyServer>, ln: TcpListener, ctx: CancellationToke
         let cancel = ctx.clone();
         tokio::spawn(async move {
             let _permit = permit; // 连接活着期间占坑，drop 时归还
-            // 停止代理要连已 spawn 的隧道一起收：select 一取消，conn 被 drop 即关 socket，
-            // MITM 分支不接 cancel 也覆盖得到。
+            // 停止代理要连已 spawn 的隧道一起收：select 一取消 conn 被 drop 即关 socket，MITM 分支也覆盖。
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 _ = srv.handle(conn, cancel.clone()) => {}
@@ -143,10 +142,7 @@ impl ProxyServer {
 
     async fn handle_connect(&self, mut client: TcpStream, target: &str, cancel: CancellationToken) {
         let (host, port) = split_target(target, 443);
-        // 开放代理闸：受管域名(GitHub 系)全速加速；其它域名只放行 443 的 HTTPS 透明
-        // 隧道——用户拼接的镜像 clone URL(域名=镜像站)靠它才能用。环回/私网/CGNAT/
-        // 链路本地/组播/保留段由 connect_upstream 兜底腿的 bogon 过滤拒绝，非 443 一律 502——
-        // 借代理扫内网、打云元数据、摸非 HTTPS 服务的路仍然全堵（审计 #7）。
+        // 开放代理闸：受管域名全速加速，其他域名只放 443 透明隧道（拼接镜像 clone URL 用）；非 443 一律 502，bogon 过滤堵内网/元数据/非 HTTPS。
         if !pool::route::is_managed(&host) && port != 443 {
             (self.log)(&format!(
                 "[拒绝] {host}:{port} 非受管域名且非 443, 不做开放转发(仅加速 GitHub 系与 https 镜像隧道)"
@@ -297,8 +293,7 @@ impl ProxyServer {
     }
 }
 
-/// 无可用上游：502 + 一行带原因的日志（CONNECT 与明文 HTTP 共用出口）。
-/// 带上原因才能区分"内网地址被保险拦了"和"恰好拨不通"，排障不用猜。
+/// 无可用上游：502 + 带原因的日志（CONNECT 与明文 HTTP 共用），原因能区分被保险拦与拨不通。
 async fn reject(client: &mut TcpStream, log: &LogFn, host: &str, why: &str) {
     let _ = client
         .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -385,14 +380,11 @@ pub fn split_target(target: &str, def: u16) -> (String, u16) {
     (target.to_lowercase(), def)
 }
 
-/// 上游唯一入口：串发池按 routes.json 串发，其余交系统 DNS 直连；这是真名透传腿。
-/// 池串发全灭也必须给出通道（git clone 走这里，不能一上来就 502）：落系统 DNS
-/// 真名透传——与直连同款成功率，是兜底不是加速。
+/// 上游唯一入口：按 routes.json 走池，池全灭落系统 DNS 真名透传（兜底不是加速，git clone 不能一上来 502）。
 pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String), String> {
     // 非 443 不走 IP 表：串发恒拨 443，git:// 与 SSH 会被连错端口。
     if port == 443 && pool::route::is_managed(host) {
-        // 按类分流：内容域公开 CDN 段——TCP 竞速（仅 MITM 关模式的隧道消费）；
-        // 会话域/其他——串发+游标保持现状，跨 IP 并发 SYN 是风控画像。
+        // 按类分流：内容域 TCP 竞速（MITM 关的隧道用）；会话域/其他串发+游标（跨 IP 并发 SYN 是风控画像）。
         let dialed = if crate::server::upstream::host_class(host)
             == crate::server::upstream::HostClass::Content
         {
@@ -415,8 +407,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
         }
     }
     let addr = format!("{host}:{port}");
-    // 先解析再过保险：hosts 劫持把受管域名指进环回/私网时照连就是送信——
-    // 白名单只保证"名字像 GitHub"，不保证"地址不是内网"。
+    // 先解析再过保险：hosts 把受管域名指进环回/私网时照连就是送信，白名单只保证名字像 GitHub。
     let lookup = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::net::lookup_host(&addr),
@@ -441,9 +432,7 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
     Ok((Dialed::Plain(tcp), "system-dns".to_string()))
 }
 
-/// 兜底腿的地址保险：环回/私网/链路本地/CGNAT/组播/保留段一律拒拨。
-/// 内嵌 v4 的 v6（v4-mapped、v4-compatible、6to4、Teredo）先折回 v4 再判，
-/// 不能因为"换了个 v6 形状"就绕过同一份保险。MITM 的 DNS 直拨腿也用它。
+/// 兜底腿地址保险：环回/私网/链路本地/CGNAT/组播/保留段一律拒；内嵌 v4 的 v6 先折回 v4 再判，MITM DNS 直拨腿也用。
 pub(crate) fn bogon_addr(ip: std::net::IpAddr) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     fn v4_from(hi: u16, lo: u16) -> IpAddr {
@@ -500,9 +489,7 @@ pub(crate) fn bogon_addr(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// 双向透传，任一方向结束即关两侧；可选首字节看门狗与握手首包分片。
-/// `cancel` 是进程级停止信号；首字节判死也会掐断另一路——只 shutdown 写半部时，
-/// 客户端不关自己写半部会让 join! 永远 pending，task + 上游 TCP + 两条 fd 全留着。
+/// 双向透传，任一方向结束即关两侧；首字节判死掐断另一路——只 shutdown 写半部会让 join! 永久 pending，task+TCP+fd 全挂着。
 async fn bidir_copy<A, B>(
     a: &mut A,
     b: &mut B,
@@ -516,8 +503,7 @@ where
 {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    // 两路共用 gate：超时/停止一起收；正常 EOF 不取消，保留 TCP 半关闭语义
-    // （客户端先 shutdown(Write) 时，上游→客户端那一半仍要把响应传完）。
+    // 两路共用 gate：超时/停止一起收；正常 EOF 不取消，保留 TCP 半关闭（客户端先 shutdown 时另一半仍传完）。
     let gate = CancellationToken::new();
     let pair = async {
         tokio::join!(

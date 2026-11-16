@@ -132,16 +132,13 @@ pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
     base.build()
 }
 
-/// 加载/生成 CA；load 分支同样重申 key 的 ACL（可读根私钥 = 可伪造叶子证书 MITM），
-/// 收紧失败禁用 MITM——失败详情由调用方落日志。
+/// 加载/生成 CA，load 分支也重申 key 的 ACL：根私钥可读 = 可伪造叶子证书，收紧失败即禁用 MITM。
 pub fn load_or_generate(dir: &Path, _log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
     if let Ok(a) = load(&cert_path, &key_path) {
         let key_str = key_path.to_string_lossy().into_owned();
-        // 已有 CA 与首次生成同款口径：ACL 收不紧 = 根私钥可能被同机其他账户读走
-        // （可伪造叶子证书解密流量）——不带病上岗，禁用 MITM。
-        // 不删钥：删了会让用户已信任的 CA 作废、下次启动重建还得重装根证书。
+        // 已有 CA 与首次生成同口径：ACL 收不紧就禁用 MITM；不删钥，免得已信任的 CA 作废。
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_str) {
             return Err(format!("ca.key ACL 收紧失败, 禁用 MITM(已有 CA): {e}"));
         }
@@ -209,8 +206,7 @@ impl Authority {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy()) {
-            // 收紧失败 = 根私钥可能被同机其他账户读走（可伪造叶子证书解密流量）：
-            // 删钥让 MITM 起不来，绝不带病上岗。load_or_generate 把错误往上传。
+            // 收紧失败 = 根私钥可被同机其他账户读走，删钥让 MITM 起不来，绝不带病上岗。
             let _ = std::fs::remove_file(key_path);
             return Err(format!("ca.key 权限收紧失败, 已删除该文件(禁用 MITM): {e}"));
         }
