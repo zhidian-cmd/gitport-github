@@ -990,6 +990,33 @@ async fn repo_embryo_pipeline_establishes_then_swaps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v7 片段闸：软导航片段（无 </html>）不碰胚——形状混入会让胚反复换形（conduit 事件的教训）。
+#[tokio::test]
+async fn repo_embryo_pipeline_ignores_fragments() {
+    let (dir, _g) = own_dir("frag");
+    let (log, _lines) = log_capture();
+    let req = get_req("https://github.com/octocat/repo/");
+    // 先立一个正常胚
+    let _ = repo_embryo_pipeline(
+        &log,
+        &req,
+        plain_html_resp(&embryo_html("aaaa1111", "cccc3333", "n1")),
+    )
+    .await;
+    assert!(dir.join("embryo.json").exists(), "前提：胚已立");
+    // 片段（无 </html>，带资产引用）：原样直出且不换胚
+    let frag = "<link rel=\"stylesheet\" href=\"https://github.githubassets.com/assets/fragment-9999.css\" /><div>fragment body</div>";
+    let out = repo_embryo_pipeline(&log, &req, plain_html_resp(frag)).await;
+    let body = resp_body(out).await;
+    assert!(body.contains("fragment-9999.css"), "片段原样直出: {body}");
+    let e = std::fs::read_to_string(dir.join("embryo.json")).unwrap();
+    assert!(
+        !e.contains("fragment-9999"),
+        "片段不得换胚: {e}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// v7 资产分支：白名单 200 入库 → cache_take 本地回放；上游 404 剔胚自愈。
 #[tokio::test]
 async fn asset_branch_stores_replays_and_heals() {

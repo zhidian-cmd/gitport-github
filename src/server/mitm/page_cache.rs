@@ -63,6 +63,7 @@ const XHR_PREFIXES: &[&str] = &[
     "/search/custom_scopes",
     "/in-product-messaging/",
     "/github-copilot/chat/repositories_search",
+    "/conduit/",
     // 首页的跟班：会变的全在这些接口里（见 README 的首页那节）
     "/dashboard/",
     "/productivity_dashboard/",
@@ -1430,6 +1431,16 @@ async fn repo_embryo_pipeline<B>(
         (log)("[解析] 失败 解码: 正文非 UTF-8, 直出");
         return hyper::Response::from_parts(parts, protocol::full_body(bytes));
     };
+    // 完整文档闸：软导航片段（无 </html>）不碰胚——片段形状与整页不同，混进来会让胚反复换形。
+    if !html_complete(html.as_bytes(), "identity") {
+        if super::quiet::first_time("parsefrag", req.uri().path()) {
+            (log)(&format!(
+                "[解析] 片段不立胚 {} 直出",
+                req.uri().path()
+            ));
+        }
+        return hyper::Response::from_parts(parts, protocol::full_body(bytes));
+    }
     let fresh = match parse::extract_skeleton(&html) {
         Some(s) => s,
         None => {
