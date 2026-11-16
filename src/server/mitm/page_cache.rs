@@ -1344,10 +1344,13 @@ async fn collect_asset<B>(
             log,
         ) && super::quiet::first_time("assetnew", &name)
         {
-            (log)(&format!(
-                "[资产] 入库 {name} ({}KB)",
-                bytes.len() / 1024
-            ));
+            // 小正文（GitHub 的迷你 chunk 常只有几百字节）按字节显示，别被整数除法抹成 0KB。
+            let size = if bytes.len() < 1024 {
+                format!("{}B", bytes.len())
+            } else {
+                format!("{}KB", bytes.len() / 1024)
+            };
+            (log)(&format!("[资产] 入库 {name} ({size})"));
         }
     }
     hyper::Response::from_parts(parts, protocol::full_body(bytes))
