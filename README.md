@@ -97,4 +97,4 @@ cargo test
 4. 仅 Windows，依赖 BoringSSL 本地编译。
 5. 仓库不附基准数据，代码注释里的实测数字都来自作者环境。
 
-机制细节（分流矩阵、通道池、失败分级、切片与合并、解密面）见 `docs/architecture.md`。
+机制细节（分流矩阵、通道池、失败分级、切片与合并、解密面）见 `docs/architecture.md`；缓存体系全解（三层各管什么、胚与资产库怎么配合、日志判读）见 `docs/cache.md`。
