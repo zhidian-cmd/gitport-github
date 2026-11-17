@@ -552,9 +552,9 @@ fn split_delay() -> std::time::Duration {
     std::time::Duration::from_millis(config::HELLO_SPLIT_DELAY_MIN_MS + (fresh_rand() % span))
 }
 
-/// TLS 握手首段分片：2~3 段、切点随机；仅总闸开启且首字节为 0x16 才拆。
+/// TLS 握手首段分片：2~3 段、切点随机；仅首字节为 0x16 才拆（非 TLS 流不碰）。
 fn hello_split_ranges(first_read: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
-    if !config::HELLO_SPLIT_ENABLED || first_read.len() < 32 || first_read[0] != 0x16 {
+    if first_read.len() < 32 || first_read[0] != 0x16 {
         return None;
     }
     let n = first_read.len();

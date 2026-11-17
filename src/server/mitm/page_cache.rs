@@ -833,10 +833,7 @@ fn spawn_page_refetch(
             let mut b = hyper::Request::builder()
                 .uri(format!("https://{host}{path_q}"))
                 .header("accept", "text/html, */*")
-                .header(
-                    "user-agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
-                );
+                .header("user-agent", upstream::BROWSER_UA);
             b = match bucket {
                 "br" => b.header("accept-encoding", "br"),
                 "gzip" => b.header("accept-encoding", "gzip"),

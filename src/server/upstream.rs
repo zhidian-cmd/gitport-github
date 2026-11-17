@@ -45,14 +45,6 @@ pub(crate) struct ConnSlot {
     last_used: u64,
 }
 
-/// 同 IP 通道上限：会话域/内容域/其他恒 1——多通道一律换 IP 另起（同 IP 溢出例外）。
-pub(crate) fn max_conns_per_ip(class: HostClass) -> usize {
-    match class {
-        HostClass::Session => crate::config::MAX_CONNS_SESSION,
-        _ => crate::config::MAX_CONNS_CONTENT,
-    }
-}
-
 /// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
 const DIAL_SLOW_MS: u64 = 1500;
 
@@ -198,18 +190,12 @@ fn pooled_normal(ip: &str) -> Option<H2Upstream> {
         .map(|c| c.up.clone())
 }
 
-/// 暂缓剩余秒数转发（状态行用）；判据表在 pool::speed。
-pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
-    pool::speed::bench_remaining_secs(ip)
-}
-
 /// 新连接入库唯一入口：同 IP 只留一条（一 IP 一通道），后到作废返现成的。
 pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
     let mut g = lock(conn_pool());
     let h = g.entry(ip.to_string()).or_default();
-    let cap = up.owner.as_deref()
-        .map(|owner| max_conns_per_ip(host_class(owner)))
-        .unwrap_or(usize::MAX);
+    // 同 IP 通道上限恒 1：多通道互抢带宽、摊薄窗口，要多条就换 IP 另起（同 IP 溢出例外）。
+    let cap = 1usize;
     // 常驻名额按非溢出通道算：溢出是拥挤时的临时工，不占"一 IP 一通道"的名额。
     let normal_cnt = h.iter().filter(|c| !c.up.overflow).count();
     if !up.overflow && normal_cnt >= cap {
@@ -501,7 +487,7 @@ pub(crate) async fn h2_dial(
 }
 
 /// 单通道原因：会话域/大文件是规则，候选不足是没得选——日志要能看懂。
-fn single_channel_reason(class: HostClass, _distinct: usize, free: usize) -> String {
+fn single_channel_reason(class: HostClass, free: usize) -> String {
     match class {
         HostClass::Session => "会话域固定同一 IP, 不开第二条(防风控)".to_string(),
         HostClass::Other => "大文件/文档站: 单通道".to_string(),
@@ -701,7 +687,7 @@ async fn dial_h2_race(
     });
     (log)(&format!(
         "[建连] {host} 单通道({})",
-        single_channel_reason(host_class(host), distinct, free)
+        single_channel_reason(host_class(host), free)
     ));
     // 等串发结果用绝对硬窗（同 BUILD_WAIT_SECS）：recv 无界等会既不返回也不兜底；串发独立跑，超窗只影响这条请求。
     let dl = tokio::time::Instant::now() + Duration::from_secs(pool::BUILD_WAIT_SECS);
@@ -746,6 +732,9 @@ pub async fn dial_upstream(host: &str, probe_path: &str, log: &LogFn) -> Result<
 }
 /// 流式直通响应头预算：git push 大包 GitHub 收完包校验才应答（2GB@1MB/s ≈ 35 分钟），给 30 分钟。
 pub const STREAM_HEAD_BUDGET_SECS: u64 = 1800;
+
+/// 镜像/后台拉取恒定浏览器 UA（CF 系镜像拦非浏览器 UA）；全仓唯一一份，防版本漂移。
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// hop-by-hop 头（RFC 7230 §6.1）；mirror_request 与 h2_request_head 单点共用。
 pub fn is_hop_by_hop(name: &str) -> bool {

@@ -16,8 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 
-use crate::util::LogFn;
-
 /// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
 /// 叶子上下文缓存上限：受管行含通配（githubusercontent.com/github.io），只进不出会随浏览慢慢涨。
@@ -133,7 +131,7 @@ pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
 }
 
 /// 加载/生成 CA，load 分支也重申 key 的 ACL：根私钥可读 = 可伪造叶子证书，收紧失败即禁用 MITM。
-pub fn load_or_generate(dir: &Path, _log: Option<&LogFn>) -> Result<Arc<Authority>, String> {
+pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
     if let Ok(a) = load(&cert_path, &key_path) {

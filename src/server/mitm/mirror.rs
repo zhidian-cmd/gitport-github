@@ -1788,8 +1788,8 @@ pub fn set_calibrate_report(r: Option<String>) {
     }
 }
 
-/// CF 系镜像拦非浏览器 UA（裸 Mozilla/5.0 一律 403），镜像腿恒定浏览器 UA。
-const MIRROR_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// CF 系镜像拦非浏览器 UA（裸 Mozilla/5.0 一律 403），镜像腿恒定浏览器 UA（全仓唯一一份）。
+use crate::server::upstream::BROWSER_UA as MIRROR_UA;
 
 fn mirror_get(uri: http::Uri) -> Result<hyper::Request<BoxBody>, String> {
     hyper::Request::builder()

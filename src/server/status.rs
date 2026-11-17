@@ -1,4 +1,5 @@
 //! 状态行：每 30s 摊开池内通道的暂缓/占用状态，只打最近有活动的 host。
+use crate::pool::speed::bench_remaining_secs;
 use crate::server::upstream;
 use crate::util::LogFn;
 use std::time::Duration;
@@ -29,7 +30,7 @@ fn emit(log: &LogFn) {
         let mut parts: Vec<String> = Vec::with_capacity(chans.len());
         for (ip, inflight, cap, _idle) in &chans {
             let mut p = String::new();
-            if let Some(r) = upstream::bench_remaining_secs(ip) {
+            if let Some(r) = bench_remaining_secs(ip) {
                 p += &format!(" 暂缓{}s", r);
             }
             if *inflight > 0 {

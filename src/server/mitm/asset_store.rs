@@ -284,10 +284,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool 
     let req = match hyper::Request::builder()
         .uri(url)
         .header("accept", "*/*")
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
-        )
+        .header("user-agent", upstream::BROWSER_UA)
         .body(protocol::empty_body())
     {
         Ok(r) => r,

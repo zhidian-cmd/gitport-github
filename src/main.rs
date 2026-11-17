@@ -77,7 +77,7 @@ fn run() {
     };
     pool::serial_load(&exe_dir, settings::last_ips(), Some(log_fn.clone()));
     let t_routes = t0.elapsed();
-    let ca = match certgen::load_or_generate(&exe_dir, Some(&log_fn)) {
+    let ca = match certgen::load_or_generate(&exe_dir) {
         Ok(c) => Some(c),
         Err(e) => {
             log_fn(&format!("CA 初始化失败, MITM 不可用: {e}"));

@@ -34,10 +34,6 @@ pub const H2_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 /// 闲置（无在途流）超此秒数即焚通道，远短于对端 60~90s 静默掐死窗口，探活机制因此整体移除。
 pub const CONN_IDLE_RETIRE_SECS: u64 = 10;
-/// 同 IP 通道上限恒 1：多通道互抢带宽、摊薄窗口，要多条就换 IP。
-pub const MAX_CONNS_CONTENT: usize = 1;
-/// 会话域同 IP 通道上限：恒 1 条。
-pub const MAX_CONNS_SESSION: usize = 1;
 /// 直连切片 5s 界：没拉完的段由镜像链续传，段失败立即换镜像。
 pub const MEDIA_RESCUE_WAIT_SECS: u64 = 5;
 /// CONNECT 隧道首字节看门狗：上游 TCP 活着但被黑洞时，代理先于浏览器判死+垫底。
@@ -50,7 +46,6 @@ pub const PROXY_MAX_CONNS: usize = 256;
 pub const BLACKHOLE_FIRST_BYTE_MS: u64 = 30_000;
 
 /// 隧道首包分片：0x16 开头的 ClientHello 拆 2~3 段随机构造发出；DPI 拼不齐 SNI 就不会 RST，非 TLS 流不碰。
-pub const HELLO_SPLIT_ENABLED: bool = true;
 /// 首刀上限：1..=FIRST_MAX 字节随机（覆盖 TLS 记录头 5B 一带）。
 pub const HELLO_SPLIT_FIRST_MAX: usize = 16;
 /// 段间隔随机范围（毫秒），每段间隔独立抽取。

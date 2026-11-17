@@ -166,19 +166,19 @@ fn credentials_stripped_only_on_pure_cdn_hosts() {
 /// 单通道日志必须说清是「会话域规则」还是「候选真的不够」，别再混成一行。
 #[test]
 fn single_channel_reason_separates_rule_from_shortage() {
-    let rule = single_channel_reason(HostClass::Session, 26, 0);
+    let rule = single_channel_reason(HostClass::Session, 0);
     assert!(rule.contains("会话域"), "会话域优先，候选再多也按规则解释");
     assert!(rule.contains("不开第二条"), "规则单通道要说清是不开，不是没得开");
 
-    let other = single_channel_reason(HostClass::Other, 5, 4);
+    let other = single_channel_reason(HostClass::Other, 4);
     assert!(other.contains("大文件"), "大文件/文档站单通道要单独说");
 
-    let short = single_channel_reason(HostClass::Content, 3, 1);
+    let short = single_channel_reason(HostClass::Content, 1);
     assert!(short.contains("候选"), "候选不足单独说");
     assert!(!short.contains("会话域"), "候选不足不许冒充会话域规则");
 
     // 会话域即使只剩 1 家，也仍按规则归因。
-    assert!(single_channel_reason(HostClass::Session, 1, 0).contains("会话域"));
+    assert!(single_channel_reason(HostClass::Session, 0).contains("会话域"));
     assert_ne!(rule, short, "两种原因不能印成同一句话");
     assert_ne!(other, rule);
 }

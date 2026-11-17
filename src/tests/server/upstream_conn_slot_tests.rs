@@ -297,46 +297,6 @@ async fn inflight_count_follows_response_body_lifecycle() {
     assert_eq!(up.inflight.load(order), 0, "body 丢弃后必须归还槽位");
 }
 
-/// 两个 host 并发入库同一 IP（内容域）：两条通道并存不互斥；会话域仍恒单通道。
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn concurrent_content_hosts_coexist_on_one_ip() {
-    let _g = crate::pool::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-
-    let same = "9.9.9.2";
-    let other = "9.9.9.3";
-    let a = mk_up(same).await;
-    let b = mk_up(same).await;
-    let (ra, rb) = tokio::join!(
-        async move { store_h2(same, a) },
-        async move { store_h2(same, b) },
-    );
-    // 内容域/其他（owner 无 session 标志）：两条并存
-    assert_ne!(ra.id, rb.id, "内容域同 IP 两条通道并存");
-    {
-        let g = lock(conn_pool());
-        assert_eq!(g.get(same).unwrap().len(), 2, "内容域同 IP 两条并存");
-    }
-    // 第二条通道落在另一个 IP：仍然允许， EWMA 轮转也照旧。
-    store_h2(other, mk_up(other).await);
-    let ips = vec![same.to_string(), other.to_string()];
-    assert_eq!(
-        lock(conn_pool())
-            .iter()
-            .filter(|(k, _)| ips.contains(k))
-            .map(|(_, h)| h.len())
-            .sum::<usize>(),
-        3,
-        "同 IP 两条 + 另一 IP 一条 = 三条"
-    );
-    assert!(cached_h2_in(&ips).is_some());
-    let _ = lock(conn_pool()).remove(same);
-    let _ = lock(conn_pool()).remove(other);
-
-}
-
 /// v2 复用单元 = IP：给定候选 IP 集合，池里任一命中都可复用，:authority 保持目标 host。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
