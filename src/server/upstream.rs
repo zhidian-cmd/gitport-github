@@ -518,7 +518,7 @@ pub(crate) fn rank_legs(mut legs: Vec<RaceLeg>) -> Vec<RaceLeg> {
 /// 内容域竞速：全部候选 IP 一 IP 一腿并发拨，取最快一条入池，其余当场关闭。
 const RACE_WINDOW_SECS: u64 = 8;
 
-async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
+async fn race_build(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     let cands = pool::dial_candidates(host);
     if cands.len() < 2 {
         // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
@@ -713,7 +713,7 @@ async fn dial_h2_race(
 }
 
 /// 建连统一入口：双腿各拨各的新连接；串发全灭冷却中快速失败，调用方走兜底。
-pub async fn dial_upstream(host: &str, probe_path: &str, log: &LogFn) -> Result<H2Upstream, String> {
+pub async fn dial_upstream(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
     if pool::SERIAL_COOL.open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
     }
@@ -731,7 +731,7 @@ pub async fn dial_upstream(host: &str, probe_path: &str, log: &LogFn) -> Result<
     };
     // 内容域：多路竞速 + 首包排名，只留最快一条入池。
     if host_class(host) == HostClass::Content {
-        return race_build(host, probe_path, log).await;
+        return race_build(host, log).await;
     }
     dial_h2_race(host, log, &occupied).await
 }

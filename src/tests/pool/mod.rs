@@ -487,9 +487,9 @@ fn toggle_gates_big_file_chains_only() {
     crate::settings::save_worker_mirrors(Vec::new());
 }
 
-/// 双字典合并优先级：同 host 三处都有时，mirrors_big/small 赢、旧 mirrors 不覆盖；仅旧字典有的 host 照常并入（升级兼容的钉子）。
+/// 裸 mirrors 旧字典已随两代迁移层停读：新字典照常生效，旧段整段忽略（gist 链不再并入）。
 #[test]
-fn merged_chains_prefers_typed_dictionaries_over_legacy() {
+fn bare_mirrors_segment_is_no_longer_read() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edges::clear_all();
     // 隔离：.example 自建镜像会被收编进注册表并跨测试持久化，先清空。
@@ -503,38 +503,32 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
   "mirrors_small": {"raw.githubusercontent.com": ["https://small.example"]},
   "mirrors": {
     "objects.githubusercontent.com": ["https://legacy-wrong.example"],
-    "raw.githubusercontent.com": ["https://legacy-wrong.example"],
     "gist.githubusercontent.com": ["https://legacy-only.example"]
   }
 }"#,
     )
     .unwrap();
     serial_load(&dir, Vec::new(), None);
-    // 断言只锁优先级：旧 mirrors 不得覆盖新字典，新字典成员居首，旧字典独有成员追加在尾。
     let big = mirror_chain("objects.githubusercontent.com");
     assert_eq!(
         big.first(),
         Some(&"https://big.example".to_string()),
-        "mirrors_big 赢, 旧 mirrors 不得覆盖(legacy-wrong 缺席且 big 居首): {big:?}"
+        "mirrors_big 照常生效: {big:?}"
     );
     assert!(
         !big.contains(&"https://legacy-wrong.example".to_string()),
-        "旧 mirrors 不得覆盖新字典已声明的 host: {big:?}"
+        "裸 mirrors 段已停读, 不得混入: {big:?}"
     );
     let small = mirror_chain("raw.githubusercontent.com");
     assert_eq!(
         small.first(),
         Some(&"https://small.example".to_string()),
-        "mirrors_small 赢: {small:?}"
+        "mirrors_small 照常生效: {small:?}"
     );
     assert!(
-        !small.contains(&"https://legacy-wrong.example".to_string()),
-        "旧 mirrors 不得覆盖新字典已声明的 host: {small:?}"
-    );
-    let legacy = mirror_chain("gist.githubusercontent.com");
-    assert!(
-        legacy.contains(&"https://legacy-only.example".to_string()),
-        "仅旧字典有的 host 照常并入: {legacy:?}"
+        !mirror_chain("gist.githubusercontent.com")
+            .contains(&"https://legacy-only.example".to_string()),
+        "裸 mirrors 段的链不再并入"
     );
     // 清场：正规路径删除自建镜像（注册表 + 全部链），不给后续测试留全局残留。
     apply_worker_mirrors(Vec::new()).ok();
@@ -645,7 +639,7 @@ fn mirror_chain_load_and_topup() {
         r#"{
   "ips": [{"ip": "140.82.112.3", "sni": "baidu.com", "hosts": ["github.com"]}],
   "hosts": {"github.com": {}},
-  "mirrors": {
+  "mirrors_small": {
     "raw.githubusercontent.com": ["https://v4.gh-proxy.org", "https://my-self.example.com"],
     "not-a-content.host": ["https://v4.gh-proxy.org"]
   }

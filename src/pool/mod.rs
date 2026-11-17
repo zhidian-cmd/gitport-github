@@ -69,29 +69,15 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 路由表文档：v2 给 ips+hosts，旧 routes 字典与旧三池在迁移期兼容；latency = 测速键值。
+/// 路由表文档：v2 给 ips+hosts；latency = 测速键值。
 #[derive(Default)]
 struct TopoDoc {
     hosts: Vec<route::HostSpec>,
     ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
-    /// 来自新版 mirrors_small 的 host 键：与旧 mirrors 残留区分开，后者优先级最低、不得覆盖新版声明。
-    small_hosts: Vec<String>,
     latency: HashMap<String, u64>,
     /// 大文件域单链（所有 big host 共用一条，不再每 host 一条）。
     big: Vec<String>,
-}
-
-/// 合并为运行时单表（小文件/媒体链 per-host；大文件域已单链化不进此表）。
-fn merged_chains(
-    small: &HashMap<String, Vec<String>>,
-    legacy: &HashMap<String, Vec<String>>,
-) -> HashMap<String, Vec<String>> {
-    let mut out = small.clone();
-    for (h, c) in legacy {
-        out.entry(h.clone()).or_insert_with(|| c.clone());
-    }
-    out
 }
 
 /// 容错解析：坏段只丢那一段；salvaged = 有段被丢弃，调用方备份原文件。
@@ -100,7 +86,6 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
     let obj = root.as_object()?;
     let mut doc = TopoDoc::default();
     let mut small = HashMap::new();
-    let mut legacy = HashMap::new();
     let mut salvaged = false;
 
     // v2 格式：ips + hosts。
@@ -209,7 +194,13 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         };
         let slot = match k.as_str() {
             "mirrors_small" => &mut small,
-            _ => &mut legacy,
+            // 0.5.2 前的裸 mirrors 旧字典（及未知 mirrors* 键）：随两代迁移层一并停读
+            other => {
+                if let Some(l) = log {
+                    l(&format!("[串发] routes.json {other} 段已停读(旧格式), 该段忽略"));
+                }
+                continue;
+            }
         };
         for (host, chain) in m {
             match serde_json::from_value::<Vec<String>>(chain.clone()) {
@@ -227,8 +218,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
             }
         }
     }
-    doc.chains = merged_chains(&small, &legacy);
-    doc.small_hosts = small.keys().cloned().collect();
+    doc.chains = small;
     // 测速键：顶层旧布局（{ip: ms}）先读，节点条目内的同键覆盖（新布局）。
     if let Some(v) = obj.get("latency") {
         if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
@@ -422,7 +412,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             hosts: seeds.hosts.clone(),
             ips: seeds.ips.clone(),
             chains: seeds.chains.clone(),
-            small_hosts: Vec::new(),
             latency: HashMap::new(),
             big: Vec::new(),
         },
@@ -479,7 +468,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.cursor.insert(key.clone(), ip.clone());
         }
     }
-    let small_hosts = std::mem::take(&mut doc.small_hosts);
     for (host, chain) in doc.chains {
         if !is_chain_key(&host) {
             if let Some(l) = log.as_ref() {
@@ -498,28 +486,18 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             continue;
         }
         if route::is_big_file_host(&host) {
-            if small_hosts.contains(&host) {
-                // 新版 typed 字典里的 big host = 用户把链放错字典：归位合并，不静默丢。
-                for u in vc {
-                    if !tab.big_mirrors.contains(&u) {
-                        tab.big_mirrors.push(u);
-                    }
-                }
-            } else {
-                // 旧 mirrors 字典优先级最低：新版已声明就不覆盖，但留日志——过去静默丢弃，用户查不到原因。
-                if let Some(l) = log.as_ref() {
-                    l(&format!(
-                        "[串发] routes.json 旧 mirrors 的 {host} 链已被 mirrors_big 单链取代, 该段忽略"
-                    ));
+            // 用户把 big host 的链放错字典：归位合并进大文件单链，不静默丢。
+            for u in vc {
+                if !tab.big_mirrors.contains(&u) {
+                    tab.big_mirrors.push(u);
                 }
             }
         } else {
             tab.mirrors.insert(host, vc);
         }
     }
-    // 非内置镜像收编进注册表(幂等)：手改塞进来的自建节点重启不丢。
+    // 手改/收编的镜像进注册表(幂等)：工作台看得到、开关管得到、删得掉。
     {
-        let builtin = builtin_mirror_urls();
         let mut registry = crate::settings::worker_mirrors();
         let mut adopted = false;
         // host 排序仅为确定性。
@@ -527,9 +505,6 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         hosts.sort();
         for h in hosts {
             for u in &tab.mirrors[h] {
-                if builtin.contains(u) {
-                    continue;
-                }
                 if registry.iter().any(|w| w.url == *u) {
                     continue;
                 }
@@ -544,7 +519,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
         // 手改的 big 镜像必须收编注册表：否则工作台看不到、开关管不到、删不掉。
         for u in &tab.big_mirrors {
-            if builtin.contains(u) || registry.iter().any(|w| w.url == *u) {
+            if registry.iter().any(|w| w.url == *u) {
                 continue;
             }
             registry.push(crate::settings::WorkerMirror {
@@ -1071,7 +1046,6 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// 通道获取统一入口：从池取可用通道（取→建→溢出），来源对调用方不可见；fresh 只用于失败归因（新拨罚边，沿用只摘）。
 pub async fn get_or_build(
     host: &str,
-    probe_path: &str,
     log: &LogFn,
 ) -> Result<(crate::server::upstream::H2Upstream, bool), String> {
     use crate::server::upstream as chan;
@@ -1124,7 +1098,7 @@ pub async fn get_or_build(
         if remain.is_zero() {
             return Err(format!("{host} 建造在途等待超时({BUILD_WAIT_SECS}s), 走兜底"));
         }
-        match tokio::time::timeout(remain, chan::dial_upstream(host, probe_path, log)).await {
+        match tokio::time::timeout(remain, chan::dial_upstream(host, log)).await {
             Ok(Err(e)) if e == chan::ERR_ALL_CLAIMED => {
                 // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（界照旧）。
                 drop(_guard);
@@ -1144,7 +1118,7 @@ pub async fn get_or_build(
 /* ---------- 黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
 
 /// 黑洞按域处置：会话域摘黑+游标前移+预建；内容域软禁黑 IP 60s（不杀在途）+换血补缺；其他域暂缓即可。
-pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
+pub fn on_channel_blackhole(host: &str, ip: &str, log: &LogFn) {
     use crate::server::upstream as chan;
     match chan::host_class(host) {
         chan::HostClass::Session => {
@@ -1155,11 +1129,10 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
                 "[黑洞] {host} 会话通道 {ip} 弃用, 游标挪动并预建替代通道"
             ));
             let host = host.to_string();
-            let path = path.to_string();
             let log = log.clone();
             tokio::spawn(async move {
                 // 预建：池空即拨，游标已指向下一候选 IP
-                let _ = get_or_build(&host, &path, &log).await;
+                let _ = get_or_build(&host, &log).await;
             });
         }
         chan::HostClass::Content => {
@@ -1169,7 +1142,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
                 "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
             ));
             if speed::try_begin_rebuild(host) {
-                ensure_coverage(host, path, log.clone());
+                ensure_coverage(host, log.clone());
             }
         }
         _ => {
@@ -1179,7 +1152,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, path: &str, log: &LogFn) {
 }
 
 /// 建连机器人：把 host 缺通道的 IP 都建出来（一 IP 一条），直接入池，去留交给真实流量。
-fn ensure_coverage(host: &str, _path: &str, log: LogFn) {
+fn ensure_coverage(host: &str, log: LogFn) {
     let host = host.to_string();
     tokio::spawn(async move {
         use crate::server::upstream as chan;
@@ -1363,7 +1336,7 @@ pub async fn gather_channels(
     }
     // 池空先建，再把池里现成的（可能不止这条）一并收进来。
     if got.is_empty() {
-        match get_or_build(host, "", log).await {
+        match get_or_build(host, log).await {
             Ok((up, _)) => got.push(up),
             Err(_) => return Vec::new(),
         }
@@ -1428,11 +1401,6 @@ pub fn align_custom_mirrors(
         }
     }
     changed
-}
-
-/// seeds 里的内置镜像地址（区分公共镜像与用户自建）。
-fn builtin_mirror_urls() -> std::collections::HashSet<String> {
-    seed_db().chains.into_values().flatten().collect()
 }
 
 /// 按注册表对齐全部镜像链（幂等）：开关只管大文件单链，小文件链全留、仅摘已删地址；persist=false 只改内存不落盘。

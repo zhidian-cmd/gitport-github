@@ -334,7 +334,7 @@ async fn stream_passthrough(
             }
         }
         // 流式请求不许捡现成连接：body 没有副本，发出去就收不回。
-        match upstream::dial_upstream(host, &path, log).await {
+        match upstream::dial_upstream(host, log).await {
             Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),
                 Err(e) => {
@@ -565,7 +565,7 @@ pub(super) async fn get_direct(
 ) -> Result<hyper::Response<BoxBody>, String> {
     let path = path_of(out.uri());
     let budget = request_budget(host);
-    let (mut up, mut fresh) = pool::get_or_build(host, &path, log).await?;
+    let (mut up, mut fresh) = pool::get_or_build(host, log).await?;
     let mut retried = false;
     loop {
         match stream_on(&up, out, body, budget).await {
@@ -585,7 +585,7 @@ pub(super) async fn get_direct(
                         return Err("421 边缘连续拒绝".to_string());
                     }
                     retried = true;
-                    (up, fresh) = pool::get_or_build(host, &path, log).await?;
+                    (up, fresh) = pool::get_or_build(host, log).await?;
                     continue;
                 }
                 *info.lock().unwrap() = ip.clone();
@@ -598,7 +598,7 @@ pub(super) async fn get_direct(
                 } else {
                     quiet::note_reuse(log, host, &ip, ms);
                 }
-                return Ok(meter_body(log, host, &path, &ip, resp));
+                return Ok(meter_body(log, host, &ip, resp));
             }
             Err(e) => {
                 // 通道失败：摘通道 + 记账（骑来的不罚 IP，新拨的罚边冷却），换一条重试一次。
@@ -615,7 +615,7 @@ pub(super) async fn get_direct(
                     return Err(e);
                 }
                 retried = true;
-                (up, fresh) = pool::get_or_build(host, &path, log).await?;
+                    (up, fresh) = pool::get_or_build(host, log).await?;
             }
         }
     }
@@ -637,14 +637,12 @@ fn no_body_expected(resp: &hyper::Response<BoxBody>) -> bool {
 fn meter_body(
     log: &LogFn,
     host: &str,
-    path: &str,
     ip: &str,
     resp: hyper::Response<BoxBody>,
 ) -> hyper::Response<BoxBody> {
     struct WatchInner {
         log: LogFn,
         host: String,
-        path: String,
         ip: String,
         bytes: std::sync::atomic::AtomicU64,
         /// 数据窗起点 = **第一个数据字节**到达的时刻。
@@ -667,7 +665,6 @@ fn meter_body(
     let inner = Arc::new(WatchInner {
         log: log.clone(),
         host: host.to_string(),
-        path: path.to_string(),
         ip: ip.to_string(),
         bytes: std::sync::atomic::AtomicU64::new(0),
         first_frame: std::sync::Mutex::new(None),
@@ -694,7 +691,7 @@ fn meter_body(
                 w.ip,
                 crate::config::BLACKHOLE_FIRST_BYTE_MS
             ));
-            pool::on_channel_blackhole(&w.host, &w.ip, &w.path, &w.log);
+            pool::on_channel_blackhole(&w.host, &w.ip, &w.log);
         });
     }
     // 闭包持有 inner：body 活多久它活多久——计数与看门狗判定跟着 body 走。

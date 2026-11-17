@@ -321,7 +321,7 @@ async fn collect_stall_bounded(
 async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
     let name = asset_dbg_name(url);
     // ① 通道：池内现成通道，没有就拨（内容域竞速 IP）
-    let (up, fresh) = match crate::pool::get_or_build(ASSET_HOST, "/", log).await {
+    let (up, fresh) = match crate::pool::get_or_build(ASSET_HOST, log).await {
         Ok(v) => v,
         Err(e) => {
             (log)(&format!("[资产] 独立拉取拨号失败({e}), {name} 本次不入库"));

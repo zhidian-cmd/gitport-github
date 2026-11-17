@@ -819,7 +819,7 @@ fn spawn_page_refetch(
         loop {
             attempt += 1;
             // ① 通道：池内现成通道，没有就拨（单流）
-            let (up, _) = match crate::pool::get_or_build(&host, &path_q, &log).await {
+            let (up, _) = match crate::pool::get_or_build(&host, &log).await {
                 Ok(v) => v,
                 Err(e) => {
                     (log)(&format!(

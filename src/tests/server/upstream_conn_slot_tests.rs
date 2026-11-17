@@ -732,7 +732,7 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let id = up.id;
     store_h2(&ip, up);
     let log: LogFn = Arc::new(|_| {});
-    let (got, fresh) = crate::pool::get_or_build("github.com", "", &log)
+    let (got, fresh) = crate::pool::get_or_build("github.com", &log)
         .await
         .expect("池里有通道应直接返回");
     assert_eq!(got.id, id, "应骑池里现成的那条");

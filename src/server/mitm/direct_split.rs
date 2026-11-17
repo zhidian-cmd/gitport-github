@@ -475,7 +475,7 @@ pub(super) async fn try_direct_split(
                     };
                 }
                 // 无链：直连同通道从剩余偏移重拉（池自动重建死通道）。
-                let (up, _) = pool::get_or_build(&host, "", &log).await?;
+                let (up, _) = pool::get_or_build(&host, &log).await?;
                 let req = tpl.build(from, to).map_err(|e| e.to_string())?;
                 let resp = tokio::time::timeout(
                     Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),

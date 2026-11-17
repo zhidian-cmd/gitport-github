@@ -1751,10 +1751,6 @@ pub const CALIBRATE_TEMPLATES: &[(&str, &str)] = &[
         "https://raw.githubusercontent.com/torvalds/linux/master/README",
     ),
     (
-        "codeload.github.com",
-        "https://codeload.github.com/octocat/Hello-World/tar.gz/refs/heads/master",
-    ),
-    (
         "gist.githubusercontent.com",
         "https://gist.githubusercontent.com/octocat/6cad326836d38bd3a7ae/raw/db9c55113504e46fa076e7df3a04ce592e2e86d8/hello_world.rb",
     ),
