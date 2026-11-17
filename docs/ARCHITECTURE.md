@@ -101,7 +101,7 @@ sequenceDiagram
     M->>M: 单实例判定（已有实例则 POST /api/show 唤窗口）
     M->>M: 切工作目录到 exe 目录，建 .cache
     M->>S: load() 读 settings.json
-    M->>P: serial_load() 装 routes.json（旧 plans.json 迁移）
+    M->>P: serial_load() 装 routes.json
     M->>C: load_or_generate() 载/建 CA（ACL 失败则禁用 MITM）
     M->>R: start_proxy_with() 绑定 127.0.0.1:7810
     M->>S: ensure_system_proxy()（开关全关时是 no-op）

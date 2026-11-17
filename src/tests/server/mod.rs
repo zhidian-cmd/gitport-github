@@ -34,7 +34,7 @@ async fn plain_http_post_body_forwarded_intact() {
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(
         dir.join("routes.json"),
-        r#"{"core":[{"ip":"127.0.0.1","sni":"a.example"}]}"#,
+        r#"{"ips":[{"ip":"127.0.0.1","sni":"a.example","hosts":["github.com"]}], "hosts": {}}"#,
     )
     .unwrap();
     crate::pool::serial_load(&dir, Vec::new(), None);

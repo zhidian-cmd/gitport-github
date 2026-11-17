@@ -84,11 +84,9 @@ fn bad_route_row_does_not_wipe_table() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "routes": [
-    {"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "1.2.3.4", "sni": "baidu.com"}]},
-    {"match": "bad\\.example", "fallback": "mirror2", "plans": []}
-  ],
-  "mirrors": {"raw.githubusercontent.com": ["https://v4.gh-proxy.org"]}
+  "ips": [{"ip": "1.2.3.4", "sni": "baidu.com", "hosts": ["github.com"]}],
+  "hosts": {"github.com": {}, "bad.example": {"fallback": "mirror2"}},
+  "mirrors_small": {"raw.githubusercontent.com": ["https://v4.gh-proxy.org"]}
 }"#,
     )
     .unwrap();
@@ -117,20 +115,19 @@ fn bad_route_row_does_not_wipe_table() {
     assert!(dir.join("routes.json.bak").exists(), "有行写坏应备份原文件");
 }
 
+/// v1/0.5.3 旧格式不再被读懂：路由行按种子重建、原文件备份 .bak，绝不静默半重建。
 #[test]
-fn legacy_plans_file_renamed_to_routes() {
-    // 老用户的 plans.json 必须原样搬成 routes.json：表不能被种子顶掉，原表留 .bak。
+fn old_format_routes_rebuild_from_seeds() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edges::clear_all();
     let dir = tmpdir();
     crate::settings::save_worker_mirrors(Vec::new());
     std::fs::write(
-        dir.join("plans.json"),
+        dir.join("routes.json"),
         r#"{
   "routes": [
     {"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "9.9.9.1", "sni": "baidu.com"}]}
-  ],
-  "mirrors": {"raw.githubusercontent.com": ["https://v4.gh-proxy.org"]}
+  ]
 }"#,
     )
     .unwrap();
@@ -139,55 +136,22 @@ fn legacy_plans_file_renamed_to_routes() {
     let log: LogFn = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_string()));
     serial_load(&dir, Vec::new(), Some(log));
 
-    assert!(!dir.join("plans.json").exists(), "旧名应被搬走, 不能留两份");
-    assert!(dir.join("routes.json").exists(), "新名必须出现");
-    assert!(dir.join("routes.json.bak").exists(), "搬之前应留 .bak 保险");
-    let ips = target_ips("github.com");
-    assert_eq!(ips[0], "9.9.9.1", "老表必须原样生效且在前, 不能被种子顶掉");
-    assert!(ips.len() > 1, "种子应正常补边: {ips:?}");
-    assert_eq!(
-        mirror_chain("raw.githubusercontent.com"),
-        vec!["https://v4.gh-proxy.org".to_string()],
-        "镜像链也要跟着搬过来"
+    assert!(
+        route::route_for("github.com").is_some(),
+        "旧格式文件路由行按种子重建, github.com 照常可路由"
+    );
+    assert!(!target_ips("github.com").is_empty(), "种子 IP 边应就位");
+    assert!(
+        dir.join("routes.json.bak").exists(),
+        "旧格式原文件应备份为 routes.json.bak"
     );
     assert!(
         seen.lock()
             .unwrap()
             .iter()
-            .any(|l| l.contains("已更名为 routes.json")),
-        "日志应说明改名: {:?}",
+            .any(|l| l.contains("无 ips/hosts 路由行")),
+        "日志应说清按种子重建: {:?}",
         seen.lock().unwrap()
-    );
-}
-
-#[test]
-fn existing_routes_file_wins_over_legacy() {
-    // 新表已在时旧名必须被忽略：否则用户改 plans.json 会"改了但不生效"。
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    let dir = tmpdir();
-    crate::settings::save_worker_mirrors(Vec::new());
-    std::fs::write(
-        dir.join("routes.json"),
-        r#"{"routes": [{"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "1.1.1.1"}]}]}"#,
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("plans.json"),
-        r#"{"routes": [{"match": "(.*\\.)?github\\.com", "pac": "github.com", "plans": [{"ip": "2.2.2.2"}]}]}"#,
-    )
-    .unwrap();
-    serial_load(&dir, Vec::new(), None);
-
-    let ips = target_ips("github.com");
-    assert_eq!(ips[0], "1.1.1.1", "routes.json 是唯一权威, 旧名不得覆盖");
-    assert!(
-        !ips.contains(&"2.2.2.2".to_string()),
-        "旧名条目不得混入: {ips:?}"
-    );
-    assert!(
-        dir.join("plans.json").exists(),
-        "旧文件不由程序删, 留给用户处理"
     );
 }
 
@@ -217,76 +181,6 @@ fn former_direct_domains_now_pooled() {
 }
 
 #[test]
-fn legacy_pools_migrate_to_route_rows() {
-    // 旧三池 → v2：完整行集，IP 摊成节点，direct/real/donor 标志按 v2 语义处置。
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    let dir = tmpdir();
-    crate::settings::save_worker_mirrors(Vec::new());
-    std::fs::write(
-        dir.join("routes.json"),
-        r#"{
-  "core": [
-    {"ip": "1.2.3.4", "sni": "ech", "成功次数": "9/9", "分数": 99}
-  ],
-  "edge": [
-    {"ip": "140.82.112.29", "sni": "real"},
-    {"ip": "185.199.108.154", "sni": "sni"},
-    {"ip": "185.199.109.153", "sni": "sni"},
-    {"ip": "185.199.110.133", "sni": "baidu.com"}
-  ]
-}"#,
-    )
-    .unwrap();
-    serial_load(&dir, Vec::new(), None);
-
-    let github = target_ips("github.com");
-    assert!(
-        github.contains(&"1.2.3.4".to_string()),
-        "core 摊到 github.com: {github:?}"
-    );
-    let row = route::route_for("github.com").expect("core 应迁到 github.com 行");
-    assert_eq!(row.key, "github.com");
-
-    let content = target_ips("avatars.githubusercontent.com");
-    assert!(
-        content.contains(&"185.199.110.133".to_string()),
-        "133 段服务内容域: {content:?}"
-    );
-    assert!(
-        content.contains(&"185.199.108.154".to_string()),
-        "同一张证书的整段边缘都应服务内容域(154 上的活通道可被内容域复用): {content:?}"
-    );
-    assert!(route::is_content("avatars.githubusercontent.com"));
-    assert_eq!(
-        route::fallback_for("avatars.githubusercontent.com"),
-        route::Fallback::MirrorDns
-    );
-
-    let assets = target_ips("github.githubassets.com");
-    assert!(
-        assets.contains(&"185.199.108.154".to_string()),
-        "assets 行: {assets:?}"
-    );
-
-    let io = target_ips("octocat.github.io");
-    assert!(io.contains(&"185.199.109.153".to_string()), "io 行: {io:?}");
-
-    let app = target_ips("api.githubapp.com");
-    assert!(
-        app.contains(&"140.82.112.29".to_string()),
-        "githubapp 行: {app:?}"
-    );
-
-    // 启动只读不写：旧格式文件原样留在盘上，迁移只发生在运行时表里。
-    let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
-    assert!(
-        b.contains("\"core\"") && !b.contains("\"hosts\""),
-        "手改表不应被启动重写: {b}"
-    );
-}
-
-#[test]
 fn seed_topup_appends_missing_and_keeps_order() {
     // 用户条目在前，种子只补缺；已存在的 IP 不重复。
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -296,10 +190,8 @@ fn seed_topup_appends_missing_and_keeps_order() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "routes": [
-    {"match": ".*\\.githubusercontent\\.com", "content": true, "fallback": "mirror",
-     "plans": [{"ip": "9.9.9.9", "sni": "baidu.com"}]}
-  ]
+  "ips": [{"ip": "9.9.9.9", "sni": "baidu.com", "hosts": ["*.githubusercontent.com"]}],
+  "hosts": {"*.githubusercontent.com": {"content": true, "fallback": "mirror"}}
 }"#,
     )
     .unwrap();
@@ -556,7 +448,6 @@ fn toggle_gates_big_file_chains_only() {
         dir.join("routes.json"),
         r#"{
   "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
-  "core": [],
   "mirrors_big":   {"objects.githubusercontent.com": ["https://on.example", "https://off.example"]},
   "mirrors_small": {"raw.githubusercontent.com": ["https://on.example"]}
 }"#,
@@ -607,7 +498,6 @@ fn merged_chains_prefers_typed_dictionaries_over_legacy() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "core": [],
   "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
   "mirrors_big":   ["https://big.example"],
   "mirrors_small": {"raw.githubusercontent.com": ["https://small.example"]},
@@ -660,7 +550,6 @@ fn hand_written_big_mirror_is_adopted_into_registry() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "core": [],
   "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
   "mirrors_big": ["https://big-self.example"]
 }"#,
@@ -687,7 +576,6 @@ fn legacy_big_host_chains_are_merged_not_dropped() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "core": [],
   "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
   "mirrors_big": ["https://new.example"],
   "mirrors_small": {"objects.githubusercontent.com": ["https://legacy.example"]}
@@ -716,7 +604,11 @@ fn fresh_install_mirror_lands_in_all_chains() {
     edges::clear_all();
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
-    std::fs::write(dir.join("routes.json"), r#"{"core": []}"#).unwrap();
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{"ips": [], "hosts": {}, "mirrors_small": {}}"#,
+    )
+    .unwrap();
     serial_load(&dir, Vec::new(), None);
     assert!(
         mirror_chain("raw.githubusercontent.com").is_empty(),
@@ -751,7 +643,8 @@ fn mirror_chain_load_and_topup() {
     std::fs::write(
         dir.join("routes.json"),
         r#"{
-  "core": [{"ip": "140.82.112.3", "sni": "baidu.com"}],
+  "ips": [{"ip": "140.82.112.3", "sni": "baidu.com", "hosts": ["github.com"]}],
+  "hosts": {"github.com": {}},
   "mirrors": {
     "raw.githubusercontent.com": ["https://v4.gh-proxy.org", "https://my-self.example.com"],
     "not-a-content.host": ["https://v4.gh-proxy.org"]
@@ -937,7 +830,13 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     crate::settings::save_worker_mirrors(Vec::new());
     std::fs::write(
         dir.join("routes.json"),
-        r#"{"core":[{"ip":"127.0.0.1","sni":"a.example"},{"ip":"127.0.0.2","sni":"a.example"}]}"#,
+        r#"{
+  "ips": [
+    {"ip": "127.0.0.1", "sni": "a.example", "hosts": ["github.com"]},
+    {"ip": "127.0.0.2", "sni": "a.example", "hosts": ["github.com"]}
+  ],
+  "hosts": {}
+}"#,
     )
     .unwrap();
     serial_load(&dir, Vec::new(), None);

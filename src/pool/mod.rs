@@ -6,7 +6,7 @@ pub mod route;
 pub mod speed;
 
 use crate::util::{lock, LogFn};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 
 /// 路由表文件名：`ips` 节点 + `hosts` 行 + 镜像链，手改入口。
 const ROUTES_FILE: &str = "routes.json";
-/// 0.5.3 及以前的文件名，首启一次性迁走（迁完原表留 .bak）。
-const LEGACY_ROUTES_FILE: &str = "plans.json";
 
 const SEEDS_JSON: &str = include_str!("seeds.json");
 
@@ -149,69 +147,6 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
 
-    // 兼容层：v1 的 routes 字典（含 plans）与 0.5.3 的正则数组折算成 v2；旧三池同理。
-    let has_v2 = doc.ips.len() + doc.hosts.len() > 0;
-    if !has_v2 {
-        if let Some(routes) = obj.get("routes") {
-            // 两种旧格式折成 (是否v1字典行, 标签, 行值) 走同一循环：行值都是对象，只能按外层容器区分。
-            let rows: Vec<(bool, String, &serde_json::Value)> = match routes {
-                serde_json::Value::Object(map) => {
-                    map.iter().map(|(k, v)| (true, k.clone(), v)).collect()
-                }
-                // 0.5.3 及以前：数组 + `match` 正则，读进来一次性转成域名键。
-                serde_json::Value::Array(list) => list
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (false, i.to_string(), v))
-                    .collect(),
-                _ => {
-                    if let Some(l) = log {
-                        l("[串发] routes.json routes 既不是对象也不是数组, 本次按种子重建");
-                    }
-                    return None;
-                }
-            };
-            for (is_v1, key, body) in rows {
-                let converted = if is_v1 {
-                    v1_route_spec(&key, body)
-                } else {
-                    legacy_spec_from_row(body)
-                };
-                match converted {
-                    Ok(Some(spec)) => {
-                        doc.hosts.push(spec.0);
-                        doc.ips.extend(spec.1);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        salvaged = true;
-                        if let Some(l) = log {
-                            l(&format!(
-                                "[串发] routes.json routes[{key}] 写坏({e}), 该行丢弃"
-                            ));
-                        }
-                    }
-                }
-            }
-        } else {
-            // 最老的旧三池。
-            let mut pools: HashMap<String, Vec<V1Plan>> = HashMap::new();
-            for (k, v) in obj {
-                if k.starts_with("mirrors") {
-                    continue;
-                }
-                if let Ok(p) = serde_json::from_value::<Vec<V1Plan>>(v.clone()) {
-                    pools.insert(k.clone(), p);
-                }
-            }
-            if !pools.is_empty() {
-                let (hs, is) = legacy_pools_to_v2(&pools);
-                doc.hosts = hs;
-                doc.ips = is;
-            }
-        }
-    }
-
     for (k, v) in obj {
         if !k.starts_with("mirrors") {
             continue;
@@ -306,260 +241,6 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     Some((doc, salvaged))
-}
-
-/// v1 plan 形态（仅迁移解析用）。
-#[derive(Clone, Debug, Deserialize)]
-struct V1Plan {
-    ip: String,
-    #[serde(default)]
-    sni: String,
-}
-
-/// 旧格式一条（0.5.3 及以前）：`match` 是整串正则，转成等价的域名键再折算。
-fn legacy_spec_from_row(
-    v: &serde_json::Value,
-) -> Result<Option<(route::HostSpec, Vec<route::IpSpec>)>, String> {
-    let mut v = v.clone();
-    let Some(obj) = v.as_object_mut() else {
-        return Err("值不是对象".to_string());
-    };
-    let pat = obj
-        .remove("match")
-        .and_then(|m| m.as_str().map(str::to_string))
-        .ok_or_else(|| "缺 match".to_string())?;
-    let key = legacy_match_to_key(&pat);
-    obj.insert("key".to_string(), serde_json::Value::String(key.clone()));
-    v1_route_spec(&key, &v)
-}
-
-/// 老表正则收敛成域名键，只认三种形态：可选前缀→裸键、点通配→星号键、裸键精确；其余按字面去转义。
-fn legacy_match_to_key(pat: &str) -> String {
-    let p = pat.trim();
-    if let Some(rest) = p.strip_prefix("(.*\\.)?") {
-        return rest.replace("\\.", ".");
-    }
-    if let Some(rest) = p.strip_prefix(".*\\.") {
-        return format!("*.{}", rest.replace("\\.", "."));
-    }
-    p.replace("\\.", ".")
-}
-
-/// 旧 routes 字典一条 → (hosts 行, 单 IP 节点)：direct 保留，real/donor 标志丢弃（v2 无此概念）。
-fn v1_route_spec(
-    key: &str,
-    body: &serde_json::Value,
-) -> Result<Option<(route::HostSpec, Vec<route::IpSpec>)>, String> {
-    let mut v = body.clone();
-    let Some(obj) = v.as_object_mut() else {
-        return Err("值不是对象".to_string());
-    };
-    obj.insert(
-        "key".to_string(),
-        serde_json::Value::String(key.to_string()),
-    );
-    let spec: V1RouteBody = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    let host = route::HostSpec {
-        key: key.to_string(),
-        // v2 实测后 direct 4 域进池；迁移时旧 direct 标志一并解除，IP 边由种子补。
-        action: None,
-        content: spec.content,
-        // v1 格式没有会话概念：迁移时按主站族补上风控面标记。
-        session: matches!(key, "github.com" | "api.github.com"),
-        fallback: spec.fallback.clone(),
-        ..Default::default()
-    };
-    let mut ips = Vec::new();
-    for p in spec.plans.iter().chain(spec.real_plans.iter()) {
-        ips.push(route::IpSpec {
-            ip: p.ip.clone(),
-            sni: if p.sni.is_empty() {
-                key.to_string()
-            } else {
-                p.sni.clone()
-            },
-            verify: verify_for(&p.ip),
-            hosts: vec![key.to_string()],
-            latency: HashMap::new(),
-        });
-    }
-    Ok(Some((host, ips)))
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct V1RouteBody {
-    action: Option<String>,
-    content: bool,
-    fallback: Option<String>,
-    plans: Vec<V1Plan>,
-    #[serde(rename = "realPlans")]
-    real_plans: Vec<V1Plan>,
-}
-
-/// Fastly 四段的末段；迁移时用来把旧 edge 池拆回各族。
-fn fastly_seg(ip: &str) -> Option<&str> {
-    let mut o = ip.split('.');
-    match (o.next(), o.next(), o.next(), o.next()) {
-        (Some("185"), Some("199"), Some("108" | "109" | "110" | "111"), Some(last)) => Some(last),
-        _ => None,
-    }
-}
-
-/// 旧三池 → v2：完整行集（v1 legacy_routes 同款）+ IP 摊成节点；direct 4 域按实测进池。
-fn legacy_pools_to_v2(
-    pools: &HashMap<String, Vec<V1Plan>>,
-) -> (Vec<route::HostSpec>, Vec<route::IpSpec>) {
-    let empty: Vec<V1Plan> = Vec::new();
-    let core = pools.get("core").unwrap_or(&empty);
-    let api = pools.get("api").unwrap_or(&empty);
-    let edge = pools.get("edge").unwrap_or(&empty);
-    let seg = |want: &str| -> Vec<&V1Plan> {
-        edge.iter()
-            .filter(|p| fastly_seg(&p.ip) == Some(want))
-            .collect()
-    };
-    let mut ips: Vec<route::IpSpec> = Vec::new();
-    let mut push_all = |list: Vec<&V1Plan>, hosts: &[&str]| {
-        for p in list {
-            ips.push(route::IpSpec {
-                ip: p.ip.clone(),
-                sni: if p.sni.is_empty() {
-                    "baidu.com".to_string()
-                } else {
-                    p.sni.clone()
-                },
-                verify: verify_for(&p.ip),
-                hosts: hosts.iter().map(|h| h.to_string()).collect(),
-                latency: HashMap::new(),
-            });
-        }
-    };
-    let i133 = seg("133");
-    let i153 = seg("153");
-    let i154 = seg("154");
-    let i215 = seg("215");
-    push_all(core.iter().collect(), &["github.com"]);
-    push_all(api.iter().collect(), &["api.github.com"]);
-    push_all(
-        i133,
-        &[
-            "*.githubusercontent.com",
-            "raw.github.com",
-            "support.github.com",
-            "resources.github.com",
-        ],
-    );
-    push_all(
-        i153,
-        &[
-            "github.io",
-            "desktop.github.com",
-            "pages.github.com",
-            "skills.github.com",
-            "archiveprogram.github.com",
-            "socialimpact.github.com",
-        ],
-    );
-    push_all(i154, &["githubassets.com", "docs.github.com"]);
-    push_all(i215, &["githubassets.com"]);
-    let azure: Vec<&V1Plan> = edge.iter().filter(|p| p.ip.starts_with("4.249.")).collect();
-    push_all(azure, &["copilot-proxy.githubusercontent.com"]);
-    let other: Vec<&V1Plan> = edge
-        .iter()
-        .filter(|p| fastly_seg(&p.ip).is_none() && !p.ip.starts_with("4.249."))
-        .collect();
-    push_all(other, &["githubapp.com"]);
-
-    let mut hosts = vec![
-        route::HostSpec {
-            key: "github.com".into(),
-            action: None,
-            content: false,
-            session: true,
-            fallback: None,
-            ..Default::default()
-        },
-        route::HostSpec {
-            key: "api.github.com".into(),
-            action: None,
-            content: false,
-            session: true,
-            fallback: None,
-            ..Default::default()
-        },
-        route::HostSpec {
-            key: "*.githubusercontent.com".into(),
-            action: None,
-            content: true,
-            session: false,
-            fallback: Some("mirror".into()),
-            ..Default::default()
-        },
-        route::HostSpec {
-            key: "githubassets.com".into(),
-            action: None,
-            content: false,
-            session: false,
-            fallback: None,
-            ..Default::default()
-        },
-        route::HostSpec {
-            key: "github.io".into(),
-            action: None,
-            content: false,
-            session: false,
-            fallback: None,
-            ..Default::default()
-        },
-        route::HostSpec {
-            key: "githubapp.com".into(),
-            action: None,
-            content: false,
-            session: false,
-            fallback: None,
-            ..Default::default()
-        },
-    ];
-    for h in LEGACY_HOST_ROWS {
-        hosts.push(route::HostSpec {
-            key: (*h).to_string(),
-            action: None,
-            content: false,
-            session: false,
-            fallback: None,
-            ..Default::default()
-        });
-    }
-    (hosts, ips)
-}
-
-/// v1 白名单行（real 标志丢弃）。
-const LEGACY_HOST_ROWS: &[&str] = &[
-    "docs.github.com",
-    "support.github.com",
-    "resources.github.com",
-    "desktop.github.com",
-    "pages.github.com",
-    "skills.github.com",
-    "archiveprogram.github.com",
-    "socialimpact.github.com",
-    "raw.github.com",
-    "copilot-proxy.githubusercontent.com",
-];
-
-/// 迁移期锚点推断：Fastly 段与 Azure 段按实测证书形态给 verify；未知段留空 = 按目标 host 校验。
-fn verify_for(ip: &str) -> String {
-    let segs: Vec<&str> = ip.split('.').collect();
-    if segs.len() != 4 {
-        return String::new();
-    }
-    match (segs[0], segs[1], segs[3]) {
-        ("185", "199", "153" | "133") => "github.com".to_string(),
-        ("185", "199", "154" | "215") => "githubassets.com".to_string(),
-        ("4", "249", _) => "actions.githubusercontent.com".to_string(),
-        _ => String::new(),
-    }
 }
 
 /// 落盘：ips 在前、hosts 只写特殊行，镜像链按 CONTENT_HOSTS 序。
@@ -694,46 +375,10 @@ pub fn save_routes_now() {
     write_routes_file(&routes_path(), &mirror_chains_snapshot());
 }
 
-/// 旧名 plans.json → routes.json：只搬一次，搬前留 .bak，rename 失败退化为复制。
-fn migrate_legacy_name(path: &Path, log: Option<&LogFn>) {
-    let Some(dir) = path.parent() else { return };
-    let old = dir.join(LEGACY_ROUTES_FILE);
-    if path.exists() {
-        // 新表已在：旧名一律不读。否则用户手改旧文件会"看起来改了但没生效"。
-        if old.exists() {
-            if let Some(l) = log {
-                l("[串发] routes.json 已存在, 旧 plans.json 忽略(可自行删除)");
-            }
-        }
-        return;
-    }
-    if !old.exists() {
-        return;
-    }
-    let bak = path.with_extension("json.bak");
-    if std::fs::rename(&old, path).is_err() {
-        // rename 失败（被占用/跨卷）：退化成复制，旧名留下让用户自己删。
-        if std::fs::copy(&old, path).is_err() {
-            if let Some(l) = log {
-                l("[串发] plans.json 更名为 routes.json 失败, 本次按种子重建");
-            }
-            return;
-        }
-    }
-    // 旧 .bak 更值钱就留着，只在新备份缺席时补一份。
-    if !bak.exists() {
-        let _ = std::fs::copy(path, &bak);
-    }
-    if let Some(l) = log {
-        l("[串发] plans.json 已更名为 routes.json, 原表备份在 routes.json.bak");
-    }
-}
-
 pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<LogFn>) {
     *lock(&SERIAL_DIR) = Some(data_dir.to_path_buf());
     *lock(&SERIAL_LOG) = log.clone();
     let path = routes_path();
-    migrate_legacy_name(&path, log.as_ref());
     let raw = std::fs::read_to_string(&path).ok();
     let parsed = raw
         .as_deref()
@@ -755,14 +400,33 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     }
 
     let seeds = seed_db();
-    let mut doc = parsed.map(|(d, _)| d).unwrap_or_else(|| TopoDoc {
-        hosts: seeds.hosts.clone(),
-        ips: seeds.ips.clone(),
-        chains: seeds.chains.clone(),
-        small_hosts: Vec::new(),
-        latency: HashMap::new(),
-        big: Vec::new(),
-    });
+    let mut doc = match parsed {
+        Some((mut d, _)) => {
+            // v1/0.5.3 旧格式（routes 字典/旧三池）不再被读懂：文件在却拆不出任何路由行 = 旧格式或残缺，
+            // 路由行按种子重建（用户镜像链/测速值保留），绝不静默半重建——只有镜像链没有路由的表跑不起来。
+            if d.hosts.is_empty() && d.ips.is_empty() {
+                if let Some(l) = log.as_ref() {
+                    l("[串发] routes.json 无 ips/hosts 路由行(旧格式或残缺), 路由行按种子重建");
+                }
+                if std::fs::copy(&path, path.with_extension("json.bak")).is_ok() {
+                    if let Some(l) = log.as_ref() {
+                        l("[串发] routes.json 原文件已备份为 routes.json.bak");
+                    }
+                }
+                d.hosts = seeds.hosts.clone();
+                d.ips = seeds.ips.clone();
+            }
+            d
+        }
+        None => TopoDoc {
+            hosts: seeds.hosts.clone(),
+            ips: seeds.ips.clone(),
+            chains: seeds.chains.clone(),
+            small_hosts: Vec::new(),
+            latency: HashMap::new(),
+            big: Vec::new(),
+        },
+    };
     latency::install(std::mem::take(&mut doc.latency));
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
     fill_hosts_from_nodes(&mut doc);
