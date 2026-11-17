@@ -1,6 +1,6 @@
-//! githubassets 资产库：immutable 资产按"资产名"一存长用（同资产不同哈希只保留最新），本地透明回放。
+﻿//! githubassets 资产库：immutable 资产按"资产名"一存长用（同资产不同哈希只保留最新），本地透明回放。
 //! 落盘槽位按资产名寻址（URL 文件名去内容哈希）；条目 = [4B 头长][头 json(key/status/headers)][体]。
-//! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量 15MB，超限按文件年龄淘汰。
+//! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量 25MB，超限按文件年龄淘汰。
 //! 时代中立：取侧校验条目 key 与请求 URL 精确相等——同资产换哈希 = miss = 回源拉新覆盖，永不跨发版给错内容。
 
 use crate::server::protocol::{self, BoxBody};
@@ -25,7 +25,7 @@ fn fnv1a(data: &[u8]) -> u64 {
 
 /// 资产库容量上限：超限按文件年龄从旧到新淘汰（被新版本取代的旧代条目天然最老，先走；
 /// 误淘汰热资产无害——下次请求重拉入库，时间戳变新自动排到最后）。
-const ASSET_MAX_BYTES: u64 = 15 * 1024 * 1024;
+const ASSET_MAX_BYTES: u64 = 25 * 1024 * 1024;
 const ASSET_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const ASSET_DIR: &str = "assets";
 
