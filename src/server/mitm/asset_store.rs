@@ -1,7 +1,7 @@
-//! githubassets 资产库：immutable 资产按 URL 一存永逸，本地透明回放。
-//! 键 = 完整 URL；条目 = [4B 头长][头 json(key/status/headers)][体]，tmp+rename 原子覆盖。
-//! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量攒够整库清空（资产可再生）。
-//! 时代中立：URL 即内容指纹，同 URL 永远同字节，永不跨发版给错内容。
+//! githubassets 资产库：immutable 资产按"资产名"一存长用（同资产不同哈希只保留最新），本地透明回放。
+//! 落盘槽位按资产名寻址（URL 文件名去内容哈希）；条目 = [4B 头长][头 json(key/status/headers)][体]。
+//! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量 15MB，超限按文件年龄淘汰。
+//! 时代中立：取侧校验条目 key 与请求 URL 精确相等——同资产换哈希 = miss = 回源拉新覆盖，永不跨发版给错内容。
 
 use crate::server::protocol::{self, BoxBody};
 use bytes::Bytes;
@@ -19,8 +19,9 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
-/// 资产库容量上限：攒够整库清空（资产可再生，不做淘汰排序）。
-const ASSET_MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// 资产库容量上限：超限按文件年龄从旧到新淘汰（被新版本取代的旧代条目天然最老，先走；
+/// 误淘汰热资产无害——下次请求重拉入库，时间戳变新自动排到最后）。
+const ASSET_MAX_BYTES: u64 = 15 * 1024 * 1024;
 const ASSET_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const ASSET_DIR: &str = "assets";
 
@@ -30,24 +31,68 @@ fn content_type_allowed(ct: &str) -> bool {
     ct.contains("javascript") || ct.contains("css") || ct.contains("font")
 }
 
-fn asset_path(dir: &std::path::Path, url: &str) -> std::path::PathBuf {
-    dir.join(ASSET_DIR).join(format!("{:016x}", fnv1a(url.as_bytes())))
+/// 从 URL 文件名提取"资产名"（去内容哈希）：同资产不同哈希归并到同一落盘槽位，
+/// 写新版本 = 覆盖旧版本（只保留最新）。两族命名：
+/// JS `[名字]-[哈希].js`（哈希 = 最后一个 '-' 之后的段，8..=16 位 [A-Za-z0-9_-]）；
+/// CSS module `[名字].[16位hex].module.css`。不匹配 = None（按完整 URL 落盘，不参与归并，无害）。
+fn asset_logical_name(url: &str) -> Option<String> {
+    let filename = url.rsplit('/').next()?;
+    let dot = filename.rfind('.')?;
+    let stem = &filename[..dot];
+    // CSS module 族：[名字].[16位hex].module.css
+    if let Some(rest) = stem.strip_suffix(".module") {
+        return match rest.rsplit_once('.') {
+            Some((name, hash))
+                if hash.len() == 16 && hash.bytes().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                Some(format!("{name}.module"))
+            }
+            _ => None,
+        };
+    }
+    // JS 族：[名字]-[哈希]
+    let (name, hash) = stem.rsplit_once('-')?;
+    ((8..=16).contains(&hash.len())
+        && hash
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+    .then(|| name.to_string())
 }
 
-static ASSET_BYTES_SINCE_WIPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn asset_path(dir: &std::path::Path, url: &str) -> std::path::PathBuf {
+    // 同资产（名字相同）不同哈希共用一个槽位：写新版本覆盖旧版本（只保留最新）。
+    let key = asset_logical_name(url).unwrap_or_else(|| url.to_string());
+    dir.join(ASSET_DIR).join(format!("{:016x}", fnv1a(key.as_bytes())))
+}
 
-/// 攒够上限整库清空（资产可再生，不做淘汰排序）。
-fn maybe_wipe_assets(dir: &std::path::Path, written: usize) {
-    use std::sync::atomic::Ordering;
-    let pending =
-        ASSET_BYTES_SINCE_WIPE.fetch_add(written as u64, Ordering::Relaxed) + written as u64;
-    if pending >= ASSET_MAX_BYTES
-        && ASSET_BYTES_SINCE_WIPE
-            .compare_exchange(pending, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        let _ = std::fs::remove_dir_all(dir.join(ASSET_DIR));
+/// 容量强制：总量超限则按修改时间从旧到新删，删到限额以内为止。返回淘汰条数。
+fn enforce_cap(dir: &std::path::Path, max: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir.join(ASSET_DIR)) else {
+        return 0;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let md = e.metadata().ok()?;
+            Some((md.modified().ok()?, md.len(), e.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= max {
+        return 0;
     }
+    files.sort_by_key(|(t, _, _)| *t);
+    let mut evicted = 0usize;
+    for (_, len, path) in files {
+        if total <= max {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            evicted += 1;
+        }
+    }
+    evicted
 }
 
 /// 本地命中：按 URL 读回条目并重建响应（头原样带回，浏览器拿到 immutable 后自会停问）。
@@ -109,7 +154,6 @@ pub(super) fn persist_blocking(
         "headers": hdrs,
     });
     let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-    maybe_wipe_assets(dir, 4 + hbytes.len() + bytes.len());
     let mut buf = Vec::with_capacity(4 + hbytes.len() + bytes.len());
     buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(&hbytes);
@@ -126,7 +170,10 @@ pub(super) fn persist_blocking(
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
-    })
+    })?;
+    // 容量强制：超限淘汰最旧（新写入的时间戳最新，天然排最后）
+    enforce_cap(dir, ASSET_MAX_BYTES);
+    Ok(())
 }
 
 /// 入库准入门（collect 侧调用）：200 + 白名单类型 + 体积上限。
