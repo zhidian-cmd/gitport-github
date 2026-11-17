@@ -27,6 +27,7 @@ pub fn set_webui_port(p: u16) {
 
 pub const HEAD_TIMEOUT_SECS: u64 = 30;
 /// 拨号单阶段上限：TCP 1.15s、TLS 1.35s（合计 2.5s，健康全流程 ~334ms 的 7 倍余量）；不设整轮总预算。
+/// 合计必须 > upstream::DIAL_SLOW_MS(1500)——成功耗时不可能超过拨号上限，压到线内慢成功检测窗失效（编译期断言钉在 upstream.rs）。
 pub const TCP_CONNECT_TIMEOUT_MS: u64 = 1150;
 pub const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 1350;
 /// h2 SETTINGS 握手限时：对端装死会永久持有 per-host 拨号锁，拖死整个域名。

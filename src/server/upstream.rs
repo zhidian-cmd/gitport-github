@@ -48,6 +48,13 @@ pub(crate) struct ConnSlot {
 /// 拨号成功但耗时超过此值 = 撞上 GFW 抖动：延迟表记实测，游标挪窝别黏住慢 IP。
 const DIAL_SLOW_MS: u64 = 1500;
 
+/// 拨号单阶段合计必须大于慢成功阈值：成功耗时不可能超过拨号上限，合计压到线内
+/// h2_dial 的"慢成功游标挪窝"就永远走不到，GFW 抖动保护静默失效——编译期钉死。
+const _: () = assert!(
+    crate::config::TCP_CONNECT_TIMEOUT_MS + crate::config::TLS_HANDSHAKE_TIMEOUT_MS > DIAL_SLOW_MS,
+    "TCP+TLS 拨号合计必须 > DIAL_SLOW_MS(1500), 否则慢成功检测窗失效"
+);
+
 /// host 三类：内容域竞速取最速一条+短预算；会话域单通道单 IP（跨 IP 是风控特征）；其他单通道即用即建。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HostClass {
@@ -298,7 +305,7 @@ pub(crate) fn conn_count_on_ip(ip: &str) -> usize {
     lock(conn_pool()).get(ip).map(|h| h.len()).unwrap_or(0)
 }
 
-/// 该 IP 正编通道的 (在途流, 流上限)，无正编 = None（溢出不算）；摘除只 notify，驱动自摘出池。
+/// 黑洞处置（会话域）用：notify 该 IP 池内首条通道的关闭信号，驱动收到即自摘出池。
 pub(crate) fn cull_channel(ip: &str) {
     let close = {
         let g = lock(conn_pool());
