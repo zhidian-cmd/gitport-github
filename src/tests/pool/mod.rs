@@ -170,10 +170,9 @@ fn former_direct_domains_now_pooled() {
         "api.mcp.github.com",
     ] {
         assert!(route::is_managed(host), "{host} 应进代理");
-        assert_eq!(
-            route::master_route(host, "GET", "/"),
-            route::Route::Pool,
-            "{host} 应走池"
+        assert!(
+            !route::is_mirror_route(host, "GET", "/"),
+            "{host} 应走池（非镜像分流）"
         );
         assert!(!target_ips(host).is_empty(), "{host} 应有种子补的 IP 边");
     }

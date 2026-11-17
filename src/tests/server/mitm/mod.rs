@@ -41,7 +41,7 @@ use super::*;
 
 #[test]
 fn release_asset_path_gate() {
-    use pool::route::{master_route, Route};
+    use pool::route::is_mirror_route;
     // 断言依赖种子表的 hosts 声明；别的测试会换全局表，先锁住并装回种子再判。
     let _g = crate::pool::TEST_LOCK
         .lock()
@@ -50,12 +50,10 @@ fn release_asset_path_gate() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     crate::pool::serial_load(&dir, Vec::new(), None);
-    let mirror = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Mirror);
-    let pool = |host: &str, path: &str| matches!(master_route(host, "GET", path), Route::Pool);
-    let not_mirror =
-        |host: &str, path: &str| !matches!(master_route(host, "GET", path), Route::Mirror);
+    let mirror = |host: &str, path: &str| is_mirror_route(host, "GET", path);
+    let not_mirror = |host: &str, path: &str| !is_mirror_route(host, "GET", path);
     assert!(
-        pool(
+        not_mirror(
             "github.com",
             "/torvalds/linux/archive/refs/tags/v6.6.tar.gz"
         ),
@@ -81,7 +79,7 @@ fn release_asset_path_gate() {
     assert!(not_mirror("github.com", "/torvalds/linux/git-upload-pack"));
     assert!(not_mirror("api.github.com", "/repos/x/y/releases/assets/1"));
     assert!(
-        pool("codeload.github.com", "/x/y/legacy.tar.gz"),
+        not_mirror("codeload.github.com", "/x/y/legacy.tar.gz"),
         "codeload 命中 github.com 裸键走池"
     );
 }

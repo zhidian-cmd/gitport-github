@@ -6,14 +6,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
-    System,
-    Mirror,
-    Pool,
-    Tunnel,
-}
-
 /// host 侧开关位；全部来自 routes.json 的 hosts 块。
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
@@ -451,20 +443,17 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     }
 }
 
-/// 总路由：直连行→System，未命中→Tunnel，大文件域/附件→Mirror，其余→Pool；codeload 已迁池。
-pub fn master_route(host: &str, method: &str, path: &str) -> Route {
+/// 总路由判定：生产只分流镜像（大文件域/附件 GET|HEAD → Mirror），直连行/表外/其余
+/// 各走既定管线（System/Tunnel/Pool）——四值枚举里只有 Mirror 被读，坍成布尔。
+pub fn is_mirror_route(host: &str, method: &str, path: &str) -> bool {
     let Some(row) = route_for(host) else {
-        return Route::Tunnel;
+        return false;
     };
     if row.flags.direct {
-        return Route::System;
+        return false;
     }
-    if matches!(method, "GET" | "HEAD")
+    matches!(method, "GET" | "HEAD")
         && (is_big_file_host(host) || is_release_asset_path(host, path))
-    {
-        return Route::Mirror;
-    }
-    Route::Pool
 }
 
 #[cfg(test)]

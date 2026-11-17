@@ -26,10 +26,7 @@ pub(super) async fn dispatch(
     let is_simple = is_simple(out_body.method());
     // 镜像回落域：镜像链 + 直连同台竞速，ECT 统一派发；全部候选耗尽才 502。
     if is_simple
-        && matches!(
-            pool::route::master_route(host, out_body.method().as_str(), path),
-            pool::route::Route::Mirror
-        )
+        && pool::route::is_mirror_route(host, out_body.method().as_str(), path)
     {
         let chain_host = pool::route::mirror_chain_host(host, path);
         let new_bytes =

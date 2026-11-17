@@ -212,9 +212,10 @@ fn cursor_keys_follow_routes() {
     );
 }
 
-/// 总路由：直连行短路 → System；表外 → Tunnel；大文件域/附件下载 → Mirror；archive 走池。
+/// 总路由判定：只有镜像分流被生产读取——大文件域/附件 GET|HEAD 为真，
+/// 直连行/表外/普通页面为假（原 System/Tunnel/Pool 语义由反面断言钉住）。
 #[test]
-fn master_route_direct_tunnel_mirror() {
+fn mirror_route_matches_big_and_attachment_only() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -226,30 +227,30 @@ fn master_route_direct_tunnel_mirror() {
         ("github.com", "{}"),
         ("*.githubusercontent.com", r#"{"content":true}"#),
     ]);
-    assert_eq!(
-        master_route("objects-origin.githubusercontent.com", "PUT", "/x"),
-        Route::System
-    );
-    assert_eq!(master_route("github.com", "GET", "/"), Route::Pool);
-    assert_eq!(
-        master_route("github.com", "GET", "/o/r/releases/download/v1/f.zip"),
-        Route::Mirror
-    );
-    assert_eq!(
-        master_route("github.com", "GET", "/o/r/archive/x.zip"),
-        Route::Pool,
+    // 直连行 → false（原 System 语义）
+    assert!(!is_mirror_route(
+        "objects-origin.githubusercontent.com",
+        "PUT",
+        "/x"
+    ));
+    // 表外 → false（原 Tunnel 语义）
+    assert!(!is_mirror_route("example.com", "GET", "/"));
+    // 普通页面/archive/codeload → false（原 Pool 语义；codeload 已迁池）
+    assert!(!is_mirror_route("github.com", "GET", "/"));
+    assert!(
+        !is_mirror_route("github.com", "GET", "/o/r/archive/x.zip"),
         "archive 迁池，不再走镜像"
     );
-    assert_eq!(
-        master_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
-        Route::Pool,
+    assert!(
+        !is_mirror_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
         "codeload 命中 github.com 裸键走池"
     );
-    assert_eq!(
-        master_route("example.com", "GET", "/"),
-        Route::Tunnel,
-        "表外域名走隧道"
-    );
+    // 附件下载 GET|HEAD → true（原 Mirror 语义）
+    assert!(is_mirror_route(
+        "github.com",
+        "GET",
+        "/o/r/releases/download/v1/f.zip"
+    ));
 }
 
 /// 坏键在校验期就拒绝：空、缺域名、通配不在开头、带协议/路径、action/fallback 拼错。

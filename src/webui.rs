@@ -29,6 +29,14 @@ pub struct App {
     pub version: &'static str,
 }
 
+impl App {
+    /// 日志闭包收口：LogFn 拼装的唯一出口。
+    fn log_fn(&self) -> crate::util::LogFn {
+        let logs = self.logs.clone();
+        Arc::new(move |m: &str| logs.log(m))
+    }
+}
+
 fn local_origin(o: &str) -> bool {
     let lower = o.to_lowercase();
     let o = lower.trim_end_matches('/');
@@ -268,8 +276,7 @@ impl Drop for CalibDone {
 }
 
 async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
-    let logs = st.logs.clone();
-    let log: crate::util::LogFn = Arc::new(move |m: &str| logs.log(m));
+    let log = st.log_fn();
     if crate::server::mitm::CALIB_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return (
             [
@@ -345,11 +352,9 @@ async fn api_worker_mirrors(
         Ok((_, removed, added)) => {
             // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
             pool::sync_custom_mirrors(&removed, true);
+            let log = st.log_fn();
             for url in added {
-                let log: crate::util::LogFn = {
-                    let l = st.logs.clone();
-                    Arc::new(move |msg: &str| l.log(msg))
-                };
+                let log = log.clone();
                 tokio::spawn(async move {
                     match crate::server::mitm::mirror::discover_template(&url, &log).await {
                         Ok(tpl) => {

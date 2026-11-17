@@ -9,7 +9,7 @@ use crate::util::{lock, LogFn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// 路由表文件名：`ips` 节点 + `hosts` 行 + 镜像链，手改入口。
@@ -708,20 +708,16 @@ fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
 }
 
 /// 全局拨号认领集：同一 IP 全进程至多一条腿在拨（跨 host 去重），窗口 = 起拨到入库/失败；TCP 隧道腿 1:1 不认领。
-static DIAL_CLAIMS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static DIAL_CLAIMS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// 认领拨号：返回 false = 已有别的腿在拨这个 IP，本腿不出场。
 pub(crate) fn claim_dial(ip: &str) -> bool {
-    lock(&DIAL_CLAIMS)
-        .get_or_insert_with(HashSet::new)
-        .insert(ip.to_string())
+    lock(&DIAL_CLAIMS).insert(ip.to_string())
 }
 
 /// 释放认领：入库/失败后必调——漏放 = 该 IP 本进程永久哑火。
 pub(crate) fn release_dial(ip: &str) {
-    if let Some(t) = lock(&DIAL_CLAIMS).as_mut() {
-        t.remove(ip);
-    }
+    lock(&DIAL_CLAIMS).remove(ip);
 }
 
 /// 串发请求描述：拨哪个 host、怎么拨。
@@ -747,10 +743,9 @@ fn cert_miss(msg: &str) -> bool {
 /// 锚点选错提示：同一 (IP, 锚点) 只打一次；空锚点失败 = 默认证书没覆盖该域名。
 fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&LogFn>) {
     let Some(log) = log else { return };
-    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     {
-        let mut g = lock(&SEEN);
-        let seen = g.get_or_insert_with(HashSet::new);
+        let mut seen = lock(&SEEN);
         let key = format!("{ip}|{verify}");
         if seen.contains(&key) {
             return;
@@ -798,9 +793,9 @@ pub fn dial_cooling(ip: &str, sni: &str) -> bool {
 
 /// 串发日志限速：每 host 每 60s 最多 12 行，留证又不刷屏。
 fn serial_try_allowed(host: &str) -> bool {
-    static Q: Mutex<Option<HashMap<String, (u32, Instant)>>> = Mutex::new(None);
-    let mut g = lock(&Q);
-    let map = g.get_or_insert_with(HashMap::new);
+    static Q: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut map = lock(&Q);
     if map.len() >= 256 {
         map.clear();
     }

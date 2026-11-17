@@ -29,7 +29,6 @@ pub use mirror::{calibrate_chains, last_calibrate_report, set_calibrate_report, 
 use defuse::gh_defuse;
 use mirror::chain_fetch;
 
-const CONTENT_REQUEST_BUDGET: Duration = Duration::from_secs(2); // 内容域（CDN 静态）响应头预算
 const SESSION_REQUEST_BUDGET: Duration = Duration::from_secs(4); // 会话域（动态页面/API）响应头预算
 pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     if authority.is_none() || !crate::settings::mitm() {
@@ -412,12 +411,12 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// 响应头预算按 host 分类：黑洞必烧满预算，罩更久纯浪费；CDN 静态 2s，会话域 4s（现场拼页面偶有 2~3s）。
+/// 响应头预算按 host 分类：黑洞必烧满预算，罩更久纯浪费；CDN 静态/其他 2s（protocol::REQUEST_BUDGET），会话域 4s（现场拼页面偶有 2~3s）。
 fn request_budget(host: &str) -> Duration {
-    match upstream::host_class(host) {
-        upstream::HostClass::Content => CONTENT_REQUEST_BUDGET,
-        upstream::HostClass::Session => SESSION_REQUEST_BUDGET,
-        upstream::HostClass::Other => REQUEST_BUDGET,
+    if upstream::host_class(host) == upstream::HostClass::Session {
+        SESSION_REQUEST_BUDGET
+    } else {
+        REQUEST_BUDGET
     }
 }
 

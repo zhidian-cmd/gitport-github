@@ -1,7 +1,7 @@
 //! 暂缓/复测账本：判黑通道先停车，60s 到期由真实流量复验；换血按 host 限频。测速判定已拆。
 use crate::util::lock;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// 暂缓时长：判黑的通道先放着不发，到期复测，不重拨。
@@ -10,12 +10,12 @@ const BENCH_SECS: u64 = 60;
 const REBUILD_COOLDOWN_SECS: u64 = 60;
 
 /// 暂缓表：ip → 到期时刻。
-static BENCH: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+static BENCH: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 暂缓：判黑的通道先不发（60 秒），到期复测，不重拨。
 pub fn bench(ip: &str) {
-    let mut g = lock(&BENCH);
-    let t = g.get_or_insert_with(HashMap::new);
+    let mut t = lock(&BENCH);
     // 过期清理在这里做（写入是低频事件）：usable 是每请求热路径，不在它身上全表扫。
     let now = Instant::now();
     t.retain(|_, u| now < *u);
@@ -27,10 +27,7 @@ pub fn bench(ip: &str) {
 
 /// 软排除只摘暂缓中的 IP；全暂缓则原样返回，绝不筛空候选；过期项由下次 bench 顺手清。
 pub fn usable(ips: &[String]) -> Vec<String> {
-    let g = lock(&BENCH);
-    let Some(t) = g.as_ref() else {
-        return ips.to_vec();
-    };
+    let t = lock(&BENCH);
     let now = Instant::now();
     let live: Vec<String> = ips
         .iter()
@@ -46,9 +43,8 @@ pub fn usable(ips: &[String]) -> Vec<String> {
 
 /// 暂缓剩余秒数（状态行用）；未暂缓/已到期 = None。
 pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
-    let g = lock(&BENCH);
-    g.as_ref()?
-        .get(ip)
+    let t = lock(&BENCH);
+    t.get(ip)
         .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
         .filter(|s| *s > 0)
 }
@@ -59,12 +55,12 @@ struct HostRace {
     last: Option<Instant>,
 }
 
-static HOSTS: Mutex<Option<HashMap<String, HostRace>>> = Mutex::new(None);
+static HOSTS: LazyLock<Mutex<HashMap<String, HostRace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 检查+写入必须一次持锁完成，否则一页几十个并发报黑全触发换血，同一批 IP 重复拨满闸门。
 pub fn try_begin_rebuild(host: &str) -> bool {
-    let mut g = lock(&HOSTS);
-    let m = g.get_or_insert_with(HashMap::new);
+    let mut m = lock(&HOSTS);
     // 顺带卫生：24h 没动静的 host 条目清掉；表只涨不清会跟着子域数膨胀。
     let cutoff = Instant::now() - Duration::from_secs(24 * 3600);
     m.retain(|_, st| st.last.is_some_and(|t| t > cutoff));
@@ -85,8 +81,8 @@ pub fn try_begin_rebuild(host: &str) -> bool {
 /// 测试专用：清空暂缓表与重建节奏表。
 #[cfg(test)]
 pub(crate) fn clear() {
-    *lock(&BENCH) = Some(HashMap::new());
-    *lock(&HOSTS) = Some(HashMap::new());
+    *lock(&BENCH) = HashMap::new();
+    *lock(&HOSTS) = HashMap::new();
 }
 
 #[cfg(test)]
