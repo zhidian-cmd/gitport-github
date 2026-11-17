@@ -307,7 +307,7 @@ gitport-github/
 ├─ assets/
 │   ├─ app.rc              资源脚本
 │   └─ icon.ico            托盘与窗口图标
-├─ tools/                  排障脚本（缓存检查、变体对比、计时探针），非基准测试
+├─ tools/                  排障脚本（缓存检查、托盘标签修复），非基准测试
 ├─ docs/
 │   └─ architecture.md     本文件
 └─ src/
