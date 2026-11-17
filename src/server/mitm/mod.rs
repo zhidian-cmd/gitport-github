@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
  mod asset_store;
  mod defuse;
+mod entry;
  mod direct_split;
  mod merge;
  mod page_cache;

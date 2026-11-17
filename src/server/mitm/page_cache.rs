@@ -720,69 +720,33 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
             .unwrap_or(u64::MAX); // 取不到间隔（含 mtime 在未来：系统时间回拨过）按过期处理，交旧+后台重拉
         swr_expired = age > KEEP_MAX_AGE_MS;
     }
-    if raw.len() < 4 {
-        return Err("文件过短");
-    }
-    let hlen =
-        u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    let end = 4usize.checked_add(hlen).ok_or("头部长度溢出")?;
-    if raw.len() < end {
-        return Err("条目截断"); // miss 自愈
-    }
-    let header: serde_json::Value =
-        serde_json::from_slice(&raw[4..end]).map_err(|_| "元数据损坏")?;
-    if header.get("key").and_then(|k| k.as_str()) != Some(key) {
-        return Err("哈希碰撞"); // 不服务错页
-    }
-    let Some(st) = header.get("status").and_then(|v| v.as_u64()) else {
-        return Err("状态码损坏");
-    };
-    let status = u16::try_from(st).map_err(|_| "状态码损坏")?;
-    if status != 200 {
-        return Err("条目非 200"); // 拦截页/304：当 miss
-    }
-    let Some(headers) = header.get("headers").and_then(|v| v.as_array()) else {
-        return Err("头部字段损坏");
-    };
-    let mut hdrs: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
-        Vec::with_capacity(headers.len());
-    for pair in headers {
-        let (Some(k), Some(v)) = (
-            pair.get(0).and_then(|x| x.as_str()),
-            pair.get(1).and_then(|x| x.as_str()),
-        ) else {
-            continue;
-        };
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            hdrs.push((name, val));
-        }
-    }
-    let enc = hdrs.iter().find(|(k, _)| k.as_str() == "content-encoding")
+    let entry = super::entry::decode(&raw, key)?;
+    let enc = entry
+        .headers
+        .iter()
+        .find(|(k, _)| k.as_str() == "content-encoding")
         .and_then(|(_, v)| v.to_str().ok())
         .map(body_encoding)
         .unwrap_or("identity");
-    let body = &raw[end..];
-    let p = plain_prefix(body, enc);
+    let body = entry.body;
+    let p = plain_prefix(&body, enc);
     if (logged_in && is_logged_out_body(&p)) || is_gate_page(&p) {
         return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
     }
     // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
     if key.ends_with("-k")
-        && hdrs.iter().any(|(k, v)| {
+        && entry.headers.iter().any(|(k, v)| {
             k.as_str() == "content-type"
                 && v.to_str()
                     .map(|v| v.starts_with("text/html"))
                     .unwrap_or(false)
         })
-        && !html_complete(body, enc)
+        && !html_complete(&body, enc)
     {
         let _ = std::fs::remove_file(&path);
         return Err("骨架条目截断(无</html>)");
     }
-    Ok(((status, hdrs, Bytes::copy_from_slice(body)), swr_expired))
+    Ok(((entry.status, entry.headers, body), swr_expired))
 }
 
 // ---------- 页面快照 SWR（v6.11：过期交旧 + 后台静默重拉，前台零等待） ----------
@@ -923,12 +887,13 @@ fn spawn_page_refetch(
                 return;
             }
             // ④ 覆盖入库（全量格式，替换旧骨架）；覆盖后 mtime 复新，过期标记自动解除。
-            let header = serde_json::json!({
-                "key": key,
-                "status": http::StatusCode::OK.as_u16(),
-                "headers": hdrs,
-            });
-            match write_entry_file(&page_cache_dir(), &key, &bytes, &header) {
+            match write_entry_file(
+                &page_cache_dir(),
+                &key,
+                &bytes,
+                http::StatusCode::OK.as_u16(),
+                &hdrs,
+            ) {
                 Ok(_) => (log)(&format!(
                     "[缓存] 页面重拉完成, 快照已更新 (尝试 {attempt} 次)"
                 )),
@@ -980,19 +945,16 @@ fn write_entry_file(
     dir: &std::path::Path,
     key: &str,
     body: &[u8],
-    header: &serde_json::Value,
+    status: u16,
+    hdrs: &[Vec<String>],
 ) -> Result<(), String> {
-    let hbytes = serde_json::to_vec(header).map_err(|e| e.to_string())?;
+    let buf = super::entry::encode(key, status, hdrs, body);
     // 记账口径必须等于实际写入量：4 字节长度前缀 + 头部 JSON + 正文。
-    maybe_wipe_on_growth(dir, 4 + hbytes.len() + body.len());
+    maybe_wipe_on_growth(dir, buf.len());
     let pages = entry_dir(dir, key);
     let tmp = dir.join("tmp");
     std::fs::create_dir_all(&pages).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(4 + hbytes.len() + body.len());
-    buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&hbytes);
-    buf.extend_from_slice(body);
     // 纳秒时钟防极端重入（管家线程本已串行）
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1018,16 +980,7 @@ fn persist_page_entry_blocking(
     if !ensure_cache_dir_with_acl(dir) {
         return Err("缓存目录创建失败".to_string());
     }
-    write_entry_file(
-        dir,
-        key,
-        bytes,
-        &serde_json::json!({
-            "key": key,
-            "status": status,
-            "headers": hdrs,
-        }),
-    )
+    write_entry_file(dir, key, bytes, status, hdrs)
 }
 
 /// no-store 一律不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理已按会话号哈希分钥匙语义等价，全拒会干掉页面缓存。

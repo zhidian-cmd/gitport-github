@@ -117,42 +117,14 @@ fn enforce_cap(dir: &std::path::Path, max: u64) -> usize {
 /// 本地命中：按 URL 读回条目并重建响应（头原样带回，浏览器拿到 immutable 后自会停问）。
 pub(super) fn take(dir: &std::path::Path, url: &str) -> Option<axum::response::Response<BoxBody>> {
     let raw = std::fs::read(asset_path(dir, url)).ok()?;
-    if raw.len() < 4 {
-        return None;
-    }
-    let hlen = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    let end = 4usize.checked_add(hlen)?;
-    if raw.len() < end {
-        return None;
-    }
-    let header: serde_json::Value = serde_json::from_slice(&raw[4..end]).ok()?;
-    if header.get("key").and_then(|k| k.as_str()) != Some(url) {
-        return None; // 哈希碰撞不服务错文件
-    }
-    let st = header.get("status").and_then(|v| v.as_u64())?;
-    if st != StatusCode::OK.as_u16() as u64 {
-        return None;
-    }
-    let arr = header.get("headers").and_then(|v| v.as_array())?;
+    let entry = super::entry::decode(&raw, url).ok()?;
     let mut hdrmap = hyper::HeaderMap::new();
-    for pair in arr {
-        let (Some(k), Some(v)) = (
-            pair.get(0).and_then(|x| x.as_str()),
-            pair.get(1).and_then(|x| x.as_str()),
-        ) else {
-            continue;
-        };
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            hdrmap.insert(name, val);
-        }
+    for (k, v) in entry.headers {
+        hdrmap.insert(k, v);
     }
-    let body = Bytes::copy_from_slice(&raw[end..]);
     let mut resp = hyper::Response::builder()
         .status(StatusCode::OK)
-        .body(protocol::full_body(body))
+        .body(protocol::full_body(entry.body))
         .ok()?;
     *resp.headers_mut() = hdrmap;
     Some(resp)
@@ -167,16 +139,7 @@ pub(super) fn persist_blocking(
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir.join(ASSET_DIR)).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir.join("tmp")).map_err(|e| e.to_string())?;
-    let header = serde_json::json!({
-        "key": url,
-        "status": StatusCode::OK.as_u16(),
-        "headers": hdrs,
-    });
-    let hbytes = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(4 + hbytes.len() + bytes.len());
-    buf.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&hbytes);
-    buf.extend_from_slice(bytes);
+    let buf = super::entry::encode(url, StatusCode::OK.as_u16(), hdrs, bytes);
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
