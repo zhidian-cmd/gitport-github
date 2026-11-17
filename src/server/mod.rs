@@ -395,7 +395,6 @@ pub async fn connect_upstream(host: &str, port: u16) -> Result<(Dialed, String),
                     host,
                     tls_handshake: false,
                     skip_ips: &[],
-                    prefer_shared: None,
                 },
                 None,
             )

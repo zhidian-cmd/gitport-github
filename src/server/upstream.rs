@@ -441,7 +441,6 @@ pub(crate) async fn h2_dial(
     host: &str,
     log: &LogFn,
     skip_ips: &[String],
-    prefer_shared: Option<bool>,
 ) -> Result<H2Upstream, String> {
     let t_dial = std::time::Instant::now();
     let (conn_io, ip, sni) = pool::serial_dial_skip(
@@ -449,7 +448,6 @@ pub(crate) async fn h2_dial(
             host,
             tls_handshake: true,
             skip_ips,
-            prefer_shared,
         },
         Some(log),
     )
@@ -517,7 +515,7 @@ async fn race_build(host: &str, _probe_path: &str, log: &LogFn) -> Result<H2Upst
     let cands = pool::dial_candidates(host);
     if cands.len() < 2 {
         // 候选不足两条没法赛：退回单腿串发（跟旧路径一致）。
-        return h2_dial(host, log, &[], None).await;
+        return h2_dial(host, log, &[]).await;
     }
     (log)(&format!("[建连] {host} {} 路竞速(错峰 50ms)", cands.len()));
     // 参赛名单快照：收尾并集排名按它认领池内现成通道。
@@ -675,13 +673,13 @@ async fn dial_h2_race(
         // 会话域候选全被占：重拨必被 store_h2 作废，立即交兜底。
         return Err(format!("{host} 候选均已有通道, 请重查连接池"));
     }
-    // 单腿串发：独占档礼让在前——仅排序偏好，独占拨完自动轮到共享，无任何保证。
+    // 单腿串发：候选按游标+延迟序逐个试。
     tokio::spawn({
         let host = host.to_string();
         let log2 = log.clone();
         let skip = occupied.to_vec();
         async move {
-            let r = h2_dial(&host, &log2, &skip, Some(false)).await;
+            let r = h2_dial(&host, &log2, &skip).await;
             let _ = tx.send(r).await;
         }
     });

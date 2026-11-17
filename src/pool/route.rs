@@ -3,7 +3,7 @@
 use super::edges;
 use crate::util::lock;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +92,6 @@ pub struct NodeIp {
     pub ip: String,
     pub sni: String,
     pub verify: String,
-    /// 装表时算好：这个 IP 会被多个 host 用到（prefer_shared 分档排序用）。
-    pub shared: bool,
 }
 
 /// host 侧路由行；裸键含自身+子域，`*.` 仅子域，最长键胜。
@@ -223,38 +221,20 @@ struct Topology {
     nodes: Vec<IpNode>,
     /// 路由键 → 节点下标。
     host_index: HashMap<String, Vec<usize>>,
-    /// 装表时算好的共享 IP：挂了 2 个以上路由键，或含 `*.` 通配键（一个键背后几十个 host）。
-    shared: HashSet<String>,
 }
 
 impl Topology {
     fn build(rows: Vec<RouteRow>, nodes: Vec<IpNode>) -> Self {
         let mut host_index: HashMap<String, Vec<usize>> = HashMap::new();
-        // 按具体 IP 聚合，不按节点数：一个 IP 被拆到几个节点各挂一键，照样是共享。
-        let mut keys_per_ip: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut wildcard: HashSet<String> = HashSet::new();
         for (i, n) in nodes.iter().enumerate() {
             for k in &n.hosts {
                 host_index.entry(k.clone()).or_default().push(i);
-                for ip in &n.ips {
-                    keys_per_ip.entry(ip.clone()).or_default().insert(k.clone());
-                    if k.starts_with("*.") {
-                        wildcard.insert(ip.clone());
-                    }
-                }
             }
         }
-        // 宁可多标（只是多个标记），不能漏标（漏了 prefer_shared 分档就失真）。
-        let shared: HashSet<String> = keys_per_ip
-            .into_iter()
-            .filter(|(ip, keys)| keys.len() >= 2 || wildcard.contains(ip))
-            .map(|(ip, _)| ip)
-            .collect();
         Self {
             rows,
             nodes,
             host_index,
-            shared,
         }
     }
 }
@@ -341,7 +321,6 @@ pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
                 } else {
                     node.verify.clone()
                 },
-                shared: topo.shared.contains(ip),
             });
         }
     }

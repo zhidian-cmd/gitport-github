@@ -947,7 +947,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            prefer_shared: None,
         },
         None,
     )
@@ -972,7 +971,6 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
             host: "github.com",
             tls_handshake: false,
             skip_ips: &[],
-            prefer_shared: None,
         },
         None,
     )
@@ -1014,16 +1012,15 @@ fn dial_order_cursor_first_then_latency_asc() {
         ip: ip.into(),
         sni: String::new(),
         verify: String::new(),
-        shared: false,
     };
     let circle = vec![mk("1.1.1.1"), mk("2.2.2.2"), mk("3.3.3.3"), mk("4.4.4.4")];
     latency::install(HashMap::new());
     latency::seed("2.2.2.2", 300);
     latency::seed("3.3.3.3", 200);
     latency::seed("4.4.4.4", 100);
-    assert_eq!(dial_order(&circle, Some("1.1.1.1"), None), vec![0, 3, 2, 1]);
-    assert_eq!(dial_order(&circle, None, None), vec![3, 2, 1, 0]);
-    assert_eq!(dial_order(&circle, Some("3.3.3.3"), None), vec![2, 3, 1, 0]);
+    assert_eq!(dial_order(&circle, Some("1.1.1.1")), vec![0, 3, 2, 1]);
+    assert_eq!(dial_order(&circle, None), vec![3, 2, 1, 0]);
+    assert_eq!(dial_order(&circle, Some("3.3.3.3")), vec![2, 3, 1, 0]);
     latency::install(HashMap::new());
 }
 
@@ -1067,71 +1064,6 @@ fn codeload_route_isolated_to_verified_ips() {
             targets.iter().map(|t| &t.ip).collect::<Vec<_>>()
         );
     }
-}
-
-/// 共享标记装表时算好：挂两个键算共享，只挂一个通配键也算（一个键背后几十个 host）。
-#[test]
-fn shared_ip_marks_come_from_topology() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    edges::clear_all();
-    let rows: Vec<route::RouteRow> = [
-        r#"{"key":"github.com"}"#,
-        r#"{"key":"api.github.com"}"#,
-        r#"{"key":"*.githubusercontent.com","content":true}"#,
-    ]
-    .iter()
-    .map(|j| route::RouteRow::new(serde_json::from_str(j).unwrap()).unwrap())
-    .collect();
-    let nodes: Vec<route::IpNode> = [
-        r#"{"ip":"1.2.3.4","hosts":["github.com"]}"#,
-        r#"{"ip":"5.6.7.8","hosts":["github.com","api.github.com"]}"#,
-        r#"{"ip":"9.9.9.9","hosts":["*.githubusercontent.com"]}"#,
-    ]
-    .iter()
-    .map(|j| {
-        let spec: route::IpSpec = serde_json::from_str(j).unwrap();
-        build_node(spec).unwrap()
-    })
-    .collect();
-    route::install(rows, nodes);
-
-    let gh = route::dial_targets("github.com").unwrap();
-    let shared = |ip: &str| gh.iter().find(|t| t.ip == ip).unwrap().shared;
-    assert!(!shared("1.2.3.4"), "单个精确域名 = 独占");
-    assert!(shared("5.6.7.8"), "两个键 = 共享");
-    let avatars = route::dial_targets("avatars.githubusercontent.com").unwrap();
-    assert!(
-        avatars.iter().all(|t| t.shared),
-        "只挂一个通配键也必须算共享，否则多个 host 撞上没人拦"
-    );
-}
-
-/// dial_order 分档排序：prefer_shared 时独占/共享分档、档内游标+延迟升序，None 纯游标+延迟序；断言依赖空延迟表，必须持 TEST_LOCK 串行。
-#[test]
-fn dial_order_partitions_exclusive_and_shared() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mk = |ip: &str, shared: bool| route::NodeIp {
-        ip: ip.to_string(),
-        sni: String::new(),
-        verify: String::new(),
-        shared,
-    };
-    // 1.1.1.1 独占；2.2.2.2/3.3.3.3 共享。未测延迟 → 各档内保持表序。
-    let circle = vec![mk("1.1.1.1", false), mk("2.2.2.2", true), mk("3.3.3.3", true)];
-    let ips = |o: Vec<usize>| o.into_iter().map(|i| circle[i].ip.clone()).collect::<Vec<_>>();
-
-    let o = ips(dial_order(&circle, None, Some(true)));
-    assert_eq!(o, ["2.2.2.2", "3.3.3.3", "1.1.1.1"], "共享档整档在前");
-    let o = ips(dial_order(&circle, None, Some(false)));
-    assert_eq!(o, ["1.1.1.1", "2.2.2.2", "3.3.3.3"], "独占档整档在前");
-    // 游标置顶只发生在它所属的档内：游标在共享 3.3.3.3 → 共享档内它提前，独占档不动。
-    let o = ips(dial_order(&circle, Some("3.3.3.3"), Some(true)));
-    assert_eq!(o, ["3.3.3.3", "2.2.2.2", "1.1.1.1"]);
-    // 游标在另一档时不越档：它只在自己档内置顶（3.3.3.3 属共享档），独占档保持延迟序。
-    let o = ips(dial_order(&circle, Some("3.3.3.3"), Some(false)));
-    assert_eq!(o, ["1.1.1.1", "3.3.3.3", "2.2.2.2"]);
-    let o = ips(dial_order(&circle, None, None));
-    assert_eq!(o.len(), 3, "不分档 = 全体一个序");
 }
 
 /// 媒体救援链（图片/视频）是保留键：解析、落盘回写、注册表对齐都不能弄丢；全程纯函数不碰磁盘真网。
