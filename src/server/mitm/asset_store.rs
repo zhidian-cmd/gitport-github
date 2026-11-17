@@ -4,8 +4,12 @@
 //! 时代中立：取侧校验条目 key 与请求 URL 精确相等——同资产换哈希 = miss = 回源拉新覆盖，永不跨发版给错内容。
 
 use crate::server::protocol::{self, BoxBody};
+use crate::server::upstream;
+use crate::util::LogFn;
 use bytes::Bytes;
 use http::StatusCode;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 pub(super) const ASSET_HOST: &str = "github.githubassets.com";
 
@@ -63,6 +67,21 @@ fn asset_path(dir: &std::path::Path, url: &str) -> std::path::PathBuf {
     // 同资产（名字相同）不同哈希共用一个槽位：写新版本覆盖旧版本（只保留最新）。
     let key = asset_logical_name(url).unwrap_or_else(|| url.to_string());
     dir.join(ASSET_DIR).join(format!("{:016x}", fnv1a(key.as_bytes())))
+}
+
+/// 资产库键：完整 URL（含查询串）。
+pub(super) fn asset_request_url<B>(req: &hyper::Request<B>, host: &str) -> String {
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    format!("https://{host}{pq}")
+}
+
+/// 日志用：资产 URL 只露文件名。
+pub(super) fn asset_dbg_name(url: &str) -> &str {
+    url.rsplit('/').next().unwrap_or(url)
 }
 
 /// 容量强制：总量超限则按修改时间从旧到新删，删到限额以内为止。返回淘汰条数。
@@ -181,6 +200,152 @@ pub(super) fn storable(status: StatusCode, content_type: &str, body_len: usize) 
     status == StatusCode::OK
         && content_type_allowed(content_type)
         && body_len <= ASSET_MAX_BODY_BYTES
+}
+
+// ---------- 强绑定服务：资产请求只问资产库 ----------
+
+/// 同 URL 在途拉取的等待者登记表：首个 miss 发起独立拉取，后续 miss 排队等同一份结果。
+static INFLIGHT: OnceLock<Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>>> =
+    OnceLock::new();
+
+fn inflight() -> &'static Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>> {
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 登记：返回 (完成通知接收端, 是否发起者)。发起者负责拉取并在完成后逐个唤醒。
+fn register_waiter(url: &str) -> (tokio::sync::oneshot::Receiver<()>, bool) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut g = crate::util::lock(inflight());
+    let v = g.entry(url.to_string()).or_default();
+    let initiator = v.is_empty();
+    v.push(tx);
+    (rx, initiator)
+}
+
+/// 完成通知：逐个唤醒等待者并撤销登记。
+fn signal_done(url: &str) {
+    let waiters = crate::util::lock(inflight()).remove(url);
+    if let Some(v) = waiters {
+        for tx in v {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// 资产请求强绑定入口：命中本地回放；miss 独立拉取（与浏览器连接解耦——浏览器中途放弃，
+/// 拉取继续完成并入库）。返回 None = 独立拉取失败，调用方回落既有 switchboard 路径。
+pub(super) async fn serve_or_fetch<B>(
+    log: &LogFn,
+    req: &hyper::Request<B>,
+    host: &str,
+) -> Option<axum::response::Response<BoxBody>> {
+    let url = asset_request_url(req, host);
+    let dir = super::page_cache::page_cache_dir();
+    // ① 命中：本地回放
+    if let Some(resp) = take(&dir, &url) {
+        if super::quiet::first_time("assethit", &url) {
+            (log)(&format!("[资产] 命中 {}", asset_dbg_name(&url)));
+        }
+        return Some(resp);
+    }
+    // ② miss：登记等待者；发起者拉起独立拉取任务（浏览器断开不影响）
+    let (rx, initiator) = register_waiter(&url);
+    if initiator {
+        spawn_detached_fetch(dir.clone(), log.clone(), url.clone());
+    }
+    // ③ 等完成（发起者与后续等待者都等同一份结果）
+    rx.await.ok()?;
+    // ④ 从库出：命中 = 交付；没有 = 拉取失败/不可收录 → None 回落
+    take(&dir, &url)
+}
+
+/// 独立拉取任务：向通道池申请通道拉取资产，门检通过即入库。与浏览器连接解耦——
+/// 浏览器断开只影响 oneshot 接收端，任务持有发送端继续跑完。
+fn spawn_detached_fetch(dir: std::path::PathBuf, log: LogFn, url: String) {
+    tokio::spawn(async move {
+        let ok = fetch_and_store(&dir, &log, &url).await;
+        signal_done(&url);
+        let _ = ok; // 结果已由 fetch_and_store 内部落日志
+    });
+}
+
+/// 拉取 + 门检 + 入库。返回是否成功入库。
+async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool {
+    let name = asset_dbg_name(url);
+    // ① 通道：池内现成通道，没有就拨（内容域竞速 IP）
+    let (up, _) = match crate::pool::get_or_build(ASSET_HOST, "/", log).await {
+        Ok(v) => v,
+        Err(e) => {
+            (log)(&format!("[资产] 独立拉取拨号失败({e}), {name} 本次不入库"));
+            return false;
+        }
+    };
+    // ② 请求
+    let req = match hyper::Request::builder()
+        .uri(url)
+        .header("accept", "*/*")
+        .header(
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+        )
+        .body(protocol::empty_body())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            (log)(&format!("[资产] 请求构造失败({e}), {name} 本次不入库"));
+            return false;
+        }
+    };
+    // ③ 拉取收体
+    let resp = match upstream::h2_send(&up, &req, &None::<Bytes>).await {
+        Ok(r) => r,
+        Err(e) => {
+            (log)(&format!("[资产] 独立拉取失败({e}), {name} 本次不入库"));
+            return false;
+        }
+    };
+    let (parts, body) = resp.into_parts();
+    if parts.status != StatusCode::OK {
+        (log)(&format!(
+            "[资产] 独立拉取上游 {}, {name} 不入库回落",
+            parts.status.as_u16()
+        ));
+        return false;
+    }
+    let ct = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let collected = match http_body_util::BodyExt::collect(body).await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            (log)(&format!("[资产] 独立拉取收体失败({e}), {name} 本次不入库"));
+            return false;
+        }
+    };
+    // ④ 门检 + 入库
+    if !storable(StatusCode::OK, &ct, collected.len()) {
+        (log)(&format!("[资产] 不收录({ct} / {}B), {name} 回落", collected.len()));
+        return false;
+    }
+    let hdrs: Vec<Vec<String>> = parts
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
+        .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
+        .collect();
+    match persist_blocking(dir, url, &collected, &hdrs) {
+        Ok(_) => {
+            (log)(&format!("[资产] 独立拉取入库 {name} ({}B)", collected.len()));
+            true
+        }
+        Err(e) => {
+            (log)(&format!("[资产] 独立拉取入库失败({e}), {name}"));
+            false
+        }
+    }
 }
 
 #[cfg(test)]

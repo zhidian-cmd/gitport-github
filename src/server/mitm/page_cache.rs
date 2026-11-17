@@ -214,25 +214,12 @@ fn cache_eligible_rules(
 }
 
 /// 取路由：命中 = 纯本地读；未命中/空闲后第一页 = None，走上游。
+/// githubassets 资产不在此处理：mitm_http 的资产库强绑定分支接管（命中回放 / miss 独立拉取）。
 pub(super) fn cache_take<B>(
     log: &LogFn,
     req: &hyper::Request<B>,
     host: &str,
 ) -> Option<axum::response::Response<BoxBody>> {
-    // 资产库回放：githubassets 的 GET 先查本地（immutable 一存永逸）；Range 请求与未命中走原直连。
-    if host == asset_store::ASSET_HOST
-        && req.method() == Method::GET
-        && !req.headers().contains_key("range")
-    {
-        let url = asset_request_url(req, host);
-        if let Some(resp) = asset_store::take(&page_cache_dir(), &url) {
-            if super::quiet::first_time("assethit", &url) {
-                (log)(&format!("[资产] 命中 {}", asset_dbg_name(&url)));
-            }
-            return Some(resp);
-        }
-        return None;
-    }
     let xhr = is_xhr_nav(req, host);
     let search_page = is_search_page(req.uri().path());
     if !is_doc_nav(req) && !xhr && !search_page {
@@ -511,7 +498,7 @@ fn rebuild_cached_response(
 static CACHE_DIR_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
-fn page_cache_dir() -> std::path::PathBuf {
+pub(super) fn page_cache_dir() -> std::path::PathBuf {
     #[cfg(test)]
     if let Some(d) = CACHE_DIR_OVERRIDE
         .lock()
@@ -1178,22 +1165,7 @@ async fn collect_and_submit(
     }
 }
 
-// ---------- 资产库入库（githubassets → 本地回放） ----------
-
-/// 资产库键：完整 URL（含查询串）。
-fn asset_request_url<B>(req: &hyper::Request<B>, host: &str) -> String {
-    let pq = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
-    format!("https://{host}{pq}")
-}
-
-/// 日志用：资产 URL 只露文件名。
-fn asset_dbg_name(url: &str) -> &str {
-    url.rsplit('/').next().unwrap_or(url)
-}
+// ---------- 资产库入库（githubassets → 本地回放；强绑定入口在 asset_store::serve_or_fetch） ----------
 
 /// 资产入库分支：收集白名单内的 200 体投管家保存（响应原样交回浏览器，不等写盘）。
 async fn collect_asset<B>(
@@ -1201,8 +1173,8 @@ async fn collect_asset<B>(
     req: &hyper::Request<B>,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
-    let url = asset_request_url(req, asset_store::ASSET_HOST);
-    let name = asset_dbg_name(&url).to_string();
+    let url = asset_store::asset_request_url(req, asset_store::ASSET_HOST);
+    let name = asset_store::asset_dbg_name(&url).to_string();
     let (mut parts, body) = resp.into_parts();
     if parts.status != StatusCode::OK {
         return hyper::Response::from_parts(parts, body);

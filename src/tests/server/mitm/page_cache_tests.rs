@@ -911,8 +911,10 @@ async fn asset_branch_stores_and_replays() {
         .to_bytes();
     assert_eq!(stored_body.as_ref(), b"console.log(1)");
 
-    // 回放：cache_take 本地命中
-    let hit = cache_take(&log, &req, asset_store::ASSET_HOST).expect("必须本地命中");
+    // 回放：资产库强绑定入口本地命中
+    let hit = asset_store::serve_or_fetch(&log, &req, asset_store::ASSET_HOST)
+        .await
+        .expect("必须本地命中");
     assert_eq!(hit.status(), 200);
     let _ = std::fs::remove_dir_all(&dir);
 }

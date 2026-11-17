@@ -150,6 +150,16 @@ async fn mitm_http(
     }
 
     let info = UpstreamInfo::default();
+    // 资产库强绑定：githubassets 资产只问资产库（命中回放 / miss 独立拉取入库，浏览器放弃拉取不放弃）；
+    // 独立拉取失败返回 None，落到下方既有 switchboard 路径兜底。
+    if host == asset_store::ASSET_HOST
+        && req.method() == Method::GET
+        && !req.headers().contains_key("range")
+    {
+        if let Some(resp) = asset_store::serve_or_fetch(&log, &req, &host).await {
+            return write_upstream(&log, resp, "asset", &info, &host, &path_of(req.uri()));
+        }
+    }
     // 页面缓存命中即秒回；勿加 SWR/ETag 验证，旧 cookie 重用会被判账号泄露。
     if let Some(cached) = page_cache::cache_take(&log, &req, &host) {
         return write_upstream(&log, cached, "cache", &info, &host, &path_of(req.uri()));
