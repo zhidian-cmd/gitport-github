@@ -236,6 +236,8 @@ pub(super) struct MergeBody {
     last_tick: Instant,
     /// 上次让位时刻（全局，不按段），用来给让位整体限速。
     last_cut_any: Option<Instant>,
+    /// 让位开关：直连腿骑单通道，多开流不加吞吐（185.199 聚合水管恒定），关掉让位保住现网行为。
+    pub(super) allow_yield: bool,
     finished: bool,
     /// 生命周期钩子：随 body 一起丢弃（切片计划里登记的在途区间靠它注销）。
     _guard: Option<Box<dyn Send + Sync>>,
@@ -257,9 +259,16 @@ impl MergeBody {
             dead_fills: 0,
             last_tick: Instant::now(),
             last_cut_any: None,
+            allow_yield: true,
             finished: false,
             _guard: None,
         }
+    }
+
+    /// 关掉让位（直连腿用）：慢段只走停滞补发，不做"抢给更快流"的让位。
+    pub(super) fn without_yield(mut self) -> Self {
+        self.allow_yield = false;
+        self
     }
 
     /// 挂一个生命周期钩子：body 被丢弃时一起释放（用于注销在途区间登记）。

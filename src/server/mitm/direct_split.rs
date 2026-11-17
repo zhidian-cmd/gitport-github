@@ -1,20 +1,19 @@
 //! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
+//! 段的交付/停滞收尸/补发统一挂镜像腿的 MergeBody+drive_split（见 merge.rs），本文件只管段位分配与救援闭包。
+use super::merge::MergeBody;
+use super::mirror::{drive_split, Fetch, SplitCtx};
 use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
 use bytes::Bytes;
 use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use hyper::body::Frame;
 use std::{
-    collections::{HashMap, VecDeque},
-    future::Future,
-    pin::Pin,
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
         LazyLock, Mutex,
     },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -27,8 +26,6 @@ const MAX_SEGS: usize = 8;
 const PROBE_BYTES: u64 = 10 * 1024;
 /// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
 const MAX_ACTIVE: usize = 6;
-// 单段在用户态的缓冲上限：快段先到先存，超过就暂时不读它（常量与合并层共用，见 merge::SEG_BUFFER_MAX）。
-use super::merge::SEG_BUFFER_MAX;
 /// 段响应头预算：头应毫秒级，8s 只防上游装死。
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
@@ -403,13 +400,7 @@ pub(super) async fn try_direct_split(
                 )
                 .await;
                 match res {
-                    Ok(Ok((body, hs))) => {
-                        return Ok(SegFetch {
-                            body,
-                            hs,
-                            rescued: false,
-                        });
-                    }
+                    Ok(Ok((body, hs))) => return Ok((body, hs)),
                     _ => {
                         if attempt >= 3 {
                             return Err("段拉取重试耗尽".to_string());
@@ -433,19 +424,19 @@ pub(super) async fn try_direct_split(
         ));
         return None;
     }
-    let mut entries: Vec<(BoxBody, usize, u64, bool)> = Vec::with_capacity(segs.len() + 1);
+    let mut entries: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len() + 1);
     let mut first_headers: Option<HeaderMap> = None;
     if let Some((bytes, hs)) = &prefix {
         // 探片 10KB = 交付首段：字节已在手，头用它（206 头，Range 语义头会被剥）。
         first_headers = Some(hs.clone());
-        entries.push((protocol::full_body(bytes.clone()), bytes.len(), 0, false));
+        entries.push((0, PROBE_BYTES, Instant::now(), protocol::full_body(bytes.clone())));
     }
     for (i, r) in results.into_iter().enumerate() {
-        let f = r.ok()?;
+        let (body, hs) = r.ok()?;
         if first_headers.is_none() {
-            first_headers = Some(f.hs);
+            first_headers = Some(hs);
         }
-        entries.push((f.body, (segs[i].1 - segs[i].0) as usize, segs[i].0, f.rescued));
+        entries.push((segs[i].0, segs[i].1, Instant::now(), body));
     }
     // 总长记忆命中时没走过探片，用第一段的 content-type 补一道媒体校验。
     let hs = first_headers.as_ref()?;
@@ -462,33 +453,58 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
-    // 有救援链（图片/视频）→ 镜像续传；无链（脚本/未配镜像）→ 停滞时直连同通道从剩余偏移重拉。
+    // 救援收口成一个 Fetch 闭包：有链（图片/视频）→ 镜像续传；无链（脚本/未配镜像）→ 直连同通道从剩余偏移重拉。
     let chain = match kind {
         MediaKind::Script => Vec::new(),
         _ => pool::mirror_chain(kind.chain()),
     };
-    let resume = if chain.is_empty() {
-        Some(Resume::Direct {
-            tpl: tpl.clone(),
+    let fetch: Fetch = {
+        let tpl = std::sync::Arc::new(tpl);
+        let host = host.to_string();
+        let log = log.clone();
+        std::sync::Arc::new(move |from: u64, to: u64| {
+            let tpl = tpl.clone();
+            let chain = chain.clone();
+            let host = host.clone();
+            let log = log.clone();
+            Box::pin(async move {
+                if !chain.is_empty() {
+                    return match rescue_segment(&tpl, kind, &chain, from, to, &log).await {
+                        Some((body, _hs)) => Ok(body),
+                        None => Err("镜像救援不可用(链全灭或熔断中)".to_string()),
+                    };
+                }
+                // 无链：直连同通道从剩余偏移重拉（池自动重建死通道）。
+                let (up, _) = pool::get_or_build(&host, "", &log).await?;
+                let req = tpl.build(from, to).map_err(|e| e.to_string())?;
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
+                    upstream::h2_send(&up, &req, &None::<Bytes>),
+                )
+                .await
+                .map_err(|_| "救援段响应头超时".to_string())??;
+                if resp.status() != StatusCode::PARTIAL_CONTENT {
+                    return Err(format!("救援段回 {}", resp.status()));
+                }
+                merge::check_segment_start(
+                    resp
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    from,
+                )?;
+                Ok(resp.into_body())
+            })
+        })
+    };
+    let body = drive_split(
+        // 直连骑单通道：多开流不加吞吐（185.199 聚合水管恒定），关掉让位保住现网行为。
+        MergeBody::new(entries, total).without_yield().hold(Box::new(guard)),
+        SplitCtx {
+            fetch,
             host: host.to_string(),
             log: log.clone(),
-        })
-    } else {
-        Some(Resume::Mirror(RescueCtx {
-            tpl: tpl.clone(),
-            kind,
-            chain,
-            log: log.clone(),
-        }))
-    };
-    let body = BoxBody::new(
-        SegmentedBody::build(
-            entries,
-            total,
-            resume,
-            Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
-        )
-        .hold(guard),
+        },
     );
     (log)(&format!(
         "[直连切片] {host}{} {total}B 切 {} 段 池内直连并发",
@@ -526,304 +542,6 @@ impl ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         ACTIVE.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// 救援上下文：模板（按偏移重建 Range）、媒体类别（选链）、链快照、host（缺链告警节流）、日志。
-#[derive(Clone)]
-struct RescueCtx {
-    tpl: Tpl,
-    kind: MediaKind,
-    chain: Vec<String>,
-    log: LogFn,
-}
-
-/// 段future 的产出：体 + 头 + 是否已来自镜像救援（救援过的体不再做体级 5s 换镜）。
-struct SegFetch {
-    body: BoxBody,
-    hs: HeaderMap,
-    rescued: bool,
-}
-
-struct Seg {
-    body: BoxBody,
-    buf: VecDeque<Bytes>,
-    buffered: usize,
-    expected: usize,
-    got: usize,
-    done: bool,
-    /// 本段请求起点（Range 头），救援续传按它算偏移。
-    s: u64,
-    /// 本段终点（Range 尾 +1），换体时期望字节按它重算。
-    e: u64,
-    /// 在途的续传任务（镜像救援或直连重拉）；就绪即换体。
-    handle: Option<tokio::task::JoinHandle<Option<(BoxBody, u64)>>>,
-    /// 体已来自镜像（或不可续传）：不再触发体级停滞续传。
-    no_rescue: bool,
-    /// 连续无新字节的起点；来数据即清。None = 有数据或尚未看过。
-    stall_since: Option<Instant>,
-    /// 本段已重拉次数（直连独走模式的续传上限）。
-    refetches: u8,
-}
-
-impl Seg {
-    /// 续传换体：直连残体与缓冲一并丢弃，从交付偏移重算——已交付都是连续前缀，流内无重复无缺口。
-    fn install_rescue(&mut self, body: BoxBody, start: u64, no_rescue: bool) {
-        self.buf.clear();
-        self.buffered = 0;
-        self.got = 0;
-        self.expected = (self.e - start) as usize;
-        self.body = body;
-        self.handle = None;
-        self.no_rescue = no_rescue; // 镜像体不再二次救援；直连重拉体允许再停滞再重拉
-        self.stall_since = None;
-    }
-}
-
-/// 段停滞（5s 无进度）时的续传方式。
-enum Resume {
-    /// 镜像链救援（链序逐个试）。
-    Mirror(RescueCtx),
-    /// 直连同通道从剩余偏移重拉（池自动重建死通道）。
-    Direct { tpl: Tpl, host: String, log: LogFn },
-}
-
-/// 按段序交付，但每轮 poll 所有段——只盯队首会让未读段占死连接级流控窗口；每段挂停滞界，没拉完的冻结直连侧。
-pub(super) struct SegmentedBody {
-    segs: Vec<Seg>,
-    idx: usize,
-    total: u64,
-    sent: u64,
-    guard: Option<ActiveGuard>,
-    finished: bool,
-    resume: Option<Resume>,
-    resume_after: Duration,
-    /// 静默上游闹钟：上游不发不关时没有东西唤醒 waker，到点自醒重 poll，停滞救援判据才有机会过线。
-    tick: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl SegmentedBody {
-    /// 无续传的拼装（仅测试用）：停滞界整个关掉，生产路径一律走 build。
-    #[cfg(test)]
-    fn new(entries: Vec<(BoxBody, usize)>, total: u64) -> Self {
-        let entries = entries
-            .into_iter()
-            .map(|(body, expected)| (body, expected, 0, true))
-            .collect();
-        Self::build(entries, total, None, Duration::MAX)
-    }
-
-    fn build(
-        entries: Vec<(BoxBody, usize, u64, bool)>,
-        total: u64,
-        resume: Option<Resume>,
-        resume_after: Duration,
-    ) -> Self {
-        SegmentedBody {
-            segs: entries
-                .into_iter()
-                .map(|(body, expected, s, rescued)| Seg {
-                    body,
-                    buf: VecDeque::new(),
-                    buffered: 0,
-                    expected,
-                    got: 0,
-                    done: false,
-                    s,
-                    e: s + expected as u64,
-                    handle: None,
-                    no_rescue: rescued,
-                    stall_since: None,
-                    refetches: 0,
-                })
-                .collect(),
-            idx: 0,
-            total,
-            sent: 0,
-            guard: None,
-            finished: false,
-            resume,
-            resume_after,
-            tick: None,
-        }
-    }
-
-    fn hold(mut self, g: ActiveGuard) -> Self {
-        self.guard = Some(g);
-        self
-    }
-}
-
-impl hyper::body::Body for SegmentedBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let me = self.get_mut();
-        if me.finished {
-            return Poll::Ready(None);
-        }
-        for seg in me.segs.iter_mut() {
-            if seg.done {
-                continue;
-            }
-            // 停滞 5s 无新字节：有链→镜像从已交付偏移续传；无链→同通道从剩余偏移重拉，每段至多 3 次。
-            if !seg.no_rescue
-                && seg.handle.is_none()
-                && seg.got < seg.expected
-                && seg
-                    .stall_since
-                    .is_some_and(|t| t.elapsed() >= me.resume_after)
-            {
-                match &me.resume {
-                    Some(Resume::Mirror(ctx)) => {
-                        if !MEDIA_RESCUE_BREAKER.open(ctx.kind.chain()) && !ctx.chain.is_empty() {
-                            let start = seg.s + seg.got as u64;
-                            let e = seg.e;
-                            let tpl = ctx.tpl.clone();
-                            let kind = ctx.kind;
-                            let chain = ctx.chain.clone();
-                            let log = ctx.log.clone();
-                            seg.handle = Some(tokio::spawn(async move {
-                                rescue_segment(&tpl, kind, &chain, start, e, &log)
-                                    .await
-                                    .map(|(body, _hs)| (body, start))
-                            }));
-                        }
-                        // 熔断开着：不置位不判死，骑直连流（60s 后熔断关自然恢复）。
-                    }
-                    Some(Resume::Direct { tpl, host, log }) => {
-                        if seg.refetches < 3 {
-                            seg.refetches += 1;
-                            let start = seg.s + seg.got as u64;
-                            let e = seg.e;
-                            let tpl = tpl.clone();
-                            let host = host.clone();
-                            let log = log.clone();
-                            seg.handle = Some(tokio::spawn(async move {
-                                let (up, _) = pool::get_or_build(&host, "", &log).await.ok()?;
-                                let req = tpl.build(start, e).ok()?;
-                                let resp = tokio::time::timeout(
-                                    Duration::from_secs(crate::config::MEDIA_RESCUE_WAIT_SECS),
-                                    upstream::h2_send(&up, &req, &None::<Bytes>),
-                                )
-                                .await
-                                .ok()?
-                                .ok()?;
-                                if resp.status() != http::StatusCode::PARTIAL_CONTENT {
-                                    return None;
-                                }
-                                Some((resp.into_body(), start))
-                            }));
-                        }
-                        // 重试耗尽：段错误上抛（浏览器对断流会自行重试整页）。
-                    }
-                    None => {}
-                }
-            }
-            if let Some(handle) = &mut seg.handle {
-                match Pin::new(handle).poll(cx) {
-                    Poll::Ready(Ok(Some((body, start)))) => {
-                        let mirror_body = matches!(&me.resume, Some(Resume::Mirror(_)));
-                        seg.install_rescue(body, start, mirror_body);
-                    }
-                    Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
-                        me.finished = true;
-                        return Poll::Ready(Some(Err(std::io::Error::other(
-                            "段停滞续传失败(重试耗尽)",
-                        ))));
-                    }
-                    Poll::Pending => {}
-                }
-                if seg.handle.is_some() {
-                    continue; // 续传在途：本段冻结，等其他段的数据把窗口腾出来
-                }
-            }
-            if seg.buffered >= SEG_BUFFER_MAX {
-                continue;
-            }
-            match Pin::new(&mut seg.body).poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    if let Ok(d) = frame.into_data() {
-                        seg.got += d.len();
-                        seg.stall_since = None;
-                        // 终点超长的字节会吃掉全局总长预算，尾段发不完——直接报错。
-                        if seg.got > seg.expected {
-                            me.finished = true;
-                            return Poll::Ready(Some(Err(std::io::Error::other(
-                                "直连段超出本段字节数",
-                            ))));
-                        }
-                        seg.buffered += d.len();
-                        seg.buf.push_back(d);
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    me.finished = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
-                Poll::Ready(None) => seg.done = true,
-                Poll::Pending => {
-                    if seg.stall_since.is_none() {
-                        seg.stall_since = Some(Instant::now());
-                    }
-                }
-            }
-        }
-        loop {
-            if me.sent >= me.total {
-                me.finished = true;
-                return Poll::Ready(None);
-            }
-            let Some(seg) = me.segs.get_mut(me.idx) else {
-                me.finished = true;
-                return Poll::Ready(None);
-            };
-            if let Some(chunk) = seg.buf.pop_front() {
-                seg.buffered -= chunk.len();
-                let room = (me.total - me.sent) as usize;
-                let out = if chunk.len() <= room {
-                    chunk
-                } else {
-                    chunk.slice(..room)
-                };
-                if out.is_empty() {
-                    continue;
-                }
-                me.sent += out.len() as u64;
-                return Poll::Ready(Some(Ok(Frame::data(out))));
-            }
-            if seg.done {
-                if seg.got < seg.expected {
-                    me.finished = true;
-                    return Poll::Ready(Some(Err(std::io::Error::other("直连段提前结束"))));
-                }
-                me.idx += 1;
-                continue;
-            }
-            // 上游静默装死不触发 waker，挂闹钟到点自醒重 poll；否则下载挂死、ActiveGuard 不归还，攒满 MAX_ACTIVE 后全进程大图都不切片。
-            match me.tick.as_mut() {
-                Some(t) => {
-                    if t.as_mut().poll(cx).is_ready() {
-                        me.tick = None;
-                        cx.waker().wake_by_ref();
-                    }
-                }
-                None => {
-                    let mut t = Box::pin(tokio::time::sleep(me.resume_after));
-                    // 布防即 poll：把当前 waker 注册进闹钟——只挂不 poll 的闹钟永远不响。
-                    if t.as_mut().poll(cx).is_ready() {
-                        cx.waker().wake_by_ref();
-                    } else {
-                        me.tick = Some(t);
-                    }
-                }
-            }
-            return Poll::Pending;
-        }
     }
 }
 

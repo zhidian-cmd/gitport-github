@@ -614,6 +614,46 @@ async fn driver_gives_up_after_repeated_dead_fills() {
     assert!(res.is_err(), "补不起来必须报错，不能假装下完");
 }
 
+/// 供 prefix 字节后永久 Pending（不注册 waker）：模拟静默装死的上游。
+fn silent_body(prefix: &'static [u8]) -> BoxBody {
+    struct Silent {
+        left: Option<Bytes>,
+    }
+    impl hyper::body::Body for Silent {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let me = self.get_mut();
+            match me.left.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    BoxBody::new(Silent {
+        left: Some(Bytes::from_static(prefix)),
+    })
+}
+
+/// 静默装死的上游不许永久挂死（直连切片搬来的回归钉子）：waker 注册进静默上游永不触发，
+/// drive_split 的 500ms Tick 是唯一唤醒源——停滞收尸 → 补发 → 连续空手 → 错误上抛。
+#[tokio::test]
+async fn driver_silent_upstream_wakes_and_errors() {
+    let now = Instant::now();
+    let mb = MergeBody::new(vec![(0, 10, now, silent_body(b"abc"))], 10);
+    let fetch: Fetch = Arc::new(|_, _| Box::pin(async { Err("起流失败".to_string()) }));
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        http_body_util::BodyExt::collect(drive_split(mb, ctx_with(fetch))),
+    )
+    .await;
+    let collected = res.expect("静默停滞不许永久挂死: collect 必须限时收场");
+    assert!(collected.is_err(), "补发连续空手必须错误上抛, 而非无声挂起");
+}
+
 /* ---------- 并发区间请求的段位分配 ---------- */
 
 /// 两个区间同时在下：8MB + 400KB，段位 9 个 → 大的吃 8 段、小的只拿 1 段。

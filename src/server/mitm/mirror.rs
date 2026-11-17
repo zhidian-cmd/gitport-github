@@ -1342,15 +1342,15 @@ async fn finish_fill(
 }
 
 /// 起流函数的返回：一条从 from 拉到 to 的流。
-type FetchFuture =
+pub(super) type FetchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoxBody, String>> + Send + Sync>>;
-type Fetch = Arc<dyn Fn(u64, u64) -> FetchFuture + Send + Sync>;
+pub(super) type Fetch = Arc<dyn Fn(u64, u64) -> FetchFuture + Send + Sync>;
 
-/// 切片调度上下文：缺口、让位尾巴都往这里要新流。
-struct SplitCtx {
-    fetch: Fetch,
-    host: String,
-    log: LogFn,
+/// 切片调度上下文：缺口、让位尾巴都往这里要新流（直连腿与镜像腿共用驱动）。
+pub(super) struct SplitCtx {
+    pub(super) fetch: Fetch,
+    pub(super) host: String,
+    pub(super) log: LogFn,
 }
 
 /// 体检间隔：停滞是 5s 判据，500ms 看一眼足够，又不至于空转。
@@ -1402,7 +1402,7 @@ fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
 }
 
 /// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连再久不挡泵数据与让位。
-fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
+pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Fetched>(8);
     // tx 每个状态机实例克隆一份：unfold 的闭包是 FnMut，不能把 tx 移出去。
     let stream = futures_util::stream::unfold(
@@ -1468,7 +1468,11 @@ fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                             (ctx.log)(&format!("[切片] {} 有段停滞, 尾巴转补发", ctx.host));
                             continue;
                         }
-                        if let Some((from, to)) = mb.plan_cut(now) {
+                        let cut = mb
+                            .allow_yield
+                            .then(|| mb.plan_cut(now))
+                            .flatten();
+                        if let Some((from, to)) = cut {
                             (ctx.log)(&format!(
                                 "[切片] {} 慢段让位 [{from}..{to}) 交闲连接 ({}KB)",
                                 ctx.host,

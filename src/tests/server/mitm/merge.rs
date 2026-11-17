@@ -253,6 +253,17 @@ fn merge_no_gap_when_boundary_aligned() {
     assert_eq!(out, b"AAAABBBB");
 }
 
+/// 上游多给的尾巴不能溢出声明总长：交付线到 total 即收，多余字节丢弃（直连切片搬来的回归钉子）。
+#[test]
+fn merge_stops_at_declared_total() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![(0, 40, now, seg(&[3u8; 100]))], 40);
+    let mut out = Vec::new();
+    assert!(drain(&mut m, &mut out));
+    assert_eq!(out.len(), 40);
+    assert!(out.iter().all(|&b| b == 3));
+}
+
 /// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流；多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
 #[test]
 fn cut_shrinks_boundary_and_hands_off_tail() {
