@@ -161,3 +161,146 @@ fn cap_evicts_oldest_first() {
     assert!(take(&dir, ub).is_some() && take(&dir, uc).is_some(), "限额内不得误删");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 等待者中继语义：首个=发起者、后续=等待者；signal_done 全员唤醒并撤销登记；之后重新武装。
+/// （失败/panic 后若不撤销登记，同 URL 会永久楔死——发现 1/2 的反面钉子。）
+#[tokio::test]
+async fn waiter_relay_rearm_and_wake() {
+    let url = "https://github.githubassets.com/relay-11112222.js";
+    let (rx1, i1) = register_waiter(url);
+    assert!(i1, "首个必须判发起者");
+    let (rx2, i2) = register_waiter(url);
+    assert!(!i2, "第二个必须判等待者");
+    signal_done(url);
+    assert!(
+        rx1.await.is_ok() && rx2.await.is_ok(),
+        "signal_done 必须唤醒全体等待者"
+    );
+    let (rx3, i3) = register_waiter(url);
+    assert!(
+        i3,
+        "撤销登记后必须重新武装（否则失败/panic 后 URL 永久楔死）"
+    );
+    signal_done(url);
+    let _ = rx3.await;
+}
+
+/// 发现 1 回归钉子：上游全灭时，并发 miss 的等待者必须限时拿到 None 且登记清空，
+/// 绝不永久挂在 rx 上（装死上游曾让同 URL 楔死到重启）。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // TEST_LOCK 护全局路由表/串发表，跨 await 有意为之
+async fn miss_dead_upstream_releases_waiters() {
+    use std::sync::Arc;
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::edges::clear_all();
+    crate::settings::save_worker_mirrors(Vec::new());
+    let dir = std::env::temp_dir().join(format!("gitport_asset_miss_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 自建路由表：ASSET_HOST → 回环 IP，不碰真网
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{
+  "ips": [
+    {"ip": "127.0.0.1", "sni": "a.example", "hosts": ["github.githubassets.com"]},
+    {"ip": "127.0.0.2", "sni": "a.example", "hosts": ["github.githubassets.com"]}
+  ],
+  "hosts": {"github.githubassets.com": {}}
+}"#,
+    )
+    .unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+    // dial_port 指向一个刚释放的端口：必然拒连，拨号秒败
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = dead.local_addr().unwrap().port();
+    drop(dead);
+    crate::pool::dial::set_dial_port(port);
+
+    let url = "https://github.githubassets.com/miss-33334444.js";
+    let req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(url)
+        .body(protocol::empty_body())
+        .unwrap();
+    let log: LogFn = Arc::new(|_| {});
+    let (ra, rb) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            serve_or_fetch(&log, &req, ASSET_HOST)
+        ),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            serve_or_fetch(&log, &req, ASSET_HOST)
+        ),
+    );
+    let ra = ra.expect("20s 内必须返回（等待者不许挂死）");
+    let rb = rb.expect("20s 内必须返回（等待者不许挂死）");
+    assert!(ra.is_none() && rb.is_none(), "拉取全灭必须回落 None");
+    assert!(
+        !inflight()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(url),
+        "拉取结束后登记表必须清空该 URL"
+    );
+    crate::pool::dial::set_dial_port(0); // 复位，别影响别的测试
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 每隔 interval 吐一帧共 n 帧，吐完 EOF——慢滴流测试用。
+fn slow_frames(data: &'static [u8], n: usize, interval: std::time::Duration) -> BoxBody {
+    let stream = futures_util::stream::unfold(0usize, move |i| async move {
+        if i >= n {
+            return None;
+        }
+        tokio::time::sleep(interval).await;
+        let b = Bytes::from_static(&data[i..i + 1]);
+        Some((Ok::<_, std::io::Error>(hyper::body::Frame::data(b)), i + 1))
+    });
+    BoxBody::new(http_body_util::StreamBody::new(stream))
+}
+
+/// 吐一帧后永久 Pending——装死上游测试用。
+fn silent_after(data: &'static [u8]) -> BoxBody {
+    struct Silent {
+        left: Option<Bytes>,
+    }
+    impl hyper::body::Body for Silent {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            let me = self.get_mut();
+            match me.left.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    BoxBody::new(Silent {
+        left: Some(Bytes::from_static(data)),
+    })
+}
+
+/// 停滞界判据（发现 1 修复核心）：慢滴流拉多久都不杀，零帧停滞才判死。
+#[tokio::test]
+async fn collect_stall_bounded_slow_frames_pass_and_silence_fails() {
+    // 慢帧：每 40ms 吐 3 帧（真实时钟 ~120ms < 200ms 界）→ 成功收集
+    let body = slow_frames(b"abc", 3, std::time::Duration::from_millis(40));
+    let got = collect_stall_bounded(body, std::time::Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert_eq!(got.as_ref(), b"abc", "慢滴流必须完整收集");
+    // 装死：吐 1 帧后永久沉默 → 停滞界报错
+    let body = silent_after(b"ab");
+    assert!(
+        collect_stall_bounded(body, std::time::Duration::from_millis(60))
+            .await
+            .is_err(),
+        "零帧停滞必须判死"
+    );
+}

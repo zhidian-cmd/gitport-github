@@ -259,25 +259,73 @@ pub(super) async fn serve_or_fetch<B>(
     take(&dir, &url)
 }
 
+/// 停滞界：流被接受却 30s 不发头 / 连续 30s 零帧 = 装死（与 meter_body 的判黑同语义：
+/// 30s 零进度）。慢滴流每帧重置，拉多久都行——后台拉取不设总时限，慢极也要拉完入库。
+const HEAD_STALL_SECS: u64 = 30;
+const BODY_STALL_SECS: u64 = 30;
+
 /// 独立拉取任务：向通道池申请通道拉取资产，门检通过即入库。与浏览器连接解耦——
 /// 浏览器断开只影响 oneshot 接收端，任务持有发送端继续跑完。
+/// 任何退出路径（完成/失败/panic）都必须 signal_done：不收尾的话 sender 永远留在
+/// INFLIGHT 表里，等待者永久 pend，同 URL 从此楔死。
 fn spawn_detached_fetch(dir: std::path::PathBuf, log: LogFn, url: String) {
     tokio::spawn(async move {
-        let ok = fetch_and_store(&dir, &log, &url).await;
+        // 内层任务跑拉取（所有 await 都有停滞界，必然终结）；外层收尾保证 signal_done 必达。
+        let handle = tokio::spawn({
+            let dir = dir.clone();
+            let log = log.clone();
+            let url = url.clone();
+            async move { fetch_and_store(&dir, &log, &url).await }
+        });
+        match handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                (log)(&format!(
+                    "[资产] 后台拉取 panic({e}), {} 等待者已释放回落",
+                    asset_dbg_name(&url)
+                ));
+            }
+            Err(e) => {
+                (log)(&format!(
+                    "[资产] 后台拉取任务异常结束({e}), {} 等待者已释放回落",
+                    asset_dbg_name(&url)
+                ));
+            }
+        }
         signal_done(&url);
-        let _ = ok; // 结果已由 fetch_and_store 内部落日志
     });
 }
 
-/// 拉取 + 门检 + 入库。返回是否成功入库。
-async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool {
+/// 逐帧收体：只设停滞界、不设总时限——每来一帧就重置，慢滴流拉多久都行，
+/// 连续 stall 零帧 = 上游装死，报错收尾（黑洞交 report_failure 上报池子）。
+async fn collect_stall_bounded(
+    mut body: BoxBody,
+    stall: std::time::Duration,
+) -> Result<Bytes, String> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(stall, http_body_util::BodyExt::frame(&mut body)).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(d) = frame.into_data() {
+                    out.extend_from_slice(&d);
+                }
+            }
+            Ok(Some(Err(e))) => return Err(e.to_string()),
+            Ok(None) => return Ok(Bytes::from(out)),
+            Err(_) => return Err(format!("体停滞超 {stall:?} 零帧, 判装死")),
+        }
+    }
+}
+
+/// 拉取 + 门检 + 入库。结果只落日志——等待者无论成败都会走 take→回落。
+async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
     let name = asset_dbg_name(url);
     // ① 通道：池内现成通道，没有就拨（内容域竞速 IP）
-    let (up, _) = match crate::pool::get_or_build(ASSET_HOST, "/", log).await {
+    let (up, fresh) = match crate::pool::get_or_build(ASSET_HOST, "/", log).await {
         Ok(v) => v,
         Err(e) => {
             (log)(&format!("[资产] 独立拉取拨号失败({e}), {name} 本次不入库"));
-            return false;
+            return;
         }
     };
     // ② 请求
@@ -290,15 +338,28 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool 
         Ok(r) => r,
         Err(e) => {
             (log)(&format!("[资产] 请求构造失败({e}), {name} 本次不入库"));
-            return false;
+            return;
         }
     };
-    // ③ 拉取收体
-    let resp = match upstream::h2_send(&up, &req, &None::<Bytes>).await {
-        Ok(r) => r,
-        Err(e) => {
+    // ③ 响应头（停滞界：流被接受却不发头 = 装死）
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(HEAD_STALL_SECS),
+        upstream::h2_send(&up, &req, &None::<Bytes>),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             (log)(&format!("[资产] 独立拉取失败({e}), {name} 本次不入库"));
-            return false;
+            crate::pool::report_failure(&up, ASSET_HOST, fresh); // 通道类失败交池子摘除/换血
+            return;
+        }
+        Err(_) => {
+            (log)(&format!(
+                "[资产] 独立拉取 {HEAD_STALL_SECS}s 不发响应头, 判装死, {name} 本次不入库"
+            ));
+            crate::pool::report_failure(&up, ASSET_HOST, fresh);
+            return;
         }
     };
     let (parts, body) = resp.into_parts();
@@ -307,7 +368,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool 
             "[资产] 独立拉取上游 {}, {name} 不入库回落",
             parts.status.as_u16()
         ));
-        return false;
+        return;
     }
     let ct = parts
         .headers
@@ -315,17 +376,21 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let collected = match http_body_util::BodyExt::collect(body).await {
-        Ok(c) => c.to_bytes(),
+    // ④ 收体（逐帧停滞界：慢滴流拉多久都行，零帧判装死）
+    let collected = match collect_stall_bounded(body, std::time::Duration::from_secs(BODY_STALL_SECS))
+        .await
+    {
+        Ok(c) => c,
         Err(e) => {
             (log)(&format!("[资产] 独立拉取收体失败({e}), {name} 本次不入库"));
-            return false;
+            crate::pool::report_failure(&up, ASSET_HOST, fresh);
+            return;
         }
     };
-    // ④ 门检 + 入库
+    // ⑤ 门检 + 入库（上游正常应答但不入库 ≠ 黑洞，不上报池子）
     if !storable(StatusCode::OK, &ct, collected.len()) {
         (log)(&format!("[资产] 不收录({ct} / {}B), {name} 回落", collected.len()));
-        return false;
+        return;
     }
     let hdrs: Vec<Vec<String>> = parts
         .headers
@@ -334,14 +399,8 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) -> bool 
         .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
         .collect();
     match persist_blocking(dir, url, &collected, &hdrs) {
-        Ok(_) => {
-            (log)(&format!("[资产] 独立拉取入库 {name} ({}B)", collected.len()));
-            true
-        }
-        Err(e) => {
-            (log)(&format!("[资产] 独立拉取入库失败({e}), {name}"));
-            false
-        }
+        Ok(_) => (log)(&format!("[资产] 独立拉取入库 {name} ({}B)", collected.len())),
+        Err(e) => (log)(&format!("[资产] 独立拉取入库失败({e}), {name}")),
     }
 }
 
