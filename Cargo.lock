@@ -1032,6 +1032,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "percent-encoding",
  "rcgen",
  "rustls",
  "rustls-native-certs",

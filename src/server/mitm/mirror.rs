@@ -9,6 +9,7 @@ use crate::server::upstream;
 use crate::util::{now_ms, LogFn};
 use bytes::Bytes;
 use http::Method;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1534,6 +1535,13 @@ fn mirror_url(mirror: &str, orig_url: &str) -> String {
     fill_template(tpl, mirror, orig_url)
 }
 
+/// {url_enc} 转义集：字母数字与 . - _ ~ 之外全部转义（RFC 3986 unreserved 同款）。
+const UNRESERVED_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
 /// 填模板：把原链接拆段（scheme://host/seg0/seg1/seg2/rest…）逐占位符替换。
 fn fill_template(tpl: String, mirror: &str, orig_url: &str) -> String {
     let after_scheme = orig_url
@@ -1558,21 +1566,10 @@ fn fill_template(tpl: String, mirror: &str, orig_url: &str) -> String {
         .replace("{ref}", reference)
         .replace("{path}", &path_rest);
     if out.contains("{url_enc}") {
-        out = out.replace("{url_enc}", &percent_encode(orig_url));
-    }
-    out
-}
-
-/// 最小百分号编码：字母数字与 . - _ ~ 之外全部转义（整段编码型镜像用）。
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
+        out = out.replace(
+            "{url_enc}",
+            &utf8_percent_encode(orig_url, UNRESERVED_SET).to_string(),
+        );
     }
     out
 }

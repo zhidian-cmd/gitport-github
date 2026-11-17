@@ -408,6 +408,19 @@ fn rotate_walk_respects_limit() {
     assert_eq!(walk_order(1, 0, 5), vec![0], "单镜像：不切分，行为同旧");
 }
 
+/// {url_enc} 转义口径：字母数字与 . - _ ~ 保留，其余（含中文与 ://）逐字节 %XX。
+#[test]
+fn fill_template_url_enc_keeps_unreserved_only() {
+    let url = "https://raw.githubusercontent.com/a/b/main/文件 name.png?q=1";
+    let out = fill_template("{mirror}/{url_enc}".to_string(), "https://m.example", url);
+    assert_eq!(
+        out,
+        "https://m.example/https%3A%2F%2Fraw.githubusercontent.com%2Fa%2Fb%2Fmain%2F%E6%96%87%E4%BB%B6%20name.png%3Fq%3D1"
+    );
+    let plain = fill_template("{mirror}/{url}".to_string(), "https://m.example", url);
+    assert_eq!(plain, "https://m.example/".to_string() + url, "{url} 原样拼接");
+}
+
 #[test]
 fn range_size_parsing() {
     assert_eq!(range_bytes(Some("bytes=0-1048575")), 1048576);
