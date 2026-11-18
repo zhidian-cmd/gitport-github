@@ -1159,7 +1159,7 @@ async fn collect_asset<B>(
         full.extend_from_slice(&collected);
         Bytes::from(full)
     };
-    if asset_store::storable(parts.status, &ct, bytes.len()) {
+    if asset_store::storable(parts.status, &ct) {
         let cache_hdrs: Vec<Vec<String>> = parts
             .headers
             .iter()

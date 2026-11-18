@@ -54,22 +54,18 @@ fn gates_and_misses() {
     let url = "https://github.githubassets.com/assets/app-aaaa1111.js";
     assert!(take(&dir, url).is_none(), "未入库必须 miss");
     assert!(
-        !storable(StatusCode::NOT_FOUND, "application/javascript", 10),
+        !storable(StatusCode::NOT_FOUND, "application/javascript"),
         "非 200 不收"
     );
     assert!(
-        !storable(StatusCode::OK, "image/png", 10),
+        !storable(StatusCode::OK, "image/png"),
         "白名单外类型不收（图片走原直连）"
     );
     assert!(
-        storable(StatusCode::OK, "text/css; charset=utf-8", 10),
+        storable(StatusCode::OK, "text/css; charset=utf-8"),
         "css 必须收"
     );
-    assert!(storable(StatusCode::OK, "font/woff2", 10), "字体必须收");
-    assert!(
-        !storable(StatusCode::OK, "application/javascript", ASSET_MAX_BODY_BYTES + 1),
-        "超体积上限不收"
-    );
+    assert!(storable(StatusCode::OK, "font/woff2"), "字体必须收");
     persist_blocking(&dir, url, b"a", &hdrs("application/javascript")).unwrap();
     let other = "https://github.githubassets.com/assets/app-bbbb2222.js";
     assert!(take(&dir, other).is_none(), "异 URL 不得串文件");
