@@ -945,17 +945,8 @@ async fn split_download(
     if idle_src.len() < 2 {
         return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
     }
-    // 段位：镜像一家 3 份细切、直连单通道 1 份（直连多段只摊薄窗口不加吞吐）。
-    let mut idle: Vec<&str> = Vec::with_capacity(idle_src.len() * 3 + 1);
-    for m in &idle_src {
-        if m.starts_with("direct/") {
-            idle.push(*m);
-        } else {
-            for _ in 0..3 {
-                idle.push(*m);
-            }
-        }
-    }
+    // 段位：每个源一家 1 份（镜像与直连同权）——每家同等材料，快慢由段自己说话。
+    let idle: Vec<&str> = idle_src;
     // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用；与直连切片共用同一个 Tpl（direct_split.rs）。
     let tpl = Tpl::of(out);
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
@@ -1008,8 +999,8 @@ async fn split_download(
     let (want, plan) = match range {
         Some(_) => {
             let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数×3 + 直连 1 份：镜像一家 3 份细切。
-            let plan = plan_range_segments(&slice_key, len, mirrors * 3 + 1, idle.len());
+            // 段位总数 = 镜像数 + 直连 1 份：每家 1 份。
+            let plan = plan_range_segments(&slice_key, len, mirrors + 1, idle.len());
             (plan.want, Some(plan))
         }
         None => (
