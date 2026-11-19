@@ -56,7 +56,7 @@ pub(super) async fn dispatch(
                     let chain_host = pool::route::mirror_chain_host(host, path);
                     let new_bytes =
                         mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
-                    // 直连刚失败过会带 45s 降权，ECT 自动跳过它——语义就是兜底的最后一次机会。
+                    // 直连刚失败会带降权（硬错 45s / 超时 15s），ECT 自动跳过它——语义就是兜底的最后一次机会。
                     match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay)
                         .await
                     {

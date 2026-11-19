@@ -805,11 +805,9 @@ fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
     http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
 }
 
-/* ---------- 同 URL 并发区间请求的段位分配 ----------
-   下载器常对一个文件同时发好几个 Range 请求；每个请求各自切满所有镜像，
-   叠加起来就是把 7 家镜像同时按几十路打（日志里 4 秒内 4 次「切 N 段」）。
-   段大小改成按"这个 URL 上在途区间的总字节 ÷ 段位总数(镜像+2)"现算：
-   大区间先占段位，小区间只拿 1 段，总并发不超段位。 */
+// 同 URL 并发区间请求的段位分配：下载器常对一个文件同时发好几个 Range，每个各自切满全部镜像，
+// 叠加就是把所有镜像按几十路打（日志曾 4 秒 4 次「切 N 段」）。段大小按"该 URL 在途区间总字节 ÷ 段位总数(镜像 + 直连 1)"现算：
+// 大区间先占段位，小区间只拿 1 段，总并发不超段位。
 
 /// 在途区间：请求进来登记，响应体释放时注销。
 struct RangePlan {
@@ -876,7 +874,7 @@ fn plan_quota(
     mine.clamp(1, my_len.max(1) as usize)
 }
 
-/// 登记本次区间并给出段数。key 用 host+path，同一资源的不同签名查询串归到一起。
+/// 登记本次区间并给出段数。key 用完整 URL（含查询串）：同 URL 的并发请求共享段位配额，不同签名对象不并池。
 fn plan_range_segments(
     key: &str,
     len: u64,

@@ -1,14 +1,34 @@
 # gitport-github
 
-Windows 本地 GitHub 加速代理：按 `routes.json` 给 GitHub 系域名选 IP，可选 MITM 纠错，可选接管浏览器 PAC 与 git。
+Windows 本地 GitHub 加速代理（中国大陆访问 GitHub 用）：按 `routes.json` 给 GitHub 系域名选 IP，可选 MITM 纠错，可选接管浏览器 PAC 与 git。
 
-## 不做什么
+## 为加速做了什么
 
-- 不写系统 hosts，不写 `http.sslVerify=false`
-- 不做全局代理：非 GitHub 域名只放行 443 隧道，其余一律 `502`
-- 不缓存 `github.com` 的 html（仓库页零转换直出，列表页/首页按会话或 7 天短存）；githubassets 的 js/css/字体入库一份本地透明回放
-- 不给镜像下载做内容校验（见下文"镜像"）
-- 不需要管理员权限
+| 慢的原因 | 做了什么 | 效果 |
+|---|---|---|
+| 域名解析被干扰，返回假地址，连到假服务器 | 内置真实 IP 表（routes.json）跳过解析，直连表内 IP；候选按实测建连延迟升序——每次拨号自动回流，失败自动降权，测速按钮提供重启后的初始基线；游标驻留的 IP 优先 | 干扰免疫，首连落在实测最快 IP |
+| 边缘 IP 迁移、部分 IP 间歇不可达 | 每（IP，域名）组合实测记账：连接失败冷却 2 分钟、服务端拒绝冷却 4 小时；失效 IP 不重复浪费等待，恢复后自动回队 | 首连落在实测最快 IP，失效 IP 不重复浪费等待 |
+| 握手第一段明文里的目标字段触发针对性干扰——TCP 通了，TLS 完不成（不开 MITM，透传） | 握手消息拆 2~3 段、隔随机时间发送——真名保留，分片让干扰拼不齐 | 干扰窗口期连接照样建立——一切加速的前提 |
+| 同上（开 MITM） | 握手里的目标字段直接换成不受限域名，证书按预设锚点验证（验的仍是真 GitHub 证书）——不依赖分片运气 | 干扰不适用；连接建立完全不受窗口期影响 |
+| 一页十几个域名各建各的 TLS 连接，一排握手串行等待 | 同 IP 只建一条 HTTP/2 连接多路复用（:authority 区分目标）；并发建连按 IP 仲裁，只放一个去拨 | 握手次数从按域名计降到按 IP 计，冷启动大幅缩短 |
+| 单连接上并发流互相争抢；空闲连接被服务端回收，下次重握手 | 每 IP 恒 1 条通道，流排队由 h2 服务端配额调度；闲置 10 秒销毁 | 不养僵尸连接，并发不失控 |
+| 发版日全部 js/css/字体换新哈希 URL，全网抢拉 + 网络波动，极慢 | 同 URL 只拉一次（并发的重复请求等首拉结果）；拉取与浏览器解耦，页面关了也拉完入库；之后本地磁盘回放 | 发版日只慢一波，整个版本周期资产零网络 |
+| 列表页/首页/头像内容没变，却每次重新下载 | 列表页会话内缓存、首页骨架 7 天、头像 302 本地直答；仓库页 HTML 永不缓存，真拉真交付 | 高频页面零等待，低频页面保新鲜 |
+| api.github.com 上游 75% 是埋点和心跳，真请求被挤在后面 | 三类遥测本地读掉回 204，零字节发往 GitHub | api 上游归零，真请求显著变快 |
+| release 附件单条连接拉取，跨境单流只有几百 KB/s | 按字节切段，直连 + 镜像同台并发；慢段按速率反比让位，停滞收割后断点续拉，按偏移拼回完整文件 | 总吞吐贴最快链路，不被单条慢链路拖死 |
+| 镜像站时好时坏，固定顺序轮询反复撞死镜像 | 记录失败时间与吞吐，请求优先派给健康且快的；整链全灭熔断 60 秒，同域毫秒级快速失败 | 可用时不空耗，不可用时不傻等 |
+| 部分请求浏览器没主动要压缩，白多传字节 | github.com / api 强制 gzip：仓库页 327KB → 44.5KB；其余放行原生 br/zstd | 传输量降约 7 倍 |
+
+另有两件不图快的事：githubassets 资产入库——同 URL 只拉一次、与浏览器解耦（页面关了也拉完入库），只是不让重复拉白占网络；不写 hosts、不写 `sslVerify`、不需要管理员——卸载零残留。
+
+## 缺点
+
+- 这是 GitHub 加速器，不是全局代理：非 GitHub 域名只放行 443 隧道，其余一律 `502`
+- 镜像无内容校验：流式转发无法既校验又实时交付，单家镜像只能污染自己负责的那段
+- 页面缓存与资产库明文落盘，隔离只靠 ACL
+- 半开放 443 隧道：本机任意进程可把它当"任意公网 443"的转发器；内网与环回已被 bogon 过滤挡住
+- 仅 Windows，依赖 BoringSSL 本地编译
+- 仓库不附基准数据，代码注释里的实测数字都来自作者环境
 
 ## 跑起来
 
@@ -55,11 +75,11 @@ gitport-github.exe [-port 7810] [-webui 7811] [-tray] [-headless]
 
 ## 镜像
 
-首次安装内置 8 家（可按条停用）：
+首次安装内置 6 家（可按条停用）：
 
 ```
-gh-proxy.org          gh-proxy.com          ghgo.de5.net       ghfile.geekertao.top
-gh.meali.top          github.chenc.dev      gh.dpik.top        ghproxy.icu
+gh-proxy.org          gh-proxy.com          ghgo.de5.net
+gh.meali.top          gh.dpik.top           ghproxy.icu
 ```
 
 - 只对 `GET`/`HEAD` 的大文件与 Release 路径生效；API 与会话域不走镜像。
@@ -80,6 +100,15 @@ routes.json        路由表与镜像链
 
 启动会打一行分段耗时（配置 / 路由表 / CA / 代理），排障用。日志与页面缓存都落在 `.cache`。
 
+## 测试
+
+```
+cargo test                    # 全量（220 余例；5 例真实网络探针默认 ignored）
+cargo test pool::             # 只跑某模块（按路径过滤）
+```
+
+测试集中在 `src/tests/`，目录与被测模块一一镜像（如 `src/tests/server/mitm/mirror.rs` 测 `src/server/mitm/mirror.rs`）；测试专用导入走 `#[cfg(test)]` 门，不进 release。路由表/串发表这类进程级全局态的跨用例串行靠 `TEST_LOCK`（见 `src/pool/mod.rs`）。新增测试放镜像目录对齐模块，别散进业务文件。
+
 ## 构建
 
 ```
@@ -87,14 +116,11 @@ cargo build --release
 cargo test
 ```
 
-仅 Windows。`.cargo/config.toml` 里固化的是作者机器上的 BoringSSL 构建路径（clang-cl + Ninja + nasm + 指定工具集），换机器要改。
+仅 Windows + BoringSSL 本地编译。换机器必须核对 `.cargo/config.toml`（文件头注释写全了缘由）：
 
-## 限制
+- `[env]` 四个 `CC`/`CXX` 变量 → 本机 clang-cl.exe 路径（原生 MSVC 的 cl.exe 在项目子树内被构建脚本拉起会报 D8050/LNK1104，clang-cl 不受影响）
+- `INCLUDE`/`LIB` → 完好的 MSVC 工具集（v143）与 Windows SDK 路径
+- `CMAKE_GENERATOR = "Ninja"`，且 `ninja.exe`/`nasm.exe` 在 PATH
+- `[profile.dev.package.boring-sys]` 的 `opt-level = 1` 是修 /MDd 链接错的补丁，别删
 
-1. 镜像无内容校验，流式转发无法既校验又实时交付。
-2. 页面缓存与资产库明文落盘，隔离只靠 ACL。
-3. 半开放 443 隧道：本机任意进程可把它当"任意公网 443"的转发器；内网与环回已被 bogon 过滤挡住。
-4. 仅 Windows，依赖 BoringSSL 本地编译。
-5. 仓库不附基准数据，代码注释里的实测数字都来自作者环境。
-
-机制细节（分流矩阵、通道池、失败分级、切片与合并、解密面）见 `docs/architecture.md`；缓存体系全解（三层各管什么、胚与资产库怎么配合、日志判读）见 `docs/cache.md`。
+机制细节（分流矩阵、通道池、失败分级、切片与合并、解密面）见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；缓存体系全解（三层各管什么、胚与资产库怎么配合、日志判读）见 [docs/CACHE.md](docs/CACHE.md)；镜像与切片统合加速全解（切片、ECT 派发、让位）见 [docs/MIRROR.md](docs/MIRROR.md)；术语速查（每个机制词的大白话 + 全部边界数字与代码常量对齐）见 [docs/GLOSSARY.md](docs/GLOSSARY.md)。

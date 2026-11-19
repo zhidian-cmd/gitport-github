@@ -1,6 +1,6 @@
 # 技术文档
 
-面向要读这份代码的人：先看结构，再看数据流，最后看每张文件表。
+面向要读这份代码的人：先看结构，再看数据流，最后看每张文件表。术语先查 [GLOSSARY.md](GLOSSARY.md)（每个机制词的大白话 + 全部边界数字与代码常量对齐）。
 
 > 行号会随代码漂移，文档里的引用以文件与函数名为准。
 
@@ -354,7 +354,7 @@ gitport-github/
 2. `pool/route.rs` → `pool/mod.rs` → `server/upstream.rs`：路由图怎么变成一条连接。
 3. `server/mod.rs`：CONNECT 的四条出口。
 4. `server/mitm/mod.rs` → `switchboard.rs`：解密后按 URL 分诊。
-5. `mirror.rs` → `direct_split.rs` → `merge.rs`：内容域的三件套。
+5. `mirror.rs` → `direct_split.rs` → `merge.rs`：内容域的三件套。镜像与切片统合加速全解（ECT 派发、切片、让位、凭据防护）见 [MIRROR.md](MIRROR.md)。
 6. `settings.rs`：系统写入与还原的判定（这里出错最容易被用户察觉）。
 7. `certgen.rs` + `winsec.rs`：安全边界。
 

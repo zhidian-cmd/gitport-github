@@ -333,7 +333,7 @@ async fn stream_passthrough(
                 }
             }
         }
-        // 流式请求不许捡现成连接：body 没有副本，发出去就收不回。
+        // 流式请求允许骑缓存腿（上面已试），但缓存腿开流失败的兜底必须全新拨号——body 没有副本，不再翻别的现成通道试错。
         match upstream::dial_upstream(host, log).await {
             Ok(up) => match upstream::h2_open_stream(&up, out, false).await {
                 Ok((fut, send, guard)) => break 'conn (fut, send, guard, up),

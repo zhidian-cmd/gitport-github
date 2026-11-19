@@ -23,8 +23,7 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
-/// 资产库容量上限：超限按文件年龄从旧到新淘汰（被新版本取代的旧代条目天然最老，先走；
-/// 误淘汰热资产无害——下次请求重拉入库，时间戳变新自动排到最后）。
+/// 容量上限 15MB：超限按文件年龄从旧到新淘汰（旧代条目天然最老先走；误淘汰热资产无害，重拉后时间戳变新排回最后）。
 const ASSET_MAX_BYTES: u64 = 15 * 1024 * 1024;
 const ASSET_DIR: &str = "assets";
 
@@ -34,10 +33,9 @@ fn content_type_allowed(ct: &str) -> bool {
     ct.contains("javascript") || ct.contains("css") || ct.contains("font")
 }
 
-/// 从 URL 文件名提取"资产名"（去内容哈希）：同资产不同哈希归并到同一落盘槽位，
-/// 写新版本 = 覆盖旧版本（只保留最新）。两族命名：
-/// JS `[名字]-[哈希].js`（哈希 = 最后一个 '-' 之后的段，8..=16 位 [A-Za-z0-9_-]）；
-/// CSS module `[名字].[16位hex].module.css`。不匹配 = None（按完整 URL 落盘，不参与归并，无害）。
+/// 从 URL 文件名提取"资产名"（去内容哈希）：同资产不同哈希归并同一落盘槽位，写新版 = 覆盖旧版。
+/// 两族命名：JS `[名字]-[哈希]`（哈希 = 末 '-' 后段，8..=16 位 [A-Za-z0-9_-]）；CSS module `[名字].[16位hex].module.css`。
+/// 不匹配 = None（按完整 URL 落盘，不参与归并，无害）。
 fn asset_logical_name(url: &str) -> Option<String> {
     let filename = url.rsplit('/').next()?;
     let dot = filename.rfind('.')?;

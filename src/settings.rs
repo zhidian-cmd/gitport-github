@@ -52,15 +52,13 @@ fn on_by_default() -> bool {
     true
 }
 
-/// 首启内置 8 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；下载按实测吞吐选家、失败顺延，删掉后不再出现。
+/// 首启内置 6 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；2026-11-19 实测 2 家拒 Range（回 302/301 非 206，切片段必失败），剔除；下载按实测吞吐选家、失败顺延，删掉后不再出现。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
     [
         "https://gh-proxy.org",       // 788ms
         "https://gh-proxy.com",       // 822ms
         "https://ghgo.de5.net",       // 950ms
-        "https://ghfile.geekertao.top", // 972ms
         "https://gh.meali.top",       // 1011ms
-        "https://github.chenc.dev",   // 1050ms
         "https://gh.dpik.top",        // 1064ms
         "https://ghproxy.icu",        // 1070ms
     ]
