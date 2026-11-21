@@ -67,7 +67,7 @@ pub(super) fn parse_range(range: Option<&str>) -> Option<(u64, Option<u64>)> {
     Some((a, b))
 }
 
-/// 单字节探片（bytes=N-N）：下载器先探文件大小，走链头直通，不切分也不记分。
+/// 单字节探片（bytes=N-N）：下载器先探文件大小，不切分也不记分；大文件域直连第一棒（chain_fetch 起轮点），镜像兜底。
 pub(super) fn is_probe_range(range: Option<&str>) -> bool {
     matches!(parse_range(range), Some((a, Some(b))) if a == b)
 }

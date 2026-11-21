@@ -436,7 +436,7 @@ pub(super) async fn chain_fetch(
         .unwrap_or(candidates.len())
         .min(candidates.len());
     let new_bytes = range_bytes(out.headers().get("range").and_then(|v| v.to_str().ok()));
-    // 单字节探片是下载器探路，按小文件走：链头直通，不切分、不记账。
+    // 单字节探片是下载器探路，不切分、不记账；大文件域直连第一棒（见下 start 起轮点），镜像兜底。
     let big = pool::route::is_big_file_host(&chain_host) && !merge::is_probe_range(range);
     // 镜像有富余时切片并发拉；条件不满足(探片/开区间/不支持 Range/无空闲镜像)交回单流。
     if big {
@@ -446,8 +446,12 @@ pub(super) async fn chain_fetch(
             Err(e) => (log)(&format!("[切片] {host}{path} 放弃切片({e}), 回单流")),
         }
     }
+    // 探片（下载器总长探测）直连先行：起轮点从链头换到直连腿（候选表末位），轮一圈直连第一棒、镜像跟后兜底。
+    let probe = merge::is_probe_range(range) && pool::route::is_big_file_host(&chain_host);
     let start = if big {
         pick_mirror(&candidates, new_bytes)
+    } else if probe {
+        candidates.len() - 1
     } else {
         0
     };
@@ -478,7 +482,13 @@ pub(super) async fn chain_fetch(
                     }
                     (log)(&format!(
                         "[直连] {host}{path} {}({}ms), 候选 {}/{}",
-                        if big { "ECT 胜出" } else { "链序首位" },
+                        if big {
+                            "ECT 胜出"
+                        } else if probe {
+                            "探片直连"
+                        } else {
+                            "链序首位"
+                        },
                         t0.elapsed().as_millis(),
                         i + 1,
                         candidates.len()

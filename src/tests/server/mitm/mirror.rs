@@ -167,6 +167,71 @@ async fn breaker_spares_direct_only_requests() {
     pool::MIRROR_BREAKER.clear(host);
 }
 
+/// 探片直连先行：大文件域 bytes=N-N 探测起轮点在直连腿（旧序从链头镜像起轮），镜像全程不被碰。
+#[tokio::test]
+async fn probe_range_starts_at_direct_leg() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // 隔离：serial_load 会把链上镜像收编进注册表并跨测试持久化，先清空。
+    crate::settings::save_worker_mirrors(Vec::new());
+    let dir = std::env::temp_dir().join("gitport_probe_direct_seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("routes.json"),
+        r#"{
+  "hosts": {"objects.githubusercontent.com": {"content": true, "big": true}},
+  "mirrors_big": ["https://127.0.0.1:1"]
+}"#,
+    )
+    .unwrap();
+    crate::pool::serial_load(&dir, Vec::new(), None);
+    pool::MIRROR_BREAKER.clear("objects.githubusercontent.com");
+
+    let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let log: LogFn = {
+        let lines = lines.clone();
+        Arc::new(move |s: &str| lines.lock().unwrap().push(s.to_string()))
+    };
+    let req = hyper::Request::builder()
+        .method(Method::GET)
+        .uri("https://objects.githubusercontent.com/big.bin")
+        .header("range", "bytes=0-0")
+        .body(protocol::empty_body())
+        .unwrap();
+    let resp = chain_fetch(
+        &log,
+        &req,
+        "objects.githubusercontent.com",
+        Box::pin(async {
+            Ok::<_, String>(
+                hyper::Response::builder()
+                    .status(http::StatusCode::PARTIAL_CONTENT)
+                    .header("content-range", "bytes 0-0/12345678")
+                    .body(protocol::empty_body())
+                    .unwrap(),
+            )
+        }),
+        &Default::default(),
+        &None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.extensions().get::<&'static str>().copied(),
+        Some("direct"),
+        "探片响应应来自直连腿"
+    );
+    let got = lines.lock().unwrap().join("\n");
+    assert!(got.contains("探片直连"), "直连第一棒应有探片直连标签: {got}");
+    assert!(
+        !got.contains("127.0.0.1:1"),
+        "镜像只兜底, 探片不应触碰镜像: {got}"
+    );
+    crate::settings::save_worker_mirrors(Vec::new());
+}
+
 /// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 失败窗未过的不追加, 已在窗内不重复。
 #[test]
 fn append_direct_gated_by_health_and_presence() {
