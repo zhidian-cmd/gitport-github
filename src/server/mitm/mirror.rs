@@ -855,7 +855,8 @@ fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
     http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
 }
 
-/// 切片下载：校准门（未测镜像>0 且候选全闲）通过才每镜像一片并发测量；否则单流 ECT 最优。
+/// 切片下载：校准（未测镜像>0 且候选全闲）或原生浏览器下载（无 Range）→ 每镜像一片；
+/// 带 Range 的请求（下载器自己拆好的连接）单流 ECT 最优——并行度归下载器。
 async fn split_download(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -883,21 +884,22 @@ async fn split_download(
         .filter(|m| !fail_window_active(&mirror_load(m), now))
         .map(|m| m.as_str())
         .collect();
-    // 校准门：有未测镜像（无实测快照）且候选全闲 → 每镜像一片，同一批 350ms 窗口同时测速；
-    // 否则单流直发 ECT 最优——加速外包给下载器（连接数/波次 IDM 定），代理只做路由。
+    let range = out.headers().get("range").and_then(|v| v.to_str().ok());
+    // 切片门：校准（有未测镜像且候选全闲 → 每镜像一片，同一批 350ms 窗口同时测速）
+    // 或 原生浏览器下载（无 Range——浏览器不会自己开并行，代理就是它唯一的并行来源）；
+    // 带 Range 的请求（下载器自己拆好的分片连接）→ 单流 ECT 最优，并行度归下载器。
     let unmeasured = healthy
         .iter()
         .any(|m| mirror_load(m).meas_prev.load(Ordering::Relaxed) == 0);
     let all_idle = healthy
         .iter()
         .all(|m| mirror_load(m).in_flight_bytes.load(Ordering::Relaxed) == 0);
-    if !(unmeasured && all_idle) {
+    if !((unmeasured && all_idle) || range.is_none()) {
         return Ok(None);
     }
     let idle: Vec<&str> = healthy.clone();
     // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用；与直连切片共用同一个 Tpl（direct_split.rs）。
     let tpl = Tpl::of(out);
-    let range = out.headers().get("range").and_then(|v| v.to_str().ok());
     let (base, len, known_total) = match range {
         // 开区间/多区间/畸形：长度未知或语义不同，不切
         Some(_) => match merge::parse_range(range) {
@@ -945,14 +947,14 @@ async fn split_download(
             }
         },
     };
-    // 校准切片：每镜像一片（区间 ÷ 镜像数），同一批测速窗同时出成绩。
+    // 每镜像一片（区间 ÷ 镜像数）：校准同批出成绩；原生浏览器下载以此获得代理侧并行。
     let want = idle.len();
     let segs = merge::split_even(base, len, want);
     if segs.len() < 2 {
         return Ok(None);
     }
     (log)(&format!(
-        "[切片] {host}{path} 校准切 {} 段(每镜像一片), 并发测量",
+        "[切片] {host}{path} 切 {} 段(每镜像一片), 并发拉取",
         segs.len()
     ));
     // 有镜像兜底才给直连设按跳预算；没镜像（用户没配/链全灭）时直连是唯一的路，不能掐，交给它按 IP 表自己换、自己等。
