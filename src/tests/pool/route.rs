@@ -388,3 +388,64 @@ fn wildcard_key_stall_filters_subdomain_dial() {
     assert!(t.is_empty(), "按路由键记的冷却必须滤到子域查询");
     crate::pool::edges::clear_all();
 }
+
+/// 渲染族六域必须拨 k8s 边缘、不得落 Fastly 池：通配行把 *.githubusercontent.com 全压到 185.199，
+/// 而 Fastly 不伺服这些域（"500 Domain Not Found"→421 风暴把共享 IP 冤枉冷却 4 小时，
+/// notebook 渲染 "Unable to render code block"，2026-11-22 实证）。
+#[test]
+fn render_family_dials_k8s_edge_not_fastly() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
+    const FAMILY: [&str; 6] = [
+        "notebooks.githubusercontent.com",
+        "render.githubusercontent.com",
+        "cloud-camo.githubusercontent.com",
+        "github-production-user-asset-6210df1e.githubusercontent.com",
+        "experiments.githubusercontent.com",
+        "github.githubusercontent.com",
+    ];
+    for h in FAMILY {
+        let row = route_for(h).expect("渲染族应有显式行");
+        assert!(!row.flags.big, "{h} 不是大文件域");
+        assert!(!row.flags.content, "{h} 脱离内容竞速池");
+        let targets = dial_targets(h).expect("渲染族应有拨号边");
+        assert!(!targets.is_empty(), "{h} 拨号边不应为空");
+        for t in &targets {
+            assert!(
+                t.ip.starts_with("140.82."),
+                "{h} 应拨 k8s 边缘, 实际拨 {}",
+                t.ip
+            );
+        }
+    }
+    // 对照组：Fastly 族原样不动，不得混入 k8s 边。
+    for h in [
+        "raw.githubusercontent.com",
+        "avatars.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    ] {
+        let targets = dial_targets(h).expect("Fastly 族应有拨号边");
+        assert!(
+            targets.iter().any(|t| t.ip.starts_with("185.199.")),
+            "{h} 应仍走 Fastly 池"
+        );
+        assert!(
+            targets.iter().all(|t| !t.ip.starts_with("140.82.")),
+            "{h} 不得混入 k8s 边"
+        );
+    }
+    // 既有渲染域不回退：viewscreen/objects-origin 仍拨 k8s 边。
+    for h in [
+        "viewscreen.githubusercontent.com",
+        "objects-origin.githubusercontent.com",
+    ] {
+        let targets = dial_targets(h).expect("既有渲染域应有拨号边");
+        assert!(
+            targets.iter().any(|t| t.ip.starts_with("140.82.")),
+            "{h} 应仍拨 k8s 边缘"
+        );
+    }
+}

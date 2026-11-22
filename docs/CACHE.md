@@ -27,7 +27,7 @@
 | 搜索页与搜索计数 XHR | 会话缓存 | 同上 | 同上 |
 | 首页信息流片段（/conduit/* 等软导航响应） | 会话缓存 | 同上 | 不是完整页面，只做会话级短存 |
 | githubassets 的 js/css/字体 | 资产库 | 15MB 按年龄淘汰 | 全站共享、内容哈希命名、immutable || 头像 / raw / camo / 私有图 | 透传直连 | — | 内容与人/仓库绑定，无复用价值 |
-| 文档站（viewscreen） | 透传直连 | — | 独立域，自有缓存头 |
+| 渲染族（viewscreen/notebooks/render/cloud-camo 等独立渲染域） | 透传直连 | — | 独立域，自有缓存头；拨号钉死 k8s 边缘（seeds 显式行），不落 Fastly 池 |
 | service worker 脚本（assets-cdn/worker） | 透传直连 | — | 量小，浏览器自缓存（用户决议） |
 | settings、表单、登录页 | 永不缓存 | — | 防伪 token 与个人状态 |
 | 非 200、未登录页、闸门页、截断页 | 拒收 | — | 见门检一节 |
