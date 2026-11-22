@@ -72,27 +72,6 @@ fn content_range_total_parse() {
     assert_eq!(content_range_total(None), None);
 }
 
-/// 让位份额：速率反比（3 倍速的帮手拿大头），并扣掉它建连+爬坡期间的空转。
-#[test]
-fn split_keep_is_rate_proportional() {
-    const MB: u64 = 1024 * 1024;
-    let keep = split_keep(8 * MB, 1e6, 3e6, SPLIT_SETUP_SECS);
-    // 1MB/s 的持有者约保留 (0.5×3MB + 8MB)/4 ≈ 2.37MB，不到一半
-    assert!(
-        (2 * MB..3 * MB).contains(&keep),
-        "持有者只该留一小截，实际 {keep}"
-    );
-    // 速率相同：各一半（建连成本让持有者略多留）
-    let even = split_keep(8 * MB, 2e6, 2e6, SPLIT_SETUP_SECS);
-    assert!(even > 4 * MB && even < 5 * MB, "实际 {even}");
-    // 永远不能把一段切没
-    assert_eq!(
-        split_keep(MIN_PIECE, 1e6, 9e6, SPLIT_SETUP_SECS),
-        MIN_PIECE / 2
-    );
-    assert!(split_keep(4 * MIN_PIECE, 1.0, 1000.0, SPLIT_SETUP_SECS) <= 3 * MIN_PIECE);
-}
-
 fn seg(data: &'static [u8]) -> BoxBody {
     BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
         vec![Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(
@@ -269,7 +248,7 @@ fn merge_stops_at_declared_total() {
 fn cut_shrinks_boundary_and_hands_off_tail() {
     let now = Instant::now();
     let mut m = MergeBody::new(vec![(0, 100, now, seg(&[b'A'; 100]))], 100);
-    let cut = m.cut(0, 40, now).expect("应能切");
+    let cut = m.cut(0, 40).expect("应能切");
     assert_eq!(cut, (40, 100));
     assert_eq!(m.take_fill(), Some((40, 100)));
     let mut out = Vec::new();
@@ -303,39 +282,10 @@ fn reap_keeps_received_bytes() {
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 没有闲连接也能抢：新开一条流要付的建连成本，已经折进收益判据。
+/// 重分配：速率比例摊派公平份额——慢段（50KB/s）切到自己的份额、尾巴排补发待 ECT 重派；
+/// drain 最小的快段保留全部剩余。慢段超额 174KB > MIN_PIECE(128KB)，必切。
 #[test]
-fn plan_cut_pays_setup_without_idle_connection() {
-    let now = Instant::now();
-    let slow = 4 * MIN_PIECE;
-    let mut m = MergeBody::new(
-        vec![
-            (0, slow, now - Duration::from_secs(2), stalled(b"")),
-            (
-                slow,
-                8 * MIN_PIECE,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
-        ],
-        8 * MIN_PIECE,
-    );
-    // 手工造两条速率样本：一条慢（5KB/s）、一条快（256KB/s）。
-    for (k, got) in [(0u64, 10_000u64), (slow, MIN_PIECE)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    let cut = m
-        .plan_cut(now)
-        .expect("收益远大于建连成本，credit=0 也该切");
-    assert_eq!(cut.1, slow, "尾巴应到段尾为止");
-    assert!(cut.0 > 10_000 && cut.0 < slow, "切点 {cut:?}");
-}
-
-/// 两家一样快：谁都不该被抢——抢过来还得付建连，纯亏。
-#[test]
-fn plan_cut_spares_when_no_faster_peer() {
+fn rebalance_cuts_slow_to_fair_share() {
     let now = Instant::now();
     let half = 4 * MIN_PIECE;
     let mut m = MergeBody::new(
@@ -343,6 +293,37 @@ fn plan_cut_spares_when_no_faster_peer() {
             (0, half, now - Duration::from_secs(2), stalled(b"")),
             (
                 half,
+                2 * half,
+                now - Duration::from_secs(2),
+                stalled(b""),
+            ),
+        ],
+        2 * half,
+    );
+    for (k, got) in [(0u64, 100_000u64), (half, 200_000u64)] {
+        let s = m.segs.get_mut(&k).unwrap();
+        s.got = got;
+        s.last_poll = now;
+    }
+    let moved = m.rebalance(now);
+    assert!(moved >= MIN_PIECE, "慢段超额应被切走: {moved}");
+    let slow = m.segs.get(&0).unwrap();
+    assert!(slow.end < half, "慢段切到公平份额");
+    let fast = m.segs.get(&half).unwrap();
+    assert_eq!(fast.end, 2 * half, "drain 最小的快段保留全部剩余");
+    let (from, to) = m.take_fill().expect("尾巴排补发待 ECT 重派");
+    assert_eq!(to - from, moved, "补发区间 = 切走的字节数");
+}
+
+/// 两家同速：各自剩余恰好等于公平份额，超额 0 → 不动刀（份额收敛自带防乒乓）。
+#[test]
+fn rebalance_spares_fair_share() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(
+        vec![
+            (0, 4 * MIN_PIECE, now - Duration::from_secs(2), stalled(b"")),
+            (
+                4 * MIN_PIECE,
                 8 * MIN_PIECE,
                 now - Duration::from_secs(2),
                 stalled(b""),
@@ -350,77 +331,33 @@ fn plan_cut_spares_when_no_faster_peer() {
         ],
         8 * MIN_PIECE,
     );
-    for k in [0u64, half] {
+    for (k, got) in [(0u64, 2 * MIN_PIECE), (4 * MIN_PIECE, 2 * MIN_PIECE)] {
         let s = m.segs.get_mut(&k).unwrap();
-        s.got = MIN_PIECE;
+        s.got = got;
         s.last_poll = now;
     }
-    assert!(m.plan_cut(now).is_none(), "同样快，没有抢的收益");
+    assert_eq!(m.rebalance(now), 0, "同速同份额，超额 0 不动刀");
 }
 
-/// 比最快慢就切，但只剩 0.1MB 时抢过去反而更久（要付建连）——这时候不动刀，是算术不是门槛：remaining/best + 建连 >= remaining/我。
+/// 重分配前提：至少两条活段且总速率 > 0——单段无可摊派，零速率无判据不动刀。
 #[test]
-fn plan_cut_skips_when_handoff_costs_more() {
+fn rebalance_needs_two_live_segs_with_rates() {
     let now = Instant::now();
-    let half = 2 * MIN_PIECE;
-    let mut m = MergeBody::new(
+    let mut m = MergeBody::new(vec![(0, 4 * MIN_PIECE, now, stalled(b""))], 4 * MIN_PIECE);
+    assert_eq!(m.rebalance(now), 0, "单段无可摊派");
+    let mut two = MergeBody::new(
         vec![
-            (0, half, now - Duration::from_secs(2), stalled(b"")),
+            (0, 4 * MIN_PIECE, now, stalled(b"")),
             (
-                half,
                 4 * MIN_PIECE,
-                now - Duration::from_secs(2),
+                8 * MIN_PIECE,
+                now,
                 stalled(b""),
             ),
         ],
-        4 * MIN_PIECE,
+        8 * MIN_PIECE,
     );
-    // 慢家 0.95MB/s、快家 1.5MB/s：慢家只剩 0.1MB，抢过去还得付 0.5s 建连，不划算。
-    for (k, got) in [(0u64, 1_900_000u64), (half, 3_000_000u64)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    assert!(m.plan_cut(now).is_none(), "抢过去更久就不该抢");
-}
-
-/// 刀口上限按帮手实测速率折算（≈3 秒的量）：快源被钉死的再平衡上限随速度放开。
-#[test]
-fn plan_cut_caps_handoff_size() {
-    let now = Instant::now();
-    let big = 40 * 1024 * 1024;
-    let mut m = MergeBody::new(
-        vec![
-            (0, big / 2, now - Duration::from_secs(2), stalled(b"")),
-            (big / 2, big, now - Duration::from_secs(2), stalled(b"")),
-        ],
-        big,
-    );
-    // 慢家 0.5MB/s（还剩 19MB）；快家 2MB/s。快家该接走大头。
-    for (k, got) in [(0u64, 1_048_576u64), (big / 2, 4 * 1024 * 1024u64)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    let (from, to) = m.plan_cut(now).expect("38 秒太久，该抢");
-    let handoff = to - from;
-    assert!(handoff >= MIN_PIECE, "刀口太小不值一次建连");
-    assert!(
-        handoff <= handoff_cap(2.0 * 1024.0 * 1024.0),
-        "刀口 {handoff} 超过按速折算的封顶"
-    );
-}
-
-/// 刀口随帮手速率缩放：10MB/s 的快源该拿到比 4MB 旧常数大得多的刀口，否则快源下完自己的份额后只能以旧常数的龟速捡尾巴，聚合速率上不去。
-#[test]
-fn handoff_cap_scales_with_helper_speed() {
-    assert_eq!(handoff_cap(1024.0), MIN_PIECE, "太小的速率钳在下限");
-    assert_eq!(handoff_cap(1e7), 30_000_000, "10MB/s 帮手 ≈ 3s 的量");
-    assert_eq!(
-        handoff_cap(1e9),
-        64 * 1024 * 1024,
-        "再快也钳在 64MB，防一次让位掏空整段"
-    );
+    assert_eq!(two.rebalance(now), 0, "零速率无判据不动刀");
 }
 
 /// 近期速率：滑窗有样本按滑窗算，样本不足退回全片均速（短段的全片就是全部真相）。

@@ -1,4 +1,4 @@
-//! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
+﻿//! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
 //! 段的交付/停滞收尸/补发统一挂镜像腿的 MergeBody+drive_split（见 merge.rs），本文件只管段位分配与救援闭包。
 use super::merge::MergeBody;
 use super::mirror::{drive_split, Fetch, SplitCtx};
@@ -498,7 +498,7 @@ pub(super) async fn try_direct_split(
         })
     };
     let body = drive_split(
-        // 直连骑单通道：多开流不加吞吐（185.199 聚合水管恒定），关掉让位保住现网行为。
+        // 直连骑单通道：多开流不加吞吐（185.199 聚合水管恒定），不参与重分配，只走停滞补发。
         MergeBody::new(entries, total).without_yield().hold(Box::new(guard)),
         SplitCtx {
             fetch,

@@ -1,4 +1,4 @@
-//! 镜像加速：镜像链+直连腿 ECT 同台竞速（按实测速率切块、慢段让位、补发挑最快），直连全败才按链序串发兜底；图片链 TTFB 校准旁带；请求剥身份头。
+﻿//! 镜像加速：镜像链+直连腿 ECT 同台竞速（按实测速率切块、慢段重分配、补发挑最快），直连全败才按链序串发兜底；图片链 TTFB 校准旁带；请求剥身份头。
 use super::merge::{self, MergeBody};
 use super::direct_split::Tpl;
 use super::path_of;
@@ -27,19 +27,26 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// ECT 时间槽：每这么久把「本窗实收字节」快照给派发器并清零重开，分数 = 债务毫秒 + 建立延迟毫秒。
-/// 80ms 而非 500ms：快源整段可能一个槽内下完，粗槽采样不出差异；80ms 空窗抖动会把在途源短暂清零垫底，恢复即回。
-const ECT_WINDOW_MS: u64 = 80;
+/// 双窗口：测速窗 350ms（单流新连接路由/成绩单，零收有债清零=路由避开停摆源）；
+/// 分配窗 5ms（段内补发/重派的新鲜度，零收一律沿用——卡死语义归收尸与 mark_fail 管）。
+/// ticker 按分配窗一拍，每 MEASURE_TICKS 拍结算一次测速窗；Windows 实际粒度 ~15ms，所有源同刻度，排名不受影响。
+const ALLOC_WINDOW_MS: u64 = 5;
+const MEASURE_WINDOW_MS: u64 = 350;
+const MEASURE_TICKS: u64 = MEASURE_WINDOW_MS / ALLOC_WINDOW_MS;
 
-/// 每面镜像的记账：在途字节/流数、ECT 时间槽（本窗实收 + 上一窗快照）、失败降权窗、建连首包 ttfb。
+/// 每面镜像的记账：在途字节/流数、双窗（分配/测速）、失败降权窗、建连首包 ttfb。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
     pub(super) in_flight_streams: AtomicU64,
-    /// 本时间槽实收字节：on_frame 累加，ect_sweep 每 ECT_WINDOW_MS 快照进 window_prev 后清零。
-    window_bytes: AtomicU64,
-    /// 上一时间槽实收（派发分母）：零收有债=卡死清零，零收无债=空闲沿用，0 历史按 +∞ 垫底。
-    pub(super) window_prev: AtomicU64,
+    /// 分配窗(5ms)本窗实收：on_frame 累加，sweep 每拍快照进 alloc_prev 后清零。
+    alloc_bytes: AtomicU64,
+    /// 分配窗快照（补发/重派分母）：零收沿用旧值不清零——速率估计，卡死语义归收尸。
+    pub(super) alloc_prev: AtomicU64,
+    /// 测速窗(350ms)累计：sweep 每 MEASURE_TICKS 拍快照进 meas_prev 后清零。
+    meas_bytes: AtomicU64,
+    /// 测速窗快照（单流新连接路由分母）：零收有债=卡死清零（路由避开停摆源），无债沿用。
+    pub(super) meas_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
     /// 请求→响应头毫秒的 EMA(α=1/4)：镜像腿的建连+首包估计。直连腿不写恒 0——池通道复用零建连。
@@ -95,24 +102,36 @@ pub(super) fn note_ttfb(mirror: &str, ms: u64) {
     ld.ttfb_ms.store(ema, Ordering::Relaxed);
 }
 
-/// ECT 时间槽结算：本窗实收快照进 `window_prev` 后清零；零收有债=卡死清零，无债=空闲沿用。
-fn ect_sweep() {
+/// 双窗结算：分配窗每拍快照（零收沿用，速率估计无停机语义）；测速窗每 MEASURE_TICKS 拍结算
+/// （零收有债=卡死清零，路由避开停摆源；无债=空闲沿用）。
+fn ect_sweep(tick: u64) {
     let g = crate::util::lock(&MIRROR_LOAD);
+    let measure_due = tick % MEASURE_TICKS == 0;
     for ld in g.values() {
-        let w = ld.window_bytes.swap(0, Ordering::Relaxed);
-        if w > 0 {
-            ld.window_prev.store(w, Ordering::Relaxed);
-        } else if ld.in_flight_bytes.load(Ordering::Relaxed) > 0 {
-            ld.window_prev.store(0, Ordering::Relaxed);
+        let a = ld.alloc_bytes.swap(0, Ordering::Relaxed);
+        if a > 0 {
+            ld.alloc_prev.store(a, Ordering::Relaxed);
+        }
+        if measure_due {
+            let m = ld.meas_bytes.swap(0, Ordering::Relaxed);
+            if m > 0 {
+                ld.meas_prev.store(m, Ordering::Relaxed);
+            } else if ld.in_flight_bytes.load(Ordering::Relaxed) > 0 {
+                ld.meas_prev.store(0, Ordering::Relaxed);
+            }
         }
     }
 }
 
-/// 启动 ECT 时间槽定时器：独立线程按 ECT_WINDOW_MS 一拍，零锁争用（快照只碰各镜像自己的原子量）。
+/// 启动 ECT 定时器：独立线程按分配窗一拍（5ms 档，Windows 实际 ~15ms），零锁争用（快照只碰各镜像自己的原子量）。
 pub(crate) fn start_ect_ticker() {
-    crate::logger::spawn("ect-tick", || loop {
-        std::thread::sleep(Duration::from_millis(ECT_WINDOW_MS));
-        ect_sweep();
+    crate::logger::spawn("ect-tick", || {
+        let mut tick = 0u64;
+        loop {
+            std::thread::sleep(Duration::from_millis(ALLOC_WINDOW_MS));
+            tick += 1;
+            ect_sweep(tick);
+        }
     });
 }
 
@@ -174,8 +193,9 @@ impl LoadGuard {
         if !self.big {
             return;
         }
-        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。
-        self.load.window_bytes.fetch_add(n, Ordering::Relaxed);
+        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。双窗同喂。
+        self.load.alloc_bytes.fetch_add(n, Ordering::Relaxed);
+        self.load.meas_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -195,20 +215,26 @@ impl Drop for LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/断开都走这里)。
+        // 流数随流终结归位(正常读完/断开都走这里)。双窗累计一并清零：镜像转闲，下窗沿用旧值。
         if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.load.window_bytes.store(0, Ordering::Relaxed);
+            self.load.alloc_bytes.store(0, Ordering::Relaxed);
+            self.load.meas_bytes.store(0, Ordering::Relaxed);
         }
     }
 }
 
-/// ECT 派发：score=(在途+新增)×窗口ms÷上一窗实收，真毫秒；最小者胜、无容差。
-/// h2 复用后镜像/直连首字节对称，段级不掺 ttfb——ttfb 只进探针排序（1 字节请求的完成时间就是 ttfb）。
-fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
+/// ECT 派发：score=(在途+新增)×窗口ms÷上窗实收，真毫秒；最小者胜、无容差。
+/// 双窗按用途：单流新连接路由用测速窗（350ms 稳态成绩单），段内补发/重派用分配窗（5ms 新鲜度）。
+/// 段级不掺 ttfb——ttfb 只进探针排序（1 字节请求的完成时间就是 ttfb）。
+fn pick_mirror(chain: &[String], new_bytes: u64, measure: bool) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
     let ect_of = |ld: &MirrorLoad| -> u64 {
-        let w = ld.window_prev.load(Ordering::Relaxed);
+        let (w, win_ms) = if measure {
+            (ld.meas_prev.load(Ordering::Relaxed), MEASURE_WINDOW_MS)
+        } else {
+            (ld.alloc_prev.load(Ordering::Relaxed), ALLOC_WINDOW_MS)
+        };
         if w == 0 {
             // 零历史：整体 +∞ 垫底，档内按在途字节排梯度（闲者先试），仍高于任何有历史者。
             return u64::MAX / 2 + ld.in_flight_bytes.load(Ordering::Relaxed);
@@ -216,7 +242,7 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
         ld.in_flight_bytes
             .load(Ordering::Relaxed)
             .saturating_add(new_bytes)
-            * ECT_WINDOW_MS
+            * win_ms
             / w
     };
 
@@ -339,7 +365,7 @@ fn stream_start_mismatch(req_range: Option<&str>, resp: &hyper::Response<BoxBody
     merge::check_segment_start(cr, want).err()
 }
 
-// ---- 段日志：只记账、只打吞吐，慢段由合并层缩边界让位，掐了就是个洞 ----
+// ---- 段日志：只记账、只打吞吐，慢段由合并层缩边界重分配，掐了就是个洞 ----
 
 /// 段收尾一行：字节/毫秒/MB/s——此前日志只有“谁胜出”没有“跑多快”，判不出直连是真快还是只抢到了位置。
 fn log_seg_line(guard: &mut LoadGuard, label: &str, mirror: &str, log: &LogFn, note: &str) {
@@ -361,7 +387,7 @@ fn log_seg_line(guard: &mut LoadGuard, label: &str, mirror: &str, log: &LogFn, n
     ));
 }
 
-/// 切片段只记账、只打吞吐，不判掐：慢段由合并层缩边界让位，掐了就是个洞。
+/// 切片段只记账、只打吞吐，不判掐：慢段由合并层缩边界重分配，掐了就是个洞。
 fn account_seg(
     body: BoxBody,
     guard: LoadGuard,
@@ -460,9 +486,10 @@ pub(super) async fn chain_fetch(
         }
     }
     // 探片（下载器总长探测）直连先行：起轮点从链头换到直连腿（候选表末位），轮一圈直连第一棒、镜像跟后兜底。
+    // 单流新连接路由用测速窗（350ms 稳态成绩单）。
     let probe = merge::is_probe_range(range) && pool::route::is_big_file_host(&chain_host);
     let start = if big {
-        pick_mirror(&candidates, new_bytes)
+        pick_mirror(&candidates, new_bytes, true)
     } else if probe {
         candidates.len() - 1
     } else {
@@ -828,108 +855,7 @@ fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
     http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
 }
 
-// 同 URL 并发区间请求的段位分配：下载器常对一个文件同时发好几个 Range，每个各自切满全部镜像，
-// 叠加就是把所有镜像按几十路打（日志曾 4 秒 4 次「切 N 段」）。段大小按"该 URL 在途区间总字节 ÷ 段位总数(镜像 + 直连 1)"现算：
-// 大区间先占段位，小区间只拿 1 段，总并发不超段位。
-
-/// 在途区间：请求进来登记，响应体释放时注销。
-struct RangePlan {
-    id: u64,
-    len: u64,
-    at: Instant,
-}
-
-static RANGE_PLANS: LazyLock<Mutex<HashMap<String, Vec<RangePlan>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static RANGE_PLAN_SEQ: AtomicU64 = AtomicU64::new(1);
-/// 兜底：响应体没被正常丢弃时，登记最多留这么久，免得拖死后续分配。
-const RANGE_PLAN_TTL: Duration = Duration::from_secs(180);
-
-/// 注销登记：挂在响应体上，body drop 即释放。
-struct RangePlanGuard {
-    key: String,
-    id: u64,
-}
-
-impl Drop for RangePlanGuard {
-    fn drop(&mut self) {
-        let mut map = RANGE_PLANS.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(list) = map.get_mut(&self.key) {
-            list.retain(|p| p.id != self.id);
-            if list.is_empty() {
-                map.remove(&self.key);
-            }
-        }
-    }
-}
-
-struct RangePlanOutcome {
-    want: usize,
-    pending: u64,
-    seg: u64,
-    guard: RangePlanGuard,
-}
-
-/// 段位分配（纯函数）：段大小 = 在途总字节 ÷ 段位总数，按区间从大到小占位，每请求至少 1 段。
-fn plan_quota(
-    pending: &[(u64, u64)],
-    my_id: u64,
-    my_len: u64,
-    capacity: usize,
-    slots: usize,
-) -> usize {
-    let total: u64 = pending.iter().map(|(l, _)| *l).sum();
-    let seg = total.div_ceil(capacity.max(1) as u64).max(1);
-    let mut order: Vec<(u64, u64)> = pending.to_vec();
-    order.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let mut remaining = slots.max(1);
-    let mut mine = 1usize;
-    for (i, (l, id)) in order.iter().enumerate() {
-        // 后面还有几个请求，各留 1 段，别让大区间把段位吃光。
-        let left = order.len() - i - 1;
-        let room = remaining.saturating_sub(left).max(1);
-        let take = ((*l).div_ceil(seg).max(1) as usize).min(room);
-        remaining = remaining.saturating_sub(take);
-        if *id == my_id {
-            mine = take;
-        }
-    }
-    mine.clamp(1, my_len.max(1) as usize)
-}
-
-/// 登记本次区间并给出段数。key 用完整 URL（含查询串）：同 URL 的并发请求共享段位配额，不同签名对象不并池。
-fn plan_range_segments(
-    key: &str,
-    len: u64,
-    capacity: usize,
-    slots: usize,
-) -> RangePlanOutcome {
-    let id = RANGE_PLAN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let now = Instant::now();
-    let (pending, total) = {
-        let mut map = RANGE_PLANS.lock().unwrap_or_else(|p| p.into_inner());
-        let list = map.entry(key.to_string()).or_default();
-        list.retain(|p| now.saturating_duration_since(p.at) < RANGE_PLAN_TTL);
-        list.push(RangePlan { id, len, at: now });
-        let pending: Vec<(u64, u64)> = list.iter().map(|p| (p.len, p.id)).collect();
-        let total: u64 = pending.iter().map(|(l, _)| *l).sum();
-        (pending, total)
-    };
-    let want = plan_quota(&pending, id, len, capacity, slots);
-    // 日志用的每段字节：总量 ÷ 段位总数，与配额同一把尺子。
-    let seg = total.div_ceil(capacity.max(1) as u64).max(1);
-    RangePlanOutcome {
-        want,
-        pending: total / 1024,
-        seg: seg / 1024,
-        guard: RangePlanGuard {
-            key: key.to_string(),
-            id,
-        },
-    }
-}
-
-/// 切片下载：按空闲镜像数切段并发拉，按边界合成单条流；不足 2 段、探片或上游不支持 Range 则退回单流。
+/// 切片下载：校准门（未测镜像>0 且候选全闲）通过才每镜像一片并发测量；否则单流 ECT 最优。
 async fn split_download(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -957,17 +883,18 @@ async fn split_download(
         .filter(|m| !fail_window_active(&mirror_load(m), now))
         .map(|m| m.as_str())
         .collect();
-    // 空闲优先：切段只分给零在途的源（链序内稳定序）——旧实现按链序取前 want 家，忙链头凭位置蹭段、链尾闲源落选，白浪费一路带宽。
-    let idle_src: Vec<&str> = healthy
+    // 校准门：有未测镜像（无实测快照）且候选全闲 → 每镜像一片，同一批 350ms 窗口同时测速；
+    // 否则单流直发 ECT 最优——加速外包给下载器（连接数/波次 IDM 定），代理只做路由。
+    let unmeasured = healthy
         .iter()
-        .filter(|m| mirror_load(m).in_flight_streams.load(Ordering::Relaxed) == 0)
-        .copied()
-        .collect();
-    if idle_src.len() < 2 {
-        return Ok(None); // 镜像已占满或本来就没几家：切了只是抢自己的份额
+        .any(|m| mirror_load(m).meas_prev.load(Ordering::Relaxed) == 0);
+    let all_idle = healthy
+        .iter()
+        .all(|m| mirror_load(m).in_flight_bytes.load(Ordering::Relaxed) == 0);
+    if !(unmeasured && all_idle) {
+        return Ok(None);
     }
-    // 段位：每个源一家 1 份（镜像与直连同权）——每家同等材料，快慢由段自己说话。
-    let idle: Vec<&str> = idle_src;
+    let idle: Vec<&str> = healthy.clone();
     // 直连段模板：补发起流跑在旁路任务里，原请求不能跨任务借用；与直连切片共用同一个 Tpl（direct_split.rs）。
     let tpl = Tpl::of(out);
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
@@ -989,12 +916,12 @@ async fn split_download(
             Some(t) => (0, t, Some(t)),
             None => {
                 // 探测候选按 ECT 择优、不按链序——整包单流时链头盲选会把大下载砸在慢镜像上；冷启动全零则退化回链序。
-                // 探片是 1 字节请求，排水≈0，ttfb(建连+首包)主导排序——公式与 ect_of 同款。
+                // 探片是 1 字节请求，排水≈0，ttfb(建连+首包)主导排序——公式与 ect_of 同款（分配窗新鲜度）。
                 let mut probe_cands: Vec<&str> = healthy.clone();
                 probe_cands.sort_by_key(|m| {
                     let ld = mirror_load(m);
-                    ld.in_flight_bytes.load(Ordering::Relaxed) * ECT_WINDOW_MS
-                        / ld.window_prev.load(Ordering::Relaxed).max(1)
+                    ld.in_flight_bytes.load(Ordering::Relaxed) * ALLOC_WINDOW_MS
+                        / ld.alloc_prev.load(Ordering::Relaxed).max(1)
                         + ld.ttfb_ms.load(Ordering::Relaxed)
                 });
                 probe_cands.truncate(2);
@@ -1018,34 +945,15 @@ async fn split_download(
             }
         },
     };
-    // 非 Range 按空闲段位平均分；Range 按同 URL 在途总字节现算段大小，大区间先占、小区间保底 1 段。
-    let (want, plan) = match range {
-        Some(_) => {
-            let mirrors = healthy.iter().filter(|m| !m.starts_with("direct/")).count();
-            // 段位总数 = 镜像数 + 直连 1 份：每家 1 份。
-            let plan = plan_range_segments(&slice_key, len, mirrors + 1, idle.len());
-            (plan.want, Some(plan))
-        }
-        None => (
-            ((idle.len() as u64).min(len)).max(1) as usize,
-            None,
-        ),
-    };
-    let want = want.min(idle.len()).min(len as usize).max(1);
-    let idle = &idle[..want];
-    // 竞速切段：每家同等材料，快慢由段自己说话；慢段让位、补发走 ECT。
+    // 校准切片：每镜像一片（区间 ÷ 镜像数），同一批测速窗同时出成绩。
+    let want = idle.len();
     let segs = merge::split_even(base, len, want);
     if segs.len() < 2 {
         return Ok(None);
     }
     (log)(&format!(
-        "[切片] {host}{path} 切 {} 段(候选 {} 家, 空闲 {want}{}), 并发拉取",
-        segs.len(),
-        healthy.len(),
-        match &plan {
-            Some(p) => format!(", 在途 {}KB 每段 {}KB", p.pending, p.seg),
-            None => String::new(),
-        }
+        "[切片] {host}{path} 校准切 {} 段(每镜像一片), 并发测量",
+        segs.len()
     ));
     // 有镜像兜底才给直连设按跳预算；没镜像（用户没配/链全灭）时直连是唯一的路，不能掐，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
@@ -1155,6 +1063,11 @@ async fn split_download(
             }
             Err(err) => {
                 dead += 1;
+                // 镜像候选失败降权（超时 15s / 硬错 45s）：ECT 不再反复踩死拨号家；直连腿已在 fetch_segment_direct 内部降权。
+                let m = idle[i % idle.len()];
+                if !m.starts_with("direct/") {
+                    mark_fail(&mirror_load(m), is_timeout_err(&err));
+                }
                 (log)(&format!(
                     "[切片] {host}{path} 段 [{s}..{e}) 失败({err}), 立刻补发"
                 ));
@@ -1222,10 +1135,6 @@ async fn split_download(
         log: log.clone(),
     };
     let mut mb = MergeBody::new(bodies, len);
-    // 区间登记跟着响应体走：body drop（播完/客户端断开）即注销，后续请求才算得准在途量。
-    if let Some(p) = plan {
-        mb = mb.hold(Box::new(p.guard));
-    }
     // 开场就失败的段立刻排队补发：不等交付线走到它——那块往往在末尾，干等就是几秒。
     for (a, b) in failed {
         mb.queue_fill(a, b);
@@ -1260,7 +1169,7 @@ async fn split_fetch(
     if cands.is_empty() {
         return Err("无可用补发源".to_string());
     }
-    let m = cands[pick_mirror(&cands, to - from)].clone();
+    let m = cands[pick_mirror(&cands, to - from, false)].clone();
     let (s, e) = (base + from, base + to - 1);
     if m.starts_with("direct/") {
         let has_mirror = cands.len() > 1;
@@ -1360,7 +1269,7 @@ pub(super) type FetchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoxBody, String>> + Send + Sync>>;
 pub(super) type Fetch = Arc<dyn Fn(u64, u64) -> FetchFuture + Send + Sync>;
 
-/// 切片调度上下文：缺口、让位尾巴都往这里要新流（直连腿与镜像腿共用驱动）。
+/// 切片调度上下文：缺口、重分配尾巴都往这里要新流（直连腿与镜像腿共用驱动）。
 pub(super) struct SplitCtx {
     pub(super) fetch: Fetch,
     pub(super) host: String,
@@ -1415,7 +1324,7 @@ fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
     }
 }
 
-/// 切片驱动：发缺口、收停滞、让位慢段，其余只泵数据；起流走旁路任务，建连再久不挡泵数据与让位。
+/// 切片驱动：发缺口、收停滞、重分配慢段，其余只泵数据；起流走旁路任务，建连再久不挡泵数据与重分配。
 pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Fetched>(8);
     // tx 每个状态机实例克隆一份：unfold 的闭包是 FnMut，不能把 tx 移出去。
@@ -1475,22 +1384,19 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                             let _ = tx.send(msg).await;
                         });
                     }
-                    // 体检：停滞收尸、抢慢段。数据一直在流也要做——涓流不触发超时。
+                    // 体检：停滞收尸、速率比例重分配。数据一直在流也要做——涓流不触发超时。
                     if mb.tick_due(Instant::now()) {
                         let now = Instant::now();
                         if mb.reap_stalled(now) {
                             (ctx.log)(&format!("[切片] {} 有段停滞, 尾巴转补发", ctx.host));
                             continue;
                         }
-                        let cut = mb
-                            .allow_yield
-                            .then(|| mb.plan_cut(now))
-                            .flatten();
-                        if let Some((from, to)) = cut {
+                        let moved = mb.rebalance(now);
+                        if moved > 0 {
                             (ctx.log)(&format!(
-                                "[切片] {} 慢段让位 [{from}..{to}) 交闲连接 ({}KB)",
+                                "[切片] {} 重分配: 慢段切尾重派 ({}KB)",
                                 ctx.host,
-                                (to - from) / 1024
+                                moved / 1024
                             ));
                             continue;
                         }
