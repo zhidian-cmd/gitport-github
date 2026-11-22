@@ -59,7 +59,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .nav-group{font-size:11px;color:var(--faint);letter-spacing:.14em;padding:16px 10px 6px}
 .nav-group:first-child{padding-top:4px}
 .item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;
-      font-size:13px;color:var(--mid);text-decoration:none;transition:background .15s,color .15s}
+      font-size:15px;letter-spacing:2em;color:var(--mid);text-decoration:none;transition:background .15s,color .15s}
 .item:hover{background:var(--panel-2);color:var(--txt)}
 .item.active{background:var(--green-soft);color:var(--green);font-weight:600}
 
