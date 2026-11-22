@@ -1,6 +1,11 @@
 use super::*;
 use std::time::Duration;
 
+/// 测试段：四元组补成生产六元组（owner/ramp 默认 0，普通合并测试用不到）。
+fn t(s: u64, e: u64, at: Instant, b: BoxBody) -> (u64, u64, Instant, BoxBody, String, u64) {
+    (s, e, at, b, "test".to_string(), 0)
+}
+
 /// 平均切必须零缝覆盖整个区间，相邻段共享边界。
 #[test]
 fn split_even_covers_without_gap() {
@@ -129,20 +134,30 @@ fn drain(m: &mut MergeBody, out: &mut Vec<u8>) -> bool {
     }
 }
 
+/// 给段造一个"首帧在 now−1s、已收 got B"的速率样本，供判据测试用。
+fn with_rate(m: &mut MergeBody, start: u64, got: u64, now: Instant) {
+    let s = m.segs.get_mut(&start).unwrap();
+    s.first_at = Some(now - Duration::from_secs(1));
+    s.begin = now - Duration::from_secs(1);
+    s.got = got;
+    s.recent.push_back((now - Duration::from_secs(1), 0));
+    s.last_poll = now;
+}
+
 /// 顺序泵：段 1 供完接段 2；段 1 早断登记缺口，补发流续到边界再接段 2。
 #[test]
 fn merge_pumps_and_rescues() {
     let now = Instant::now();
     // 段 1 [0..6) 只供 2B 就 EOF（缺口 [2..6)）；段 2 [6..10) 完整。
     let mut m = MergeBody::new(
-        vec![(0, 6, now, seg(b"AA")), (6, 10, now, seg(b"BBBB"))],
+        vec![t(0, 6, now, seg(b"AA")), t(6, 10, now, seg(b"BBBB"))],
         10,
     );
     let mut out = Vec::new();
     assert!(!drain(&mut m, &mut out), "缺口在，交付不可能结束");
     assert_eq!(out, b"AA");
     assert_eq!(m.take_fill(), Some((2, 6)), "缺口 [2..6) 排进补发");
-    m.feed(2, 6, now, seg(b"CCCC"));
+    m.feed(2, 6, now, seg(b"CCCC"), "test".into(), 0);
     assert!(drain(&mut m, &mut out), "补上后应走完");
     assert_eq!(out, b"AACCCCBBBB");
     assert_eq!(m.sent(), 10);
@@ -192,8 +207,8 @@ fn segments_are_read_concurrently() {
     let tail_polls = Arc::new(AtomicUsize::new(0));
     let mut m = MergeBody::new(
         vec![
-            (0, 4, now, BoxBody::new(Stuck(stuck_polls.clone()))),
-            (
+            t(0, 4, now, BoxBody::new(Stuck(stuck_polls.clone()))),
+            t(
                 4,
                 8,
                 now,
@@ -223,7 +238,7 @@ fn segments_are_read_concurrently() {
 fn merge_no_gap_when_boundary_aligned() {
     let now = Instant::now();
     let mut m = MergeBody::new(
-        vec![(0, 4, now, seg(b"AAAA")), (4, 8, now, seg(b"BBBB"))],
+        vec![t(0, 4, now, seg(b"AAAA")), t(4, 8, now, seg(b"BBBB"))],
         8,
     );
     let mut out = Vec::new();
@@ -236,7 +251,7 @@ fn merge_no_gap_when_boundary_aligned() {
 #[test]
 fn merge_stops_at_declared_total() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 40, now, seg(&[3u8; 100]))], 40);
+    let mut m = MergeBody::new(vec![t(0, 40, now, seg(&[3u8; 100]))], 40);
     let mut out = Vec::new();
     assert!(drain(&mut m, &mut out));
     assert_eq!(out.len(), 40);
@@ -247,7 +262,7 @@ fn merge_stops_at_declared_total() {
 #[test]
 fn cut_shrinks_boundary_and_hands_off_tail() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 100, now, seg(&[b'A'; 100]))], 100);
+    let mut m = MergeBody::new(vec![t(0, 100, now, seg(&[b'A'; 100]))], 100);
     let cut = m.cut(0, 40).expect("应能切");
     assert_eq!(cut, (40, 100));
     assert_eq!(m.take_fill(), Some((40, 100)));
@@ -255,17 +270,29 @@ fn cut_shrinks_boundary_and_hands_off_tail() {
     assert!(!drain(&mut m, &mut out), "尾巴还没人接");
     assert_eq!(out.len(), 40, "父流交到新边界就停");
     assert!(out.iter().all(|&b| b == b'A'));
-    m.feed(40, 100, now, seg(&[b'C'; 60]));
+    m.feed(40, 100, now, seg(&[b'C'; 60]), "test".into(), 0);
     assert!(drain(&mut m, &mut out));
     assert_eq!(out.len(), 100);
     assert!(out[40..].iter().all(|&b| b == b'C'), "尾部必须来自接手的流");
+}
+
+/// 整段让出：cut 到 pos 时把 [pos, end) 全部排补发，父段只剩已收部分。
+#[test]
+fn cut_to_pos_hands_off_whole_remaining() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![t(0, 100, now, stalled(b"AAAA"))], 100);
+    with_rate(&mut m, 0, 40, now); // pos=40, remaining=60
+    let cut = m.cut(0, 40).expect("切到 pos 应允许");
+    assert_eq!(cut, (40, 100));
+    assert_eq!(m.segs.get(&0).unwrap().end, 40, "父段只剩已收那截");
+    assert_eq!(m.take_fill(), Some((40, 100)), "整段剩余全排补发");
 }
 
 /// 停滞只收自己没收到的那截，缓冲里的字节一个都不丢。
 #[test]
 fn reap_keeps_received_bytes() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 10, now, stalled(b"AAAA"))], 10);
+    let mut m = MergeBody::new(vec![t(0, 10, now, stalled(b"AAAA"))], 10);
     let mut out = Vec::new();
     assert!(!drain(&mut m, &mut out), "供完 4B 就该停住等");
     assert_eq!(out, b"AAAA");
@@ -277,95 +304,85 @@ fn reap_keeps_received_bytes() {
     assert_eq!(m.take_fill(), Some((4, 10)), "只补没收到的那截");
     assert!(!drain(&mut m, &mut out));
     assert_eq!(out, b"AAAA");
-    m.feed(4, 10, now, seg(b"BBBBBB"));
+    m.feed(4, 10, now, seg(b"BBBBBB"), "test".into(), 0);
     assert!(drain(&mut m, &mut out));
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 重分配：速率比例摊派公平份额——慢段（50KB/s）切到自己的份额、尾巴排补发待 ECT 重派；
-/// drain 最小的快段保留全部剩余。慢段超额 174KB > MIN_PIECE(128KB)，必切。
-#[test]
-fn rebalance_cuts_slow_to_fair_share() {
-    let now = Instant::now();
-    let half = 4 * MIN_PIECE;
+/// 本段判据：剩余传完时间 > 本家爬坡 → 切；整段剩余让出。
+fn rebalance_fixture(now: Instant, ramp: u64) -> MergeBody {
+    // 单段 [0, 1_000_000)，已收 100_000B（1s 收完 → 速率 100_000B/s），remaining=900_000B → 留着传完要 9s。
     let mut m = MergeBody::new(
-        vec![
-            (0, half, now - Duration::from_secs(2), stalled(b"")),
-            (
-                half,
-                2 * half,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
-        ],
-        2 * half,
+        vec![t(0, 1_000_000, now, stalled(b""))],
+        1_000_000,
     );
-    for (k, got) in [(0u64, 100_000u64), (half, 200_000u64)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
+    with_rate(&mut m, 0, 100_000, now);
+    m.segs.get_mut(&0).unwrap().ramp = ramp;
+    m
+}
+
+#[test]
+fn rebalance_cuts_when_remaining_slower_than_ramp() {
+    let now = Instant::now();
+    let mut m = rebalance_fixture(now, 1_000); // ramp 1s < 留着 9s → 切
     let moved = m.rebalance(now);
-    assert!(moved >= MIN_PIECE, "慢段超额应被切走: {moved}");
-    let slow = m.segs.get(&0).unwrap();
-    assert!(slow.end < half, "慢段切到公平份额");
-    let fast = m.segs.get(&half).unwrap();
-    assert_eq!(fast.end, 2 * half, "drain 最小的快段保留全部剩余");
-    let (from, to) = m.take_fill().expect("尾巴排补发待 ECT 重派");
-    assert_eq!(to - from, moved, "补发区间 = 切走的字节数");
+    assert_eq!(moved, 900_000, "整段剩余让出");
+    assert_eq!(m.segs.get(&0).unwrap().end, 100_000, "父段只剩已收那截");
+    assert_eq!(m.take_fill(), Some((100_000, 1_000_000)));
+    assert_eq!(m.last_cut_owner.as_deref(), Some("test"));
 }
 
-/// 两家同速：各自剩余恰好等于公平份额，超额 0 → 不动刀（份额收敛自带防乒乓）。
 #[test]
-fn rebalance_spares_fair_share() {
+fn rebalance_spares_when_ramp_not_worth_it() {
     let now = Instant::now();
+    let mut m = rebalance_fixture(now, 20_000); // ramp 20s > 留着 9s → 不切
+    assert_eq!(m.rebalance(now), 0, "爬坡比留着还慢，不动刀");
+    assert!(m.fill.is_empty());
+}
+
+#[test]
+fn rebalance_ignores_seg_without_first_frame() {
+    let now = Instant::now();
+    // 有 bytes 但没首帧样本 → 没速率，不动刀。
     let mut m = MergeBody::new(
-        vec![
-            (0, 4 * MIN_PIECE, now - Duration::from_secs(2), stalled(b"")),
-            (
-                4 * MIN_PIECE,
-                8 * MIN_PIECE,
-                now - Duration::from_secs(2),
-                stalled(b""),
-            ),
-        ],
-        8 * MIN_PIECE,
+        vec![t(0, 1_000_000, now, stalled(b""))],
+        1_000_000,
     );
-    for (k, got) in [(0u64, 2 * MIN_PIECE), (4 * MIN_PIECE, 2 * MIN_PIECE)] {
-        let s = m.segs.get_mut(&k).unwrap();
-        s.got = got;
-        s.last_poll = now;
-    }
-    assert_eq!(m.rebalance(now), 0, "同速同份额，超额 0 不动刀");
+    m.segs.get_mut(&0).unwrap().got = 100_000;
+    m.segs.get_mut(&0).unwrap().last_poll = now;
+    assert_eq!(m.rebalance(now), 0, "没首帧不动刀");
 }
 
-/// 重分配前提：至少两条活段且总速率 > 0——单段无可摊派，零速率无判据不动刀。
 #[test]
-fn rebalance_needs_two_live_segs_with_rates() {
+fn rebalance_cuts_small_tail_when_slow_enough() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 4 * MIN_PIECE, now, stalled(b""))], 4 * MIN_PIECE);
-    assert_eq!(m.rebalance(now), 0, "单段无可摊派");
-    let mut two = MergeBody::new(
-        vec![
-            (0, 4 * MIN_PIECE, now, stalled(b"")),
-            (
-                4 * MIN_PIECE,
-                8 * MIN_PIECE,
-                now,
-                stalled(b""),
-            ),
-        ],
-        8 * MIN_PIECE,
-    );
-    assert_eq!(two.rebalance(now), 0, "零速率无判据不动刀");
+    // 小尾巴 4KB 也切：判据只看时间，不看字节数。
+    let mut m = MergeBody::new(vec![t(0, 5_000, now, stalled(b""))], 5_000);
+    with_rate(&mut m, 0, 1_000, now); // 1s 收 1000B → 1000B/s，remaining=4000B → 留着 4s
+    m.segs.get_mut(&0).unwrap().ramp = 100; // 爬坡 0.1s → 切
+    assert_eq!(m.rebalance(now), 4_000, "小尾巴够慢照样切，无字节下限");
 }
 
-/// 近期速率：滑窗有样本按滑窗算，样本不足退回全片均速（短段的全片就是全部真相）。
+#[test]
+fn rebalance_only_cuts_once() {
+    let now = Instant::now();
+    let mut m = rebalance_fixture(now, 1_000);
+    assert!(m.rebalance(now) > 0, "第一轮切");
+    assert_eq!(m.take_fill(), Some((100_000, 1_000_000)), "尾巴排补发");
+    // 即使再来一条新段满足判据，也不再切。
+    m.feed(2_000_000, 3_000_000, now, stalled(b""), "test".into(), 0);
+    with_rate(&mut m, 2_000_000, 100_000, now);
+    assert_eq!(m.rebalance(now), 0, "只切一次，之后不再动刀");
+    assert!(m.fill.is_empty(), "第二轮没有再排队尾巴");
+}
+
+/// 近期速率：首帧起算、样本按滑窗折算，无预热门槛。
 #[test]
 fn recent_rate_prefers_sliding_window() {
     let now = Instant::now();
-    let mut s = Seg::new(0, 1 << 20, now, seg(b""));
-    s.begin = now - Duration::from_secs(2);
+    let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
+    assert_eq!(s.rate(now), 0.0, "没首帧 = 没样本 = 0");
+    s.on_first_frame(now - Duration::from_secs(2));
     s.got = 1000;
     assert!(
         (s.recent_rate(now) - 500.0).abs() < 1.0,
@@ -385,7 +402,7 @@ fn recent_rate_prefers_sliding_window() {
 #[test]
 fn dead_fill_counter_resets_on_progress() {
     let now = Instant::now();
-    let mut m = MergeBody::new(vec![(0, 4, now, seg(b"AAAA"))], 4);
+    let mut m = MergeBody::new(vec![t(0, 4, now, seg(b"AAAA"))], 4);
     for _ in 0..MAX_DEAD_FILLS {
         m.dead_fills += 1;
     }

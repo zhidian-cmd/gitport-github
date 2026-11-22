@@ -1,7 +1,7 @@
 ﻿//! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
 //! 段的交付/停滞收尸/补发统一挂镜像腿的 MergeBody+drive_split（见 merge.rs），本文件只管段位分配与救援闭包。
 use super::merge::MergeBody;
-use super::mirror::{drive_split, Fetch, SplitCtx};
+use super::mirror::{drive_split, Fetch, FilledSeg, SplitCtx};
 use super::{merge, mirror, path_of, UpstreamInfo};
 use super::super::{protocol::{self, BoxBody}, upstream};
 use crate::{pool, util::LogFn};
@@ -424,19 +424,34 @@ pub(super) async fn try_direct_split(
         ));
         return None;
     }
-    let mut entries: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len() + 1);
+    let mut entries: Vec<(u64, u64, Instant, BoxBody, String, u64)> =
+        Vec::with_capacity(segs.len() + 1);
     let mut first_headers: Option<HeaderMap> = None;
     if let Some((bytes, hs)) = &prefix {
         // 探片 10KB = 交付首段：字节已在手，头用它（206 头，Range 语义头会被剥）。
         first_headers = Some(hs.clone());
-        entries.push((0, PROBE_BYTES, Instant::now(), protocol::full_body(bytes.clone())));
+        entries.push((
+            0,
+            PROBE_BYTES,
+            Instant::now(),
+            protocol::full_body(bytes.clone()),
+            format!("direct/{}", host),
+            0,
+        ));
     }
     for (i, r) in results.into_iter().enumerate() {
         let (body, hs) = r.ok()?;
         if first_headers.is_none() {
             first_headers = Some(hs);
         }
-        entries.push((segs[i].0, segs[i].1, Instant::now(), body));
+        entries.push((
+            segs[i].0,
+            segs[i].1,
+            Instant::now(),
+            body,
+            format!("direct/{}", host),
+            0,
+        ));
     }
     // 总长记忆命中时没走过探片，用第一段的 content-type 补一道媒体校验。
     let hs = first_headers.as_ref()?;
@@ -470,7 +485,11 @@ pub(super) async fn try_direct_split(
             Box::pin(async move {
                 if !chain.is_empty() {
                     return match rescue_segment(&tpl, kind, &chain, from, to, &log).await {
-                        Some((body, _hs)) => Ok(body),
+                        Some((body, _hs)) => Ok(FilledSeg {
+                            body,
+                            owner: format!("direct/{}", host),
+                            ramp: 0,
+                        }),
                         None => Err("镜像救援不可用(链全灭或熔断中)".to_string()),
                     };
                 }
@@ -493,7 +512,11 @@ pub(super) async fn try_direct_split(
                         .and_then(|v| v.to_str().ok()),
                     from,
                 )?;
-                Ok(resp.into_body())
+                Ok(FilledSeg {
+                    body: resp.into_body(),
+                    owner: format!("direct/{}", host),
+                    ramp: 0,
+                })
             })
         })
     };

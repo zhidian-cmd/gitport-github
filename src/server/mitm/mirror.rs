@@ -27,30 +27,26 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 双窗口：测速窗 350ms（单流新连接路由/成绩单，零收有债清零=路由避开停摆源）；
-/// 分配窗 5ms（段内补发/重派的新鲜度，零收一律沿用——卡死语义归收尸与 mark_fail 管）。
-/// ticker 按分配窗一拍，每 MEASURE_TICKS 拍结算一次测速窗；Windows 实际粒度 ~15ms，所有源同刻度，排名不受影响。
+/// 唯一窗口：分配窗 5ms（新连接/补发/重派共用这一张账，零收一律沿用——卡死语义归收尸与 mark_fail 管）。
+/// ticker 按 5ms 一拍；Windows 实际粒度 ~15ms，所有源同刻度，排名不受影响。
 const ALLOC_WINDOW_MS: u64 = 5;
-const MEASURE_WINDOW_MS: u64 = 350;
-const MEASURE_TICKS: u64 = MEASURE_WINDOW_MS / ALLOC_WINDOW_MS;
 
-/// 每面镜像的记账：在途字节/流数、双窗（分配/测速）、失败降权窗、建连首包 ttfb。
+/// 每面镜像的记账：在途字节/流数、分配窗、失败降权窗、建连首包 ttfb、爬坡 EMA。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
     pub(super) in_flight_streams: AtomicU64,
     /// 分配窗(5ms)本窗实收：on_frame 累加，sweep 每拍快照进 alloc_prev 后清零。
     alloc_bytes: AtomicU64,
-    /// 分配窗快照（补发/重派分母）：零收沿用旧值不清零——速率估计，卡死语义归收尸。
+    /// 分配窗快照（新连接/补发/重派分母）：零收沿用旧值不清零——速率估计，卡死语义归收尸。
     pub(super) alloc_prev: AtomicU64,
-    /// 测速窗(350ms)累计：sweep 每 MEASURE_TICKS 拍快照进 meas_prev 后清零。
-    meas_bytes: AtomicU64,
-    /// 测速窗快照（单流新连接路由分母）：零收有债=卡死清零（路由避开停摆源），无债沿用。
-    pub(super) meas_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
     /// 请求→响应头毫秒的 EMA(α=1/4)：镜像腿的建连+首包估计。直连腿不写恒 0——池通道复用零建连。
     pub(super) ttfb_ms: AtomicU64,
+    /// 爬坡毫秒 EMA(α=1/4)：响应头到达→首帧到达。切尾判据与 ECT 派发都读它。
+    /// 镜像首切/补发、直连段都写；单流不写（读到 0 = 无先验）。同一通道每流爬坡大差不差。
+    pub(super) ramp_ms: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -102,36 +98,30 @@ pub(super) fn note_ttfb(mirror: &str, ms: u64) {
     ld.ttfb_ms.store(ema, Ordering::Relaxed);
 }
 
-/// 双窗结算：分配窗每拍快照（零收沿用，速率估计无停机语义）；测速窗每 MEASURE_TICKS 拍结算
-/// （零收有债=卡死清零，路由避开停摆源；无债=空闲沿用）。
-fn ect_sweep(tick: u64) {
+/// 爬坡毫秒入账（EMA α=1/4）：响应头到达→首帧到达，同一通道每流爬坡大差不差。
+/// 首帧到达时由 LoadGuard 调；切尾判据（本家 ramp）与 ECT 派发都读这个值。
+pub(super) fn note_ramp(load: &MirrorLoad, ms: u64) {
+    let old = load.ramp_ms.load(Ordering::Relaxed);
+    let ema = if old == 0 { ms } else { old * 3 / 4 + ms / 4 };
+    load.ramp_ms.store(ema, Ordering::Relaxed);
+}
+
+/// 单窗结算：分配窗每拍快照（零收沿用，速率估计无停机语义）——所有派发共读这一张账。
+fn ect_sweep() {
     let g = crate::util::lock(&MIRROR_LOAD);
-    let measure_due = tick % MEASURE_TICKS == 0;
     for ld in g.values() {
         let a = ld.alloc_bytes.swap(0, Ordering::Relaxed);
         if a > 0 {
             ld.alloc_prev.store(a, Ordering::Relaxed);
-        }
-        if measure_due {
-            let m = ld.meas_bytes.swap(0, Ordering::Relaxed);
-            if m > 0 {
-                ld.meas_prev.store(m, Ordering::Relaxed);
-            } else if ld.in_flight_bytes.load(Ordering::Relaxed) > 0 {
-                ld.meas_prev.store(0, Ordering::Relaxed);
-            }
         }
     }
 }
 
 /// 启动 ECT 定时器：独立线程按分配窗一拍（5ms 档，Windows 实际 ~15ms），零锁争用（快照只碰各镜像自己的原子量）。
 pub(crate) fn start_ect_ticker() {
-    crate::logger::spawn("ect-tick", || {
-        let mut tick = 0u64;
-        loop {
-            std::thread::sleep(Duration::from_millis(ALLOC_WINDOW_MS));
-            tick += 1;
-            ect_sweep(tick);
-        }
+    crate::logger::spawn("ect-tick", || loop {
+        std::thread::sleep(Duration::from_millis(ALLOC_WINDOW_MS));
+        ect_sweep();
     });
 }
 
@@ -180,7 +170,12 @@ impl LoadGuard {
     /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；大文件流顺带喂窗口采样。
     pub(super) fn on_frame(&mut self, n: u64) {
         if n > 0 && self.seg_first.is_none() {
-            self.seg_first = Some(Instant::now());
+            let at = Instant::now();
+            self.seg_first = Some(at);
+            // 段流首帧：响应头→首帧 = 爬坡。seg_start 有值的才是切片段/补发/直连段，单流不记。
+            if let Some(start) = self.seg_start {
+                note_ramp(&self.load, at.saturating_duration_since(start).as_millis() as u64);
+            }
         }
         let credit = n.min(self.charged.saturating_sub(self.delivered));
         self.delivered += credit;
@@ -193,9 +188,8 @@ impl LoadGuard {
         if !self.big {
             return;
         }
-        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。双窗同喂。
+        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。
         self.load.alloc_bytes.fetch_add(n, Ordering::Relaxed);
-        self.load.meas_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -215,35 +209,31 @@ impl Drop for LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/断开都走这里)。双窗累计一并清零：镜像转闲，下窗沿用旧值。
+        // 流数随流终结归位(正常读完/断开都走这里)。分配窗累计清零：镜像转闲，下窗沿用旧值。
         if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.load.alloc_bytes.store(0, Ordering::Relaxed);
-            self.load.meas_bytes.store(0, Ordering::Relaxed);
         }
     }
 }
 
-/// ECT 派发：score=(在途+新增)×窗口ms÷上窗实收，真毫秒；最小者胜、无容差。
-/// 双窗按用途：单流新连接路由用测速窗（350ms 稳态成绩单），段内补发/重派用分配窗（5ms 新鲜度）。
-/// 段级不掺 ttfb——ttfb 只进探针排序（1 字节请求的完成时间就是 ttfb）。
-fn pick_mirror(chain: &[String], new_bytes: u64, measure: bool) -> usize {
+/// ECT 派发：score=(在途+新增)×5ms÷上窗实收 + 本家爬坡毫秒，真毫秒；最小者胜、无容差。
+/// 单窗：新连接/补发/重派共读同一张 5ms 账。ttfb 不掺——它只进探针排序（1 字节请求的完成时间就是 ttfb）。
+fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
     let ect_of = |ld: &MirrorLoad| -> u64 {
-        let (w, win_ms) = if measure {
-            (ld.meas_prev.load(Ordering::Relaxed), MEASURE_WINDOW_MS)
-        } else {
-            (ld.alloc_prev.load(Ordering::Relaxed), ALLOC_WINDOW_MS)
-        };
+        let w = ld.alloc_prev.load(Ordering::Relaxed);
+        let ramp = ld.ramp_ms.load(Ordering::Relaxed);
         if w == 0 {
-            // 零历史：整体 +∞ 垫底，档内按在途字节排梯度（闲者先试），仍高于任何有历史者。
-            return u64::MAX / 2 + ld.in_flight_bytes.load(Ordering::Relaxed);
+            // 零历史：整体 +∞ 垫底，档内按在途字节排梯度（闲者先试），仍高于任何有历史者。爬坡项照样加。
+            return u64::MAX / 2 + ld.in_flight_bytes.load(Ordering::Relaxed) + ramp;
         }
         ld.in_flight_bytes
             .load(Ordering::Relaxed)
             .saturating_add(new_bytes)
-            * win_ms
+            * ALLOC_WINDOW_MS
             / w
+            + ramp
     };
 
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
@@ -486,10 +476,10 @@ pub(super) async fn chain_fetch(
         }
     }
     // 探片（下载器总长探测）直连先行：起轮点从链头换到直连腿（候选表末位），轮一圈直连第一棒、镜像跟后兜底。
-    // 单流新连接路由用测速窗（350ms 稳态成绩单）。
+    // 单流新连接路由读同一张 5ms 账（含本家爬坡）。
     let probe = merge::is_probe_range(range) && pool::route::is_big_file_host(&chain_host);
     let start = if big {
-        pick_mirror(&candidates, new_bytes, true)
+        pick_mirror(&candidates, new_bytes)
     } else if probe {
         candidates.len() - 1
     } else {
@@ -885,12 +875,12 @@ async fn split_download(
         .map(|m| m.as_str())
         .collect();
     let range = out.headers().get("range").and_then(|v| v.to_str().ok());
-    // 切片门：校准（有未测镜像且候选全闲 → 每镜像一片，同一批 350ms 窗口同时测速）
+    // 切片门：校准（有未测镜像且候选全闲 → 每镜像一片，同一批 5ms 窗同时测速）
     // 或 原生浏览器下载（无 Range——浏览器不会自己开并行，代理就是它唯一的并行来源）；
     // 带 Range 的请求（下载器自己拆好的分片连接）→ 单流 ECT 最优，并行度归下载器。
     let unmeasured = healthy
         .iter()
-        .any(|m| mirror_load(m).meas_prev.load(Ordering::Relaxed) == 0);
+        .any(|m| mirror_load(m).alloc_prev.load(Ordering::Relaxed) == 0);
     let all_idle = healthy
         .iter()
         .all(|m| mirror_load(m).in_flight_bytes.load(Ordering::Relaxed) == 0);
@@ -1017,7 +1007,8 @@ async fn split_download(
     let mut extra: Option<Vec<(http::HeaderName, http::HeaderValue)>> = None;
     let mut total = known_total;
     let mut seg_reported_total: Option<u64> = None;
-    let mut bodies: Vec<(u64, u64, Instant, BoxBody)> = Vec::with_capacity(segs.len());
+    let mut bodies: Vec<(u64, u64, Instant, BoxBody, String, u64)> =
+        Vec::with_capacity(segs.len());
     let mut dead = 0usize;
     let mut failed: Vec<(u64, u64)> = Vec::new();
     for (i, r) in results.into_iter().enumerate() {
@@ -1051,7 +1042,8 @@ async fn split_download(
                     m.to_string(),
                     log.clone(),
                 );
-                bodies.push((s - base, end, at, body));
+                let ramp = mirror_load(m).ramp_ms.load(Ordering::Relaxed);
+                bodies.push((s - base, end, at, body, m.to_string(), ramp));
             }
             Err(err) => {
                 dead += 1;
@@ -1063,7 +1055,15 @@ async fn split_download(
                 (log)(&format!(
                     "[切片] {host}{path} 段 [{s}..{e}) 失败({err}), 立刻补发"
                 ));
-                bodies.push((s - base, end, Instant::now(), protocol::empty_body()));
+                let ramp = mirror_load(m).ramp_ms.load(Ordering::Relaxed);
+                bodies.push((
+                    s - base,
+                    end,
+                    Instant::now(),
+                    protocol::empty_body(),
+                    m.to_string(),
+                    ramp,
+                ));
                 failed.push((s - base, end));
             }
         }
@@ -1148,8 +1148,8 @@ async fn split_fetch(
     tpl: &Tpl,
     info: &super::UpstreamInfo,
     replay: &Option<Bytes>,
-) -> Result<BoxBody, String> {
-    // 按 ECT（在途字节 ÷ 实测速度）挑最小者，不能挑"最空闲"——刚断流那家负载归零恰是最空闲，补回去就是原地打转。
+) -> Result<FilledSeg, String> {
+    // 按 ECT（排空毫秒 + 爬坡毫秒）挑最小者，不能挑"最空闲"——刚断流那家负载归零恰是最空闲，补回去就是原地打转。
     let mut cands: Vec<String> = chain
         .iter()
         .filter(|m| !m.starts_with("direct/"))
@@ -1161,7 +1161,7 @@ async fn split_fetch(
     if cands.is_empty() {
         return Err("无可用补发源".to_string());
     }
-    let m = cands[pick_mirror(&cands, to - from, false)].clone();
+    let m = cands[pick_mirror(&cands, to - from)].clone();
     let (s, e) = (base + from, base + to - 1);
     if m.starts_with("direct/") {
         let has_mirror = cands.len() > 1;
@@ -1229,7 +1229,7 @@ async fn finish_fill(
     host: &str,
     s: u64,
     log: &LogFn,
-) -> Result<BoxBody, String> {
+) -> Result<FilledSeg, String> {
     match got {
         Ok((guard, resp)) if resp.status() == http::StatusCode::PARTIAL_CONTENT => {
             merge::check_segment_start(
@@ -1240,13 +1240,18 @@ async fn finish_fill(
             )?;
             let at = Instant::now();
             let guard = guard.segment_from(at);
-            Ok(account_seg(
-                resp.into_body(),
-                guard,
-                format!("{host} 补发"),
-                m.to_string(),
-                log.clone(),
-            ))
+            let ramp = mirror_load(m).ramp_ms.load(Ordering::Relaxed);
+            Ok(FilledSeg {
+                body: account_seg(
+                    resp.into_body(),
+                    guard,
+                    format!("{host} 补发"),
+                    m.to_string(),
+                    log.clone(),
+                ),
+                owner: m.to_string(),
+                ramp,
+            })
         }
         Ok((_, resp)) => Err(format!(
             "{m} 补发回 {} 而非 206 (host {host})",
@@ -1256,9 +1261,16 @@ async fn finish_fill(
     }
 }
 
-/// 起流函数的返回：一条从 from 拉到 to 的流。
+/// 起流结果：一条从 from 拉到 to 的流，连同它来自哪家、那家爬坡毫秒（喂给段做切尾判据）。
+pub(super) struct FilledSeg {
+    pub(super) body: BoxBody,
+    pub(super) owner: String,
+    pub(super) ramp: u64,
+}
+
+/// 起流函数的返回：一条从 from 拉到 to 的流 + 来源/爬坡。
 pub(super) type FetchFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoxBody, String>> + Send + Sync>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<FilledSeg, String>> + Send + Sync>>;
 pub(super) type Fetch = Arc<dyn Fn(u64, u64) -> FetchFuture + Send + Sync>;
 
 /// 切片调度上下文：缺口、重分配尾巴都往这里要新流（直连腿与镜像腿共用驱动）。
@@ -1279,6 +1291,8 @@ enum Fetched {
         from: u64,
         to: u64,
         body: BoxBody,
+        owner: String,
+        ramp: u64,
     },
     /// ms = 这次起流本身花了多久（不含排队），用来分清"等排队"和"对方慢"。
     Err {
@@ -1298,13 +1312,19 @@ enum Wake {
 
 fn apply_fetched(mb: &mut MergeBody, ctx: &SplitCtx, msg: Fetched) {
     match msg {
-        Fetched::Ok { from, to, body } => {
+        Fetched::Ok {
+            from,
+            to,
+            body,
+            owner,
+            ramp,
+        } => {
             (ctx.log)(&format!(
                 "[切片] {} [{from}..{to}) 起新流 ({}KB)",
                 ctx.host,
                 (to - from) / 1024
             ));
-            mb.feed(from, to, Instant::now(), body);
+            mb.feed(from, to, Instant::now(), body, owner, ramp);
         }
         Fetched::Err { from, to, err, ms } => {
             (ctx.log)(&format!(
@@ -1356,7 +1376,13 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                                 match tokio::time::timeout(MIRROR_HEAD_TIMEOUT, fetch(from, to))
                                     .await
                                 {
-                                    Ok(Ok(body)) => Fetched::Ok { from, to, body },
+                                    Ok(Ok(FilledSeg { body, owner, ramp })) => Fetched::Ok {
+                                        from,
+                                        to,
+                                        body,
+                                        owner,
+                                        ramp,
+                                    },
                                     Ok(Err(e)) => Fetched::Err {
                                         from,
                                         to,
@@ -1385,8 +1411,9 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                         }
                         let moved = mb.rebalance(now);
                         if moved > 0 {
+                            let owner = mb.last_cut_owner.as_deref().unwrap_or("?");
                             (ctx.log)(&format!(
-                                "[切片] {} 重分配: 慢段切尾重派 ({}KB)",
+                                "[切片] {} 校准重分配: {owner} 剩余传完慢于爬坡, 整段让出重派 ({}KB)",
                                 ctx.host,
                                 moved / 1024
                             ));

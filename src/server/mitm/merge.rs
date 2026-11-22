@@ -8,14 +8,9 @@ use std::time::{Duration, Instant};
 
 /// 单段缓冲上限：快段先到先存，超过就暂时不读它，等交付线推进再读。
 pub(super) const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
-/// 重分配的下限：切尾重派自带 worker 首包延迟（0.2~1s 实测）与在途作废（h2 流控窗 ~64KB），
-/// 超额不足此值切一次净亏——宁可让慢源把它跑完。
-pub(super) const MIN_PIECE: u64 = 128 * 1024;
 /// 多久没收到字节算死。5s 忍得住 CDN 抖动，又不让死连接白占位置。
 pub(super) const STALL_MS: u64 = 5_000;
-/// 速率至少观察这么久才算样本，首包前的 0 不当慢。
-const RATE_WARMUP: Duration = Duration::from_millis(400);
-/// 重分配判据看近期速率：样本窗与 POLL_GAP 对齐（没在看的不算），历史慢启动/停顿不拖累当下判断。
+/// 重分配判据看近期速率：样本窗与 POLL_GAP 对齐（没在看的不算），历史停顿不拖累当下判断。
 const RECENT_WIN: Duration = Duration::from_millis(1_500);
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
@@ -110,8 +105,14 @@ struct Seg {
     buffered: usize,
     /// 已收到的字节数（含缓冲里还没交付的）。
     got: u64,
-    /// 起跑时刻（响应头到达），算速率用。
+    /// 速率起点（首帧到达时刻），算速率用；首帧前为 None。
+    first_at: Option<Instant>,
+    /// 首帧前的占位起点，仅用于 last_poll 初始化。
     begin: Instant,
+    /// 本段所属上游（切尾判据/日志用）。
+    owner: String,
+    /// 建段时快照的本家爬坡毫秒 EMA——切尾判据与它比。
+    ramp: u64,
     /// 最近一次被轮询的时刻。
     last_poll: Instant,
     /// 开始"推了没数据"的时刻；None = 有数据或没在看。
@@ -122,14 +123,14 @@ struct Seg {
     done: bool,
     /// 结束原因（仅 done 时有意义）。
     err: Option<std::io::Error>,
-    /// 收尾时冻结的均速：断了之后 begin 还在走，现算会一路衰减成假慢。
+    /// 收尾时冻结的均速：断了之后时钟还在走，现算会一路衰减成假慢。
     frozen_rate: Option<f64>,
-    /// 近期速率样本 (时刻, 已收字节)：重分配判据用滑窗，全片均速会被慢启动拖累。
+    /// 近期速率样本 (时刻, 已收字节)：重分配判据用滑窗。
     recent: VecDeque<(Instant, u64)>,
 }
 
 impl Seg {
-    fn new(start: u64, end: u64, at: Instant, body: BoxBody) -> Self {
+    fn new(start: u64, end: u64, at: Instant, body: BoxBody, owner: String, ramp: u64) -> Self {
         Seg {
             start,
             end,
@@ -137,7 +138,10 @@ impl Seg {
             buf: VecDeque::new(),
             buffered: 0,
             got: 0,
+            first_at: None,
             begin: at,
+            owner,
+            ramp,
             last_poll: at,
             stalled_since: None,
             cut: false,
@@ -153,7 +157,7 @@ impl Seg {
         self.start + self.got
     }
 
-    /// 收尾时把均速定格（begin 还在走，现算只会越来越"慢"）：优先取近期速率（最后 1.5s 实测），样本不足退回全片均速。
+    /// 收尾时把均速定格：优先取近期速率（最后 1.5s 实测），样本不足退回全片均速。
     fn freeze(&mut self, now: Instant) {
         if self.frozen_rate.is_none() {
             let r = self.recent_rate(now);
@@ -161,19 +165,28 @@ impl Seg {
         }
     }
 
-    /// 起跑至今的均速。样本不足时按 0 处理，不当成慢；收尾后返回冻结值。
+    /// 首帧到达：速率时钟从这一刻起算（爬坡不进分母——爬坡已单独计价），近期样本清空重开。
+    fn on_first_frame(&mut self, at: Instant) {
+        if self.first_at.is_none() {
+            self.first_at = Some(at);
+            self.begin = at;
+            self.recent.clear();
+        }
+    }
+
+    /// 首帧至今的均速。没首帧 = 没样本 → 0（不动刀）；收尾后返回冻结值。
     fn rate(&self, now: Instant) -> f64 {
         if let Some(r) = self.frozen_rate {
             return r;
         }
-        let el = now.saturating_duration_since(self.begin);
-        if el < RATE_WARMUP {
+        let Some(first) = self.first_at else {
             return 0.0;
-        }
+        };
+        let el = now.saturating_duration_since(first);
         self.got as f64 / el.as_secs_f64().max(0.001)
     }
 
-    /// 近期速率（最后 RECENT_WIN 的实测）：重分配判据用它，慢启动与历史停顿不进分母；样本不足 RATE_WARMUP 时退回全片均速——短段没有近期可言。
+    /// 近期速率（最后 RECENT_WIN 的实测）：重分配判据用它，历史停顿不进分母；没样本退回全片均速。
     fn recent_rate(&self, now: Instant) -> f64 {
         if let Some(r) = self.frozen_rate {
             return r;
@@ -182,9 +195,6 @@ impl Seg {
             return self.rate(now);
         };
         let el = now.saturating_duration_since(*t0);
-        if el < RATE_WARMUP {
-            return self.rate(now);
-        }
         let bytes = self.got.saturating_sub(*b0);
         bytes as f64 / el.as_secs_f64().max(0.001)
     }
@@ -207,18 +217,25 @@ pub(super) struct MergeBody {
     last_tick: Instant,
     /// 重分配开关：直连腿骑单通道，段间重分配无意义（所有段同一根水管），关掉。
     pub(super) allow_yield: bool,
+    /// 已经切过一次：校准期那轮重分配只做一次，之后所有派发交给 5ms ECT 市场。
+    rebalanced: bool,
+    /// 本轮切尾的段来自哪家（供上层日志显示）。
+    pub(super) last_cut_owner: Option<String>,
     finished: bool,
     /// 生命周期钩子：随 body 一起丢弃（切片计划里登记的在途区间靠它注销）。
     _guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl MergeBody {
-    /// segs: (start, end, 起跑时刻, 响应体)，必须连续覆盖 [0, total)。
-    pub(super) fn new(segs: Vec<(u64, u64, Instant, BoxBody)>, total: u64) -> Self {
+    /// segs: (start, end, 起跑时刻, 响应体, 所属上游, 本家爬坡毫秒)，必须连续覆盖 [0, total)。
+    pub(super) fn new(
+        segs: Vec<(u64, u64, Instant, BoxBody, String, u64)>,
+        total: u64,
+    ) -> Self {
         MergeBody {
             segs: segs
                 .into_iter()
-                .map(|(s, e, at, b)| (s, Seg::new(s, e, at, b)))
+                .map(|(s, e, at, b, owner, ramp)| (s, Seg::new(s, e, at, b, owner, ramp)))
                 .collect(),
             sent: 0,
             total,
@@ -227,6 +244,8 @@ impl MergeBody {
             dead_fills: 0,
             last_tick: Instant::now(),
             allow_yield: true,
+            rebalanced: false,
+            last_cut_owner: None,
             finished: false,
             _guard: None,
         }
@@ -280,10 +299,19 @@ impl MergeBody {
         self.queue_fill(from, to);
     }
 
-    /// 接管一条流：把 [start, end) 交给它。
-    pub(super) fn feed(&mut self, start: u64, end: u64, at: Instant, body: BoxBody) {
+    /// 接管一条流：把 [start, end) 交给它。owner/ramp 来自派发时挑中的那家。
+    pub(super) fn feed(
+        &mut self,
+        start: u64,
+        end: u64,
+        at: Instant,
+        body: BoxBody,
+        owner: String,
+        ramp: u64,
+    ) {
         self.inflight.remove(&(start, end));
-        self.segs.insert(start, Seg::new(start, end, at, body));
+        self.segs
+            .insert(start, Seg::new(start, end, at, body, owner, ramp));
     }
 
     pub(super) fn queue_fill(&mut self, from: u64, to: u64) {
@@ -328,6 +356,10 @@ impl MergeBody {
                     progressed = true;
                     // 非数据帧（trailer 等）直接丢，只关心正文。
                     if let Ok(d) = f.into_data() {
+                        // 首帧：速率时钟从这一刻起算（爬坡不进分母），近期样本清空重开。
+                        if seg.first_at.is_none() {
+                            seg.on_first_frame(now);
+                        }
                         let n = d.len() as u64;
                         seg.buffered += d.len();
                         seg.got += n;
@@ -391,20 +423,17 @@ impl MergeBody {
         any
     }
 
-    /// 速率比例重分配：测速完成后各段已有实测，剩余字节按速率摊派公平份额，
-    /// 超出份额且超额 ≥ MIN_PIECE 的段切尾排补发、由 ECT（分配窗）重派给快源；
-    /// drain 最小者份额天然最大、数学上自动保留。慢镜像名下只剩它实际下载的量。
-    /// 每拍（350ms，与测速窗同节奏）一次；切到份额后下一拍超额自然 < MIN_PIECE，无乒乓、无需冷却。
+    /// 校准期那一次重分配：只看每段自己——剩余字节按本段速率传完的时间，是否大于本家爬坡成本。
+    /// 大于说明"交给新流重新爬坡"比"留在慢源慢慢爬"划算 → 整段剩余让出，交给 5ms ECT 重新派。
+    /// 不看别的段（不摊公平份额、不比谁最快），一次切完即锁死；之后派发全交给 5ms 市场。
     pub(super) fn rebalance(&mut self, now: Instant) -> u64 {
-        if !self.allow_yield || !self.fill.is_empty() {
+        if !self.allow_yield || self.rebalanced || !self.fill.is_empty() {
             return 0;
         }
-        // 活段快照：(start, pos, remaining, rate)。没在看的（忙队首）与缓冲顶格的速率不可信，跳过。
-        let mut cands: Vec<(u64, u64, u64, f64)> = Vec::new();
-        let mut total_rate = 0.0;
-        let mut total_remaining = 0u64;
+        // 只收有首帧的活段：没首帧 = 没速率样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
+        let mut tails: Vec<(u64, u64, u64, String)> = Vec::new(); // (start, pos, old_end, owner)
         for s in self.segs.values() {
-            if s.done {
+            if s.done || s.first_at.is_none() {
                 continue;
             }
             if now.saturating_duration_since(s.last_poll) > POLL_GAP
@@ -417,48 +446,35 @@ impl MergeBody {
             if remaining == 0 {
                 continue;
             }
-            let r = s.recent_rate(now).max(0.0);
-            total_rate += r;
-            total_remaining += remaining;
-            cands.push((s.start, pos, remaining, r));
-        }
-        if cands.len() < 2 || total_rate <= 0.0 {
-            return 0;
-        }
-        // drain 最小者（剩余÷速率）保留：它的公平份额天然不小于其剩余，数学上切不动。
-        let mut best_i = 0usize;
-        let mut best_drain = f64::MAX;
-        for (i, c) in cands.iter().enumerate() {
-            let d = c.2 as f64 / c.3.max(1.0);
-            if d < best_drain {
-                best_drain = d;
-                best_i = i;
-            }
-        }
-        let mut tails: Vec<(u64, u64, u64)> = Vec::new();
-        for (i, (start, pos, remaining, rate)) in cands.iter().enumerate() {
-            if i == best_i {
+            let v = s.recent_rate(now);
+            if v <= 0.0 {
                 continue;
             }
-            let share = (total_remaining as f64 * rate / total_rate) as u64;
-            if *remaining > share + MIN_PIECE {
-                tails.push((*start, pos + share, pos + *remaining));
+            // 判据（唯一一条）：留着传完的毫秒 > 本家爬坡毫秒 → 切。
+            // recent_rate 是 B/s，remaining/v 得秒，×1000 换成毫秒再与 ramp 比。
+            if remaining as f64 / v * 1000.0 > s.ramp as f64 {
+                tails.push((s.start, pos, s.end, s.owner.clone()));
             }
         }
         let mut moved = 0u64;
-        for (start, cut_at, old_end) in tails {
-            if self.cut(start, cut_at).is_some() {
-                moved += old_end - cut_at;
+        for (start, pos, old_end, owner) in tails {
+            if self.cut(start, pos).is_some() {
+                moved += old_end - pos;
+                self.last_cut_owner = Some(owner);
             }
+        }
+        if moved > 0 {
+            self.rebalanced = true;
         }
         moved
     }
 
-    /// 把段边界缩到 cut：刀口外的字节继续下载纯属浪费，掐流；缓冲里已到的照常交付。
+    /// 整段让出：把边界缩到 pos，[pos, old_end) 全部排补发（缓冲里已到的字节照常交付）。
+    /// 允许 cut == pos（切走整段剩余）；掐流让上游停止白下载。
     fn cut(&mut self, start: u64, cut: u64) -> Option<(u64, u64)> {
         let seg = self.segs.get_mut(&start)?;
         let old_end = seg.end;
-        if cut <= seg.pos() || cut >= old_end {
+        if cut < seg.pos() || cut >= old_end {
             return None;
         }
         seg.end = cut;
