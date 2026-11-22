@@ -27,10 +27,11 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// ECT 时间槽：每这么久把「本窗实收字节」快照给派发器并清零重开，分数 = 债务 ÷ 上一窗字节。
-const ECT_WINDOW_MS: u64 = 500;
+/// ECT 时间槽：每这么久把「本窗实收字节」快照给派发器并清零重开，分数 = 债务毫秒 + 建立延迟毫秒。
+/// 80ms 而非 500ms：快源整段可能一个槽内下完，粗槽采样不出差异；80ms 空窗抖动会把在途源短暂清零垫底，恢复即回。
+const ECT_WINDOW_MS: u64 = 80;
 
-/// 每面镜像的记账：在途字节/流数、ECT 时间槽（本窗实收 + 上一窗快照）、失败降权窗。
+/// 每面镜像的记账：在途字节/流数、ECT 时间槽（本窗实收 + 上一窗快照）、失败降权窗、建连首包 ttfb。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
@@ -41,6 +42,8 @@ pub(super) struct MirrorLoad {
     pub(super) window_prev: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
+    /// 请求→响应头毫秒的 EMA(α=1/4)：镜像腿的建连+首包估计。直连腿不写恒 0——池通道复用零建连。
+    pub(super) ttfb_ms: AtomicU64,
 }
 
 static MIRROR_LOAD: LazyLock<Mutex<HashMap<String, Arc<MirrorLoad>>>> =
@@ -83,6 +86,15 @@ pub(super) fn direct_load_key(chain_host: &str) -> String {
     format!("direct/{chain_host}")
 }
 
+/// 镜像腿实测"请求→响应头"毫秒入账（EMA α=1/4）：首次直入，之后缓慢跟随，单次冷拨尖峰不长期带偏。
+/// 只有镜像腿写；直连键恒 0 = 池通道复用零建连，ECT 不罚。
+pub(super) fn note_ttfb(mirror: &str, ms: u64) {
+    let ld = mirror_load(mirror);
+    let old = ld.ttfb_ms.load(Ordering::Relaxed);
+    let ema = if old == 0 { ms } else { old * 3 / 4 + ms / 4 };
+    ld.ttfb_ms.store(ema, Ordering::Relaxed);
+}
+
 /// ECT 时间槽结算：本窗实收快照进 `window_prev` 后清零；零收有债=卡死清零，无债=空闲沿用。
 fn ect_sweep() {
     let g = crate::util::lock(&MIRROR_LOAD);
@@ -96,7 +108,7 @@ fn ect_sweep() {
     }
 }
 
-/// 启动 ECT 时间槽定时器：独立线程 500ms 一拍，零锁争用（快照只碰各镜像自己的原子量）。
+/// 启动 ECT 时间槽定时器：独立线程按 ECT_WINDOW_MS 一拍，零锁争用（快照只碰各镜像自己的原子量）。
 pub(crate) fn start_ect_ticker() {
     crate::logger::spawn("ect-tick", || loop {
         std::thread::sleep(Duration::from_millis(ECT_WINDOW_MS));
@@ -190,7 +202,7 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 派发：score=(在途+新增)÷上一窗实收，即还需几个时间槽；最小者胜、无容差。
+/// ECT 派发：score=(在途+新增)×窗口ms÷上一窗实收 + ttfb(镜像实测EMA，直连恒0)，真毫秒；最小者胜、无容差。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
@@ -203,8 +215,9 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
         ld.in_flight_bytes
             .load(Ordering::Relaxed)
             .saturating_add(new_bytes)
-            * 1024
+            * ECT_WINDOW_MS
             / w
+            + ld.ttfb_ms.load(Ordering::Relaxed)
     };
 
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {
@@ -976,11 +989,13 @@ async fn split_download(
             Some(t) => (0, t, Some(t)),
             None => {
                 // 探测候选按 ECT 择优、不按链序——整包单流时链头盲选会把大下载砸在慢镜像上；冷启动全零则退化回链序。
+                // 探片是 1 字节请求，排水≈0，ttfb(建连+首包)主导排序——公式与 ect_of 同款。
                 let mut probe_cands: Vec<&str> = healthy.clone();
                 probe_cands.sort_by_key(|m| {
                     let ld = mirror_load(m);
-                    ld.in_flight_bytes.load(Ordering::Relaxed) * 1024
+                    ld.in_flight_bytes.load(Ordering::Relaxed) * ECT_WINDOW_MS
                         / ld.window_prev.load(Ordering::Relaxed).max(1)
+                        + ld.ttfb_ms.load(Ordering::Relaxed)
                 });
                 probe_cands.truncate(2);
                 match probe_total(log, out, &probe_cands, orig_url, host, info, replay, &tpl).await
@@ -1713,12 +1728,14 @@ async fn mirror_do_inner(
 ) -> Result<hyper::Response<BoxBody>, String> {
     let had_range = req.headers().get("range").is_some();
     let client = upstream::mirror_client(log);
+    let t0 = Instant::now();
     let timed = tokio::time::timeout(MIRROR_HEAD_TIMEOUT, client.request(req));
     let resp = match timed.await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return Err(e.to_string()),
         Err(_) => return Err("镜像响应头预算超时".to_string()),
     };
+    note_ttfb(mirror, t0.elapsed().as_millis() as u64);
     let ct = resp
         .headers()
         .get("content-type")

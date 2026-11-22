@@ -361,6 +361,67 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     b.window_prev.store(0, Ordering::Relaxed);
 }
 
+/// ECT 加建连首包项：镜像快 8 倍但 ttfb 600ms，52KB 小件直连（复用零建连）反超；16MB 大件排水主导仍是快镜像赢。
+/// 旧纯速率公式下小件也选快镜像——此断言在旧代码必挂。
+#[test]
+fn ect_ttfb_flips_small_pieces_to_warm_source() {
+    let fast = mirror_load("ect-fast.test");
+    fast.window_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
+    fast.ttfb_ms.store(600, Ordering::Relaxed);
+    let direct = mirror_load(&direct_load_key("ect-d.test"));
+    direct.window_prev.store(1024 * 1024, Ordering::Relaxed);
+    let chain = vec!["ect-fast.test".to_string(), direct_load_key("ect-d.test")];
+    assert_eq!(
+        pick_mirror(&chain, 52 * 1024),
+        1,
+        "小件排水≈0, ttfb 主导: 直连(恒0)胜快镜像(600ms)"
+    );
+    assert_eq!(
+        pick_mirror(&chain, 16 * 1024 * 1024),
+        0,
+        "大件排水主导(160ms vs 1280ms): 快镜像仍胜"
+    );
+    fast.window_prev.store(0, Ordering::Relaxed);
+    fast.ttfb_ms.store(0, Ordering::Relaxed);
+    direct.window_prev.store(0, Ordering::Relaxed);
+}
+
+/// 80ms 窗口的钉子：15MB 件、镜像仅快 25% 且 ttfb 600ms——W=80 时直连胜，回退 W=500 则镜像赢。
+#[test]
+fn ect_window_80ms_pins_ttfb_balance() {
+    let m = mirror_load("ect-m.test");
+    m.window_prev.store(1280 * 1024, Ordering::Relaxed);
+    m.ttfb_ms.store(600, Ordering::Relaxed);
+    let direct = mirror_load(&direct_load_key("ect-w.test"));
+    direct.window_prev.store(1024 * 1024, Ordering::Relaxed);
+    let chain = vec!["ect-m.test".to_string(), direct_load_key("ect-w.test")];
+    assert_eq!(
+        pick_mirror(&chain, 15 * 1024 * 1024),
+        1,
+        "W=80: 直连 1200ms < 镜像 960+600ms"
+    );
+    m.window_prev.store(0, Ordering::Relaxed);
+    m.ttfb_ms.store(0, Ordering::Relaxed);
+    direct.window_prev.store(0, Ordering::Relaxed);
+}
+
+/// ttfb 入账语义：首样直入，之后 EMA α=1/4 平滑；直连键永不入账恒 0。
+#[test]
+fn ttfb_note_ema_and_direct_free() {
+    let m = mirror_load("https://ema.test");
+    note_ttfb("https://ema.test", 800);
+    assert_eq!(m.ttfb_ms.load(Ordering::Relaxed), 800, "首样直入");
+    note_ttfb("https://ema.test", 200);
+    assert_eq!(
+        m.ttfb_ms.load(Ordering::Relaxed),
+        650,
+        "EMA 800×3/4 + 200×1/4 = 650"
+    );
+    let d = mirror_load(&direct_load_key("ema.test"));
+    assert_eq!(d.ttfb_ms.load(Ordering::Relaxed), 0, "直连腿不入账恒 0");
+    m.ttfb_ms.store(0, Ordering::Relaxed);
+}
+
 /// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
 #[test]
 fn cold_start_falls_back_to_chain_order() {
