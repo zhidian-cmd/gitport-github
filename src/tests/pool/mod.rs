@@ -244,8 +244,7 @@ fn encode_routes_roundtrip() {
             "https://v4.gh-proxy.org".to_string(),
         ],
     );
-    latency::install(HashMap::new());
-    latency::seed("1.2.3.4", 111);
+    route::note_latency("1.2.3.4", 111);
     let big = vec![
         "https://big-a.example".to_string(),
         "https://big-b.example".to_string(),
@@ -266,18 +265,24 @@ fn encode_routes_roundtrip() {
     assert!(b.contains("\"mirrors_small\""), "镜像链板块应落盘: {b}");
     assert!(!b.contains("\"pac\""), "pac 不再落盘: {b}");
     assert!(
-        b.contains("\"latency\": {\"1.2.3.4\": 111}"),
-        "测速值应挂在节点条目里: {b}"
+        b.contains("\"latency\": 111"),
+        "测速值应以标量挂在节点条目里: {b}"
     );
     let (doc, _) = parse_routes_tolerant(&b, None).expect("编码结果应可解析");
     assert_eq!(doc.big, big, "大文件单链落盘后必须能逐项回读");
-    assert_eq!(doc.latency.get("1.2.3.4"), Some(&111), "测速值应可回读");
+    assert_eq!(
+        doc.ips
+            .iter()
+            .find(|s| s.ip == "1.2.3.4")
+            .and_then(|s| s.latency),
+        Some(111),
+        "测速值应可回读"
+    );
     let _row = route::RouteRow::new(
         serde_json::from_str::<route::HostSpec>(r#"{"key":"github.com"}"#).unwrap(),
     )
     .unwrap();
     // “pac 缺省 = 裸键”的派生行为由 pac_lists_split_direct_and_proxy 钉着。
-    latency::install(HashMap::new());
     let back: serde_json::Value = serde_json::from_str(&b).unwrap();
     let hosts = back["hosts"].as_object().expect("hosts 应是对象(域名作键)");
     assert_eq!(
@@ -889,7 +894,15 @@ fn seeds_are_new_routes_format() {
         .collect();
     assert!(!github_nodes.is_empty(), "主站种子 IP 不能为空");
     for spec in &seeds.ips {
-        route::expand_ip(&spec.ip).expect("种子每条 ip 都必须能展开");
+        assert!(
+            spec.ip.split('.').count() == 4
+                && spec
+                    .ip
+                    .split('.')
+                    .all(|s| s.parse::<u32>().map(|v| v <= 255).unwrap_or(false)),
+            "种子每条 ip 都必须是单个点分地址: {}",
+            spec.ip
+        );
     }
     for spec in &seeds.hosts {
         route::RouteRow::new(spec.clone()).expect("种子每行都必须能编译");
@@ -900,20 +913,21 @@ fn seeds_are_new_routes_format() {
 #[test]
 fn dial_order_cursor_first_then_latency_asc() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mk = |ip: &str| route::NodeIp {
+    let mk = |ip: &str, latency: u64| route::NodeIp {
         ip: ip.into(),
         sni: String::new(),
         verify: String::new(),
+        latency,
     };
-    let circle = vec![mk("1.1.1.1"), mk("2.2.2.2"), mk("3.3.3.3"), mk("4.4.4.4")];
-    latency::install(HashMap::new());
-    latency::seed("2.2.2.2", 300);
-    latency::seed("3.3.3.3", 200);
-    latency::seed("4.4.4.4", 100);
+    let circle = vec![
+        mk("1.1.1.1", 0),
+        mk("2.2.2.2", 300),
+        mk("3.3.3.3", 200),
+        mk("4.4.4.4", 100),
+    ];
     assert_eq!(dial_order(&circle, Some("1.1.1.1")), vec![0, 3, 2, 1]);
     assert_eq!(dial_order(&circle, None), vec![3, 2, 1, 0]);
     assert_eq!(dial_order(&circle, Some("3.3.3.3")), vec![2, 3, 1, 0]);
-    latency::install(HashMap::new());
 }
 
 /// 种子/运行表一 IP 一节点；codeload 单独成行，只挂实测能出 zip 的 IP。
@@ -986,7 +1000,6 @@ fn media_rescue_chains_roundtrip_and_align_skip() {
 
     // 落盘回写：手改的媒体链不能因 encode 丢掉。
     install_seed_routes();
-    latency::install(HashMap::new());
     let mut mirrors = HashMap::new();
     mirrors.insert(
         crate::pool::MEDIA_IMAGE_CHAIN.to_string(),

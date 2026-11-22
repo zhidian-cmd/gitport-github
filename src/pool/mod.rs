@@ -1,7 +1,6 @@
-//! 拨号与连接池：二部图（ips × hosts）唯一权威；内容域竞速取最速一条，会话/低频域串发（游标驻留、失败前移），取用统一走 get_or_build。
+﻿//! 拨号与连接池：二部图（ips × hosts）唯一权威；内容域竞速取最速一条，会话/低频域串发（游标驻留、失败前移），取用统一走 get_or_build。
 pub mod dial;
 pub mod edges;
-pub mod latency;
 pub mod route;
 pub mod speed;
 
@@ -9,6 +8,7 @@ use crate::util::{lock, LogFn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,13 +69,12 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 路由表文档：v2 给 ips+hosts；latency = 测速键值。
+/// 路由表文档：v2 给 ips+hosts（测速值在 ips 节点条目内）。
 #[derive(Default)]
 struct TopoDoc {
     hosts: Vec<route::HostSpec>,
     ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
-    latency: HashMap<String, u64>,
     /// 大文件域单链（所有 big host 共用一条，不再每 host 一条）。
     big: Vec<String>,
 }
@@ -219,15 +218,14 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     doc.chains = small;
-    // 测速键：顶层旧布局（{ip: ms}）先读，节点条目内的同键覆盖（新布局）。
-    if let Some(v) = obj.get("latency") {
-        if let Ok(m) = serde_json::from_value::<HashMap<String, u64>>(v.clone()) {
-            doc.latency = m;
-        }
-    }
-    for spec in &doc.ips {
-        for (ip, ms) in &spec.latency {
-            doc.latency.insert(ip.clone(), *ms);
+    // 测速值兼容：旧布局顶层 {ip: ms} 与节点条目内映射都已收编为节点标量（IpSpec.latency 反序列化处理），
+    // 这里只补顶层旧键 → 对应节点标量的一次迁移；新布局直接带节点标量。
+    if let Some(serde_json::Value::Object(map)) = obj.get("latency") {
+        for spec in &mut doc.ips {
+            let ip = spec.ip.trim().to_string();
+            if let Some(v) = map.get(&ip).and_then(|x| x.as_u64()) {
+                spec.latency = Some(v);
+            }
         }
     }
     Some((doc, salvaged))
@@ -237,8 +235,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
 fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // 测速值跟着节点走：只写该节点展开出的 IP，range 节点各 IP 各记各的。
-    let lat = latency::snapshot_all();
+    // 测速值跟着节点走：单 IP 节点一个标量，未测(0)不写。
     let snapshot = route::nodes_snapshot();
     let nodes: Vec<String> = snapshot
         .iter()
@@ -250,13 +247,9 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> Stri
                 format!("\"verify\": {}", json_of(&n.verify)),
                 format!("\"hosts\": [{}]", hosts.join(", ")),
             ];
-            let lat_rows: Vec<String> = n
-                .ips
-                .iter()
-                .filter_map(|ip| lat.get(ip).map(|ms| format!("{}: {}", json_of(ip), ms)))
-                .collect();
-            if !lat_rows.is_empty() {
-                fields.push(format!("\"latency\": {{{}}}", lat_rows.join(", ")));
+            let ms = n.latency.load(Ordering::Relaxed);
+            if ms > 0 {
+                fields.push(format!("\"latency\": {}", ms));
             }
             format!("    {{\n      {}\n    }}", fields.join(",\n      "))
         })
@@ -412,11 +405,9 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             hosts: seeds.hosts.clone(),
             ips: seeds.ips.clone(),
             chains: seeds.chains.clone(),
-            latency: HashMap::new(),
             big: Vec::new(),
         },
     };
-    latency::install(std::mem::take(&mut doc.latency));
     topup_from_seeds(&mut doc, &seeds, log.as_ref());
     fill_hosts_from_nodes(&mut doc);
 
@@ -543,11 +534,18 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     }
 }
 
-/// IpSpec → 运行时节点：末段范围展开 + 边界校验。
+/// IpSpec → 运行时节点：单 IP 节点（范围写法已下线），latency 跟节点走。
 fn build_node(spec: route::IpSpec) -> Result<route::IpNode, String> {
-    let ips = route::expand_ip(&spec.ip)?;
-    if ips.is_empty() {
-        return Err("ip 展开为空".to_string());
+    let ip = spec.ip.trim().to_string();
+    let segs: Vec<&str> = ip.split('.').collect();
+    let ok = segs.len() == 4
+        && segs
+            .iter()
+            .all(|s| s.parse::<u32>().map(|v| v <= 255).unwrap_or(false));
+    if !ok {
+        return Err(format!(
+            "ip {ip:?} 应为单个点分地址(每段 0~255, 范围写法已下线)"
+        ));
     }
     let mut hosts = spec.hosts;
     hosts.retain(|k| !k.trim().is_empty());
@@ -559,11 +557,12 @@ fn build_node(spec: route::IpSpec) -> Result<route::IpNode, String> {
         return Err("hosts 为空(节点不服务任何路由键)".to_string());
     }
     Ok(route::IpNode {
-        raw: spec.ip,
-        ips,
+        raw: ip.clone(),
+        ips: vec![ip],
         sni: spec.sni.trim().to_string(),
         verify: spec.verify.trim().to_string(),
         hosts,
+        latency: AtomicU64::new(spec.latency.unwrap_or(0)),
     })
 }
 
@@ -617,16 +616,12 @@ fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
         if doc.ips.len() >= SERIAL_MAX_IPS {
             break;
         }
-        let seed_ips = match route::expand_ip(&seed_node.ip) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // 按"展开 IP 集合有交集"找现有节点；找不到且 hosts 行存在 → 新建节点。
-        let hit = doc.ips.iter_mut().find(|n| {
-            route::expand_ip(&n.ip)
-                .map(|v| v.iter().any(|ip| seed_ips.contains(ip)))
-                .unwrap_or(false)
-        });
+        let seed_ip = seed_node.ip.trim().to_string();
+        // 按"同地址"找现有节点；找不到且 hosts 行存在 → 新建节点。
+        let hit = doc
+            .ips
+            .iter_mut()
+            .find(|n| n.ip.trim() == seed_ip);
         match hit {
             Some(n) => {
                 // 同节点：补缺 IP 与缺边。
@@ -694,7 +689,10 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool) {
 /// 尝试顺序：游标 IP 优先，其余按实测延迟升序、未测垫底保持表序；内容域竞速不看此序。
 fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..circle.len()).collect();
-    order.sort_by_key(|&i| (latency::get(&circle[i].ip).unwrap_or(u64::MAX), i));
+    order.sort_by_key(|&i| {
+        let l = circle[i].latency;
+        (if l == 0 { u64::MAX } else { l }, i)
+    });
     // 游标置顶。
     if let Some(ip) = start_ip {
         if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
@@ -1119,7 +1117,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, log: &LogFn) {
         chan::HostClass::Session => {
             chan::cull_channel(ip);
             cursor_note(host, ip, false); // 游标挪到下一候选，别死磕黑 IP
-            latency::sink(ip); // 拨号排序同步降权，不然游标挪了排序还把它排第一
+            route::sink_latency(ip); // 拨号排序同步降权，不然游标挪了排序还把它排第一
             (log)(&format!(
                 "[黑洞] {host} 会话通道 {ip} 弃用, 游标挪动并预建替代通道"
             ));
@@ -1220,7 +1218,7 @@ pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), Stri
             let t0 = Instant::now();
             match dial::dial_one(&node.ip, &node.sni, &node.verify, false).await {
                 Ok(conn) => {
-                    latency::note(&node.ip, t0.elapsed().as_millis() as u64);
+                    route::note_latency(&node.ip, t0.elapsed().as_millis() as u64);
                     let _ = tx2.send(Ok((conn, node.ip.clone()))).await;
                 }
                 Err(e) => {
@@ -1297,7 +1295,7 @@ async fn overflow_build(
     let conn = dial::dial_one(&node.ip, &node.sni, &node.verify, true).await.ok()?;
     match chan::h2_from_dialed(host, conn, &node.ip, log).await {
         Ok(mut up) => {
-            latency::note(&node.ip, t0.elapsed().as_millis() as u64);
+            route::note_latency(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
             (log)(&format!("[溢出] {host} 零通道 IP 补建: {}", node.ip));
             Some(chan::store_h2(&node.ip, up))

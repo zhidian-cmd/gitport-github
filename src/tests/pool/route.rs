@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 
 /// 造一行：key 是域名，body 是开关位（可为空对象）。
 fn row(key: &str, body: &str) -> RouteRow {
@@ -294,24 +294,38 @@ fn mirror_chain_host_dedicated() {
     assert_eq!(mirror_chain_host("github.com", "/o/r"), "github.com");
 }
 
-/// 末段范围展开：单段范围、多段笛卡尔积、越界拒绝。
+/// 拨号实测回流：EMA 防抖（首样直入，之后均值）；黑洞降权翻倍且钳 3~10s；表外 IP no-op。
 #[test]
-fn expand_ip_ranges() {
-    assert_eq!(
-        expand_ip("140.82.112-114.5-6").expect("应展开"),
-        vec![
-            "140.82.112.5",
-            "140.82.112.6",
-            "140.82.113.5",
-            "140.82.113.6",
-            "140.82.114.5",
-            "140.82.114.6"
-        ]
+fn latency_note_and_sink_semantics() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    install(
+        vec![],
+        vec![crate::pool::build_node(
+            serde_json::from_str::<IpSpec>(
+                r#"{"ip":"9.9.9.9","hosts":["github.com"]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()],
     );
-    assert_eq!(expand_ip("1.2.3.4").expect("单 IP 原样"), vec!["1.2.3.4"]);
-    assert!(expand_ip("1.2.3.9-7").is_err(), "起点大于终点");
-    assert!(expand_ip("1.2.3.0-999").is_err(), "超 255");
-    assert!(expand_ip("1.2.3-9.0-255.0-255").is_err(), "展开超 64");
+    note_latency("9.9.9.9", 800);
+    note_latency("9.9.9.9", 200);
+    assert_eq!(latency_of("9.9.9.9"), 500, "(800+200)/2");
+    sink_latency("9.9.9.9");
+    assert_eq!(latency_of("9.9.9.9"), 3000, "沉到已测队尾: 3s 下限");
+    sink_latency("8.8.8.8");
+    assert_eq!(latency_of("8.8.8.8"), 0, "表外 IP no-op 不炸");
+    install(vec![], vec![]); // 清场
+}
+
+/// build_node：范围/非法写法拒绝（单 IP 格式已下线多地址）。
+#[test]
+fn build_node_rejects_non_single_ip() {
+    let spec = |ip: &str| serde_json::from_str::<IpSpec>(&format!(r#"{{"ip":"{ip}","hosts":["github.com"]}}"#)).unwrap();
+    assert!(crate::pool::build_node(spec("1.2.3.4")).is_ok(), "单点分地址应通过");
+    assert!(crate::pool::build_node(spec("1.2.3.9-7")).is_err(), "范围段拒绝");
+    assert!(crate::pool::build_node(spec("1.2.3.0-999")).is_err(), "超 255 拒绝");
+    assert!(crate::pool::build_node(spec("999.1.1.1")).is_err(), "段越界拒绝");
 }
 
 /// dial_targets：按路由键汇边、去重、滤黑边。

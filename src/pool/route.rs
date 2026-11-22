@@ -4,6 +4,7 @@ use super::edges;
 use crate::util::lock;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// host 侧开关位；全部来自 routes.json 的 hosts 块。
@@ -61,21 +62,54 @@ pub struct IpSpec {
     /// 本节点服务的路由键列表。
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// 测速值（`{具体 IP: 毫秒}`）：跟着节点条目走，range 节点每个展开 IP 各记各的。
-    #[serde(default)]
-    pub latency: HashMap<String, u64>,
+    /// 拨号实测毫秒（0 = 未测）。旧文件曾用 `{具体 IP: 毫秒}` 映射，单 IP 节点收编为标量；
+    /// 兼容两种读取，写盘统一标量。
+    #[serde(default, deserialize_with = "deserialize_latency")]
+    pub latency: Option<u64>,
 }
 
-/// 展开后的运行时节点：具体 IP 组 + 伪装身份。
-#[derive(Clone, Debug)]
+/// 旧布局兼容：节点条目里的 latency 曾是 `{具体 IP: 毫秒}` 映射（range 时代每个展开 IP 各记各的）。
+/// 单 IP 节点恰有一条 → 收编为标量；多条（旧范围节点）无法对应，放弃让拨号重测。
+fn deserialize_latency<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => Ok(n.as_u64()),
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            Ok(map.values().next().and_then(|x| x.as_u64()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// 运行时节点：单个具体 IP + 伪装身份。
+#[derive(Debug)]
 pub struct IpNode {
-    /// 原始 ip 表达式（含段展开写法），落盘回写用。
+    /// 原始 ip 表达式，落盘回写用。
     pub raw: String,
     pub ips: Vec<String>,
     pub sni: String,
     pub verify: String,
     /// 服务的路由键。
     pub hosts: Vec<String>,
+    /// 拨号实测毫秒：拨号事件回流更新（原子量，拓扑在 Arc 下共享）。
+    pub latency: AtomicU64,
+}
+
+impl Clone for IpNode {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+            ips: self.ips.clone(),
+            sni: self.sni.clone(),
+            verify: self.verify.clone(),
+            hosts: self.hosts.clone(),
+            latency: AtomicU64::new(self.latency.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// 拨号候选：一个具体 IP 的完整伪装身份。
@@ -84,6 +118,8 @@ pub struct NodeIp {
     pub ip: String,
     pub sni: String,
     pub verify: String,
+    /// 拨号实测毫秒（0 = 未测）：串发排序用。
+    pub latency: u64,
 }
 
 /// host 侧路由行；裸键含自身+子域，`*.` 仅子域，最长键胜。
@@ -163,48 +199,6 @@ impl RouteRow {
         }
         !self.sub_only && host_lower == self.bare
     }
-}
-
-/// 单段 `a-b` 数字范围展开；非范围段原样返回单项。
-fn expand_seg(seg: &str, key: &str) -> Result<Vec<String>, String> {
-    if let Some((a, b)) = seg.split_once('-') {
-        let a: u32 = a
-            .parse()
-            .map_err(|_| format!("ip {key:?} 段 {seg:?} 起点不是数字"))?;
-        let b: u32 = b
-            .parse()
-            .map_err(|_| format!("ip {key:?} 段 {seg:?} 终点不是数字"))?;
-        if a > b || b > 255 {
-            return Err(format!("ip {key:?} 段 {seg:?} 越界(要求 0≤a≤b≤255)"));
-        }
-        return Ok((a..=b).map(|n| n.to_string()).collect());
-    }
-    Ok(vec![seg.to_string()])
-}
-
-/// 末段范围展开：`140.82.112-114.5-6` → 6 个 IP；多段范围做笛卡尔积，上限 64。
-pub fn expand_ip(spec: &str) -> Result<Vec<String>, String> {
-    let spec = spec.trim();
-    // 每段先各自展开成选项，再逐段拼前缀（笛卡尔积）。
-    let mut prefixes: Vec<String> = vec![String::new()];
-    for seg in spec.split('.') {
-        let outs = expand_seg(seg, spec)?;
-        let mut next: Vec<String> = Vec::with_capacity(prefixes.len() * outs.len());
-        for prefix in &prefixes {
-            for o in &outs {
-                next.push(if prefix.is_empty() {
-                    o.clone()
-                } else {
-                    format!("{prefix}.{o}")
-                });
-            }
-        }
-        prefixes = next;
-        if prefixes.len() > 64 {
-            return Err(format!("ip {spec:?} 展开超过 64 个"));
-        }
-    }
-    Ok(prefixes)
 }
 
 /// 表 + 反向索引一体：Arc 持有，脱离锁安全读（不出本模块，pub 字段供同模块方法用）。
@@ -313,10 +307,62 @@ pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
                 } else {
                     node.verify.clone()
                 },
+                latency: node.latency.load(Ordering::Relaxed),
             });
         }
     }
     Some(out)
+}
+
+/// 按具体 IP 找节点（单 IP 节点：ips 恰含它）。
+fn node_index_by_ip(topo: &Topology, ip: &str) -> Option<usize> {
+    topo.nodes
+        .iter()
+        .position(|n| n.ips.first().is_some_and(|a| a == ip))
+}
+
+/// 拨号实测回流：与旧值取均值防 GFW 抖动一刀切；未测直入。
+pub fn note_latency(ip: &str, ms: u64) {
+    let topo = match lock(&TABLE).as_ref() {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let Some(i) = node_index_by_ip(&topo, ip) else {
+        return;
+    };
+    let node = &topo.nodes[i];
+    let old = node.latency.load(Ordering::Relaxed);
+    let v = if old == 0 { ms } else { (old + ms) / 2 };
+    node.latency.store(v, Ordering::Relaxed);
+}
+
+/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选，60s 内随正常样本稀释恢复。
+pub fn sink_latency(ip: &str) {
+    let topo = match lock(&TABLE).as_ref() {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let Some(i) = node_index_by_ip(&topo, ip) else {
+        return;
+    };
+    let node = &topo.nodes[i];
+    let old = node.latency.load(Ordering::Relaxed);
+    let v = match old {
+        0 => 3000,
+        o => (o * 2).clamp(3000, 10000),
+    };
+    node.latency.store(v, Ordering::Relaxed);
+}
+
+/// 该 IP 的实测拨号毫秒；未测 = 0。
+pub(crate) fn latency_of(ip: &str) -> u64 {
+    let topo = match lock(&TABLE).as_ref() {
+        Some(t) => t.clone(),
+        None => return 0,
+    };
+    node_index_by_ip(&topo, ip)
+        .map(|i| topo.nodes[i].latency.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 /// 受管（会进代理）的域名？direct 行不算。

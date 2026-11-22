@@ -1,4 +1,4 @@
-# 技术文档
+﻿# 技术文档
 
 面向要读这份代码的人：先看结构，再看数据流，最后看每张文件表。术语先查 [GLOSSARY.md](GLOSSARY.md)（每个机制词的大白话 + 全部边界数字与代码常量对齐）。
 
@@ -43,7 +43,7 @@ flowchart LR
         EDGES[pool/edges.rs]
         POOL[pool/mod.rs]
         DIAL[pool/dial.rs]
-        LAT[pool/latency.rs]
+        LAT[route.rs 内拨号延迟(节点字段)]
         SPD[pool/speed.rs]
     end
     subgraph 其他
@@ -326,7 +326,7 @@ gitport-github/
    │   ├─ edges.rs         边状态机：(ip,键) 冷却
    │   ├─ mod.rs           取通道入口 get_or_build、串发/竞速、死亡退避、种子表
    │   ├─ dial.rs          TCP/TLS 握手执行器（boring：Chrome 指纹、SNI 与校验名解耦）
-   │   ├─ latency.rs       建连延迟表（实测回流，落 routes.json）
+
    │   ├─ speed.rs         通道暂缓与换血账本（60s 复验、60s 重建冷却）
    │   └─ seeds.json       内嵌最小路由表（只做首启引导与补边）
    ├─ server/

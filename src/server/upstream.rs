@@ -1,4 +1,4 @@
-//! 上游 HTTP 客户端：直连腿 = boring 自管 h2（fresh 语义），镜像腿 = 标准 TLS + h1 共享池；记账/挑选/开流全在此，取用统一走 pool::get_or_build。
+﻿//! 上游 HTTP 客户端：直连腿 = boring 自管 h2（fresh 语义），镜像腿 = 标准 TLS + h1 共享池；记账/挑选/开流全在此，取用统一走 pool::get_or_build。
 use super::protocol::{empty_body, BoxBody};
 use crate::pool::{self, dial::Dialed};
 use crate::util::{lock, now_ms, LogFn};
@@ -462,7 +462,7 @@ pub(crate) async fn h2_dial(
     .map_err(|e| e.to_string())?;
     let dial_ms = t_dial.elapsed().as_millis();
     // 实测建连用时进排序表（内存态），慢 IP 沉底；撞 GFW 抖动时游标挪窝，别让上次成功黏住一页请求。
-    pool::latency::note(&ip, dial_ms as u64);
+    pool::route::note_latency(&ip, dial_ms as u64);
     if dial_ms as u64 >= DIAL_SLOW_MS {
         pool::cursor_note(host, &ip, false);
     }
@@ -549,7 +549,7 @@ async fn race_build(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
                 }
             };
             let dial_ms = t0.elapsed().as_millis() as u64;
-            pool::latency::note(&node.ip, dial_ms);
+            pool::route::note_latency(&node.ip, dial_ms);
             let up = match h2_from_dialed(&host2, conn, &node.ip, &log2).await {
                 Ok(u) => u,
                 Err(e) => {
@@ -597,7 +597,7 @@ async fn race_build(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
             continue;
         }
         if let Some(up) = pooled_normal(ip) {
-            let ms = pool::latency::get(ip).unwrap_or(u64::MAX);
+            let ms = { let v = pool::route::latency_of(ip); if v == 0 { u64::MAX } else { v } };
             got.push(RaceLeg {
                 ip: ip.clone(),
                 dial_ms: ms,
