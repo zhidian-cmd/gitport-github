@@ -910,16 +910,13 @@ async fn split_download(
             // 总长记忆命中：省掉探测往返（探测本身是真实请求，结果只记 10 分钟）。
             Some(t) => (0, t, Some(t)),
             None => {
-                // 探测候选按 ECT 择优、不按链序——整包单流时链头盲选会把大下载砸在慢镜像上；冷启动全零则退化回链序。
-                // 探片是 1 字节请求，排水≈0，ttfb(建连+首包)主导排序——公式与 ect_of 同款（分配窗新鲜度）。
-                let mut probe_cands: Vec<&str> = healthy.clone();
-                probe_cands.sort_by_key(|m| {
-                    let ld = mirror_load(m);
-                    ld.in_flight_bytes.load(Ordering::Relaxed) * ALLOC_WINDOW_MS
-                        / ld.alloc_prev.load(Ordering::Relaxed).max(1)
-                        + ld.ttfb_ms.load(Ordering::Relaxed)
-                });
-                probe_cands.truncate(2);
+                // 探测顺序与降级同构 = 串发：直连先试，再按镜像链序逐家；
+                // 第一家给出 Content-Range 总长的即用，全败回单流。
+                let mut probe_cands: Vec<&str> = Vec::new();
+                if let Some(&d) = healthy.iter().find(|m| m.starts_with("direct/")) {
+                    probe_cands.push(d);
+                }
+                probe_cands.extend(healthy.iter().filter(|m| !m.starts_with("direct/")).copied());
                 match probe_total(log, out, &probe_cands, orig_url, host, info, replay, &tpl).await
                 {
                     Ok(Probe::Total(t)) if t > 0 => {
