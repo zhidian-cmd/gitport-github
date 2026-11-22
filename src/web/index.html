@@ -136,30 +136,107 @@
     headers.delete("cdn-loop"); headers.delete("x-forwarded-for");
     headers.delete("x-forwarded-proto"); headers.delete("x-real-ip");
     const target = new URL(rest);
-    // GET/HEAD 无 Range 且无凭据才走 CF 边缘缓存（带凭据的绝不入缓存也不读——私有响应以公共 URL 为键会被任何人取走/污染）；带 Range 的下载直通（缓存副本无法 206 切片）。
+    const method = request.method;
+    // GET/HEAD 且无凭据、非 git 协议才进边缘缓存（带凭据的绝不入缓存也不读——私有响应以公共 URL 为键会被任何人取走/污染）。
     const hasCreds = request.headers.has("authorization") || request.headers.has("cookie");
     // git 智能协议不进边缘缓存：info/refs 广告含过期时间戳，缓存会给 clone 喂旧货；packfile POST 本就不缓存。
     const isGit = (target.pathname.endsWith("/info/refs") && target.searchParams.get("service") === "git-upload-pack")
-      || (request.method === "POST" && /\/git-(upload|receive)-pack$/.test(target.pathname));
-    const cacheable = !isGit && !hasCreds && (request.method === "GET" || request.method === "HEAD")
-      && !request.headers.get("range");
+      || (method === "POST" && /\/git-(upload|receive)-pack$/.test(target.pathname));
+    const cacheable = !isGit && !hasCreds && (method === "GET" || method === "HEAD");
+    // 单区间 Range 解析：bytes=start-end / bytes=start-；多区间、后缀式、非 bytes 单位 → null（按直通回源走，不入缓存）。
+    const rm = cacheable && method === "GET" ? /^bytes=(\d+)-(\d*)$/.exec((request.headers.get("range") || "").trim()) : null;
+    const range = rm ? { start: Number(rm[1]), end: rm[2] === "" ? null : Number(rm[2]) } : null;
+
     if (cacheable) {
       // 缓存键必须是合法 URL："GET https://..." 这种方法前缀串会让 match 抛 TypeError → 整个请求 500。
       let cached = null;
       try { cached = await caches.default.match(target.toString()); } catch (e) {}
-      if (cached) return cached;
+      if (cached) {
+        if (range) return sliceResponse(cached, range, method === "HEAD");
+        return cached;
+      }
     }
-    const upstream = await fetch(target, { method: request.method, headers, body: request.body, redirect: "follow" });
-    if (cacheable && upstream.ok && upstream.status === 200) {
-      // put 对 206/304/Vary:* 会 reject, 限 200 且 catch 掉防未处理拒绝刷屏。
+    // 未命中：Range 请求向上游拉【完整文件】（剥掉 Range 头）——整文件 tee 进边缘缓存，
+    // 客户端要的那一片从这份流里跳偏移吐 206。此后每一片、每一次续传、每一个用户全部命中边缘，不再回源。
+    const fullFetch = cacheable && range !== null;
+    const upHeaders = new Headers(headers);
+    if (fullFetch) upHeaders.delete("range");
+    const upstream = await fetch(target, { method, headers: upHeaders, body: request.body, redirect: "follow" });
+    if (cacheable && method === "GET" && upstream.ok && upstream.status === 200) {
+      // put 对 206/304/Vary:* 会 reject；这里上游恒 200（Range 已剥），catch 掉防未处理拒绝刷屏。
       ctx.waitUntil(
         caches.default.put(target.toString(), upstream.clone())
           .catch(() => {})
       );
     }
+    if (fullFetch && upstream.ok && upstream.status === 200) {
+      return sliceResponse(upstream, range, method === "HEAD");
+    }
     return upstream;
   }
-}</pre>
+}
+
+// 单区间 Range 解析：bytes=start-end / bytes=start-；多区间、后缀式、非 bytes 单位 → null（按直通回源走，不入缓存）。
+function parseRange(hdr) {
+  if (!hdr) return null;
+  const m = /^bytes=(\d+)-(\d*)$/.exec(hdr.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = m[2] === "" ? null : Number(m[2]);
+  if (end !== null && end &lt; start) return null;
+  return { start, end };
+}
+
+// 从【完整文件】流里跳到 start、吐到 end（闭区间），输出 206 流。跳过用流式丢弃，内存恒定；到末端即 cancel 上游，不再白拉。
+function sliceBody(reader, start, end) {
+  let skipped = 0;
+  let sent = 0;
+  const want = end === null ? null : end - start + 1;
+  return new ReadableStream({
+    async pull(controller) {
+      if (want !== null && sent &gt;= want) {
+        controller.close();
+        try { await reader.cancel(); } catch (e) {}
+        return;
+      }
+      const { value, done } = await reader.read();
+      if (done) { controller.close(); return; }
+      let chunk = value;
+      if (skipped &lt; start) {
+        const skip = Math.min(start - skipped, chunk.byteLength);
+        skipped += skip;
+        chunk = chunk.subarray(skip);
+        if (chunk.byteLength === 0) return;
+      }
+      if (want !== null && sent + chunk.byteLength &gt; want) {
+        chunk = chunk.subarray(0, want - sent);
+      }
+      sent += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      try { reader.cancel(); } catch (e) {}
+    }
+  });
+}
+
+// 206 切片响应：命中缓存从缓存副本切，未命中从整文件上游流切；HEAD 只回头。
+function sliceResponse(full, range, headOnly) {
+  const cl = Number(full.headers.get("content-length") || 0) || null;
+  const start = range.start;
+  let end = range.end;
+  if (end === null && cl !== null) end = cl - 1;
+  if (cl !== null && start &gt;= cl) {
+    return new Response(null, { status: 416, headers: { "content-range": `bytes */${cl}` } });
+  }
+  const h = new Headers(full.headers);
+  h.set("content-range", `bytes ${start}-${end ?? ""}/${cl ?? "*"}`);
+  if (end !== null) h.set("content-length", String(end - start + 1));
+  else h.delete("content-length");
+  if (headOnly || !full.body) return new Response(null, { status: 206, headers: h });
+  return new Response(sliceBody(full.body.getReader(), start, end), { status: 206, headers: h });
+}
+</pre>
           <div class="row">
             <button class="btn sm" onclick="copyText(document.getElementById('workercode').textContent)">复制 Worker 代码</button>
           <div class="guide-step"><img src="/guide/step1.jpg" alt="创建应用程序" loading="lazy"></div>
