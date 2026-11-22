@@ -957,6 +957,8 @@ static MIRROR_CLIENT: std::sync::OnceLock<LegacyClient<MirrorConnector, BoxBody>
     std::sync::OnceLock::new();
 
 /// 镜像腿共享客户端（进程内单例）；首次调用者的 log 被永久持有。
+/// ALPN 协商出 h2 时 legacy 客户端自动切 h2 驱动（认 Connected 的 negotiated_h2，无需 http2(true)），
+/// 一条连接多路复用，拨号风暴（一流一连接）随之消失。
 pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxBody> {
     MIRROR_CLIENT.get_or_init(|| {
         let mut b = LegacyClient::builder(TokioExecutor::new());

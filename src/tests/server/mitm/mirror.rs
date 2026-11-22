@@ -422,6 +422,83 @@ fn ttfb_note_ema_and_direct_free() {
     m.ttfb_ms.store(0, Ordering::Relaxed);
 }
 
+/// 实网验尸：gh-proxy.org(CF) 协商 h2 拉带 Range 的真文件段，体必须读满 content-length。
+/// 当年 h2 被关的坑是"头正常、体 0B EOF"，此探针即其回归测试。网络测试，#[ignore]：
+/// `cargo test mirror_h2_body_probe -- --ignored` 单独验。
+#[tokio::test]
+#[ignore]
+async fn mirror_h2_body_probe() {
+    let mut tls = None;
+    for attempt in 1..=3 {
+        match crate::pool::dial::dial_tls_simple("gh-proxy.org").await {
+            Ok(t) => {
+                tls = Some(t);
+                break;
+            }
+            Err(e) => eprintln!("探针拨号第 {attempt} 次未成: {e}"),
+        }
+    }
+    let tls = tls.expect("3 次探针拨号全失败");
+    assert_eq!(
+        tls.ssl().selected_alpn_protocol(),
+        Some(b"h2".as_slice()),
+        "CF 系应协商出 h2"
+    );
+    drop(tls);
+    let log: LogFn = Arc::new(|_| {});
+    let client = crate::server::upstream::mirror_client(&log);
+    let mut resp = None;
+    for attempt in 1..=3 {
+        let req = hyper::Request::builder()
+            .uri("https://gh-proxy.org/https://raw.githubusercontent.com/torvalds/linux/master/README")
+            .header("user-agent", MIRROR_UA)
+            .header("range", "bytes=0-65535")
+            .body(protocol::empty_body())
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(15), client.request(req)).await {
+            Ok(Ok(r)) => {
+                resp = Some(r);
+                break;
+            }
+            other => eprintln!("拨号/请求第 {attempt} 次未成: {other:?}"),
+        }
+    }
+    let resp = resp.expect("3 次尝试全失败");
+    // raw 路径部分镜像忽略 Range 回 200 全量（gh-proxy.org 实测），与 h2 无关——靶子是体完整性：
+    // 旧坑"头正常、体 0B EOF"的回归点 = 体读不满 content-length。
+    let status = resp.status().as_u16();
+    assert!(
+        status == 206 || status == 200,
+        "镜像应回 206/200, 拿到 {status}"
+    );
+    let cl: usize = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(
+        !body.is_empty(),
+        "h2 体必须非空——旧坑'头正常体 0B EOF'回归即在此挂"
+    );
+    if cl > 0 {
+        assert_eq!(
+            body.len(),
+            cl,
+            "h2 体必须读满 content-length({cl})——旧坑'头正常体 0B EOF'回归即在此挂"
+        );
+    }
+    eprintln!(
+        "[探针] h2 体验证通过: status={status} cl={cl} body={}B 前16字节={:02x?}",
+        body.len(),
+        &body[..16.min(body.len())]
+    );
+}
+
 /// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
 #[test]
 fn cold_start_falls_back_to_chain_order() {

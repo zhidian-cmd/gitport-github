@@ -291,8 +291,10 @@ pub async fn dial_one(
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     let mut ssl = client_ssl(host, host, None)?;
-    // 镜像腿只用 HTTP/1.1：Cloudflare 系 h2 响应体读不出（头正常、体立即 0B EOF），h1.1 正常；镜像只拉文件，多路复用无收益。
-    ssl.set_alpn_protos(b"\x08http/1.1")
+    // 镜像腿报价 h2 + HTTP/1.1：CF 系多协商出 h2，一条连接多路复用，拨号风暴（一流一连接）随之消失。
+    // 早年 h2 被关是因为"头正常、体 0B EOF"；如今 Dialed::connected() 上报 negotiated_h2 + legacy 客户端
+    // http2(true) 齐活，回归探针 mirror_h2_body_probe（#[ignore]）单测验尸。
+    ssl.set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
     apply_cached_session(&mut ssl, host);
     let tcp = tokio::time::timeout(
