@@ -903,14 +903,7 @@ async fn split_download(
     let (base, len, known_total) = match range {
         // 开区间/多区间/畸形：长度未知或语义不同，不切
         Some(_) => match merge::parse_range(range) {
-            Some((a, Some(b))) if b >= a => {
-                let len = b - a + 1;
-                // 小区间单流直发：切段纯白建连接（曾把 1394B 的文件切出 23 段）。
-                if len < crate::server::mitm::direct_split::MIN_SPLIT_BYTES {
-                    return Ok(None);
-                }
-                (a, len, None)
-            }
+            Some((a, Some(b))) if b >= a => (a, b - a + 1, None),
             _ => return Ok(None),
         },
         None => match total_memo_get(&slice_key) {
