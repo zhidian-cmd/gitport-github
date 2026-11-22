@@ -202,7 +202,8 @@ impl Drop for LoadGuard {
     }
 }
 
-/// ECT 派发：score=(在途+新增)×窗口ms÷上一窗实收 + ttfb(镜像实测EMA，直连恒0)，真毫秒；最小者胜、无容差。
+/// ECT 派发：score=(在途+新增)×窗口ms÷上一窗实收，真毫秒；最小者胜、无容差。
+/// h2 复用后镜像/直连首字节对称，段级不掺 ttfb——ttfb 只进探针排序（1 字节请求的完成时间就是 ttfb）。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
@@ -217,7 +218,6 @@ fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
             .saturating_add(new_bytes)
             * ECT_WINDOW_MS
             / w
-            + ld.ttfb_ms.load(Ordering::Relaxed)
     };
 
     let healthy = |ld: &MirrorLoad, allow_recent_failures: bool| -> bool {

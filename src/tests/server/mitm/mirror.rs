@@ -361,48 +361,24 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     b.window_prev.store(0, Ordering::Relaxed);
 }
 
-/// ECT 加建连首包项：镜像快 8 倍但 ttfb 600ms，52KB 小件直连（复用零建连）反超；16MB 大件排水主导仍是快镜像赢。
-/// 旧纯速率公式下小件也选快镜像——此断言在旧代码必挂。
+/// 段级派发无视 ttfb（h2 复用后镜像/直连首字节对称，ttfb 只进探针排序）：快镜像 ttfb 600ms 仍按纯排水胜出。
+/// 谁把 ttfb 加回段级谁挂（620ms > 160ms 时会错选慢腿）。
 #[test]
-fn ect_ttfb_flips_small_pieces_to_warm_source() {
+fn ect_ignores_ttfb_for_segments() {
     let fast = mirror_load("ect-fast.test");
     fast.window_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
     fast.ttfb_ms.store(600, Ordering::Relaxed);
-    let direct = mirror_load(&direct_load_key("ect-d.test"));
-    direct.window_prev.store(1024 * 1024, Ordering::Relaxed);
-    let chain = vec!["ect-fast.test".to_string(), direct_load_key("ect-d.test")];
+    let slow = mirror_load("ect-slow.test");
+    slow.window_prev.store(1024 * 1024, Ordering::Relaxed);
+    let chain = vec!["ect-fast.test".to_string(), "ect-slow.test".to_string()];
     assert_eq!(
-        pick_mirror(&chain, 52 * 1024),
-        1,
-        "小件排水≈0, ttfb 主导: 直连(恒0)胜快镜像(600ms)"
-    );
-    assert_eq!(
-        pick_mirror(&chain, 16 * 1024 * 1024),
+        pick_mirror(&chain, 2 * 1024 * 1024),
         0,
-        "大件排水主导(160ms vs 1280ms): 快镜像仍胜"
+        "纯排水 20ms < 160ms, 快镜像胜"
     );
     fast.window_prev.store(0, Ordering::Relaxed);
     fast.ttfb_ms.store(0, Ordering::Relaxed);
-    direct.window_prev.store(0, Ordering::Relaxed);
-}
-
-/// 80ms 窗口的钉子：15MB 件、镜像仅快 25% 且 ttfb 600ms——W=80 时直连胜，回退 W=500 则镜像赢。
-#[test]
-fn ect_window_80ms_pins_ttfb_balance() {
-    let m = mirror_load("ect-m.test");
-    m.window_prev.store(1280 * 1024, Ordering::Relaxed);
-    m.ttfb_ms.store(600, Ordering::Relaxed);
-    let direct = mirror_load(&direct_load_key("ect-w.test"));
-    direct.window_prev.store(1024 * 1024, Ordering::Relaxed);
-    let chain = vec!["ect-m.test".to_string(), direct_load_key("ect-w.test")];
-    assert_eq!(
-        pick_mirror(&chain, 15 * 1024 * 1024),
-        1,
-        "W=80: 直连 1200ms < 镜像 960+600ms"
-    );
-    m.window_prev.store(0, Ordering::Relaxed);
-    m.ttfb_ms.store(0, Ordering::Relaxed);
-    direct.window_prev.store(0, Ordering::Relaxed);
+    slow.window_prev.store(0, Ordering::Relaxed);
 }
 
 /// ttfb 入账语义：首样直入，之后 EMA α=1/4 平滑；直连键永不入账恒 0。
