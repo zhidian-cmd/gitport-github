@@ -423,8 +423,8 @@ impl MergeBody {
         any
     }
 
-    /// 校准期那一次重分配：全组跑得最快的那段留下当接手方（含并列，永不切），
-    /// 其余段按自己判据——剩余字节按本段速率传完的时间 > 本家爬坡成本 → 整段剩余让出，交给 5ms ECT 重派。
+    /// 校准期那一次重分配：全组跑得最快的那段保留不切（含并列）——它本就满速跑，切下来重派反而亏，
+    /// 其余段按自己判据——剩余字节按本段速率传完的时间 > 本家爬坡成本 → 整段剩余让出，交给 5ms ECT 挑家重派。
     /// 一次切完即锁死；之后派发全交给 5ms 市场。停滞收尸是独立路径。
     pub(super) fn rebalance(&mut self, now: Instant) -> u64 {
         if !self.allow_yield || self.rebalanced || !self.fill.is_empty() {
@@ -457,7 +457,7 @@ impl MergeBody {
             }
             cands.push((s.start, pos, s.end, s.owner.clone(), v, s.ramp));
         }
-        // 第二遍：最快的段（含并列）留下当接手方；其余段过原判据。
+        // 第二遍：最快的段（含并列）保留不切；其余段过原判据。
         // recent_rate 是 B/s，remaining/v 得秒，×1000 换毫秒再与 ramp 比。
         let mut tails: Vec<(u64, u64, u64, String)> = Vec::new();
         for (start, pos, end, owner, v, ramp) in cands {

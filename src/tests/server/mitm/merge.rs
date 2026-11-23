@@ -359,7 +359,7 @@ fn rebalance_ignores_seg_without_first_frame() {
 #[test]
 fn rebalance_cuts_small_tail_when_slow_enough() {
     let now = Instant::now();
-    // 小尾巴 4KB 也切：判据只看时间，不看字节数。配一条更快的段当接手方。
+    // 小尾巴 4KB 也切：判据只看时间，不看字节数。配一条更快的段作对照（最快、不切）。
     let mut m = MergeBody::new(
         vec![
             t(0, 5_000, now, stalled(b"")),
@@ -386,7 +386,7 @@ fn rebalance_only_cuts_once() {
     assert!(m.fill.is_empty(), "第二轮没有再排队尾巴");
 }
 
-/// 最快段即使公式判切也留下当接手方；慢段照切。
+/// 最快段即使公式判切也保留不切（本就满速，切下来重派反而亏）；慢段照切。
 #[test]
 fn rebalance_spares_fastest_even_if_worth_cutting() {
     let now = Instant::now();
