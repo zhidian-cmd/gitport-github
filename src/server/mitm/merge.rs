@@ -221,6 +221,9 @@ pub(super) struct MergeBody {
     rebalanced: bool,
     /// 本轮切尾的段来自哪家（供上层日志显示）。
     pub(super) last_cut_owner: Option<String>,
+    /// 最后一次切割的留切明细：(留字节, 留字节传完毫秒, 切字节, 切字节交快流传完毫秒)。
+    /// 两端应当同时完成——日志打出来，实测可直接核对拖尾来源。
+    pub(super) last_cut: Option<(u64, u64, u64, u64)>,
     finished: bool,
     /// 生命周期钩子：随 body 一起丢弃（切片计划里登记的在途区间靠它注销）。
     _guard: Option<Box<dyn Send + Sync>>,
@@ -246,6 +249,7 @@ impl MergeBody {
             allow_yield: true,
             rebalanced: false,
             last_cut_owner: None,
+            last_cut: None,
             finished: false,
             _guard: None,
         }
@@ -423,17 +427,21 @@ impl MergeBody {
         any
     }
 
-    /// 校准期那一次重分配：全组跑得最快的那段保留不切（含并列）——它本就满速跑，切下来重派反而亏，
-    /// 其余段按自己判据——剩余字节按本段速率传完的时间 > 本家爬坡成本 → 整段剩余让出，交给 5ms ECT 挑家重派。
+    /// 校准期那一次重分配：全组跑得最快的那段保留不切（含并列）——它本就满速跑，切下来重派反而亏。
+    /// 其余段算"切多少"：本段剩余 R、本段速率 V、全场最快速率 V_fast、接手方爬坡 P（取最快那家的 ramp）。
+    ///   C = (R − P·V) × V_fast / (V_fast + V)
+    /// 让"留下的 R−C 按 V 传完"与"切走的 C 交快流、爬坡后传完"同时到——谁也不拖，不造新尾巴。
+    /// R − P·V ≤ 0（本段预计传完不比爬坡久）→ C ≤ 0 → 不切。只切尾部 C 字节，留下的原地跑、不重爬。
     /// 一次切完即锁死；之后派发全交给 5ms 市场。停滞收尸是独立路径。
     pub(super) fn rebalance(&mut self, now: Instant) -> u64 {
         if !self.allow_yield || self.rebalanced || !self.fill.is_empty() {
             return 0;
         }
-        // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，并记全场最快的纯排水速率。
+        // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，记全场最快纯排水速率与那家的 ramp。
         // 只收有首帧的活段：没首帧 = 没速率样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
         let mut cands: Vec<(u64, u64, u64, String, f64, u64)> = Vec::new();
         let mut fastest = 0.0f64;
+        let mut fastest_ramp = 0u64;
         for s in self.segs.values() {
             if s.done || s.first_at.is_none() {
                 continue;
@@ -454,25 +462,39 @@ impl MergeBody {
             }
             if v > fastest {
                 fastest = v;
+                fastest_ramp = s.ramp;
             }
             cands.push((s.start, pos, s.end, s.owner.clone(), v, s.ramp));
         }
-        // 第二遍：最快的段（含并列）保留不切；其余段过原判据。
-        // recent_rate 是 B/s，remaining/v 得秒，×1000 换毫秒再与 ramp 比。
-        let mut tails: Vec<(u64, u64, u64, String)> = Vec::new();
-        for (start, pos, end, owner, v, ramp) in cands {
+        // 第二遍：最快段（含并列）保留；其余按公式算切量。
+        // V、V_fast 是 B/s，P 由 ramp 毫秒换秒；C = (R − P·V) × V_fast / (V_fast + V)。
+        let p_sec = fastest_ramp as f64 / 1000.0;
+        let mut tails: Vec<(u64, u64, u64, u64, String, u64, u64, u64)> = Vec::new();
+        // (start, cut_at, kept, cut_bytes, owner, kept_ms, cut_ms, _end)
+        for (start, pos, end, owner, v, _ramp) in cands {
             if v >= fastest {
                 continue;
             }
-            if (end - pos) as f64 / v * 1000.0 > ramp as f64 {
-                tails.push((start, pos, end, owner));
+            let remaining = end - pos;
+            let c_f = (remaining as f64 - p_sec * v) * fastest / (fastest + v);
+            if c_f <= 0.0 {
+                continue; // 本段预计传完不比爬坡久 → 切 0
             }
+            let cut_bytes = (c_f as u64).min(remaining);
+            if cut_bytes == 0 {
+                continue;
+            }
+            let kept = remaining - cut_bytes;
+            let kept_ms = (kept as f64 / v * 1000.0) as u64;
+            let cut_ms = (fastest_ramp as f64 + cut_bytes as f64 / fastest * 1000.0) as u64;
+            tails.push((start, end - cut_bytes, kept, cut_bytes, owner, kept_ms, cut_ms, end));
         }
         let mut moved = 0u64;
-        for (start, pos, old_end, owner) in tails {
-            if self.cut(start, pos).is_some() {
-                moved += old_end - pos;
+        for (start, cut_at, kept, cut_bytes, owner, kept_ms, cut_ms, _old_end) in tails {
+            if self.cut(start, cut_at).is_some() {
+                moved += cut_bytes;
                 self.last_cut_owner = Some(owner);
+                self.last_cut = Some((kept, kept_ms, cut_bytes, cut_ms));
             }
         }
         if moved > 0 {
@@ -481,8 +503,8 @@ impl MergeBody {
         moved
     }
 
-    /// 整段让出：把边界缩到 pos，[pos, old_end) 全部排补发（缓冲里已到的字节照常交付）。
-    /// 允许 cut == pos（切走整段剩余）；掐流让上游停止白下载。
+    /// 把段边界缩到 cut，[cut, old_end) 排补发（缓冲里已到的字节照常交付）。
+    /// cut == pos 即整段让出（停滞收尸走这条），cut > pos 是重分配的部分切；到新边界掐流停白下载。
     fn cut(&mut self, start: u64, cut: u64) -> Option<(u64, u64)> {
         let seg = self.segs.get_mut(&start)?;
         let old_end = seg.end;

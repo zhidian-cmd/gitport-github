@@ -1412,8 +1412,19 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                         let moved = mb.rebalance(now);
                         if moved > 0 {
                             let owner = mb.last_cut_owner.as_deref().unwrap_or("?");
+                            // 留切两端打出来，实测可直接核对是否同时完成、拖尾是不是重分配造的。
+                            let note = match mb.last_cut {
+                                Some((kept, kept_ms, cut, cut_ms)) => format!(
+                                    "留 {}KB 跑 {}ms / 切 {}KB 交快流 {}ms",
+                                    kept / 1024,
+                                    kept_ms,
+                                    cut / 1024,
+                                    cut_ms
+                                ),
+                                None => String::new(),
+                            };
                             (ctx.log)(&format!(
-                                "[切片] {} 校准重分配: {owner} 剩余传完慢于爬坡, 整段让出重派 ({}KB)",
+                                "[切片] {} 校准重分配: {owner} {note} (共 {}KB)",
                                 ctx.host,
                                 moved / 1024
                             ));
