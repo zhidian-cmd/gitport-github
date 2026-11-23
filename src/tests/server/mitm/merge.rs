@@ -309,25 +309,30 @@ fn reap_keeps_received_bytes() {
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 本段判据：剩余传完时间 > 本家爬坡 → 切；整段剩余让出。
-fn rebalance_fixture(now: Instant, ramp: u64) -> MergeBody {
-    // 单段 [0, 1_000_000)，已收 100_000B（1s 收完 → 速率 100_000B/s），remaining=900_000B → 留着传完要 9s。
+/// 两段 fixture：慢段 [0,1M) v=100k/s（drain 9s，设 ramp），快段 [1M,2M) v=500k/s（drain 1s，最快、保留）。
+/// 快段 ramp=0 但 drain 1s>0，公式本也判切——靠"最快闸门"留下。
+fn rebalance_two_seg_fixture(now: Instant, slow_ramp: u64) -> MergeBody {
     let mut m = MergeBody::new(
-        vec![t(0, 1_000_000, now, stalled(b""))],
-        1_000_000,
+        vec![
+            t(0, 1_000_000, now, stalled(b"")),
+            t(1_000_000, 2_000_000, now, stalled(b"")),
+        ],
+        2_000_000,
     );
-    with_rate(&mut m, 0, 100_000, now);
-    m.segs.get_mut(&0).unwrap().ramp = ramp;
+    with_rate(&mut m, 0, 100_000, now); // 慢：v=100k/s, remaining=900k → 9s
+    with_rate(&mut m, 1_000_000, 500_000, now); // 快：v=500k/s, remaining=500k → 1s
+    m.segs.get_mut(&0).unwrap().ramp = slow_ramp;
     m
 }
 
 #[test]
 fn rebalance_cuts_when_remaining_slower_than_ramp() {
     let now = Instant::now();
-    let mut m = rebalance_fixture(now, 1_000); // ramp 1s < 留着 9s → 切
+    let mut m = rebalance_two_seg_fixture(now, 1_000);
     let moved = m.rebalance(now);
     assert_eq!(moved, 900_000, "整段剩余让出");
-    assert_eq!(m.segs.get(&0).unwrap().end, 100_000, "父段只剩已收那截");
+    assert_eq!(m.segs.get(&0).unwrap().end, 100_000, "慢段只剩已收那截");
+    assert_eq!(m.segs.get(&1_000_000).unwrap().end, 2_000_000, "最快段保留不切");
     assert_eq!(m.take_fill(), Some((100_000, 1_000_000)));
     assert_eq!(m.last_cut_owner.as_deref(), Some("test"));
 }
@@ -335,7 +340,7 @@ fn rebalance_cuts_when_remaining_slower_than_ramp() {
 #[test]
 fn rebalance_spares_when_ramp_not_worth_it() {
     let now = Instant::now();
-    let mut m = rebalance_fixture(now, 20_000); // ramp 20s > 留着 9s → 不切
+    let mut m = rebalance_two_seg_fixture(now, 20_000); // ramp 20s > 留着 9s → 不切
     assert_eq!(m.rebalance(now), 0, "爬坡比留着还慢，不动刀");
     assert!(m.fill.is_empty());
 }
@@ -343,22 +348,27 @@ fn rebalance_spares_when_ramp_not_worth_it() {
 #[test]
 fn rebalance_ignores_seg_without_first_frame() {
     let now = Instant::now();
-    // 有 bytes 但没首帧样本 → 没速率，不动刀。
-    let mut m = MergeBody::new(
-        vec![t(0, 1_000_000, now, stalled(b""))],
-        1_000_000,
-    );
+    // 有 bytes 但没首帧样本 → 没速率，不动刀、也不参与最快比较。
+    let mut m = MergeBody::new(vec![t(0, 1_000_000, now, stalled(b""))], 1_000_000);
     m.segs.get_mut(&0).unwrap().got = 100_000;
     m.segs.get_mut(&0).unwrap().last_poll = now;
     assert_eq!(m.rebalance(now), 0, "没首帧不动刀");
+    assert!(m.fill.is_empty());
 }
 
 #[test]
 fn rebalance_cuts_small_tail_when_slow_enough() {
     let now = Instant::now();
-    // 小尾巴 4KB 也切：判据只看时间，不看字节数。
-    let mut m = MergeBody::new(vec![t(0, 5_000, now, stalled(b""))], 5_000);
-    with_rate(&mut m, 0, 1_000, now); // 1s 收 1000B → 1000B/s，remaining=4000B → 留着 4s
+    // 小尾巴 4KB 也切：判据只看时间，不看字节数。配一条更快的段当接手方。
+    let mut m = MergeBody::new(
+        vec![
+            t(0, 5_000, now, stalled(b"")),
+            t(5_000, 20_000, now, stalled(b"")),
+        ],
+        20_000,
+    );
+    with_rate(&mut m, 0, 1_000, now); // 慢：v=1000B/s, remaining=4000 → 4s
+    with_rate(&mut m, 5_000, 10_000, now); // 快陪衬：v=10k/s, remaining=10k → 1s
     m.segs.get_mut(&0).unwrap().ramp = 100; // 爬坡 0.1s → 切
     assert_eq!(m.rebalance(now), 4_000, "小尾巴够慢照样切，无字节下限");
 }
@@ -366,14 +376,59 @@ fn rebalance_cuts_small_tail_when_slow_enough() {
 #[test]
 fn rebalance_only_cuts_once() {
     let now = Instant::now();
-    let mut m = rebalance_fixture(now, 1_000);
+    let mut m = rebalance_two_seg_fixture(now, 1_000);
     assert!(m.rebalance(now) > 0, "第一轮切");
     assert_eq!(m.take_fill(), Some((100_000, 1_000_000)), "尾巴排补发");
-    // 即使再来一条新段满足判据，也不再切。
-    m.feed(2_000_000, 3_000_000, now, stalled(b""), "test".into(), 0);
+    // 再来一段满足判据（v=100k < 最快 500k）也不切。
+    m.feed(2_000_000, 3_000_000, now, stalled(b""), "test".into(), 1_000);
     with_rate(&mut m, 2_000_000, 100_000, now);
     assert_eq!(m.rebalance(now), 0, "只切一次，之后不再动刀");
     assert!(m.fill.is_empty(), "第二轮没有再排队尾巴");
+}
+
+/// 最快段即使公式判切也留下当接手方；慢段照切。
+#[test]
+fn rebalance_spares_fastest_even_if_worth_cutting() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(
+        vec![
+            t(0, 20_000_000, now, stalled(b"")),
+            t(20_000_000, 30_000_000, now, stalled(b"")),
+        ],
+        30_000_000,
+    );
+    with_rate(&mut m, 0, 10_000_000, now); // A 快：10MB/s, remaining=10M → 1s，ramp 0 → 公式也判切
+    with_rate(&mut m, 20_000_000, 1_000_000, now); // B 慢：1MB/s, remaining=9M → 9s，ramp 0 → 判切
+    let moved = m.rebalance(now);
+    assert_eq!(moved, 9_000_000, "只切慢段 B");
+    assert_eq!(m.segs.get(&0).unwrap().end, 20_000_000, "最快段 A 保留不切");
+}
+
+/// 并列最快的两段都不切。
+#[test]
+fn rebalance_spares_all_when_tied_fastest() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(
+        vec![
+            t(0, 2_000_000, now, stalled(b"")),
+            t(2_000_000, 4_000_000, now, stalled(b"")),
+        ],
+        4_000_000,
+    );
+    with_rate(&mut m, 0, 1_000_000, now); // 同速 1MB/s，drain 各 1s，ramp 0 → 公式都判切
+    with_rate(&mut m, 2_000_000, 1_000_000, now);
+    assert_eq!(m.rebalance(now), 0, "并列最快都保留");
+    assert!(m.fill.is_empty());
+}
+
+/// 单段即全场最快 → 永不切自己。
+#[test]
+fn rebalance_single_seg_never_cuts() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(vec![t(0, 1_000_000, now, stalled(b""))], 1_000_000);
+    with_rate(&mut m, 0, 100_000, now); // drain 9s，ramp 0 → 公式判切
+    assert_eq!(m.rebalance(now), 0, "单段是最快，不切自己");
+    assert!(m.fill.is_empty());
 }
 
 /// 近期速率：首帧起算、样本按滑窗折算，无预热门槛。

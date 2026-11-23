@@ -423,15 +423,17 @@ impl MergeBody {
         any
     }
 
-    /// 校准期那一次重分配：只看每段自己——剩余字节按本段速率传完的时间，是否大于本家爬坡成本。
-    /// 大于说明"交给新流重新爬坡"比"留在慢源慢慢爬"划算 → 整段剩余让出，交给 5ms ECT 重新派。
-    /// 不看别的段（不摊公平份额、不比谁最快），一次切完即锁死；之后派发全交给 5ms 市场。
+    /// 校准期那一次重分配：全组跑得最快的那段留下当接手方（含并列，永不切），
+    /// 其余段按自己判据——剩余字节按本段速率传完的时间 > 本家爬坡成本 → 整段剩余让出，交给 5ms ECT 重派。
+    /// 一次切完即锁死；之后派发全交给 5ms 市场。停滞收尸是独立路径。
     pub(super) fn rebalance(&mut self, now: Instant) -> u64 {
         if !self.allow_yield || self.rebalanced || !self.fill.is_empty() {
             return 0;
         }
+        // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，并记全场最快的纯排水速率。
         // 只收有首帧的活段：没首帧 = 没速率样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
-        let mut tails: Vec<(u64, u64, u64, String)> = Vec::new(); // (start, pos, old_end, owner)
+        let mut cands: Vec<(u64, u64, u64, String, f64, u64)> = Vec::new();
+        let mut fastest = 0.0f64;
         for s in self.segs.values() {
             if s.done || s.first_at.is_none() {
                 continue;
@@ -450,10 +452,20 @@ impl MergeBody {
             if v <= 0.0 {
                 continue;
             }
-            // 判据（唯一一条）：留着传完的毫秒 > 本家爬坡毫秒 → 切。
-            // recent_rate 是 B/s，remaining/v 得秒，×1000 换成毫秒再与 ramp 比。
-            if remaining as f64 / v * 1000.0 > s.ramp as f64 {
-                tails.push((s.start, pos, s.end, s.owner.clone()));
+            if v > fastest {
+                fastest = v;
+            }
+            cands.push((s.start, pos, s.end, s.owner.clone(), v, s.ramp));
+        }
+        // 第二遍：最快的段（含并列）留下当接手方；其余段过原判据。
+        // recent_rate 是 B/s，remaining/v 得秒，×1000 换毫秒再与 ramp 比。
+        let mut tails: Vec<(u64, u64, u64, String)> = Vec::new();
+        for (start, pos, end, owner, v, ramp) in cands {
+            if v >= fastest {
+                continue;
+            }
+            if (end - pos) as f64 / v * 1000.0 > ramp as f64 {
+                tails.push((start, pos, end, owner));
             }
         }
         let mut moved = 0u64;
