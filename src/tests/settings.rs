@@ -320,3 +320,174 @@ fn salvage_gives_up_on_truncated_or_missing_value() {
     );
     assert_eq!(super::salvage_str_field(r#"{"mitm":true}"#, "gitProxyBackup"), None);
 }
+
+// ---- gitconfig 文件编辑（替代 git.exe 子进程，根治关机 0xc0000142 弹窗）----
+
+/// 样本：gitport 会碰的键都在，外加用户自己的内容；值含 git 写法的转义路径。
+const GITCFG_SAMPLE: &str = "[core]\n\trepositoryformatversion = 0\n\
+[user]\n\tname = someone\n\
+[http]\n\tproxy = http://127.0.0.1:9999\n\
+[http \"https://github.com/\"]\n\tsslCAInfo = C:\\\\Users\\\\me\\\\ca.crt\n\
+[http \"https://objects.githubusercontent.com/\"]\n\tsslCAInfo = C:\\\\Users\\\\me\\\\ca.crt\n";
+
+/// 键值读回：多值键取最后；键名还原完整形式；转义路径反转义。
+#[test]
+fn gitcfg_parse_reads_pairs_and_unescapes() {
+    let entries = super::git_parse(GITCFG_SAMPLE).unwrap();
+    let pairs = super::git_pairs(&entries);
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| name == k)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(get("core.repositoryformatversion").as_deref(), Some("0"));
+    assert_eq!(get("http.proxy").as_deref(), Some("http://127.0.0.1:9999"));
+    // 键名与 git config --list 同语义：key 部分一律小写（subsection 原样）
+    assert_eq!(
+        get("http.https://github.com/.sslcainfo").as_deref(),
+        Some("C:\\Users\\me\\ca.crt"),
+        "git 写文件的 \\\\ 转义要还原成真实路径"
+    );
+    // 多值键取最后（HashMap 覆盖语义 = git --get 取最后一次出现）
+    let two = "[http]\n\tproxy = a\n\tproxy = b\n";
+    let pairs = super::git_pairs(&super::git_parse(two).unwrap());
+    let last = pairs.iter().rev().find(|(k, _)| k == "http.proxy").unwrap();
+    assert_eq!(last.1, "b");
+}
+
+/// 解析拒绝：非法转义与 git 同判，整份 Err → 调用方只读不动。
+#[test]
+fn gitcfg_parse_rejects_bad_escape() {
+    assert!(super::git_parse("[http]\n\tproxy = C:\\Users\\x\n").is_err());
+    assert!(super::git_parse("[http\n").is_err());
+}
+
+/// Set：替换最后一次出现；未编辑的行字节级原样保留。
+#[test]
+fn gitcfg_set_replaces_last_and_keeps_rest() {
+    let entries = &mut super::git_parse(GITCFG_SAMPLE).unwrap();
+    let target = super::git_split_key("http.proxy").unwrap();
+    assert!(super::git_apply(entries, target, super::GitEdit::Set("http://127.0.0.1:7810".into())));
+    let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
+    assert!(out.contains("proxy = http://127.0.0.1:7810\n"));
+    assert!(!out.contains("http://127.0.0.1:9999"));
+    // 未编辑行原样：core 段、user 段、CA 转义路径都在
+    assert!(out.contains("[core]\n\trepositoryformatversion = 0\n"));
+    assert!(out.contains("[user]\n\tname = someone\n"));
+    assert!(out.contains("sslCAInfo = C:\\\\Users\\\\me\\\\ca.crt\n"));
+    // 同值再 Set：无改动不落盘
+    let entries = &mut super::git_parse("[http]\n\tproxy = http://127.0.0.1:7810\n").unwrap();
+    assert!(!super::git_apply(
+        entries,
+        super::git_split_key("http.proxy").unwrap(),
+        super::GitEdit::Set("http://127.0.0.1:7810".into())
+    ));
+}
+
+/// Set：段在键不在 → 追加进段内；段也不在 → 文件尾建段头 + 键行。
+#[test]
+fn gitcfg_set_appends_and_creates_section() {
+    // 段在键不在：插在段内最后（下一个段头之前）
+    let entries = &mut super::git_parse("[https]\n\tkeep = 1\n[http]\n\ta = b\n").unwrap();
+    assert!(super::git_apply(
+        entries,
+        super::git_split_key("https.proxy").unwrap(),
+        super::GitEdit::Set("http://127.0.0.1:7810".into())
+    ));
+    let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
+    assert_eq!(
+        out,
+        "[https]\n\tkeep = 1\n\thttps-proxy-placeholder\n[http]\n\ta = b\n"
+            .replace("https-proxy-placeholder", "proxy = http://127.0.0.1:7810")
+    );
+    // 段不在：文件尾建 [http "url"] 段头 + 键行
+    let entries = &mut super::git_parse("[core]\n\tok = 1\n").unwrap();
+    assert!(super::git_apply(
+        entries,
+        super::git_split_key("http.https://objects.githubusercontent.com/.sslCAInfo").unwrap(),
+        super::GitEdit::Set("C:\\gp\\ca.crt".into())
+    ));
+    let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
+    assert!(out.starts_with("[core]\n\tok = 1\n"));
+    assert!(out.contains("[http \"https://objects.githubusercontent.com/\"]\n\tsslcainfo = C:\\\\gp\\\\ca.crt\n"));
+}
+
+/// Unset：删最后一次出现；键不存在零改动（不许凭空创建文件内容）。
+#[test]
+fn gitcfg_unset_removes_last_only() {
+    let two = "[http]\n\tproxy = mine\n\tproxy = ours\n\tkeep = 1\n";
+    let entries = &mut super::git_parse(two).unwrap();
+    assert!(super::git_apply(
+        entries,
+        super::git_split_key("http.proxy").unwrap(),
+        super::GitEdit::Unset
+    ));
+    let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
+    assert_eq!(out, "[http]\n\tproxy = mine\n\tkeep = 1\n");
+    let entries = &mut super::git_parse("[core]\n\tok = 1\n").unwrap();
+    assert!(!super::git_apply(
+        entries,
+        super::git_split_key("http.proxy").unwrap(),
+        super::GitEdit::Unset
+    ));
+}
+
+/// 往返：接管写入的键值，读回一致——文件编辑与 git.exe 行为等价的底线。
+#[test]
+fn gitcfg_roundtrip_set_read_unset() {
+    let ours = "http://127.0.0.1:7810";
+    let entries = &mut super::git_parse(GITCFG_SAMPLE).unwrap();
+    super::git_apply(entries, super::git_split_key("http.proxy").unwrap(), super::GitEdit::Set(ours.into()));
+    super::git_apply(entries, super::git_split_key("http.proxy").unwrap(), super::GitEdit::Unset);
+    let round = super::git_parse(&entries.iter().map(|e| e.raw.as_str()).collect::<String>()).unwrap();
+    let pairs = super::git_pairs(&round);
+    assert!(!pairs.iter().any(|(k, v)| k == "http.proxy" && v == ours), "写完即删后不许残留");
+    // 没被编辑的 CA 键往返无损（转义 ↔ 反转义；键名与 git --list 同为小写）
+    assert_eq!(
+        pairs.iter().find(|(k, _)| k == "http.https://github.com/.sslcainfo").unwrap().1,
+        "C:\\Users\\me\\ca.crt"
+    );
+}
+
+/// 键名拆段：三种形态，URL 子节里的点不参与拆分。
+#[test]
+fn gitcfg_split_key_shapes() {
+    assert_eq!(
+        super::git_split_key("http.proxy"),
+        Some(("http".into(), None, "proxy".into()))
+    );
+    assert_eq!(
+        super::git_split_key("https.proxy"),
+        Some(("https".into(), None, "proxy".into()))
+    );
+    assert_eq!(
+        super::git_split_key("http.https://objects.githubusercontent.com/.sslCAInfo"),
+        Some((
+            "http".into(),
+            Some("https://objects.githubusercontent.com/".into()),
+            "sslcainfo".into()
+        ))
+    );
+    assert_eq!(super::git_split_key("nopoint"), None);
+    assert_eq!(super::git_split_key(".proxy"), None);
+}
+
+/// 防回归：GIT_CA_KEYS 与解析器输出的键名（key 部分一律小写）必须精确对得上——
+/// 大小写错位会让 remove 判定查不到键，CA 键永远清不掉（2026-11-24 修复的既有 bug）。
+#[test]
+fn gitcfg_ca_keys_match_parsed_names() {
+    for key in super::GIT_CA_KEYS {
+        let (_, Some(sub), _) = super::git_split_key(key).unwrap() else {
+            panic!("CA 键 {key:?} 拆不出子节");
+        };
+        // 子节按原样写回段头（URL 大小写敏感），键行用 git 实际写法（保留原大小写也能解析成小写键名）
+        let file = format!("[http \"{sub}\"]\n\tsslCAInfo = v\n");
+        let entries = super::git_parse(&file).unwrap();
+        let names: Vec<String> = super::git_pairs(&entries).into_iter().map(|(k, _)| k).collect();
+        assert!(
+            names.contains(&key.to_string()),
+            "常量键 {key:?} 与解析输出 {names:?} 对不上"
+        );
+    }
+}

@@ -703,31 +703,327 @@ fn git_proxy_url() -> String {
 }
 
 /// CA 信任键：按 URL 作用域只对 GitHub 系生效，不动全局 sslBackend；让 clone/push 过 MITM 进池。
+/// 键名必须全小写（.sslcainfo）：git config --list 输出的 key 部分一律小写，map 按精确匹配查，
+/// 大写会对不上导致退出时 CA 键永远清不掉（2026-11-24 修复的既有 bug）。
 const GIT_CA_KEYS: &[&str] = &[
-    "http.https://github.com/.sslCAInfo",
-    "http.https://codeload.github.com/.sslCAInfo",
-    "http.https://raw.githubusercontent.com/.sslCAInfo",
-    "http.https://objects.githubusercontent.com/.sslCAInfo",
-    "http.https://release-assets.githubusercontent.com/.sslCAInfo",
-    "http.https://media.githubusercontent.com/.sslCAInfo",
+    "http.https://github.com/.sslcainfo",
+    "http.https://codeload.github.com/.sslcainfo",
+    "http.https://raw.githubusercontent.com/.sslcainfo",
+    "http.https://objects.githubusercontent.com/.sslcainfo",
+    "http.https://release-assets.githubusercontent.com/.sslcainfo",
+    "http.https://media.githubusercontent.com/.sslcainfo",
 ];
 const GIT_PROXY_KEYS: &[&str] = &["http.proxy", "https.proxy"];
 /// 备份两段的分隔符（URL 里不可能出现）。
 const GIT_BACKUP_SEP: char = '\u{1}';
 
-/// 隐藏窗口跑 git：GUI 进程 spawn 控制台程序会弹黑框，必须压掉。
-fn git_run(args: &[&str]) -> Result<String, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("git")
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("git 未安装或不在 PATH({e})"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+// ---- git 全局配置：直接编辑 ~/.gitconfig ----
+// 以前靠启动 git.exe 子进程读写（git config --global）。关机时还原要 spawn 子进程，
+// Windows 正在拆会话时 git.exe 的 DLL 初始化失败(0xc0000142)，错误弹窗拦在关机画面上。
+// 改文件编辑根除它：只动 [http]/[https]/[http "url"] 段的 8 个键，未编辑行字节级原样保留，
+// 解析失败只读不动，绝不写坏用户配置；落盘走 fsx 原子写。
+
+/// git 全局配置文件：GIT_CONFIG_GLOBAL 优先（git 自己的规则），否则 HOME，再退 USERPROFILE。
+fn git_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("GIT_CONFIG_GLOBAL") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".gitconfig"))
+}
+
+/// .gitconfig 的一行。raw 恒为原文（含行尾），未编辑的行字节级回写。
+enum GitLine {
+    /// [section] 或 [section "subsection"]：section 小写，subsection 原样（git 对它大小写敏感）。
+    Section { section: String, sub: Option<String> },
+    /// key = value：key 小写，value 已反转义，indent 沿用原行。
+    Pair { indent: String, key: String, value: String },
+    /// 注释/空行等。
+    Verbatim,
+}
+
+struct GitEntry {
+    line: GitLine,
+    raw: String,
+}
+
+/// 值反转义：\\ \" \n \t \b 之外一律拒绝（与 git 同判，宁可跳过也别误读）。
+fn git_unescape(s: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some(other) => return Err(format!("非法转义 \\{other}")),
+            None => return Err("转义符后无字符".into()),
+        }
+    }
+    Ok(out)
+}
+
+/// 值转义：写文件时对 \ " 换行 制表 退格 转义，其余原样。
+fn git_escape_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 8);
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 解析一行正文（已去行尾换行）。语法子集 = gitport 会写的 + 常见的：
+/// 段头、key = value（裸值或引号值）、行内 #/; 注释（前面是空白才算）。解析不了 → Err，整份只读不动。
+fn git_parse_line(body: &str) -> Result<GitLine, String> {
+    let t = body.trim();
+    if t.starts_with('[') {
+        // 段头：section 到空白或 ]；可选 "subsection"（内可转义 \" \\）；必须 ] 收尾。
+        let rest = &t[1..];
+        let name_end = rest
+            .find(|c: char| c.is_whitespace() || c == ']')
+            .ok_or_else(|| format!("段头无结束 {body:?}"))?;
+        let section = rest[..name_end].to_ascii_lowercase();
+        let after = rest[name_end..].trim_start();
+        if let Some(sub_rest) = after.strip_prefix('"') {
+            let mut sub = String::new();
+            let mut it = sub_rest.chars();
+            loop {
+                match it.next() {
+                    Some('"') => break,
+                    Some('\\') => match it.next() {
+                        Some('\\') => sub.push('\\'),
+                        Some('"') => sub.push('"'),
+                        _ => return Err(format!("段头子节非法转义 {body:?}")),
+                    },
+                    Some(c) => sub.push(c),
+                    None => return Err(format!("段头子节未闭合 {body:?}")),
+                }
+            }
+            let tail = it.as_str().trim_start();
+            let tail = tail
+                .strip_prefix(']')
+                .ok_or_else(|| format!("段头无结束 {body:?}"))?;
+            let tail = tail.trim();
+            if !tail.is_empty() && !tail.starts_with('#') && !tail.starts_with(';') {
+                return Err(format!("段头 ] 后有多余内容 {body:?}"));
+            }
+            return Ok(GitLine::Section { section, sub: Some(sub) });
+        }
+        if after.starts_with(']') {
+            return Ok(GitLine::Section { section, sub: None });
+        }
+        return Err(format!("段头格式 {body:?}"));
+    }
+    // 键行：indent 保留；key 到空白/=/#/; 为止。
+    let indent: String = body.chars().take_while(|c| c.is_whitespace()).collect();
+    let t = body.trim_start();
+    let key_end = t
+        .find(|c: char| c.is_whitespace() || c == '=' || c == '#' || c == ';')
+        .unwrap_or(t.len());
+    let key = t[..key_end].to_ascii_lowercase();
+    if key.is_empty() {
+        return Err(format!("键行无名 {body:?}"));
+    }
+    let rest = t[key_end..].trim_start();
+    let value = match rest.strip_prefix('=') {
+        Some(v) => {
+            let v = v.trim_start();
+            if let Some(q) = v.strip_prefix('"') {
+                // 引号值：内部转义处理，引号后只许注释或空白。
+                let mut out = String::new();
+                let mut it = q.chars();
+                loop {
+                    match it.next() {
+                        Some('"') => break,
+                        Some('\\') => match it.next() {
+                            Some('\\') => out.push('\\'),
+                            Some('"') => out.push('"'),
+                            Some('n') => out.push('\n'),
+                            Some('t') => out.push('\t'),
+                            Some('b') => out.push('\u{8}'),
+                            Some(other) => {
+                                return Err(format!("值非法转义 \\{other} {body:?}"))
+                            }
+                            None => return Err(format!("引号未闭合 {body:?}")),
+                        },
+                        Some(c) => out.push(c),
+                        None => return Err(format!("引号未闭合 {body:?}")),
+                    }
+                }
+                let tail = it.as_str().trim();
+                if !tail.is_empty() && !tail.starts_with('#') && !tail.starts_with(';') {
+                    return Err(format!("引号后有多余内容 {body:?}"));
+                }
+                out
+            } else {
+                // 裸值：先扫截断点（#/; 前是空白才算注释，转义字符不参与），尾部空白去除，再转义。
+                let chars: Vec<char> = v.chars().collect();
+                let mut i = 0;
+                let mut prev_space = true;
+                let mut end = chars.len();
+                while i < chars.len() {
+                    let c = chars[i];
+                    if c == '\\' {
+                        i += 2;
+                        prev_space = false;
+                        continue;
+                    }
+                    if (c == '#' || c == ';') && prev_space {
+                        end = i;
+                        break;
+                    }
+                    prev_space = c.is_whitespace();
+                    i += 1;
+                }
+                let text: String = chars[..end.min(chars.len())].iter().collect();
+                git_unescape(text.trim_end())?
+            }
+        }
+        None => String::new(), // 无等号的布尔键：proxy/sslCAInfo 不会这样，读成空值即可
+    };
+    Ok(GitLine::Pair { indent, key, value })
+}
+
+/// 解析 .gitconfig 全文。
+fn git_parse(content: &str) -> Result<Vec<GitEntry>, String> {
+    let mut out = Vec::new();
+    for raw in content.split_inclusive('\n') {
+        let body = raw.strip_suffix('\n').unwrap_or(raw);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let line = if body.trim().is_empty() {
+            GitLine::Verbatim
+        } else {
+            git_parse_line(body)?
+        };
+        out.push(GitEntry { line, raw: raw.to_string() });
+    }
+    Ok(out)
+}
+
+/// 完整键名拆段：最后一个点后是键名；剩余里第一个点前是段，中间是子节。
+/// "http.proxy" → (http, None, proxy)；"http.https://x/.sslCAInfo" → (http, Some("https://x/"), sslCAInfo)。
+fn git_split_key(key: &str) -> Option<(String, Option<String>, String)> {
+    let (head, last) = key.rsplit_once('.')?;
+    if head.is_empty() || last.is_empty() {
+        return None;
+    }
+    Some(match head.split_once('.') {
+        Some((sec, sub)) if !sec.is_empty() && !sub.is_empty() => {
+            (sec.to_ascii_lowercase(), Some(sub.to_string()), last.to_ascii_lowercase())
+        }
+        Some(_) => return None,
+        None => (head.to_ascii_lowercase(), None, last.to_ascii_lowercase()),
+    })
+}
+
+enum GitEdit {
+    Set(String),
+    Unset,
+}
+
+/// 把一个键的编辑应用到行表。Set 替换最后一次出现的键行（无则段内追加、段无则文件尾建段）；
+/// Unset 删除最后一次出现。与 git config 的 replace-last / unset-last 语义一致。返回是否产生改动。
+fn git_apply(
+    entries: &mut Vec<GitEntry>,
+    target: (String, Option<String>, String),
+    edit: GitEdit,
+) -> bool {
+    let (tsec, tsub, tkey) = target;
+    let tsub = tsub.as_deref();
+    let mut cur: Option<(String, Option<String>)> = None;
+    let mut last_pair: Option<usize> = None;
+    let mut last_section: Option<usize> = None;
+    for (i, e) in entries.iter().enumerate() {
+        match &e.line {
+            GitLine::Section { section, sub } => {
+                if *section == tsec && sub.as_deref() == tsub {
+                    last_section = Some(i);
+                }
+                cur = Some((section.clone(), sub.clone()));
+            }
+            GitLine::Pair { key, .. } => {
+                if *key == tkey
+                    && cur
+                        .as_ref()
+                        .map(|(s, b)| s == &tsec && b.as_deref() == tsub)
+                        .unwrap_or(false)
+                {
+                    last_pair = Some(i);
+                }
+            }
+            GitLine::Verbatim => {}
+        }
+    }
+    match edit {
+        GitEdit::Set(v) => {
+            if let Some(i) = last_pair {
+                if let GitLine::Pair { indent, key, value } = &mut entries[i].line {
+                    if *value == v {
+                        return false;
+                    }
+                    *value = v.clone();
+                    entries[i].raw = format!("{indent}{key} = {}\n", git_escape_value(&v));
+                    return true;
+                }
+            }
+            let pair_raw = format!("\t{tkey} = {}\n", git_escape_value(&v));
+            let pair = GitEntry {
+                line: GitLine::Pair { indent: "\t".into(), key: tkey.clone(), value: v },
+                raw: pair_raw,
+            };
+            match last_section {
+                Some(si) => {
+                    // 插在该段范围内最后：下一个段头之前（段内可能全是注释行）。
+                    let next_sec = entries
+                        .iter()
+                        .skip(si + 1)
+                        .position(|e| matches!(e.line, GitLine::Section { .. }))
+                        .map(|p| si + 1 + p)
+                        .unwrap_or(entries.len());
+                    entries.insert(next_sec, pair);
+                }
+                None => {
+                    let header = match tsub {
+                        Some(s) => format!("[{tsec} \"{}\"]\n", git_escape_value(s)),
+                        None => format!("[{tsec}]\n"),
+                    };
+                    let sec = GitEntry {
+                        line: GitLine::Section { section: tsec, sub: tsub.map(String::from) },
+                        raw: header,
+                    };
+                    entries.push(sec);
+                    entries.push(pair);
+                }
+            }
+            true
+        }
+        GitEdit::Unset => match last_pair {
+            Some(i) => {
+                entries.remove(i);
+                true
+            }
+            None => false,
+        },
+    }
 }
 
 /// 读单个 git 键；未设置时 None。
@@ -735,16 +1031,85 @@ fn git_get(map: &HashMap<String, String>, key: &str) -> Option<String> {
     map.get(key).cloned().filter(|v| !v.is_empty())
 }
 
-/// 一次 `--list` 拿全全局键值（多值键取最后一行，与 --get 同语义）。
-fn git_map() -> Result<HashMap<String, String>, String> {
-    let out = git_run(&["config", "--global", "--list"])?;
-    let mut m = HashMap::new();
-    for line in out.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            m.insert(k.to_string(), v.to_string());
+/// 键值对组装：多值键取最后（与 git config --list/--get 同语义）；键名还原为完整形式。
+fn git_pairs(entries: &[GitEntry]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cur: Option<(String, Option<String>)> = None;
+    for e in entries {
+        match &e.line {
+            GitLine::Section { section, sub } => cur = Some((section.clone(), sub.clone())),
+            GitLine::Pair { key, value, .. } => {
+                let name = match &cur {
+                    Some((s, Some(sub))) => format!("{s}.{sub}.{key}"),
+                    Some((s, None)) => format!("{s}.{key}"),
+                    None => key.clone(),
+                };
+                out.push((name, value.clone()));
+            }
+            GitLine::Verbatim => {}
         }
     }
+    out
+}
+
+/// 读全局键值：多值键取最后一次（与 git config --list/--get 同语义）。文件不存在 = 空。
+fn git_map() -> Result<HashMap<String, String>, String> {
+    let entries = git_load_entries()?;
+    let mut m = HashMap::new();
+    for (k, v) in git_pairs(&entries) {
+        m.insert(k, v);
+    }
     Ok(m)
+}
+
+/// git 全局配置条目：文件不存在 = 空；非 UTF-8 / 语法不认识 = Err（调用方只读不动）。
+fn git_load_entries() -> Result<Vec<GitEntry>, String> {
+    let Some(path) = git_config_path() else {
+        return Err("找不到 git 全局配置位置".into());
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let s = String::from_utf8(bytes).map_err(|_| ".gitconfig 不是 UTF-8".to_string())?;
+            git_parse(&s)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("读 .gitconfig 失败({e})")),
+    }
+}
+
+/// 行表回写：原样拼回 + 原子落盘。
+fn git_save_entries(path: &Path, entries: &[GitEntry]) -> Result<(), String> {
+    let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
+    crate::fsx::write_atomic(path, out.as_bytes())
+        .map_err(|e| format!("写 .gitconfig 失败({e})"))
+}
+
+/// 写一个全局键（替换最后一次出现）。改动才落盘。
+fn git_set_key(key: &str, value: &str) -> Result<(), String> {
+    let Some(path) = git_config_path() else {
+        return Err("找不到 git 全局配置位置".into());
+    };
+    let target =
+        git_split_key(key).ok_or_else(|| format!("键名无法拆段({key})"))?;
+    let mut entries = git_load_entries()?;
+    if git_apply(&mut entries, target, GitEdit::Set(value.to_string())) {
+        git_save_entries(&path, &entries)?;
+    }
+    Ok(())
+}
+
+/// 删一个全局键的最后一次出现。改动才落盘；键本就不存在时不创建文件。
+fn git_unset_key(key: &str) -> Result<(), String> {
+    let Some(path) = git_config_path() else {
+        return Err("找不到 git 全局配置位置".into());
+    };
+    let target =
+        git_split_key(key).ok_or_else(|| format!("键名无法拆段({key})"))?;
+    let mut entries = git_load_entries()?;
+    if git_apply(&mut entries, target, GitEdit::Unset) {
+        git_save_entries(&path, &entries)?;
+    }
+    Ok(())
 }
 
 /// 纯判定：键该还原备份、清掉还是不动。当前值是别人写的 → 永远不动。
@@ -782,7 +1147,7 @@ fn ensure_git_proxy() -> String {
         *state().git_proxy_backup.lock().unwrap() = backups.join(&GIT_BACKUP_SEP.to_string());
     }
     for key in GIT_PROXY_KEYS {
-        let _ = git_run(&["config", "--global", key, &ours]);
+        let _ = git_set_key(key, &ours);
     }
     let ca = exe_dir().join("ca.crt");
     if ca.exists() {
@@ -791,7 +1156,7 @@ fn ensure_git_proxy() -> String {
             // 用户自己的 CA 信任不动：我们的写入对它毫无意义，覆盖了反而坏别人的事
             let cur = git_get(&map, key).unwrap_or_default();
             if cur.is_empty() || cur == ca_str {
-                let _ = git_run(&["config", "--global", key, &ca_str]);
+                let _ = git_set_key(key, &ca_str);
             }
         }
     }
@@ -821,11 +1186,11 @@ fn remove_git_proxy() -> String {
         let backup = backups.get(i).map(|s| s.as_str()).unwrap_or("");
         match git_key_action(git_get(&map, key).as_deref(), &ours, backup) {
             GitKeyAction::Restore(v) => {
-                let _ = git_run(&["config", "--global", key, &v]);
+                let _ = git_set_key(key, &v);
                 touched = true;
             }
             GitKeyAction::Unset => {
-                let _ = git_run(&["config", "--global", "--unset", key]);
+                let _ = git_unset_key(key);
                 touched = true;
             }
             GitKeyAction::Keep => {}
@@ -834,7 +1199,7 @@ fn remove_git_proxy() -> String {
     let ca_str = exe_dir().join("ca.crt").to_string_lossy().to_string();
     for key in GIT_CA_KEYS {
         if git_get(&map, key).as_deref() == Some(ca_str.as_str()) {
-            let _ = git_run(&["config", "--global", "--unset", key]);
+            let _ = git_unset_key(key);
             touched = true;
         }
     }
