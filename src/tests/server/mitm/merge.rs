@@ -516,7 +516,7 @@ fn steady_rate_uses_only_post_first_frame_window() {
     assert!(!s.sample_steady(now), "没首帧不落定");
     let first = now - Duration::from_secs(2);
     // 首帧 burst 800KB，随后才慢慢收。
-    s.on_first_frame(first, 800 * 1024);
+    s.on_first_frame(first);
     s.got = 800 * 1024;
     assert!(
         !s.sample_steady(first + Duration::from_millis(400)),
@@ -543,21 +543,32 @@ fn steady_rate_uses_only_post_first_frame_window() {
     assert_eq!(s.steady_rate.unwrap(), r, "稳态速度一旦落定不再变");
 }
 
-/// 提前收尾的路：没走到 600ms 就 EOF，用首帧剔除后的全程均速定格，不用含 burst 的 got。
+/// 提前收尾的路：一趟到齐等不到 600ms 窗，用已知区间长度算全程均速，不从 got 累加、不剔首帧。
 #[test]
-fn early_finish_freeze_excludes_first_frame() {
+fn early_finish_freeze_uses_known_range() {
     let now = Instant::now();
     let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
     let first = now - Duration::from_millis(200);
-    s.on_first_frame(first, 100_000); // 首帧 burst 100KB
-    s.got = 100_000 + 20_000; // 之后只收 20KB
-    assert!(s.freeze(now), "提前收尾应落定速度");
+    s.on_first_frame(first); // 首帧即整段到齐
+    s.got = 1 << 20; // 实测字节也到齐，但 freeze 不看 got
+    assert!(s.freeze(now, true), "提前收尾应落定速度");
     let r = s.steady_rate.unwrap();
     assert!(
-        (r - 100_000.0).abs() < 100.0,
-        "首帧剔除后 20KB/0.2s = 100KB/s；不剔除则会被 burst 抬到 600KB/s",
+        (r - (1 << 20) as f64 / 0.2).abs() < 100.0,
+        "已知区间 1MB/0.2s = 5MB/s；一趟到齐也测得到: {r}",
     );
-    assert!(!s.freeze(now), "已落定不重复喂");
+    assert!(!s.freeze(now, true), "已落定不重复喂");
+}
+
+/// 出错/停滞段不落速度样本——假速度不进基准、不喂 EMA。
+#[test]
+fn freeze_skips_failed_segments() {
+    let now = Instant::now();
+    let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
+    s.on_first_frame(now - Duration::from_millis(200));
+    s.got = 1 << 20;
+    assert!(!s.freeze(now, false), "出错段不落速度样本");
+    assert!(s.steady_rate.is_none(), "出错段不留速度");
 }
 
 /// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。

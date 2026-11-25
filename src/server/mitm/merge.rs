@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 pub(super) const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
 /// 多久没收到字节算死。5s 忍得住 CDN 抖动，又不让死连接白占位置。
 pub(super) const STALL_MS: u64 = 5_000;
-/// 稳态速度采样：首帧后 500ms 记基线、600ms 落定。首帧 burst 不进分子，爬坡单独计价。
+/// 稳态速度采样：首帧后 500ms 记基线、600ms 落定，取这 100ms 的增量；增量 0 不落定，留给整段均速兜底。
 const STEADY_BASE_MS: u64 = 500;
 const STEADY_RATE_MS: u64 = 600;
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
@@ -109,12 +109,10 @@ struct Seg {
     got: u64,
     /// 速率起点（首帧到达时刻），算速率用；首帧前为 None。
     first_at: Option<Instant>,
-    /// 首帧那一帧的字节数：首帧 burst 不进任何速度分子。
-    first_frame_bytes: u64,
     /// 稳态窗基线：首帧后 500ms 的 (时刻, 已收字节)，600ms 时用 (now−base) 算速度。
     w1_at: Option<Instant>,
     w1_got: u64,
-    /// 段级稳态速度 B/s：500→600ms 窗的实测；提前收尾时按首帧剔除后的全程均速。
+    /// 段级稳态速度 B/s：500→600ms 窗的实测；一趟到齐等不到窗时用整段已知长度算全程均速。
     /// 一旦落定值不再变；没样本为 None，不动刀、不进 V_fast。
     steady_rate: Option<f64>,
     /// 首帧前的占位起点，仅用于 last_poll 初始化。
@@ -145,7 +143,6 @@ impl Seg {
             buffered: 0,
             got: 0,
             first_at: None,
-            first_frame_bytes: 0,
             w1_at: None,
             w1_got: 0,
             steady_rate: None,
@@ -165,16 +162,15 @@ impl Seg {
         self.start + self.got
     }
 
-    /// 首帧到达：速率时钟从这一刻起算（爬坡不进分母——爬坡已单独计价），记下首帧字节供剔除。
-    fn on_first_frame(&mut self, at: Instant, n: u64) {
+    /// 首帧到达：速率时钟从这一刻起算（爬坡不进分母——爬坡已单独计价）。
+    fn on_first_frame(&mut self, at: Instant) {
         if self.first_at.is_none() {
             self.first_at = Some(at);
-            self.first_frame_bytes = n;
             self.begin = at;
         }
     }
 
-    /// 采样稳态速度的首帧后基线（500ms）：此刻的已收字节排除首帧 burst 后作分子起点。
+    /// 采样稳态速度的首帧后基线（500ms）：此刻的已收字节作分子起点，爬坡已单独计价。
     /// 返回 true 表示本拍落下了一个稳态速度，调用方据此喂镜像 EMA 并提前体检。
     fn sample_steady(&mut self, now: Instant) -> bool {
         if self.steady_rate.is_some() {
@@ -196,21 +192,26 @@ impl Seg {
         let t0 = self.w1_at.unwrap_or(now);
         let el = now.saturating_duration_since(t0).as_secs_f64().max(0.001);
         let bytes = self.got.saturating_sub(self.w1_got);
+        if bytes == 0 {
+            // 这 100ms 一个字节没进：一趟到齐的特征，写 0 没意义。留给 freeze 用整段均速兜底。
+            return false;
+        }
         self.steady_rate = Some(bytes as f64 / el);
         true
     }
 
-    /// 收尾定格：已有 600ms 窗速度就留着；没有（提前下完/停滞）才用首帧剔除后的全程均速。
+    /// 收尾定格：已有 600ms 窗速度就留着；没有才用整段已知长度算全程均速（一趟到齐也能测到）。
+    /// 出错/停滞段不落样本——它的速度不代表链路快慢，不进基准也不喂 EMA。
     /// 返回 true 表示本拍落下了速度样本（供 EMA/体检），已落定过返回 false 不重复喂。
-    fn freeze(&mut self, now: Instant) -> bool {
-        if self.steady_rate.is_some() {
+    fn freeze(&mut self, now: Instant, ok: bool) -> bool {
+        if self.steady_rate.is_some() || !ok {
             return false;
         }
         let Some(first) = self.first_at else {
             return false; // 连首帧都没到，没样本，不动刀、不进基准
         };
         let el = now.saturating_duration_since(first).as_secs_f64().max(0.001);
-        let bytes = self.got.saturating_sub(self.first_frame_bytes);
+        let bytes = self.end.saturating_sub(self.start); // 区间是我们自己切的，长度已知，不从 got 累加
         self.steady_rate = Some(bytes as f64 / el);
         true
     }
@@ -391,9 +392,9 @@ impl MergeBody {
                     // 非数据帧（trailer 等）直接丢，只关心正文。
                     if let Ok(d) = f.into_data() {
                         let n = d.len() as u64;
-                        // 首帧：速率时钟从这一刻起算（爬坡不进分母），记下首帧字节供速度分子剔除。
+                        // 首帧：速率时钟从这一刻起算（爬坡不进分母）。
                         if seg.first_at.is_none() {
-                            seg.on_first_frame(now, n);
+                            seg.on_first_frame(now);
                         }
                         seg.buffered += d.len();
                         seg.got += n;
@@ -403,15 +404,13 @@ impl MergeBody {
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
                     progressed = true;
-                    if seg.freeze(now) {
-                        steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
-                    }
+                    seg.freeze(now, false); // 出错段不落速度样本
                     seg.done = true;
                     seg.err = Some(e);
                 }
                 std::task::Poll::Ready(None) => {
                     progressed = true;
-                    if seg.freeze(now) {
+                    if seg.freeze(now, true) {
                         // 提前下完：定格首帧剔除后的均速，供别人当"最快"基准并喂 EMA。
                         steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
                     }
@@ -451,7 +450,7 @@ impl MergeBody {
             let old_end = seg.end;
             seg.end = pos;
             seg.body = protocol::empty_body();
-            seg.freeze(now); // 停滞段不喂 EMA（err 段不进基准），只留速度供诊断
+            seg.freeze(now, false); // 停滞段不落速度样本（不进基准、不喂 EMA）
             seg.done = true;
             seg.err = Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
