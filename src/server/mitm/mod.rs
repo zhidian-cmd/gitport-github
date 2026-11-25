@@ -74,9 +74,10 @@ pub async fn handle_connect_mitm(
     });
     let result = if alpn == b"h2" {
         hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-            // h2 连接窗照 upstream 的 4MB 调：默认 64KB 会把上百个流压成按 RTT 串行，多通道也灌不进浏览器。
-            .initial_stream_window_size(1024 * 1024) // 流级 1MB
-            .initial_connection_window_size(4 * 1024 * 1024) // 连接级聚合 4MB
+            // h2 窗口照 upstream 顶到协议上限 2^31−1：默认 64KB 会把上百个流压成按 RTT 串行，
+            // 多通道也灌不进浏览器；窗口不预分配内存、背压靠 release_capacity，顶格无代价。
+            .initial_stream_window_size(i32::MAX as u32) // 流级顶格
+            .initial_connection_window_size(i32::MAX as u32) // 连接级顶格（所有流共享）
             .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
             .await
     } else {

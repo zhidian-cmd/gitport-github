@@ -399,10 +399,13 @@ pub async fn h2_from_dialed(
     ip: &str,
     log: &LogFn,
 ) -> Result<H2Upstream, String> {
-    // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s），放大为流 1MB/连接 4MB。
+    // h2 默认窗口 64KB 会把单页 129 并发压成按 RTT 串行（实测 FCP 34s）。顶到协议上限 2^31−1：
+    // 窗口只是在途额度上限、不预分配内存，背压靠 release_capacity（消费停就不回窗），所以顶格无代价；
+    // 连接级是整条连接所有流共享的，必须一次给足，否则多流互等 WINDOW_UPDATE、复用退化成排队。
+    let h2_window = i32::MAX as u32; // 2147483647 = h2 MAX_WINDOW_SIZE，三个 builder 的 assert 均通过
     let mut cb = h2::client::Builder::new();
-    cb.initial_window_size(1024 * 1024) // 流级 1MB
-        .initial_connection_window_size(4 * 1024 * 1024); // 连接级聚合 4MB
+    cb.initial_window_size(h2_window) // 流级顶格
+        .initial_connection_window_size(h2_window); // 连接级顶格（所有流共享）
                                                           // h2 握手必须限时：对端 TLS 通了之后装死会永久持有 per-host 拨号锁，拖死整个域名。
     let (send, conn) = tokio::time::timeout(
         std::time::Duration::from_secs(crate::config::H2_HANDSHAKE_TIMEOUT_SECS),
@@ -964,7 +967,12 @@ pub fn mirror_client(log: &LogFn) -> &'static LegacyClient<MirrorConnector, BoxB
             .pool_idle_timeout(MIRROR_POOL_IDLE)
             // pool_idle_timeout 必须配 pool_timer 才生效（hyper-util 内部行为）。
             .pool_timer(hyper_util::rt::TokioTimer::new())
-            .retry_canceled_requests(true);
+            .retry_canceled_requests(true)
+            // h2 窗口照直连腿/本地入站顶到协议上限 2^31−1：默认 64KB 下每条新流起步只能发一个窗口，
+            // 得等 WINDOW_UPDATE 一轮轮填管道，镜像 RTT 高就要爬好几秒，切尾/补发又不断起新流重爬。
+            // 顶格让新流一上来就能灌满；窗口不预分配内存、背压靠 release_capacity，无代价。
+            .http2_initial_stream_window_size(i32::MAX as u32)
+            .http2_initial_connection_window_size(i32::MAX as u32);
         b.build(MirrorConnector { log: log.clone() })
     })
 }
