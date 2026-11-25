@@ -63,13 +63,6 @@
       <a href="#settings" class="item" data-view="settings"><span>设</span><span>置</span></a>
     </nav>
 
-    <div class="side-foot">
-      <span class="run-dot" id="dot"></span>
-      <div class="foot-txt">
-        <div class="foot-state" id="footState">已停止</div>
-        <div class="foot-sub"><span id="footPort">127.0.0.1:7810</span> · <span id="footVer">v?</span></div>
-      </div>
-    </div>
   </aside>
 
   <main class="main">
@@ -93,8 +86,8 @@
         <div class="grid3">
           <div class="statcard">
             <span class="label">代理服务</span>
-            <span class="value" id="sRun">已停止</span>
-            <span class="meta" id="sPortMeta">127.0.0.1:7810</span>
+            <span class="value run-state"><span class="run-dot" id="dot"></span><span id="footState">已停止</span></span>
+            <span class="meta"><span id="footPort">127.0.0.1:7810</span> · <span id="footVer">v?</span></span>
           </div>
           <div class="statcard">
             <span class="label">接入与加速</span>

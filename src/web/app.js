@@ -66,12 +66,10 @@ async function refreshStatus() {
 
   $('dot').classList.toggle('on', s.running);
   $('footState').textContent = s.running ? '运行中' : '已停止';
+  $('footState').style.color = s.running ? 'var(--green)' : '';
   $('footPort').textContent = '127.0.0.1:' + s.port;
   if (s.version) $('footVer').textContent = 'v' + s.version;
   $('addr').textContent = '127.0.0.1:' + s.port;
-  $('sRun').textContent = s.running ? '运行中' : '已停止';
-  $('sRun').style.color = s.running ? 'var(--green)' : '';
-  $('sPortMeta').textContent = '127.0.0.1:' + s.port;
 
   badge('bMitm', s.mitm, 'MITM 开', 'MITM 关');
   $('sDomains').textContent = '分流域名 ' + s.domainCount + ' 个';

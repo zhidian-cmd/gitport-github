@@ -33,7 +33,7 @@
 html{overflow:hidden}
 html,body{height:100%}
 body{
-  display:grid;grid-template-columns:180px 1fr;overflow:hidden;
+  display:grid;grid-template-columns:120px 1fr;overflow:hidden;
   font-family:var(--sans);background:var(--bg);color:var(--txt);font-size:14px;
   -webkit-font-smoothing:antialiased;
 }
@@ -50,13 +50,13 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 /* ---------- 侧栏 ---------- */
 .side{display:flex;flex-direction:column;background:var(--bg-side);border-right:1px solid var(--line);min-height:0}
-.brand{display:flex;align-items:center;gap:10px;padding:20px 14px 16px}
-.mark{width:27px;height:27px;color:var(--green);flex-shrink:0}
-.brand .name{font-size:14.5px;font-weight:600;letter-spacing:.01em}
-.brand .sub{font-size:11px;color:var(--faint);margin-top:2px;letter-spacing:.02em}
+.brand{display:flex;flex-direction:column;align-items:center;gap:6px;padding:16px 8px 12px;text-align:center}
+.mark{width:24px;height:24px;color:var(--green);flex-shrink:0}
+.brand .name{font-size:11px;font-weight:600;letter-spacing:.01em;line-height:1.25}
+.brand .sub{font-size:9px;color:var(--faint);margin-top:2px;letter-spacing:.02em}
 
-.nav{flex:1;padding:2px 10px;display:flex;flex-direction:column;gap:2px;overflow-y:auto;min-height:0}
-.nav-group{font-size:11px;color:var(--faint);letter-spacing:.14em;padding:16px 10px 6px}
+.nav{flex:1;padding:2px 8px;display:flex;flex-direction:column;gap:2px;overflow-y:auto;min-height:0}
+.nav-group{font-size:10px;color:var(--faint);letter-spacing:.08em;padding:14px 8px 6px}
 .nav-group:first-child{padding-top:4px}
 /* 两字分散到按钮两端：宽度随侧栏拉伸，间距不固定；分组标题不套此类，保持原样 */
 .item{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:8px;
@@ -64,8 +64,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .item:hover{background:var(--panel-2);color:var(--txt)}
 .item.active{background:var(--green-soft);color:var(--green);font-weight:600}
 
-.side-foot{display:flex;align-items:center;gap:10px;margin:10px;padding:11px 13px;
-           background:var(--panel);border:1px solid var(--line);border-radius:10px}
 .run-dot{width:9px;height:9px;border-radius:50%;background:#39424f;flex-shrink:0}
 .run-dot.on{background:var(--green);animation:pulse 2.4s ease-out infinite}
 @keyframes pulse{
@@ -73,9 +71,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
   70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}
   100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}
 }
-.foot-state{font-size:13px;font-weight:600;color:var(--mid)}
-.foot-sub{font:11px var(--mono);color:var(--faint);margin-top:2px}
-
 /* ---------- 主区 ---------- */
 .main{display:flex;flex-direction:column;min-width:0;min-height:0;
       background:radial-gradient(1100px 280px at 72% -100px,rgba(63,185,80,.05),transparent 60%),var(--bg)}
@@ -137,6 +132,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
           color:var(--txt);transition:border-color .15s,transform .15s}
 .statcard:hover{border-color:var(--line-strong);transform:translateY(-2px)}
 .statcard .value{font-size:18px;font-weight:600}
+.statcard .value.run-state{display:flex;align-items:center;gap:9px}
 .statcard .meta{font:12px var(--mono);color:var(--faint)}
 .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
 .badge{font-size:11.5px;padding:3.5px 9px;border-radius:999px;
