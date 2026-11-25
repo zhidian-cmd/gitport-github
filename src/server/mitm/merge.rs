@@ -211,7 +211,11 @@ impl Seg {
             return false; // 连首帧都没到，没样本，不动刀、不进基准
         };
         let el = now.saturating_duration_since(first).as_secs_f64().max(0.001);
-        let bytes = self.end.saturating_sub(self.start); // 区间是我们自己切的，长度已知，不从 got 累加
+        // 一趟到齐时 got == end-start，行为不变；206 声明了完整区间却中途 EOF 时按实收计价，
+        // 别把只下了 100KB 的截断腿记成下了 1MB，否则派发会把流量导向坏腿。
+        let bytes = self
+            .got
+            .min(self.end.saturating_sub(self.start));
         self.steady_rate = Some(bytes as f64 / el);
         true
     }

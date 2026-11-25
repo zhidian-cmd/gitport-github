@@ -264,14 +264,13 @@ pub fn set_dial_port(p: u16) {
     TEST_DIAL_PORT.store(p, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// 拨一条：TCP → 可选 TLS（SNI=sni 骗墙，证书按 verify 锚点校验）。
-pub async fn dial_one(
+/// 拨一条的内核：调用方已持有闸门名额。TCP → 可选 TLS（SNI=sni 骗墙，证书按 verify 锚点校验）。
+async fn dial_one_inner(
     ip: &str,
     sni: &str,
     verify: &str,
     tls_handshake: bool,
 ) -> std::io::Result<Dialed> {
-    let _permit = gate_acquire().await;
     let addr = format!("{ip}:{}", dial_port());
     let tcp = tokio::time::timeout(
         Duration::from_millis(TCP_CONNECT_TIMEOUT_MS),
@@ -287,6 +286,33 @@ pub async fn dial_one(
 
     let tls = tls_connect(sni, verify, tcp).await?;
     Ok(Dialed::Tls(tls))
+}
+
+/// 拨一条：TCP → 可选 TLS。带全局闸门，供常规请求走。
+pub async fn dial_one(
+    ip: &str,
+    sni: &str,
+    verify: &str,
+    tls_handshake: bool,
+) -> std::io::Result<Dialed> {
+    let _permit = gate_acquire().await;
+    dial_one_inner(ip, sni, verify, tls_handshake).await
+}
+
+/// IP 测速专用：计时起点放在拿到闸门名额之后——排队是全局闸门拥堵，不是这个 IP 的建连延迟。
+/// 返回 (连接, 拨号毫秒, 排队毫秒)；排队耗时单独带回供日志，不进 latency。
+pub async fn dial_one_timed(
+    ip: &str,
+    sni: &str,
+    verify: &str,
+    tls_handshake: bool,
+) -> std::io::Result<(Dialed, u64, u64)> {
+    let t_wait = std::time::Instant::now();
+    let _permit = gate_acquire().await;
+    let queued_ms = t_wait.elapsed().as_millis() as u64;
+    let t0 = std::time::Instant::now();
+    let d = dial_one_inner(ip, sni, verify, tls_handshake).await?;
+    Ok((d, t0.elapsed().as_millis() as u64, queued_ms))
 }
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {

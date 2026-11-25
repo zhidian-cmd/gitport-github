@@ -56,8 +56,10 @@ fn mark_fail(load: &MirrorLoad, timeout_only: bool) {
     } else {
         MIRROR_FAIL_WINDOW_MS
     };
+    // 取两次里更晚的截止：同页几十流时同一镜像可能先吃硬错误(45s)又吃超时(15s)，
+    // 直接 store 会被后一次短的缩短，熔断前最后一道过滤被击穿。
     load.fail_until
-        .store(now_ms().saturating_add(win), Ordering::Relaxed);
+        .fetch_max(now_ms().saturating_add(win), Ordering::Relaxed);
 }
 
 fn fail_window_active(load: &MirrorLoad, now: u64) -> bool {

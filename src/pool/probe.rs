@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use super::{clear_dead, dial, msg_is_tcp_dead, note_dead, route};
+use super::{clear_cursors, clear_dead, dial, msg_is_tcp_dead, note_dead, route};
 use crate::util::{lock, LogFn};
 
 pub static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -48,12 +48,17 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
     let mut ok = 0usize;
     let mut fail = 0usize;
     for t in &targets {
-        let t0 = std::time::Instant::now();
         // sni 空串 = ClientHello 无 SNI 扩展（dial.rs 的既定语义），与代理拨号一致；显示口径对齐日志的「无SNI」。
         let sni_show = if t.sni.is_empty() { "无SNI".to_string() } else { t.sni.clone() };
-        match dial::dial_one(&t.ip, &t.sni, &t.verify, true).await {
-            Ok(_conn) => {
-                let ms = t0.elapsed().as_millis() as u64;
+        // 计时起点在 dial_one_timed 内部、拿到全局闸门名额之后——排队是闸门拥堵，不算这个 IP 的延迟。
+        match dial::dial_one_timed(&t.ip, &t.sni, &t.verify, true).await {
+            Ok((_conn, ms, queued_ms)) => {
+                if queued_ms >= 50 {
+                    (log)(&format!(
+                        "[IP 测速] {} 闸门排队 {queued_ms}ms(不计入延迟)",
+                        t.ip
+                    ));
+                }
                 route::set_latency(&t.ip, ms);
                 // 测速成功即证明 IP 活着：顺带清死亡退避，运行时不必再绕行等待。
                 clear_dead(&t.ip);
@@ -85,8 +90,9 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
     )
 }
 
-/// 测速结果落盘：latency 回流 routes.json + 游标全清（settings.json）。
+/// 测速结果落盘：latency 回流 routes.json + 游标全清（内存 SERIAL.cursor 与 settings.json 副本都清）。
 fn save_results() {
+    clear_cursors(); // 先清内存正生效的表，否则下次成功拨号又写回磁盘
     crate::pool::save_routes_now();
     crate::settings::set_last_ips(Vec::new());
 }

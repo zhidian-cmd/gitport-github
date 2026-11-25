@@ -243,18 +243,24 @@ pub fn store_h2(ip: &str, up: H2Upstream) -> H2Upstream {
 }
 
 /// 按连接 id 精确摘除：同 IP 两条连接靠 IP 分不开，删错会把健康的摘掉。
+/// 摘掉后必须 notify 驱动：否则它 sweep 时查自己已不在池里，(0,0,false) 两个退出条件都不成立，
+/// 抱着已摘连接 poll 到对端关闭——长跑下 socket/句柄单调堆积。驱动自己也调这里，重复 notify 无害。
 pub fn drop_h2_id(ip: &str, id: u64) {
-    let mut g = lock(conn_pool());
-    match g.get_mut(ip) {
-        Some(h) => {
+    let close = {
+        let mut g = lock(conn_pool());
+        let mut found = None;
+        if let Some(h) = g.get_mut(ip) {
             if let Some(pos) = h.iter().position(|c| c.up.id == id) {
-                h.remove(pos);
+                found = Some(h.remove(pos).up.close.clone());
             }
             if h.is_empty() {
                 g.remove(ip);
             }
         }
-        None => {}
+        found
+    };
+    if let Some(c) = close {
+        c.notify_one();
     }
 }
 

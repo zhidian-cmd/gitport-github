@@ -9,10 +9,58 @@ use crate::certgen::Authority;
 use crate::config::{self, HEAD_TIMEOUT_SECS};
 use crate::pool::{self, dial::Dialed};
 use crate::util::LogFn;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+
+/// 读头时一次读到 8192 字节，乐观客户端会把 CONNECT 头和 ClientHello 写进同一个包。
+/// 多读的体首段存进 prefix，这里让它先于 socket 被读到，再把读交给底层——否则握手首段丢失。
+struct Prefixed<S> {
+    prefix: Vec<u8>,
+    at: usize,
+    inner: S,
+}
+
+impl<S> Prefixed<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self { prefix, at: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.at < self.prefix.len() {
+            let n = buf.remaining().min(self.prefix.len() - self.at);
+            buf.put_slice(&self.prefix[self.at..self.at + n]);
+            self.at += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 pub struct ProxyServer {
     pub log: LogFn,
@@ -132,7 +180,8 @@ impl ProxyServer {
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
         if method == "CONNECT" {
-            self.handle_connect(client, &target, cancel).await;
+            self.handle_connect(client, &target, cancel, body_prefix.to_vec())
+                .await;
         } else {
             self.handle_http(client, &method, &target, headers, body_prefix, cancel)
                 .await;
@@ -140,7 +189,14 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_connect(&self, mut client: TcpStream, target: &str, cancel: CancellationToken) {
+    async fn handle_connect(
+        &self,
+        client: TcpStream,
+        target: &str,
+        cancel: CancellationToken,
+        body_prefix: Vec<u8>,
+    ) {
+        let mut client = Prefixed::new(body_prefix, client);
         let (host, port) = split_target(target, 443);
         // 开放代理闸：受管域名全速加速，其他域名只放 443 透明隧道（拼接镜像 clone URL 用）；非 443 一律 502，bogon 过滤堵内网/元数据/非 HTTPS。
         if !pool::route::is_managed(&host) && port != 443 {
@@ -294,7 +350,7 @@ impl ProxyServer {
 }
 
 /// 无可用上游：502 + 带原因的日志（CONNECT 与明文 HTTP 共用），原因能区分被保险拦与拨不通。
-async fn reject(client: &mut TcpStream, log: &LogFn, host: &str, why: &str) {
+async fn reject<S: AsyncWrite + Unpin>(client: &mut S, log: &LogFn, host: &str, why: &str) {
     let _ = client
         .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         .await;

@@ -141,3 +141,69 @@ async fn mitm_rejects_unmanaged_sni() {
     assert!(got.is_err(), "非受管域 SNI 不得握手成功");
     assert!(srv.await.unwrap().is_err(), "服务端应因拒签而握手失败");
 }
+
+/// 首握手并发去重：20 个线程同时要同一域名的叶子证书，只能真签一次。
+/// 这条不是逻辑推演——签发计数器是测试期真实累加的，多签一次就会读到 20。
+#[test]
+fn leaf_sign_once_under_concurrency() {
+    let _g = crate::pool::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::pool::install_seed_routes();
+    let dir = std::env::temp_dir().join(format!("gitport_signonce_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = load_or_generate(&dir).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(20));
+    let mut hs = Vec::new();
+    for _ in 0..20 {
+        let a2 = a.clone();
+        let b = barrier.clone();
+        hs.push(std::thread::spawn(move || {
+            b.wait(); // 尽量让 20 个线程同一时刻撞进 leaf_ctx
+            a2.leaf_ctx("github.com").unwrap()
+        }));
+    }
+    let ctxs: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+    let n = a
+        .sign_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 1, "20 个并发首握手只应签发一次，实际签了 {n} 次");
+    for c in &ctxs {
+        assert!(Arc::ptr_eq(c, &ctxs[0]), "并发请求必须拿到同一份上下文");
+    }
+}
+
+/// CA 私钥落盘后的 ACL：只应有当前用户与 SYSTEM，不能给 Everyone / Users / Authenticated Users。
+/// 用 SID 判定而不是本地化组名，中英文 Windows 都成立。
+#[test]
+fn ca_key_acl_only_current_user_and_system() {
+    let dir = std::env::temp_dir().join(format!("gitport_acl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    load_or_generate(&dir).unwrap();
+    let key = dir.join("ca.key");
+    assert!(key.exists(), "ca.key 应已写入");
+    assert!(
+        std::fs::read_to_string(&key).unwrap().contains("PRIVATE KEY"),
+        "私钥内容应完整写入"
+    );
+
+    let script = format!(
+        "(Get-Acl -LiteralPath '{}').Access | ForEach-Object {{ $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }}",
+        key.display()
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .expect("调用 powershell 读 ACL 失败");
+    let sids = String::from_utf8_lossy(&out.stdout);
+    for bad in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] {
+        assert!(
+            !sids.contains(bad),
+            "ca.key 不应授予 {bad}（Everyone/Authenticated Users/Users）: {sids}"
+        );
+    }
+    assert!(sids.contains("S-1-5-18"), "应保留 SYSTEM: {sids}");
+}

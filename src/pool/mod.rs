@@ -336,9 +336,11 @@ fn json_of<T: Serialize>(v: &T) -> String {
 /// routes.json 写盘互斥：退出落盘与后台改镜像链可能同时写，撞在一起会把两份配置搅成一份。
 static ROUTES_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-fn write_routes_file(path: &Path, mirrors: &HashMap<String, Vec<String>>) {
+fn write_routes_file(path: &Path) {
     let _guard = ROUTES_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let data = encode_routes(mirrors, &big_chain());
+    // 快照必须在写锁内拍：调用方在锁外拍的话，删除镜像后另一路拿旧快照排队写，会把已删的复活。
+    let mirrors = mirror_chains_snapshot();
+    let data = encode_routes(&mirrors, &big_chain());
     if let Err(e) = crate::fsx::write_atomic(path, data.as_bytes()) {
         // 写盘失败无声 = 镜像链/表变更重启即丢且查无痕迹，必须留一行。
         if let Some(l) = lock(&SERIAL_LOG).as_ref() {
@@ -356,7 +358,7 @@ fn routes_path() -> PathBuf {
 
 /// 立即把内存表（含 latency 回流）落盘，下次冷启动仍有拨号延迟基线。
 pub fn save_routes_now() {
-    write_routes_file(&routes_path(), &mirror_chains_snapshot());
+    write_routes_file(&routes_path());
 }
 
 pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<LogFn>) {
@@ -531,7 +533,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     sync_custom_mirrors(&[], false);
     // 只有文件不存在（全新安装）才生成一次；之后的启动一律不重写，手改原样生效。
     if raw.is_none() {
-        write_routes_file(&path, &mirror_chains_snapshot());
+        write_routes_file(&path);
     }
 }
 
@@ -786,6 +788,15 @@ pub(crate) fn clear_dead(ip: &str) {
     let mut g = lock(&SERIAL);
     if let Some(t) = g.as_mut() {
         t.dead.remove(ip);
+    }
+}
+
+/// IP 测速后清空内存游标：游标正生效的地方是这里的 SERIAL.cursor，settings.json 只是副本。
+/// 不清内存的话下次成功拨号会把旧游标整份写回磁盘，"测速后纯按延迟排序"当场失效。
+pub fn clear_cursors() {
+    let mut g = lock(&SERIAL);
+    if let Some(t) = g.as_mut() {
+        t.cursor.clear();
     }
 }
 
@@ -1439,7 +1450,7 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
     drop(g);
     if changed && persist {
-        write_routes_file(&routes_path(), &mirror_chains_snapshot());
+        write_routes_file(&routes_path());
     }
 }
 
@@ -1484,7 +1495,7 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
         tab.mirrors.insert(host.to_string(), vc);
     }
     // 写者唯一（手动校准）：先放锁再同步落盘，写盘期间不挡拨号。
-    write_routes_file(&routes_path(), &mirror_chains_snapshot());
+    write_routes_file(&routes_path());
     if let Some(log) = lock(&SERIAL_LOG).as_ref() {
         log(&format!("[镜像] {host} 链序更新({why})"));
     }

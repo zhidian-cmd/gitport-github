@@ -172,9 +172,7 @@ pub(super) fn cache_take<B>(
         req.headers().get("accept").and_then(|v| v.to_str().ok()),
     );
     let key = live_cache_key(req.uri(), host, enc, variant);
-    let ((status, hdrs, body), swr_expired) =
-        match load_disk_entry_reason(&key, session_value(cookies).is_some())
-        {
+    let ((status, hdrs, body), swr_expired) = match load_disk_entry_reason(&key) {
             Ok(v) => v,
             Err(reason) => {
                 // 盘上有条目却被读侧拒绝 = "存了却命中不了"：落日志才排查得动。
@@ -192,15 +190,7 @@ pub(super) fn cache_take<B>(
     // v6.11 SWR：过期 -k/-rk 快照不判死——交旧（浏览器缓存直出）+ 后台静默重拉（带 cookie）。
     if swr_expired {
         (log)(&format!("[缓存] 页面快照过期, 交旧 + 后台重拉 {path}"));
-        spawn_page_refetch(
-            log,
-            host,
-            &key,
-            &path,
-            cookies,
-            upstream::encoding_bucket(req),
-            session_value(cookies).is_some(),
-        );
+        spawn_page_refetch(log, host, &key, &path, cookies, upstream::encoding_bucket(req));
     }
     Some(rebuild_cached_response(status, &hdrs, body))
 }
@@ -343,15 +333,8 @@ pub(super) async fn cache_put(
     // ② keep 骨架：首页/搜索页 HTML，7 天跨会话（键无会话号）。
     //    数据正文（JSON/ndjson）与软导航片段都不进 keep。
     if keep_route(path, &ct_lower) && !soft_html {
-        let key = live_cache_key(req.uri(), host, upstream::encoding_bucket(req), "-html");
-        return collect_and_submit_keep(
-            log,
-            &key,
-            search_page,
-            session_value(cookies).is_some(),
-            resp,
-        )
-        .await;
+        // key 的编码档在函数内按响应实际编码定，不在请求侧按客户端声明预测。
+        return collect_and_submit_keep(log, req.uri(), host, search_page, resp).await;
     }
 
     // ③ XHR 内存缓存：数据正文 + 软导航 HTML 片段 15 分钟（不再枚举前缀）。
@@ -400,13 +383,20 @@ pub(super) async fn cache_put(
             .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
             .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
             .collect();
-        let key = xhr_cache_key(req.uri(), host, cookies, upstream::encoding_bucket(req));
-        xhr_store(&key, parts.status.as_u16(), cache_hdrs, bytes.clone());
-        if super::quiet::first_time("xhrstore", path) {
-            (log)(&format!(
-                "[缓存] XHR 入库 {path} ({}) 15 分钟",
-                fmt_size(bytes.len())
-            ));
+        // 按响应实际编码分桶：强制 br+gzip 时上游可能回 gzip，不能按客户端声明塞进 br 桶。
+        let enc = response_encoding(&parts.headers);
+        let key = xhr_cache_key(req.uri(), host, cookies, enc);
+        // 闸门/限流错误回 200 也不能存 15 分钟，否则前端一直拿错误数据；但响应照常交回浏览器。
+        if xhr_should_reject(&bytes, enc) {
+            (log)(&format!("[缓存] XHR 拒存 {path} (闸门/限流错误)"));
+        } else {
+            xhr_store(&key, parts.status.as_u16(), cache_hdrs, bytes.clone());
+            if super::quiet::first_time("xhrstore", path) {
+                (log)(&format!(
+                    "[缓存] XHR 入库 {path} ({}) 15 分钟",
+                    fmt_size(bytes.len())
+                ));
+            }
         }
         return hyper::Response::from_parts(parts, protocol::full_body(bytes));
     }
@@ -655,6 +645,16 @@ fn body_encoding(v: &str) -> &'static str {
     }
 }
 
+/// 从响应头读实际编码，供缓存键分桶用——上游强制 br+gzip 时可能回 gzip，
+/// 客户端声明 br 就按 br 键存会让 gzip 正文进 br 桶，只解 br 的客户端命中后乱码。
+fn response_encoding(headers: &http::HeaderMap) -> &'static str {
+    headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(body_encoding)
+        .unwrap_or("identity")
+}
+
 /// 解压后取前 8KB 并转小写：主站正文恒压缩（gzip/br），不解压扫不到字面量。
 fn plain_prefix(bytes: &[u8], enc: &str) -> String {
     let plain = super::defuse::decompress_partial(bytes, enc, 8192);
@@ -672,11 +672,6 @@ fn is_search_skeleton(key: &str, bytes: &[u8], enc: &str) -> bool {
     let plain = super::defuse::decompress_partial(bytes, enc, PAGE_CACHE_MAX_BODY_BYTES);
     let text = String::from_utf8_lossy(&plain);
     !text.contains("react-app.embeddedData")
-}
-
-/// 未登录页：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
-fn is_logged_out_body(plain: &str) -> bool {
-    plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
 }
 
 /// 软导航 HTML 片段判定：text/html 响应、解压后无 <html 根、体积在上限内——
@@ -713,6 +708,16 @@ fn is_gate_page(plain: &str) -> bool {
     GATE_MARKERS.iter().any(|m| plain.contains(m))
 }
 
+/// XHR 入库门检：闸门/限流错误即使回 200 也不能存 15 分钟（否则前端反复拿错误数据）。
+/// 只拦明确的限流/闸门标记，业务里的普通 error 字段照存。
+fn xhr_should_reject(bytes: &[u8], enc: &str) -> bool {
+    let plain = String::from_utf8_lossy(&super::defuse::decompress_partial(bytes, enc, 64 << 10))
+        .to_ascii_lowercase();
+    is_gate_page(&plain)
+        || plain.contains("\"rate_limited\"")
+        || plain.contains("secondary rate limit")
+}
+
 /// key → 文件名：稳定 64 位摘要的 16 hex。碰撞由读时 key 校验兜底，只会 miss 不会串页。
 fn page_file_name(key: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -729,16 +734,13 @@ type DiskEntry = (
 
 /// 读单文件条目，损坏/截断/非 200 即 miss；仅测试使用。
 #[cfg(test)]
-fn load_disk_entry(
-    key: &str,
-    // 带会话却拿到未登录页 = 会话已死；匿名页必须能正常命中。
-    logged_in: bool,
-) -> Option<DiskEntry> {
-    load_disk_entry_reason(key, logged_in).ok().map(|(e, _)| e)
+fn load_disk_entry(key: &str) -> Option<DiskEntry> {
+    load_disk_entry_reason(key).ok().map(|(e, _)| e)
 }
 
 /// 带拒绝原因的读取，供命中侧按需落日志。第二个元素 = 首页骨架是否过期（SWR 触发）。
-fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool), &'static str> {
+/// 骨架是无账号数据的纯壳，不分登录态——任何会话命中同一份。
+fn load_disk_entry_reason(key: &str) -> Result<(DiskEntry, bool), &'static str> {
     let path = entry_dir(&page_cache_dir()).join(page_file_name(key));
     let raw = std::fs::read(&path).map_err(|_| "无此条目")?;
     // v6.11 SWR：-k 首页骨架过期不判死——交旧 + 后台静默重拉（过期标记随条目返回）。
@@ -762,8 +764,12 @@ fn load_disk_entry_reason(key: &str, logged_in: bool) -> Result<(DiskEntry, bool
         .unwrap_or("identity");
     let body = entry.body;
     let p = plain_prefix(&body, enc);
-    if (logged_in && is_logged_out_body(&p)) || is_gate_page(&p) {
-        return Err("会话已死的未登录页/闸门页"); // 当作 miss（旧版存下的也自愈）
+    if is_gate_page(&p) {
+        return Err("闸门页"); // 当作 miss（旧版存下的也自愈）
+    }
+    // 读侧二道防线：历史上被写坏的限流骨架即使已落盘也当 miss，别让它继续命中。
+    if key.ends_with("-k") && is_search_skeleton(key, &body, enc) {
+        return Err("骨架条目是限流空壳");
     }
     // keep 条目（首页骨架）必须是完整文档：截断页删文件自愈，别让它活满 7 天。
     if key.ends_with("-k")
@@ -799,7 +805,6 @@ fn spawn_page_refetch(
     path_q: &str,
     cookie: Option<&str>,
     bucket: &'static str,
-    logged_in: bool,
 ) {
     let g = PAGE_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()));
     if !lock(g).insert(key.to_string()) {
@@ -895,7 +900,8 @@ fn spawn_page_refetch(
                 }
             };
             let bytes = collected.to_bytes();
-            // ③ 门检：完整 + 会话存活，才覆盖（重拉的货不可用，旧壳继续顶）
+            // ③ 门检：与正常写入共用同一套（体积/no-store/完整/会话/闸门/限流骨架）。
+            // 重拉货不合格就别覆盖——否则限流空壳被写进去、mtime 复新，坏页固化 7 天。
             let enc = parts
                 .headers
                 .iter()
@@ -903,20 +909,12 @@ fn spawn_page_refetch(
                 .and_then(|(_, v)| v.to_str().ok())
                 .map(body_encoding)
                 .unwrap_or("identity");
-            let plain = super::defuse::decompress_partial(&bytes, enc, 64 << 20);
-            if !html_complete(&plain, "identity") {
+            if let Some(why) = skeleton_reject_reason(&key, &bytes, enc, &parts.headers) {
                 (log)(&format!(
-                    "[缓存] 页面重拉第 {attempt} 次不完整, 60s 后再试, 旧壳继续"
+                    "[缓存] 页面重拉第 {attempt} 次门检不过({why}), 60s 后再试, 旧壳继续"
                 ));
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
-            }
-            let n = plain.len().min(8192);
-            let p8 = String::from_utf8_lossy(&plain[..n]).to_lowercase();
-            if logged_in && is_logged_out_body(&p8) {
-                (log)("[缓存] 页面重拉回未登录页(会话已死), 放弃重拉, 旧壳继续");
-                page_refresh_done(&key);
-                return;
             }
             // ④ 覆盖入库（全量格式，替换旧骨架）；覆盖后 mtime 复新，过期标记自动解除。
             match write_entry_file(
@@ -937,20 +935,10 @@ fn spawn_page_refetch(
     });
 }
 
-/// 测试专用：绕开准入直读磁盘；`page_cache_get_logged_in` 模拟带会话的请求方。
+/// 测试专用：绕开准入直读磁盘。骨架纯壳化后不再区分会话态，只有一种读取口径。
 #[cfg(test)]
 fn page_cache_get(key: &str) -> Option<axum::response::Response<BoxBody>> {
-    read_cached(key, false)
-}
-
-#[cfg(test)]
-fn page_cache_get_logged_in(key: &str) -> Option<axum::response::Response<BoxBody>> {
-    read_cached(key, true)
-}
-
-#[cfg(test)]
-fn read_cached(key: &str, logged_in: bool) -> Option<axum::response::Response<BoxBody>> {
-    let (status, hdrs, body) = load_disk_entry(key, logged_in)?;
+    let (status, hdrs, body) = load_disk_entry(key)?;
     Some(rebuild_cached_response(status, &hdrs, body))
 }
 
@@ -1023,13 +1011,40 @@ fn resp_no_store(headers: &http::HeaderMap) -> bool {
         .is_some_and(|v| v.to_ascii_lowercase().contains("no-store"))
 }
 
+/// 骨架入库门检（正常写入与 SWR 重拉共用）：Some=拒存原因，None=可存。
+/// 重拉覆盖走同一套，避免坏页（限流空壳/闸门页/截断页）绕过门检被固化 7 天。
+fn skeleton_reject_reason(
+    key: &str,
+    bytes: &[u8],
+    enc: &str,
+    headers: &http::HeaderMap,
+) -> Option<&'static str> {
+    if bytes.len() > PAGE_CACHE_MAX_BODY_BYTES {
+        return Some("超 2MB 上限");
+    }
+    if resp_no_store(headers) {
+        return Some("no-store");
+    }
+    if !html_complete(bytes, enc) {
+        return Some("HTML 不完整");
+    }
+    let plain = plain_prefix(bytes, enc);
+    if is_gate_page(&plain) {
+        return Some("闸门页");
+    }
+    if is_search_skeleton(key, bytes, enc) {
+        return Some("限流骨架");
+    }
+    None
+}
+
 /// 收集体、复判体积与会话污染后投递 Save；响应原样交回浏览器。
 /// keep 骨架收集体：门检（类型/体积/no-store/污染/闸门/完整性）后投递 Save，响应原样交回浏览器。
 async fn collect_and_submit_keep(
     log: &LogFn,
-    key: &str,
+    uri: &http::Uri,
+    host: &str,
     search_page: bool,
-    has_session: bool,
     resp: axum::response::Response<BoxBody>,
 ) -> axum::response::Response<BoxBody> {
     let (mut parts, body) = resp.into_parts();
@@ -1060,12 +1075,9 @@ async fn collect_and_submit_keep(
                 bytes = Bytes::from(full);
             }
             // 污染/闸门检测要先解压才看得见标记。
-            let enc = parts
-                .headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .map(body_encoding)
-                .unwrap_or("identity");
+            let enc = response_encoding(&parts.headers);
+            // 按响应实际编码分桶：与取侧的 encoding_bucket 预测对齐——上游回的实际编码才决定正文归属。
+            let key = live_cache_key(uri, host, enc, "-html");
             // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
             let cache_hdrs: Vec<Vec<String>> = parts
                 .headers
@@ -1073,16 +1085,9 @@ async fn collect_and_submit_keep(
                 .filter(|(k, _)| !k.as_str().eq_ignore_ascii_case("set-cookie"))
                 .map(|(k, v)| vec![k.as_str().to_string(), v.to_str().unwrap_or("").to_string()])
                 .collect();
-            // 不缓存"顶替真实内容"的页：未登录页（会话已死）与各类闸门页。
-            let plain = plain_prefix(&bytes, enc);
-            // 首页/搜索骨架(-k)跨会话存活 7 天，截断页绝不能入库——宁可这次不缓存。
-            let cacheable = bytes.len() <= PAGE_CACHE_MAX_BODY_BYTES
-                && !resp_no_store(&parts.headers)
-                && html_complete(&bytes, enc)
-                && !(has_session && is_logged_out_body(&plain))
-                && !is_gate_page(&plain)
-                && !is_search_skeleton(key, &bytes, enc);
-            if cacheable {
+            // 骨架跨会话存活 7 天，门检与重拉共用同一套（限流空壳/闸门页/截断页一律不入库）。
+            let reject = skeleton_reject_reason(&key, &bytes, enc, &parts.headers);
+            if reject.is_none() {
                 let status = parts.status.as_u16();
                 worker_send(
                     CacheMsg::Save {
@@ -1095,18 +1100,11 @@ async fn collect_and_submit_keep(
                 );
             } else if search_page {
                 // 拒存要说清是哪条门拦的，否则"翻页页进不了缓存"查不动。
-                let why = if bytes.len() > PAGE_CACHE_MAX_BODY_BYTES {
-                    "超 2MB 上限"
-                } else if has_session && is_logged_out_body(&plain) {
-                    "未登录页(会话已死)"
-                } else if is_gate_page(&plain) {
-                    "闸门页"
-                } else if is_search_skeleton(key, &bytes, enc) {
-                    "限流骨架"
-                } else {
-                    "未知原因"
-                };
-                (log)(&format!("[缓存] 拒存 {} ({why})", dbg_path(key)));
+                (log)(&format!(
+                    "[缓存] 拒存 {} ({})",
+                    dbg_path(&key),
+                    reject.unwrap_or("未知原因")
+                ));
             }
             let mut rebuilt = hyper::Response::builder()
                 .status(parts.status)
@@ -1119,7 +1117,7 @@ async fn collect_and_submit_keep(
             if search_page {
                 (log)(&format!(
                     "[缓存] 拒存 {} (正文收集失败: 上游流中断)",
-                    dbg_path(key)
+                    uri.path()
                 ));
             }
             // 收集失败：无内容可交付，回 502

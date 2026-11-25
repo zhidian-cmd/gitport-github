@@ -36,11 +36,13 @@ pub fn mitm_scope(authority: Option<&Arc<Authority>>, host: &str) -> bool {
     }
     crate::pool::route::is_managed(host)
 }
-pub async fn handle_connect_mitm(
+pub async fn handle_connect_mitm<S>(
     srv: &crate::server::ProxyServer,
-    mut client: tokio::net::TcpStream,
+    mut client: S,
     host: &str,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     if client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")

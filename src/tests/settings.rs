@@ -491,3 +491,54 @@ fn gitcfg_ca_keys_match_parsed_names() {
         );
     }
 }
+
+/// 非 UTF-8（GBK 中文 user.name）的 .gitconfig：整份解析必然失败，按字节兜底必须仍然
+/// 清掉我们写的 http.proxy / sslCAInfo，同时把 GBK 字节原样留住（不能顺手转码重写）。
+#[test]
+fn git_byte_scrub_clears_ours_in_gbk_config() {
+    let cfg = super::git_config_path();
+    let dir = std::env::temp_dir().join(format!("gitport_gitcfg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(".gitconfig");
+
+    let ours = super::git_proxy_url();
+    let ca = super::exe_dir().join("ca.crt").to_string_lossy().to_string();
+    let gbk_name: [u8; 4] = [0xD5, 0xC5, 0xC8, 0xFD]; // "张三" 的 GBK 编码，不是合法 UTF-8
+
+    let mut raw: Vec<u8> = Vec::new();
+    raw.extend_from_slice(b"[user]\n\tname = ");
+    raw.extend_from_slice(&gbk_name);
+    raw.extend_from_slice(b"\n\temail = me@example.com\n");
+    raw.extend_from_slice(b"[http]\n\tproxy = ");
+    raw.extend_from_slice(ours.as_bytes());
+    raw.extend_from_slice(b"\n");
+    raw.extend_from_slice(b"[http \"https://github.com/\"]\n\tsslCAInfo = ");
+    raw.extend_from_slice(ca.as_bytes());
+    raw.extend_from_slice(b"\n");
+    std::fs::write(&path, &raw).unwrap();
+
+    // 前提：整份解析确实因非 UTF-8 失败（git_map 内部就是 read_to_string），否则走不到兜底分支。
+    assert!(
+        std::fs::read_to_string(&path).is_err(),
+        "夹具必须是真非 UTF-8，否则测的不是兜底路径"
+    );
+
+    assert!(super::git_byte_scrub(&path).unwrap(), "应清掉我们的键");
+    let out = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains(&ours), "http.proxy 残留: {text}");
+    assert!(!text.contains(&ca), "sslCAInfo 残留: {text}");
+    assert!(text.contains("me@example.com"), "用户自己的键被误删: {text}");
+    assert!(
+        out.windows(gbk_name.len()).any(|w| w == gbk_name),
+        "GBK 字节必须原样保留，不能被转码改写"
+    );
+    assert!(
+        !super::git_byte_scrub(&path).unwrap(),
+        "已清干净后再扫不应报告有改动"
+    );
+
+    let _ = cfg;
+    let _ = std::fs::remove_dir_all(&dir);
+}

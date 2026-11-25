@@ -28,6 +28,9 @@ pub struct Authority {
     ca_x509: X509,
     /// 每主机缓存的 TLS 上下文（内含该主机的叶子证书链），值附签发时刻供到期重签。
     leaves: Mutex<HashMap<String, (SystemTime, Arc<SslContext>)>>,
+    /// 测试期签发次数：并发首握手去重是"只签一次"还是"各签各的"，只有计数能证明。
+    #[cfg(test)]
+    sign_count: std::sync::atomic::AtomicUsize,
 }
 
 fn issuer_of<'a>(
@@ -40,14 +43,14 @@ fn issuer_of<'a>(
 
 impl Authority {
     /// 主机 TLS 上下文：首次访问即签叶子并构建，缓存至 358 天重签；签发范围锁回受管域名。
+    /// 签发全程持锁：同域几十个并发握手若各自放锁去签，会并行生成几十份密钥、最后只留一份，
+    /// 首屏 CPU 瞬时飙高。持锁串行让后到的直接命中缓存，只签一次；命中路径仍是短临界区。
     fn leaf_ctx(&self, host: &str) -> Result<Arc<SslContext>, String> {
-        {
-            let leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((issued, ctx)) = leaves.get(host) {
-                // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
-                if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
-                    return Ok(ctx.clone());
-                }
+        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((issued, ctx)) = leaves.get(host) {
+            // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
+            if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
+                return Ok(ctx.clone());
             }
         }
         // MITM 只校验 CONNECT 目标域，SNI 是客户端自己给的，不锁就能借根证书签走别的域。
@@ -76,7 +79,9 @@ impl Authority {
         let key = PKey::private_key_from_der(&leaf_key.serialize_der())
             .map_err(|e| format!("叶子私钥解析失败: {e}"))?;
         let ctx = Arc::new(mitm_host_ctx(&leaf_x509, &self.ca_x509, &key)?);
-        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        self.sign_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if leaves.len() >= LEAVES_CAP && !leaves.contains_key(host) {
             // 超限清签发时刻最旧的一张：被逐出的域名下次访问照常重签，只是慢一次。
             if let Some(oldest) = leaves
@@ -164,6 +169,8 @@ fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
         ca_key,
         ca_x509,
         leaves: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        sign_count: std::sync::atomic::AtomicUsize::new(0),
     }))
 }
 
@@ -196,18 +203,32 @@ fn generate() -> Result<Arc<Authority>, String> {
         ca_key: key,
         ca_x509,
         leaves: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        sign_count: std::sync::atomic::AtomicUsize::new(0),
     }))
 }
 
 impl Authority {
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
-        std::fs::write(key_path, self.ca_key.serialize_pem()).map_err(|e| e.to_string())?;
+        use std::io::Write as _;
+        // 先建空文件、立刻收紧 ACL，再写私钥内容：
+        // 原来的 fs::write 会先以默认权限落明文私钥，收紧前被强杀就留下可被同机其他账户读的根钥。
+        // 现在写入窗口里文件是空的，即使中途被打断也没有私钥泄露。
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(key_path)
+            .map_err(|e| e.to_string())?;
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy()) {
             // 收紧失败 = 根私钥可被同机其他账户读走，删钥让 MITM 起不来，绝不带病上岗。
+            drop(f);
             let _ = std::fs::remove_file(key_path);
             return Err(format!("ca.key 权限收紧失败, 已删除该文件(禁用 MITM): {e}"));
         }
+        f.write_all(self.ca_key.serialize_pem().as_bytes())
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

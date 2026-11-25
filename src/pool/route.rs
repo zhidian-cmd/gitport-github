@@ -227,6 +227,34 @@ impl Topology {
 
 static TABLE: Mutex<Option<Arc<Topology>>> = Mutex::new(None);
 
+/// 黑洞惩罚：ip → (到期毫秒, 惩罚延迟)。原来 sink_latency 直接改 node.latency，注释承诺
+/// "60s 内稀释恢复"却没有任何回写路径，进程不重启就永远垫底。改成带过期的独立表，到期自动失效。
+static BLACKHOLE_PENALTY: std::sync::LazyLock<Mutex<HashMap<String, (u64, u64)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const BLACKHOLE_PENALTY_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 读有效延迟：惩罚未过期取较大者（沉到已测队尾但不沉过未测的 0），过期就地清掉还原真实值。
+fn effective_latency(ip: &str, real: u64) -> u64 {
+    let now = now_ms();
+    let mut g = lock(&*BLACKHOLE_PENALTY);
+    match g.get(ip) {
+        Some(&(until, penalty)) if now < until => real.max(penalty),
+        Some(_) => {
+            g.remove(ip);
+            real
+        }
+        None => real,
+    }
+}
+
 /// host → 命中的下标；路由表装载后不再变化，缓存无需失效。
 static MEMO: Mutex<Option<HashMap<String, Option<usize>>>> = Mutex::new(None);
 
@@ -307,7 +335,7 @@ pub fn dial_targets(host: &str) -> Option<Vec<NodeIp>> {
                 } else {
                     node.verify.clone()
                 },
-                latency: node.latency.load(Ordering::Relaxed),
+                latency: effective_latency(ip, node.latency.load(Ordering::Relaxed)),
             });
         }
     }
@@ -332,6 +360,8 @@ pub fn set_latency(ip: &str, ms: u64) {
         return;
     };
     topo.nodes[i].latency.store(ms, Ordering::Relaxed);
+    // 测速直写是新的真实基线：清掉旧的黑洞惩罚，别让重测过的 IP 还挂着旧降权。
+    lock(&*BLACKHOLE_PENALTY).remove(ip);
 }
 
 /// 测速目标：全部节点的全部 IP 展开（ip/sni/verify/latency），表序。
@@ -372,7 +402,8 @@ pub fn probe_targets() -> Vec<NodeIp> {
     out
 }
 
-/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选，60s 内随正常样本稀释恢复。
+/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选。
+/// 惩罚带 60s 到期：到期自动恢复真实延迟，不再永久垫底；测速直写也会立刻清掉。
 pub fn sink_latency(ip: &str) {
     let topo = match lock(&TABLE).as_ref() {
         Some(t) => t.clone(),
@@ -381,13 +412,17 @@ pub fn sink_latency(ip: &str) {
     let Some(i) = node_index_by_ip(&topo, ip) else {
         return;
     };
-    let node = &topo.nodes[i];
-    let old = node.latency.load(Ordering::Relaxed);
+    let old = topo.nodes[i].latency.load(Ordering::Relaxed);
     let v = match old {
         0 => 3000,
         o => (o * 2).clamp(3000, 10000),
     };
-    node.latency.store(v, Ordering::Relaxed);
+    // 取更晚到期，别被并发的另一次黑洞判罚缩短了窗口。
+    let mut g = lock(&*BLACKHOLE_PENALTY);
+    let until = now_ms().saturating_add(BLACKHOLE_PENALTY_MS);
+    let entry = g.entry(ip.to_string()).or_insert((0, 0));
+    entry.0 = entry.0.max(until);
+    entry.1 = entry.1.max(v);
 }
 
 /// 该 IP 的实测拨号毫秒；未测 = 0。
@@ -397,7 +432,7 @@ pub(crate) fn latency_of(ip: &str) -> u64 {
         None => return 0,
     };
     node_index_by_ip(&topo, ip)
-        .map(|i| topo.nodes[i].latency.load(Ordering::Relaxed))
+        .map(|i| effective_latency(ip, topo.nodes[i].latency.load(Ordering::Relaxed)))
         .unwrap_or(0)
 }
 

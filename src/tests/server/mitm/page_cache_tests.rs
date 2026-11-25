@@ -214,8 +214,8 @@ async fn roundtrip_gates_and_self_heal() {
         .header("content-type", "application/json")
         .body(protocol::full_body(Bytes::from_static(b"{}")))
         .unwrap();
-    let out =
-        collect_and_submit_keep(&log, "GET github.com/api/x", false, false, json_resp).await;
+    let api_uri: http::Uri = "https://github.com/api/x".parse().unwrap();
+    let out = collect_and_submit_keep(&log, &api_uri, "github.com", false, json_resp).await;
     assert_eq!(out.status(), 200, "JSON 响应原样交回（JSON 走 XHR 内存缓存）");
     assert!(
         page_cache_get("GET github.com/api/x").is_none(),
@@ -268,7 +268,8 @@ async fn roundtrip_gates_and_self_heal() {
         .insert(super::super::PeekRaw(vec![Bytes::from_static(
             b"<html>hello ",
         )]));
-    let out = collect_and_submit_keep(&log, "GET github.com/peek", false, false, sniffed).await;
+    let peek_uri: http::Uri = "https://github.com/peek".parse().unwrap();
+    let out = collect_and_submit_keep(&log, &peek_uri, "github.com", false, sniffed).await;
     let body = http_body_util::BodyExt::collect(out.into_body())
         .await
         .unwrap()
@@ -388,13 +389,19 @@ async fn keys_invalidation_and_pollution() {
         live_cache_key(&uri, "github.com", "gzip", "-html")
     };
     let sk = mk_search("q=first");
-    let _ = persist_page_entry_blocking(&dir, &sk, b"<html>s</html>", 200, &test_hdrs());
+    let _ = persist_page_entry_blocking(
+        &dir,
+        &sk,
+        b"<html>s react-app.embeddedData</html>",
+        200,
+        &test_hdrs(),
+    );
     assert!(page_cache_get(&sk).is_some(), "前提：条目已缓存");
-    let (_, expired_before) = load_disk_entry_reason(&sk, true).unwrap();
+    let (_, expired_before) = load_disk_entry_reason(&sk).unwrap();
     assert!(!expired_before, "前提：新条目未过期");
     // 直调（不经 worker 异步：并行测试会踩全局 CACHE_DIR_OVERRIDE，轮询等待放大竞态）
     invalidate_prefix_blocking(&dir, "github.com", "/search");
-    let (_, expired) = load_disk_entry_reason(&sk, true).unwrap();
+    let (_, expired) = load_disk_entry_reason(&sk).unwrap();
     assert!(expired, "写后失效必须标过期（交旧+后台重拉）");
     assert!(
         page_cache_get(&sk).is_some(),
@@ -405,13 +412,19 @@ async fn keys_invalidation_and_pollution() {
     let sub = mk_search("q=profile&type=repositories");
     let other = mk_search("q=other");
     for k in [&sub, &other] {
-        let _ = persist_page_entry_blocking(&dir, k, b"<html>i</html>", 200, &test_hdrs());
+        let _ = persist_page_entry_blocking(
+            &dir,
+            k,
+            b"<html>i react-app.embeddedData</html>",
+            200,
+            &test_hdrs(),
+        );
     }
     // 生产形态：invalidate_after_write 传的是 path()（无查询串）→ 宽前缀波及全部 /search 骨架
     // （POST /search 后各查询的骨架全部标过期交旧重拉——搜索页更新影响所有查询，属预期行为）
     invalidate_prefix_blocking(&dir, "github.com", "/search");
-    let sub_expired = load_disk_entry_reason(&sub, true).unwrap().1;
-    let other_expired = load_disk_entry_reason(&other, true).unwrap().1;
+    let sub_expired = load_disk_entry_reason(&sub).unwrap().1;
+    let other_expired = load_disk_entry_reason(&other).unwrap().1;
     assert!(sub_expired, "宽前缀应波及全部 /search 骨架");
     assert!(other_expired, "宽前缀应波及全部 /search 骨架");
 
@@ -442,63 +455,44 @@ async fn keys_invalidation_and_pollution() {
         "{search_key}"
     );
 
-    // ⑪ 未登录页不入缓存（带会话却拿到登录页 = 会话已死）
-    let poisoned = hyper::Response::builder()
-        .status(200)
-        .header("content-type", "text/html; charset=utf-8")
-        .body(protocol::full_body(Bytes::from_static(
-            b"<html><body class=\"logged-out env-production\">sign in</body></html>",
-        )))
-        .unwrap();
-    let poisoned_key = "GET github.com/-poison";
-    let _ = collect_and_submit_keep(&log, poisoned_key, false, true, poisoned).await;
-    assert!(
-        page_cache_get_logged_in(poisoned_key).is_none(),
-        "会话死亡期间的未登录页不得进缓存"
-    );
-
-    // 匿名页双向判定：未登录存下的页面匿名请求必须命中；同一正文被带会话请求拿到才算污染。
+    // ⑪ 纯壳化：骨架是无账号数据的纯壳，不再分登录/未登录变体——
+    // 带 logged-out class 的 HTML 只要无账号数据也照存照命中，任何会话态读同一份。
+    let anon_uri: http::Uri = "https://github.com/".parse().unwrap();
+    let anon_key = live_cache_key(&anon_uri, "github.com", "identity", "-html");
     let anon = b"<html><body class=\"logged-out env-production\">results</body></html>";
-    let anon_key = "GET github.com/search-anon";
-    let _ = persist_page_entry_blocking(&dir, anon_key, anon, 200, &test_hdrs());
+    let _ = persist_page_entry_blocking(&dir, &anon_key, anon, 200, &test_hdrs());
     assert!(
-        page_cache_get(anon_key).is_some(),
-        "匿名页必须能命中（否则未登录用户的缓存等于全废）"
-    );
-    assert!(
-        page_cache_get_logged_in(anon_key).is_none(),
-        "带会话却拿到未登录页 = 会话已死，仍要当 miss"
+        page_cache_get(&anon_key).is_some(),
+        "纯壳骨架必须能命中（不分登录态）"
     );
 
-    // ⑪b gzip 正文：不解压就永远看不到标记（主站正文恒 gzip，旧版这道守卫等于没有）
-    let mut html = b"<html><body class=\"logged-out env-production\">".to_vec();
-    html.extend_from_slice(&vec![b'x'; 6000]);
-    html.extend_from_slice(b"</body></html>");
+    // ⑪b gzip 正文照样按响应实际编码分桶：gzip 响应进 -gz 键，identity 键查不到（不串桶）。
+    let html = b"<html><body>results</body></html>";
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    std::io::Write::write_all(&mut enc, &html).unwrap();
+    std::io::Write::write_all(&mut enc, html).unwrap();
     let gzbody = enc.finish().unwrap();
-    assert!(
-        !is_logged_out_body(&plain_prefix(&gzbody, "identity")),
-        "压缩体裸扫扫不到——这就是旧版失效的原因"
-    );
-    assert!(
-        is_logged_out_body(&plain_prefix(&gzbody, "gzip")),
-        "解压后必须认出未登录页"
-    );
-    let poisoned_gz = hyper::Response::builder()
+    let gz_uri: http::Uri = "https://github.com/gzpath".parse().unwrap();
+    let gz_resp = hyper::Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
         .header("content-encoding", "gzip")
         .body(protocol::full_body(Bytes::from(gzbody)))
         .unwrap();
-    let poisoned_gz_key = "GET github.com/-authed-gz-poison";
-    let _ = collect_and_submit_keep(&log, poisoned_gz_key, false, true, poisoned_gz).await;
+    let _ = collect_and_submit_keep(&log, &gz_uri, "github.com", false, gz_resp).await;
+    // 写盘走异步 worker，等它落盘再查。
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let gz_key = live_cache_key(&gz_uri, "github.com", "gzip", "-html");
+    let id_key = live_cache_key(&gz_uri, "github.com", "identity", "-html");
     assert!(
-        page_cache_get_logged_in(poisoned_gz_key).is_none(),
-        "gzip 未登录页同样不得入缓存"
+        page_cache_get(&gz_key).is_some(),
+        "gzip 响应必须按实际编码进 gzip 桶"
+    );
+    assert!(
+        page_cache_get(&id_key).is_none(),
+        "gzip 正文不得串进 identity 桶"
     );
 
-    // ⑪c 闸门页：按请求 URL 回 200，写入侧与读侧都必须拦
+    // ⑪c 闸门页：按请求 URL 回 200，写入侧与读侧都必须拦（与登录态无关）
     let gate_html = b"<html><head><title>Verify your two-factor authentication (2FA) settings</title></head><body><h1>Verify your two-factor authentication (2FA) settings</h1><p>This is a one-time verification of your recently configured 2FA credentials.</p></body></html>";
     assert!(
         is_gate_page(&plain_prefix(gate_html, "identity")),
@@ -511,25 +505,20 @@ async fn keys_invalidation_and_pollution() {
         )),
         "普通页面不得误判"
     );
-    // 写入侧：与登录态无关，一律不存
+    let gate_uri: http::Uri = "https://github.com/o/r-gate".parse().unwrap();
     let gate = hyper::Response::builder()
         .status(200)
         .header("content-type", "text/html; charset=utf-8")
         .body(protocol::full_body(Bytes::from_static(gate_html)))
         .unwrap();
-    let gate_key = "GET github.com/o/r-gate";
-    let _ = collect_and_submit_keep(&log, gate_key, false, false, gate).await;
-    assert!(page_cache_get(gate_key).is_none(), "闸门页不得入缓存");
+    let _ = collect_and_submit_keep(&log, &gate_uri, "github.com", false, gate).await;
+    let gate_key = live_cache_key(&gate_uri, "github.com", "identity", "-html");
+    assert!(page_cache_get(&gate_key).is_none(), "闸门页不得入缓存");
     // 读侧：已存下的闸门页命中时也判 miss
-    let _ = persist_page_entry_blocking(
-        &dir,
-        "GET github.com/o/r-old-gate",
-        gate_html,
-        200,
-        &test_hdrs(),
-    );
+    let old_gate_key = "GET github.com/o/r-old-gate";
+    let _ = persist_page_entry_blocking(&dir, old_gate_key, gate_html, 200, &test_hdrs());
     assert!(
-        page_cache_get_logged_in("GET github.com/o/r-old-gate").is_none(),
+        page_cache_get(old_gate_key).is_none(),
         "旧的闸门页条目必须当 miss"
     );
 
@@ -584,7 +573,7 @@ fn truncated_keep_entry_self_destructs() {
     let keep = dir.join("keep");
     assert_eq!(std::fs::read_dir(&keep).unwrap().count(), 1);
     assert!(
-        load_disk_entry_reason(ck, true).is_err(),
+        load_disk_entry_reason(ck).is_err(),
         "截断骨架必须当 miss"
     );
     assert_eq!(
@@ -594,7 +583,7 @@ fn truncated_keep_entry_self_destructs() {
     );
     // 完整骨架照常命中
     let _ = persist_page_entry_blocking(&dir, ck, b"<html>ok</html>", 200, &test_hdrs());
-    assert!(load_disk_entry_reason(ck, true).is_ok(), "完整骨架必须命中");
+    assert!(load_disk_entry_reason(ck).is_ok(), "完整骨架必须命中");
 }
 
 /// 大 Cookie 被 h2 拆多行：user_session 在第二行也必须认出登录态（XHR 键的身份标签与 keep 无关）。
@@ -658,15 +647,15 @@ fn write_invalidation_marks_keep_snapshot_expired() {
         &test_hdrs(),
     )
     .unwrap();
-    let (_, expired) = load_disk_entry_reason(key, false).unwrap();
+    let (_, expired) = load_disk_entry_reason(key).unwrap();
     assert!(!expired, "新骨架不该标过期");
     // 写失效（前缀命中首页键）：条目不删，标过期，交旧
     invalidate_prefix_blocking(&dir, "github.com", "/");
     assert!(
-        load_disk_entry(key, false).is_some(),
+        load_disk_entry(key).is_some(),
         "keep 条目不得被写失效删除"
     );
-    let ((_, _, body), expired) = load_disk_entry_reason(key, false).unwrap();
+    let ((_, _, body), expired) = load_disk_entry_reason(key).unwrap();
     assert!(expired, "写失效后必须标过期(交旧+后台重拉)");
     assert_eq!(
         body.as_ref(),
@@ -682,7 +671,7 @@ fn write_invalidation_marks_keep_snapshot_expired() {
         &test_hdrs(),
     )
     .unwrap();
-    let ((_, _, body), expired) = load_disk_entry_reason(key, false).unwrap();
+    let ((_, _, body), expired) = load_disk_entry_reason(key).unwrap();
     assert!(!expired, "重拉覆盖后过期必须解除");
     assert_eq!(
         body.as_ref(),

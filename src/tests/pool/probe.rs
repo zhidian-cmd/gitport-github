@@ -1,6 +1,5 @@
 use super::*;
 use crate::pool::{dial_cooling, serial_load};
-use crate::pool::TEST_LOCK;
 use std::sync::Arc;
 
 // 路由表未装载：测速目标为空 → 立即返回且防重入标志复位（不拨号、无网络）。

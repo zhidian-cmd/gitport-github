@@ -306,8 +306,8 @@ pub fn ensure_system_proxy() -> Result<String, String> {
         save_logged();
         return Ok(format!("{note}; {git_note}"));
     }
-    clear_if_ours(&key, &cur);
     let git_note = remove_git_proxy();
+    clear_if_ours(&key, &cur)?;
     Ok(format!("未开启分流, 已还原; {git_note}"))
 }
 
@@ -318,19 +318,61 @@ pub fn remove_system_proxy() -> String {
         return git_note;
     };
     let cur = get_auto_config_url(&key);
-    clear_if_ours(&key, &cur);
-    git_note
+    match clear_if_ours(&key, &cur) {
+        Ok(()) => git_note,
+        Err(e) => format!("{git_note}; 系统代理还原失败(备份已保留): {e}"),
+    }
 }
 
-fn restore_or_clear(key: &RegKey) {
+/// 还原兜底：WinINET API 失败时直接改注册表连接 flags（只动那 4 字节，不碰 blob 里的 URL 字符串）。
+/// 接管方向已有 force_pac_flag 补位；还原方向要写入目标 flags（可能含清 PAC 位），故单独一个。
+fn force_conn_flags(want: u32) -> Result<(), String> {
+    let conn = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(CONNECTIONS_KEY, KEY_READ | KEY_SET_VALUE)
+        .map_err(|e| format!("打开 Connections 失败: {e}"))?;
+    let raw: winreg::RegValue = conn
+        .get_raw_value(CONN_SETTINGS_VALUE)
+        .map_err(|e| format!("读 {CONN_SETTINGS_VALUE} 失败: {e}"))?;
+    if raw.bytes.len() < 12 {
+        return Err(format!("{CONN_SETTINGS_VALUE} 长度异常"));
+    }
+    let mut bytes = raw.bytes.to_vec();
+    bytes[8..12].copy_from_slice(&want.to_le_bytes());
+    conn.set_raw_value(
+        CONN_SETTINGS_VALUE,
+        &winreg::RegValue {
+            bytes: bytes.into(),
+            vtype: raw.vtype,
+        },
+    )
+    .map_err(|e| format!("写 {CONN_SETTINGS_VALUE} 失败: {e}"))?;
+    Ok(())
+}
+
+/// 还原系统代理：只动上次写进去的那条 PAC（last_pac 精确比较）。
+/// 还原失败一律保留备份并返回错误——清了备份等于把用户原配置永久丢掉；
+/// WinINET API 失败时照接管方向补一次注册表兜底。
+fn restore_or_clear(key: &RegKey) -> Result<(), String> {
     let backup = state().proxy_backup.lock().unwrap().clone();
     let last = state().last_pac.lock().unwrap().clone();
     let keep_manual = manual_proxy_active(key);
     // 只排除 last_pac（自己写过），其余备份一律还原；按形状丢等于备份白做。
     if !backup.is_empty() && !pac_is_ours(&backup, &last) {
         // 用户原本就用自动配置脚本：连标志位一起还原，别只留个字符串
-        let _ = apply_conn_options(PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL, Some(&backup));
+        let want = PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL;
+        if let Err(code) = apply_conn_options(want, Some(&backup)) {
+            force_conn_flags(want)
+                .map_err(|e| format!("还原 PAC 失败(Win32 {code})，注册表补 flags 也失败: {e}"))?;
+        }
         mirror_auto_config_url(Some(&backup));
+        // 回读校验：WinINET 返回成功不代表注册表真写进去了（安全软件可能只拦注册表写）。
+        // 没真还原却把备份清了 = 用户原配置永久丢失，所以校验不过就保备份报错。
+        let now = get_auto_config_url(key);
+        if !now.eq_ignore_ascii_case(backup.trim()) {
+            return Err(format!(
+                "还原 PAC 未生效(期望 {backup}, 实际 {now:?}), 已保留原配置备份"
+            ));
+        }
     } else {
         // 没有备份就关掉「启用自动配置脚本」，只删字符串会留下半截状态。
         let flags = if keep_manual {
@@ -338,13 +380,17 @@ fn restore_or_clear(key: &RegKey) {
         } else {
             PROXY_TYPE_DIRECT
         };
-        let _ = apply_conn_options(flags, None);
+        if let Err(code) = apply_conn_options(flags, None) {
+            force_conn_flags(flags)
+                .map_err(|e| format!("关闭自动配置失败(Win32 {code})，注册表补 flags 也失败: {e}"))?;
+        }
         let _ = key.delete_value("AutoConfigURL");
     }
     *state().proxy_backup.lock().unwrap() = String::new();
     *state().last_pac.lock().unwrap() = String::new();
     refresh_wininet();
     save_logged();
+    Ok(())
 }
 
 /// 系统当前是否有生效的手动代理（ProxyEnable=1 且 ProxyServer 非空），还原时决定要不要保留。
@@ -357,12 +403,12 @@ fn manual_proxy_active(key: &RegKey) -> bool {
 }
 
 /// 确实是上次我们写进去的那条 PAC 才还原（别的工具中途接管了就不碰）。
-fn clear_if_ours(key: &RegKey, cur: &str) {
+fn clear_if_ours(key: &RegKey, cur: &str) -> Result<(), String> {
     let last = state().last_pac.lock().unwrap().clone();
     if !pac_is_ours(cur, &last) {
-        return;
+        return Ok(());
     }
-    restore_or_clear(key);
+    restore_or_clear(key)
 }
 
 pub fn close_to_tray() -> bool {
@@ -389,9 +435,14 @@ pub fn set_window_rect(l: i32, t: i32, w: i32, h: i32) -> Result<(), String> {
 }
 
 /// 布尔开关统一写法：存一次（Relaxed）+ 落盘（set_github_pac/set_close_to_tray/set_mitm 共用）。
+/// 落盘失败必须回滚内存：否则界面报"没关掉"但内存已关，下次任意成功保存又把假状态写进盘。
 fn set_flag(flag: &std::sync::atomic::AtomicBool, on: bool) -> Result<(), String> {
-    flag.store(on, std::sync::atomic::Ordering::Relaxed);
-    save()
+    let prev = flag.swap(on, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = save() {
+        flag.store(prev, std::sync::atomic::Ordering::Relaxed);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn set_close_to_tray(on: bool) -> Result<(), String> {
@@ -697,7 +748,7 @@ fn heal_stale_proxy() {
         // 本来就干净，或已是别人的 PAC：不碰，留给 ensure_system_proxy 走先备份后接管。
         return;
     }
-    restore_or_clear(&key);
+    let _ = restore_or_clear(&key); // 自愈失败保留备份，下次还能重试
 }
 
 /* ---------- git 全局代理：与 PAC 同款生命周期 ---------- */
@@ -1082,6 +1133,80 @@ fn git_load_entries() -> Result<Vec<GitEntry>, String> {
     }
 }
 
+/// 按字节清理我们写死的值：不要求整份文件可解析（GBK 中文 user.name 等常见坏值也能清）。
+/// 只删「键在我们目标集合里且值确实是我们写的」整行；其余行字节原样保留，不重写非 UTF-8 内容。
+/// 仅当 git_map() 解析失败时兜底——正常路径仍走行表，保留还原备份的语义。
+fn git_byte_scrub(path: &Path) -> Result<bool, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("读 .gitconfig 失败({e})"))?;
+    let ours = git_proxy_url();
+    let ca_str = exe_dir().join("ca.crt").to_string_lossy().to_string();
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut touched = false;
+    // 当前段：None=段外；Some((section, 可选 subsection))，与 git_pairs 的键名拼法一致。
+    let mut section: Option<(String, Option<String>)> = None;
+
+    let mut start = 0usize;
+    while start < raw.len() {
+        let end = raw[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| start + p + 1)
+            .unwrap_or(raw.len());
+        let line = &raw[start..end]; // 含行尾，命中时整行丢弃
+        start = end;
+
+        // lossy 只用于识别，绝不用它重写字节；判定不命中就原样 push 原始行。
+        let body = String::from_utf8_lossy(line);
+        let t = body.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            let inner = t[1..t.len() - 1].trim();
+            let (sec, sub) = match inner.split_once('"') {
+                Some((s, rest)) => (
+                    s.trim().to_ascii_lowercase(),
+                    Some(
+                        rest.trim_end_matches('"')
+                            .replace("\\\"", "\"")
+                            .replace("\\\\", "\\"),
+                    ),
+                ),
+                None => (inner.to_ascii_lowercase(), None),
+            };
+            section = Some((sec, sub));
+            out.extend_from_slice(line);
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            out.extend_from_slice(line);
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else {
+            out.extend_from_slice(line);
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let mut value = v.trim();
+        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+            value = &value[1..value.len() - 1];
+        }
+        let full = match &section {
+            Some((s, Some(sub))) => format!("{s}.{sub}.{key}"),
+            Some((s, None)) => format!("{s}.{key}"),
+            None => String::new(),
+        };
+        let ours_line = (GIT_PROXY_KEYS.contains(&full.as_str()) && value == ours)
+            || (GIT_CA_KEYS.contains(&full.as_str()) && value == ca_str);
+        if ours_line {
+            touched = true; // 丢整行
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    if touched {
+        crate::fsx::write_atomic(path, &out).map_err(|e| format!("写 .gitconfig 失败({e})"))?;
+    }
+    Ok(touched)
+}
+
 /// 行表回写：原样拼回 + 原子落盘。
 fn git_save_entries(path: &Path, entries: &[GitEntry]) -> Result<(), String> {
     let out: String = entries.iter().map(|e| e.raw.as_str()).collect();
@@ -1175,8 +1300,19 @@ fn ensure_git_proxy() -> String {
 
 /// 开关关/退出/自愈：只清我们写的值；有备份还原备份，别家配置原样不动。
 fn remove_git_proxy() -> String {
-    let Ok(map) = git_map() else {
-        return "git 不可用, 跳过清理".to_string();
+    let map = match git_map() {
+        Ok(m) => m,
+        Err(_) => {
+            // 整份解析不了（GBK 等非 UTF-8）时按字节清掉我们写的值，别让残留永远挂着。
+            return match git_config_path() {
+                Some(path) => match git_byte_scrub(&path) {
+                    Ok(true) => "git 配置非标准编码, 已按字节清掉代理残留".to_string(),
+                    Ok(false) => "git 配置非标准编码, 未发现我们的残留".to_string(),
+                    Err(e) => format!("git 配置非标准编码, 字节清理失败: {e}"),
+                },
+                None => "git 不可用, 跳过清理".to_string(),
+            };
+        }
     };
     let ours = git_proxy_url();
     let backups: Vec<String> = state()
@@ -1301,51 +1437,56 @@ pub fn save_worker_mirrors(list: Vec<WorkerMirror>) {
 pub fn set_worker_mirrors(
     list: Vec<WorkerMirror>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    // 读旧表、算差集、写新表必须同一把锁：原来三段分离，连续两次保存会都读到不含对方的旧表，后写覆盖先写。
+    // save() 内部也要锁这张表，所以写完先放锁再落盘，避免自锁死锁。
     let mut norm: Vec<WorkerMirror> = Vec::new();
-    for w in list {
-        let u = w.url.trim().trim_end_matches('/').to_string();
-        if u.is_empty() {
-            continue; // 未填完的空行直接忽略
+    let result = {
+        let mut guard = state().worker_mirrors.lock().unwrap();
+        let old_snapshot = guard.clone();
+        for w in list {
+            let u = w.url.trim().trim_end_matches('/').to_string();
+            if u.is_empty() {
+                continue; // 未填完的空行直接忽略
+            }
+            if !u.starts_with("https://") || u.contains(' ') {
+                return Err(format!("镜像地址须以 https:// 开头且不含空格: {u}"));
+            }
+            if norm.iter().any(|x| x.url == u) {
+                continue; // 去重
+            }
+            // 同 URL 的旧条目已探测过：编辑 on 不许把模板与探测结论弄丢。
+            let (old_tpl, old_bad) = old_snapshot
+                .iter()
+                .find(|x| x.url == u)
+                .map(|x| (x.template.clone(), x.invalid))
+                .unwrap_or_default();
+            norm.push(WorkerMirror {
+                url: u,
+                on: w.on,
+                template: if w.template.is_empty() { old_tpl } else { w.template },
+                invalid: w.invalid || old_bad,
+            });
         }
-        if !u.starts_with("https://") || u.contains(' ') {
-            return Err(format!("镜像地址须以 https:// 开头且不含空格: {u}"));
-        }
-        if norm.iter().any(|x| x.url == u) {
-            continue; // 去重
-        }
-        // 同 URL 的旧条目已探测过：编辑 on 不许把模板与探测结论弄丢。
-        let old = worker_mirrors()
-            .into_iter()
-            .find(|x| x.url == u);
-        let (old_tpl, old_bad) = old
-            .map(|x| (x.template, x.invalid))
-            .unwrap_or_default();
-        norm.push(WorkerMirror {
-            url: u,
-            on: w.on,
-            template: if w.template.is_empty() { old_tpl } else { w.template },
-            invalid: w.invalid || old_bad,
-        });
-    }
-    let old = worker_mirrors();
-    let removed: Vec<String> = old
-        .iter()
-        .map(|w| w.url.clone())
-        .filter(|u| !norm.iter().any(|n| n.url == *u))
-        .collect();
-    let added: Vec<String> = norm
-        .iter()
-        .map(|w| w.url.clone())
-        .filter(|u| !old.iter().any(|o| o.url == *u))
-        .collect();
-    let enabled: Vec<String> = norm
-        .iter()
-        .filter(|w| w.on)
-        .map(|w| w.url.clone())
-        .collect();
-    *state().worker_mirrors.lock().unwrap() = norm;
-    save()?;
-    Ok((enabled, removed, added))
+        let removed: Vec<String> = old_snapshot
+            .iter()
+            .map(|w| w.url.clone())
+            .filter(|u| !norm.iter().any(|n| n.url == *u))
+            .collect();
+        let added: Vec<String> = norm
+            .iter()
+            .map(|w| w.url.clone())
+            .filter(|u| !old_snapshot.iter().any(|o| o.url == *u))
+            .collect();
+        let enabled: Vec<String> = norm
+            .iter()
+            .filter(|w| w.on)
+            .map(|w| w.url.clone())
+            .collect();
+        *guard = norm;
+        (enabled, removed, added)
+    };
+    save()?; // 已写回内存，落盘读当前表完成
+    Ok(result)
 }
 
 /// 镜像用法模板：注册表里查该 URL；查不到/未探测 = 空（按老拼法前缀拼接用）。

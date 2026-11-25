@@ -325,15 +325,21 @@ pub(super) async fn try_direct_split(
                 );
                 return None;
             }
-            let Some(t) = merge::content_range_total(
-                resp.headers()
-                    .get("content-range")
-                    .and_then(|v| v.to_str().ok()),
-            ) else {
+            let cr = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok());
+            let Some(t) = merge::content_range_total(cr) else {
                 memo_put(&key, 0, MediaKind::Image);
                 log_skip(log, host, &path, "206 缺 Content-Range");
                 return None;
             };
+            // 探片段必须真从 0 起：CDN 把 bytes=0-10239 归一化到别的起点时，
+            // 这 10KB 会被贴上 [0,10240) 标签交付，文件开头永久错位且不报错。
+            if let Err(e) = check_segment_bounds(cr, 0, PROBE_BYTES) {
+                log_skip(log, host, &path, &format!("探片 206 起点异常({e}), 退回单流"));
+                return None;
+            }
             let Some(kind) = MediaKind::of_content_type(
                 resp.headers()
                     .get("content-type")
