@@ -75,11 +75,13 @@ gitport-github.exe [-port 7810] [-webui 7811] [-tray] [-headless]
 
 ## 镜像
 
-首次安装内置 6 家（可按条停用）：
+首次安装内置 10 家（可按条停用）：
 
 ```
 gh-proxy.org          gh-proxy.com          ghgo.de5.net
 gh.meali.top          gh.dpik.top           ghproxy.icu
+v4.gh-proxy.org       v6.gh-proxy.org       cdn.gh-proxy.org
+axisnow.gh-proxy.org
 ```
 
 - 只对 `GET`/`HEAD` 的大文件与 Release 路径生效；API 与会话域不走镜像。

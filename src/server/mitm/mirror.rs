@@ -845,6 +845,19 @@ fn segment_range(s: u64, end: u64) -> Result<http::HeaderValue, String> {
     http::HeaderValue::from_str(&format!("bytes={s}-{end}")).map_err(|err| err.to_string())
 }
 
+/// 无 Range（浏览器原生下载）固定 16 片——浏览器不会自己开并行，代理是唯一并行来源；
+/// 带 Range（下载器已拆片）仍按候选数每家一片做校准，并行度主要归下载器。
+const NATIVE_DOWNLOAD_SEGS: usize = 16;
+
+/// 纯函数形态便于钉住"无 Range → 16 片 / 有 Range → 每家一片"的分流。
+fn split_want(no_range: bool, candidates: usize) -> usize {
+    if no_range {
+        NATIVE_DOWNLOAD_SEGS
+    } else {
+        candidates
+    }
+}
+
 /// 切片下载：校准（未测镜像>0 且候选全闲）或原生浏览器下载（无 Range）→ 每镜像一片；
 /// 带 Range 的请求（下载器自己拆好的连接）单流 ECT 最优——并行度归下载器。
 async fn split_download(
@@ -927,8 +940,9 @@ async fn split_download(
             }
         },
     };
-    // 每镜像一片（区间 ÷ 镜像数）：校准同批出成绩；原生浏览器下载以此获得代理侧并行。
-    let want = idle.len();
+    // 原生浏览器下载（无 Range）：浏览器自己不会开并行，代理是唯一并行来源，固定 16 片；
+    // 带 Range 的校准期仍按候选数每家一片，同一批 5ms 窗出成绩。
+    let want = split_want(range.is_none(), idle.len());
     let segs = merge::split_even(base, len, want);
     if segs.len() < 2 {
         return Ok(None);

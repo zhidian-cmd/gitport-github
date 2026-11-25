@@ -31,6 +31,24 @@ fn mirror_chain_cap_scope() {
     }
 }
 
+/// 浏览器原生下载（无 Range）固定 16 片，带 Range 的校准期仍每家一片；现有 split_even 据此零缝覆盖。
+#[test]
+fn native_download_splits_into_sixteen_segments() {
+    assert_eq!(split_want(true, 11), 16, "无 Range 固定 16 片");
+    assert_eq!(split_want(false, 11), 11, "带 Range 校准仍每家一片");
+    assert_eq!(split_want(true, 1), 16, "候选只有 1 家也报 16（split_even 会收缩到字节数）");
+
+    let segs = merge::split_even(0, 8 * 1024 * 1024, split_want(true, 11));
+    assert_eq!(segs.len(), 16);
+    let mut next = 0;
+    for (s, e) in segs {
+        assert_eq!(s, next, "段间零缝");
+        assert!(e > s, "每段至少 1 字节");
+        next = e;
+    }
+    assert_eq!(next, 8 * 1024 * 1024, "覆盖到文件尾");
+}
+
 #[test]
 fn mirror_request_strips_identity_and_hop_by_hop() {
     let out = hyper::Request::builder()

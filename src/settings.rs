@@ -52,21 +52,26 @@ fn on_by_default() -> bool {
     true
 }
 
-/// 首启内置 6 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；2026-11-19 实测 2 家拒 Range（回 302/301 非 206，切片段必失败），剔除；下载按实测吞吐选家、失败顺延，删掉后不再出现。
+/// 首启内置 10 家镜像：2026-11-14 全测 29 家（5 种用法、双轮计时），1 家全模板超时剔除；2026-11-19 实测 2 家拒 Range（回 302/301 非 206，切片段必失败），剔除；2026-11-25 补入 4 家 gh-proxy 子域（v4/v6/cdn/axisnow），大文件实测 206 正常。下载按实测吞吐选家、失败顺延，删掉后不再出现。
 fn default_worker_mirrors() -> Vec<WorkerMirror> {
     [
-        "https://gh-proxy.org",       // 788ms
-        "https://gh-proxy.com",       // 822ms
-        "https://ghgo.de5.net",       // 950ms
-        "https://gh.meali.top",       // 1011ms
-        "https://gh.dpik.top",        // 1064ms
-        "https://ghproxy.icu",        // 1070ms
+        ("https://gh-proxy.org", ""), // 788ms
+        ("https://gh-proxy.com", ""), // 822ms
+        ("https://ghgo.de5.net", ""), // 950ms
+        ("https://gh.meali.top", ""), // 1011ms
+        ("https://gh.dpik.top", ""), // 1064ms
+        ("https://ghproxy.icu", ""), // 1070ms
+        // 以下 4 家带模板，与运行态 settings.json 里试探保存的写法一致。
+        ("https://v4.gh-proxy.org", "{mirror}/{url}"),
+        ("https://v6.gh-proxy.org", "{mirror}/{url}"),
+        ("https://cdn.gh-proxy.org", "{mirror}/{url}"),
+        ("https://axisnow.gh-proxy.org", "{mirror}/{url}"),
     ]
     .iter()
-    .map(|u| WorkerMirror {
+    .map(|(u, tpl)| WorkerMirror {
         url: u.to_string(),
         on: true,
-        template: String::new(), // 前缀型用法不需要模板
+        template: tpl.to_string(),
         invalid: false,
     })
     .collect()
