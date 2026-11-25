@@ -134,13 +134,13 @@ fn drain(m: &mut MergeBody, out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// 给段造一个"首帧在 now−1s、已收 got B"的速率样本，供判据测试用。
+/// 给段造一个"首帧在 now−1s、稳态速度 got B/s"的样本，供判据测试用。
 fn with_rate(m: &mut MergeBody, start: u64, got: u64, now: Instant) {
     let s = m.segs.get_mut(&start).unwrap();
     s.first_at = Some(now - Duration::from_secs(1));
     s.begin = now - Duration::from_secs(1);
     s.got = got;
-    s.recent.push_back((now - Duration::from_secs(1), 0));
+    s.steady_rate = Some(got as f64);
     s.last_poll = now;
 }
 
@@ -456,8 +456,8 @@ fn rebalance_single_seg_never_cuts() {
     assert!(m.fill.is_empty());
 }
 
-/// 快段在体检点之前下完也要当基准：它冻结的速率进 fastest 比较后，慢段按它算切量；
-/// 否则只剩活段的旧速度，切量偏小，快段白跑。done 段本身不进 cands、不被切。
+/// 快段在体检点之前下完也要当基准：它定格的稳态速度进 fastest 比较后，慢段按它算切量；
+/// 否则只剩活段的速度，切量偏小，快段白跑。done 段本身不进 cands、不被切。
 #[test]
 fn rebalance_done_segment_rate_becomes_baseline() {
     let now = Instant::now();
@@ -468,12 +468,12 @@ fn rebalance_done_segment_rate_becomes_baseline() {
         ],
         2_000_000,
     );
-    // A 已正常收尾，冻结 500k/s；B 活着 100k/s、R=900k。
+    // A 已正常收尾，稳态 500k/s；B 活着 100k/s、R=900k。
     m.segs.get_mut(&0).unwrap().done = true;
-    m.segs.get_mut(&0).unwrap().frozen_rate = Some(500_000.0);
+    m.segs.get_mut(&0).unwrap().steady_rate = Some(500_000.0);
     with_rate(&mut m, 1_000_000, 100_000, now);
     // C = 900000 × 500000/(500000+100000) = 750000。
-    assert_eq!(m.rebalance(now), 750_000, "快段冻结速率必须进基准");
+    assert_eq!(m.rebalance(now), 750_000, "快段稳态速度必须进基准");
     assert_eq!(m.segs.get(&0).unwrap().end, 1_000, "done 段不参与被切");
 
     // 对照：没有快段基准时，这段自己就是全场最快，不动刀——证明切量确实来自冻结速率。
@@ -500,33 +500,64 @@ fn segment_completion_raises_done_probe() {
     assert_eq!(out, b"AA");
     assert!(m.segs.get(&0).unwrap().done, "段已 EOF 收尾");
     assert!(
-        m.segs.get(&0).unwrap().frozen_rate.is_some(),
-        "收尾时定格速率，供基准比较"
+        m.segs.get(&0).unwrap().steady_rate.is_some(),
+        "收尾时定格稳态速度，供基准比较"
     );
     assert!(m.take_done_probe(), "完成事件必须置位");
     assert!(!m.take_done_probe(), "取走即清，避免重复触发");
 }
 
-/// 近期速率：首帧起算、样本按滑窗折算，无预热门槛。
+/// 稳态采样：首帧 burst 不进分子，只用 500→600ms 窗内的实收字节算速度。
 #[test]
-fn recent_rate_prefers_sliding_window() {
+fn steady_rate_uses_only_post_first_frame_window() {
     let now = Instant::now();
     let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
-    assert_eq!(s.rate(now), 0.0, "没首帧 = 没样本 = 0");
-    s.on_first_frame(now - Duration::from_secs(2));
-    s.got = 1000;
+    // 没首帧时任何采样都不落定。
+    assert!(!s.sample_steady(now), "没首帧不落定");
+    let first = now - Duration::from_secs(2);
+    // 首帧 burst 800KB，随后才慢慢收。
+    s.on_first_frame(first, 800 * 1024);
+    s.got = 800 * 1024;
     assert!(
-        (s.recent_rate(now) - 500.0).abs() < 1.0,
-        "无近期样本退回全片均速(1000B/2s): {}",
-        s.recent_rate(now)
+        !s.sample_steady(first + Duration::from_millis(400)),
+        "没到 500ms 基线不落定"
     );
-    // 滑窗内 1.2s 收 1200B → 1000B/s；全片均速的历史包袱不进判据。
-    s.recent
-        .push_back((now - Duration::from_millis(1200), 1000));
-    s.got = 2200; // 生产里 recent 样本就是 (时刻, got) 快照，末样本恒等于 got
-    s.recent.push_back((now, s.got));
-    let r = s.recent_rate(now);
-    assert!((r - 1000.0).abs() < 1.0, "近期速率应按滑窗折算: {r}");
+
+    // 500ms 基线：此刻 got 已是首帧+首帧后那 1000B。
+    let base = first + Duration::from_millis(500);
+    s.got += 1000;
+    assert!(!s.sample_steady(base), "基线拍只记快照，不落定");
+
+    // 600ms：窗内又收 1000B（100ms）→ 10000B/s。
+    let end = first + Duration::from_millis(600);
+    s.got += 1000;
+    assert!(s.sample_steady(end), "600ms 应落定稳态速度");
+    let r = s.steady_rate.unwrap();
+    assert!(
+        (r - 10_000.0).abs() < 100.0,
+        "只用窗内 1000B/100ms 算，首帧 burst 不进分子: {r}"
+    );
+    // 落定后不再变：后续再收多少都不改。
+    s.got += 1_000_000;
+    assert!(!s.sample_steady(end + Duration::from_secs(1)), "落定后不再采");
+    assert_eq!(s.steady_rate.unwrap(), r, "稳态速度一旦落定不再变");
+}
+
+/// 提前收尾的路：没走到 600ms 就 EOF，用首帧剔除后的全程均速定格，不用含 burst 的 got。
+#[test]
+fn early_finish_freeze_excludes_first_frame() {
+    let now = Instant::now();
+    let mut s = Seg::new(0, 1 << 20, now, seg(b""), "test".into(), 0);
+    let first = now - Duration::from_millis(200);
+    s.on_first_frame(first, 100_000); // 首帧 burst 100KB
+    s.got = 100_000 + 20_000; // 之后只收 20KB
+    assert!(s.freeze(now), "提前收尾应落定速度");
+    let r = s.steady_rate.unwrap();
+    assert!(
+        (r - 100_000.0).abs() < 100.0,
+        "首帧剔除后 20KB/0.2s = 100KB/s；不剔除则会被 burst 抬到 600KB/s",
+    );
+    assert!(!s.freeze(now), "已落定不重复喂");
 }
 
 /// 有进展就清零：补发只要下到字节，就不该算进"连续空手"。

@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 pub(super) const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
 /// 多久没收到字节算死。5s 忍得住 CDN 抖动，又不让死连接白占位置。
 pub(super) const STALL_MS: u64 = 5_000;
-/// 重分配判据看近期速率：样本窗与 POLL_GAP 对齐（没在看的不算），历史停顿不拖累当下判断。
-const RECENT_WIN: Duration = Duration::from_millis(1_500);
+/// 稳态速度采样：首帧后 500ms 记基线、600ms 落定。首帧 burst 不进分子，爬坡单独计价。
+const STEADY_BASE_MS: u64 = 500;
+const STEADY_RATE_MS: u64 = 600;
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
 /// 轮询断档超过这么久，回来后重新起算停滞——那是我们自己在忙队首，不是上游死了。
@@ -108,6 +109,14 @@ struct Seg {
     got: u64,
     /// 速率起点（首帧到达时刻），算速率用；首帧前为 None。
     first_at: Option<Instant>,
+    /// 首帧那一帧的字节数：首帧 burst 不进任何速度分子。
+    first_frame_bytes: u64,
+    /// 稳态窗基线：首帧后 500ms 的 (时刻, 已收字节)，600ms 时用 (now−base) 算速度。
+    w1_at: Option<Instant>,
+    w1_got: u64,
+    /// 段级稳态速度 B/s：500→600ms 窗的实测；提前收尾时按首帧剔除后的全程均速。
+    /// 一旦落定值不再变；没样本为 None，不动刀、不进 V_fast。
+    steady_rate: Option<f64>,
     /// 首帧前的占位起点，仅用于 last_poll 初始化。
     begin: Instant,
     /// 本段所属上游（切尾判据/日志用）。
@@ -124,10 +133,6 @@ struct Seg {
     done: bool,
     /// 结束原因（仅 done 时有意义）。
     err: Option<std::io::Error>,
-    /// 收尾时冻结的均速：断了之后时钟还在走，现算会一路衰减成假慢。
-    frozen_rate: Option<f64>,
-    /// 近期速率样本 (时刻, 已收字节)：重分配判据用滑窗。
-    recent: VecDeque<(Instant, u64)>,
 }
 
 impl Seg {
@@ -140,6 +145,10 @@ impl Seg {
             buffered: 0,
             got: 0,
             first_at: None,
+            first_frame_bytes: 0,
+            w1_at: None,
+            w1_got: 0,
+            steady_rate: None,
             begin: at,
             owner,
             ramp,
@@ -148,8 +157,6 @@ impl Seg {
             cut: false,
             done: false,
             err: None,
-            frozen_rate: None,
-            recent: VecDeque::new(),
         }
     }
 
@@ -158,46 +165,54 @@ impl Seg {
         self.start + self.got
     }
 
-    /// 收尾时把均速定格：优先取近期速率（最后 1.5s 实测），样本不足退回全片均速。
-    fn freeze(&mut self, now: Instant) {
-        if self.frozen_rate.is_none() {
-            let r = self.recent_rate(now);
-            self.frozen_rate = Some(if r > 0.0 { r } else { self.rate(now) });
-        }
-    }
-
-    /// 首帧到达：速率时钟从这一刻起算（爬坡不进分母——爬坡已单独计价），近期样本清空重开。
-    fn on_first_frame(&mut self, at: Instant) {
+    /// 首帧到达：速率时钟从这一刻起算（爬坡不进分母——爬坡已单独计价），记下首帧字节供剔除。
+    fn on_first_frame(&mut self, at: Instant, n: u64) {
         if self.first_at.is_none() {
             self.first_at = Some(at);
+            self.first_frame_bytes = n;
             self.begin = at;
-            self.recent.clear();
         }
     }
 
-    /// 首帧至今的均速。没首帧 = 没样本 → 0（不动刀）；收尾后返回冻结值。
-    fn rate(&self, now: Instant) -> f64 {
-        if let Some(r) = self.frozen_rate {
-            return r;
+    /// 采样稳态速度的首帧后基线（500ms）：此刻的已收字节排除首帧 burst 后作分子起点。
+    /// 返回 true 表示本拍落下了一个稳态速度，调用方据此喂镜像 EMA 并提前体检。
+    fn sample_steady(&mut self, now: Instant) -> bool {
+        if self.steady_rate.is_some() {
+            return false;
         }
         let Some(first) = self.first_at else {
-            return 0.0;
+            return false;
         };
-        let el = now.saturating_duration_since(first);
-        self.got as f64 / el.as_secs_f64().max(0.001)
+        if self.w1_at.is_none() {
+            if now.saturating_duration_since(first) >= Duration::from_millis(STEADY_BASE_MS) {
+                self.w1_at = Some(now);
+                self.w1_got = self.got;
+            }
+            return false;
+        }
+        if now.saturating_duration_since(first) < Duration::from_millis(STEADY_RATE_MS) {
+            return false;
+        }
+        let t0 = self.w1_at.unwrap_or(now);
+        let el = now.saturating_duration_since(t0).as_secs_f64().max(0.001);
+        let bytes = self.got.saturating_sub(self.w1_got);
+        self.steady_rate = Some(bytes as f64 / el);
+        true
     }
 
-    /// 近期速率（最后 RECENT_WIN 的实测）：重分配判据用它，历史停顿不进分母；没样本退回全片均速。
-    fn recent_rate(&self, now: Instant) -> f64 {
-        if let Some(r) = self.frozen_rate {
-            return r;
+    /// 收尾定格：已有 600ms 窗速度就留着；没有（提前下完/停滞）才用首帧剔除后的全程均速。
+    /// 返回 true 表示本拍落下了速度样本（供 EMA/体检），已落定过返回 false 不重复喂。
+    fn freeze(&mut self, now: Instant) -> bool {
+        if self.steady_rate.is_some() {
+            return false;
         }
-        let Some((t0, b0)) = self.recent.front() else {
-            return self.rate(now);
+        let Some(first) = self.first_at else {
+            return false; // 连首帧都没到，没样本，不动刀、不进基准
         };
-        let el = now.saturating_duration_since(*t0);
-        let bytes = self.got.saturating_sub(*b0);
-        bytes as f64 / el.as_secs_f64().max(0.001)
+        let el = now.saturating_duration_since(first).as_secs_f64().max(0.001);
+        let bytes = self.got.saturating_sub(self.first_frame_bytes);
+        self.steady_rate = Some(bytes as f64 / el);
+        true
     }
 }
 
@@ -220,9 +235,11 @@ pub(super) struct MergeBody {
     pub(super) allow_yield: bool,
     /// 已经切过一次：校准期那轮重分配只做一次，之后所有派发交给 5ms ECT 市场。
     rebalanced: bool,
-    /// 段正常收尾（freeze 定格速率）后置位：驱动循环据此提前跑一次 rebalance。
+    /// 有新段落定稳态速度（600ms 采样或提前收尾）后置位：驱动循环据此提前跑一次 rebalance。
     /// 只作触发信号，要不要切由 rebalance 自己算；取走即清。
     done_probe: bool,
+    /// 本拍新落定的段级稳态速度 (owner, B/s)：驱动循环取走喂镜像级 EMA。
+    steady_events: Vec<(String, f64)>,
     /// 本轮切尾的段来自哪家（供上层日志显示）。
     pub(super) last_cut_owner: Option<String>,
     /// 最后一次切割的留切明细：(留字节, 留字节传完毫秒, 切字节, 切字节交快流传完毫秒)。
@@ -253,6 +270,7 @@ impl MergeBody {
             allow_yield: true,
             rebalanced: false,
             done_probe: false,
+            steady_events: Vec::new(),
             last_cut_owner: None,
             last_cut: None,
             finished: false,
@@ -294,10 +312,15 @@ impl MergeBody {
         true
     }
 
-    /// 段收尾事件：有段刚定格速率就返回 true 并清标志。
-    /// 驱动循环据此提前体检，让快段的冻结速率立刻进基准，不等 500ms 时钟。
+    /// 段收尾/稳态采样事件：有段刚落定速度就返回 true 并清标志。
+    /// 驱动循环据此提前体检，让快段的稳态速率立刻进基准，不等 500ms 时钟。
     pub(super) fn take_done_probe(&mut self) -> bool {
         std::mem::take(&mut self.done_probe)
+    }
+
+    /// 取走本拍新落定的段级稳态速度，喂镜像级 EMA；取走即清。
+    pub(super) fn take_steady_events(&mut self) -> Vec<(String, f64)> {
+        std::mem::take(&mut self.steady_events)
     }
 
     /// 取一个待发区间（缺口 / 重分配尾巴）。派出即登记在途，回来（feed/retry_fill）才清。
@@ -344,10 +367,15 @@ impl MergeBody {
         let now = Instant::now();
         let mut progressed = false;
         let mut just_done = false;
+        let mut steady = Vec::new();
         for seg in self.segs.values_mut() {
             // 重分配后的父段：掐掉上游流停止白下载（刀口外字节要丢），缓冲里已到的照常交付；这段必须排在缓冲守卫之前，否则父段灌满 2MB 时守卫 continue 会永远跳过掐流。
             if seg.cut && seg.pos() >= seg.end {
                 seg.body = protocol::empty_body();
+            }
+            // 稳态采样不依赖缓冲水位：哪怕段被缓冲守卫跳过，600ms 窗也要照常落定。
+            if !seg.done && seg.sample_steady(now) {
+                steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
             }
             if seg.done || seg.buffered >= SEG_BUFFER_MAX {
                 continue;
@@ -357,26 +385,16 @@ impl MergeBody {
                 seg.stalled_since = Some(now);
             }
             seg.last_poll = now;
-            // 记近期速率样本点：判重分配用滑窗，全片均速的历史包袱不进判据。
-            seg.recent.push_back((now, seg.got));
-            while seg.recent.len() > 64
-                || seg
-                    .recent
-                    .front()
-                    .is_some_and(|(t, _)| now.saturating_duration_since(*t) > RECENT_WIN)
-            {
-                seg.recent.pop_front();
-            }
             match std::pin::Pin::new(&mut seg.body).poll_frame(cx) {
                 std::task::Poll::Ready(Some(Ok(f))) => {
                     progressed = true;
                     // 非数据帧（trailer 等）直接丢，只关心正文。
                     if let Ok(d) = f.into_data() {
-                        // 首帧：速率时钟从这一刻起算（爬坡不进分母），近期样本清空重开。
-                        if seg.first_at.is_none() {
-                            seg.on_first_frame(now);
-                        }
                         let n = d.len() as u64;
+                        // 首帧：速率时钟从这一刻起算（爬坡不进分母），记下首帧字节供速度分子剔除。
+                        if seg.first_at.is_none() {
+                            seg.on_first_frame(now, n);
+                        }
                         seg.buffered += d.len();
                         seg.got += n;
                         seg.buf.push_back(d);
@@ -385,13 +403,18 @@ impl MergeBody {
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
                     progressed = true;
-                    seg.freeze(now);
+                    if seg.freeze(now) {
+                        steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
+                    }
                     seg.done = true;
                     seg.err = Some(e);
                 }
                 std::task::Poll::Ready(None) => {
                     progressed = true;
-                    seg.freeze(now); // 定格这家的实测速度，供别人当"最快"基准
+                    if seg.freeze(now) {
+                        // 提前下完：定格首帧剔除后的均速，供别人当"最快"基准并喂 EMA。
+                        steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
+                    }
                     seg.done = true;
                     just_done = true; // 借用结束后交给驱动循环提前体检，不在这里直接 rebalance
                 }
@@ -400,9 +423,10 @@ impl MergeBody {
                 }
             }
         }
-        if just_done {
+        if just_done || !steady.is_empty() {
             self.done_probe = true;
         }
+        self.steady_events.extend(steady);
         progressed
     }
 
@@ -427,7 +451,7 @@ impl MergeBody {
             let old_end = seg.end;
             seg.end = pos;
             seg.body = protocol::empty_body();
-            seg.freeze(now);
+            seg.freeze(now); // 停滞段不喂 EMA（err 段不进基准），只留速度供诊断
             seg.done = true;
             seg.err = Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -455,9 +479,9 @@ impl MergeBody {
             return 0;
         }
         // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，记全场最快纯排水速率与那家的 ramp。
-        // 只收有首帧的活段：没首帧 = 没速率样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
-        // 已正常收尾的段不进 cands（下完了，切它没意义），但它 freeze 的速率要参与最快比较——
-        // 快段可能在体检点之前就跑完，不拿它的速度当基准就只能按活段的旧速度切，切量偏小。
+        // 只收已落定稳态速度的活段：600ms 窗没到 = 没样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
+        // 已正常收尾的段不进 cands（下完了，切它没意义），但它定格的稳态速度要参与最快比较——
+        // 快段可能在体检点之前就跑完，不拿它的速度当基准就只能按活段的速度切，切量偏小。
         // 出错/停滞收尾的段不算基准，避免把假快速度喂给判据。
         let mut cands: Vec<(u64, u64, u64, String, f64, u64)> = Vec::new();
         let mut fastest = 0.0f64;
@@ -465,7 +489,7 @@ impl MergeBody {
         for s in self.segs.values() {
             if s.done {
                 if s.err.is_none() {
-                    if let Some(v) = s.frozen_rate {
+                    if let Some(v) = s.steady_rate {
                         if v > fastest {
                             fastest = v;
                             fastest_ramp = s.ramp;
@@ -474,9 +498,10 @@ impl MergeBody {
                 }
                 continue;
             }
-            if s.first_at.is_none() {
+            // 稳态速度还没落定（首帧未到 / 没到 600ms 窗）→ 不动刀，等下次体检。
+            let Some(v) = s.steady_rate else {
                 continue;
-            }
+            };
             if now.saturating_duration_since(s.last_poll) > POLL_GAP
                 || s.buffered >= SEG_BUFFER_MAX
             {
@@ -487,7 +512,6 @@ impl MergeBody {
             if remaining == 0 {
                 continue;
             }
-            let v = s.recent_rate(now);
             if v <= 0.0 {
                 continue;
             }

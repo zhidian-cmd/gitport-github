@@ -28,19 +28,15 @@ const MIRROR_FAIL_WINDOW_MS: u64 = 45_000;
 const TIMEOUT_FAIL_WINDOW_MS: u64 = 15_000;
 /// 开放区间/无 Range 的体积假设，仅影响派发权重。
 const ASSUMED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
-/// 唯一窗口：分配窗 5ms（新连接/补发/重派共用这一张账，零收一律沿用——卡死语义归收尸与 mark_fail 管）。
-/// ticker 按 5ms 一拍；Windows 实际粒度 ~15ms，所有源同刻度，排名不受影响。
-const ALLOC_WINDOW_MS: u64 = 5;
 
-/// 每面镜像的记账：在途字节/流数、分配窗、失败降权窗、建连首包 ttfb、爬坡 EMA。
+/// 每面镜像的记账：在途字节/流数、单流稳态速度、失败降权窗、建连首包 ttfb、爬坡 EMA。
 #[derive(Default)]
 pub(super) struct MirrorLoad {
     pub(super) in_flight_bytes: AtomicU64,
     pub(super) in_flight_streams: AtomicU64,
-    /// 分配窗(5ms)本窗实收：on_frame 累加，sweep 每拍快照进 alloc_prev 后清零。
-    alloc_bytes: AtomicU64,
-    /// 分配窗快照（新连接/补发/重派分母）：零收沿用旧值不清零——速率估计，卡死语义归收尸。
-    pub(super) alloc_prev: AtomicU64,
+    /// 单流稳态速度 B/s 的 EMA(α=1/4)：来自切片段的 500-600ms 窗（首帧 burst 已剔除）。
+    /// ECT 分母 = 这个数 × 在途流数；没有样本（0）时新连接零历史垫底。
+    pub(super) steady_rate_bps: AtomicU64,
     /// 失败降权到期时刻(纪元 ms)。0 = 健康；超时类失败写短窗，硬错误写长窗。
     pub(super) fail_until: AtomicU64,
     /// 请求→响应头毫秒的 EMA(α=1/4)：镜像腿的建连+首包估计。直连腿不写恒 0——池通道复用零建连。
@@ -107,23 +103,17 @@ pub(super) fn note_ramp(load: &MirrorLoad, ms: u64) {
     load.ramp_ms.store(ema, Ordering::Relaxed);
 }
 
-/// 单窗结算：分配窗每拍快照（零收沿用，速率估计无停机语义）——所有派发共读这一张账。
-fn ect_sweep() {
-    let g = crate::util::lock(&MIRROR_LOAD);
-    for ld in g.values() {
-        let a = ld.alloc_bytes.swap(0, Ordering::Relaxed);
-        if a > 0 {
-            ld.alloc_prev.store(a, Ordering::Relaxed);
-        }
+/// 段级稳态速度入账（EMA α=1/4）：600ms 窗或提前收尾时由 MergeBody 交上来。
+/// 首次直入，之后平滑；0（空窗/没下到字节）不写，别把 EMA 拉成假慢。
+pub(super) fn note_steady(mirror: &str, bps: f64) {
+    if !bps.is_finite() || bps <= 0.0 {
+        return;
     }
-}
-
-/// 启动 ECT 定时器：独立线程按分配窗一拍（5ms 档，Windows 实际 ~15ms），零锁争用（快照只碰各镜像自己的原子量）。
-pub(crate) fn start_ect_ticker() {
-    crate::logger::spawn("ect-tick", || loop {
-        std::thread::sleep(Duration::from_millis(ALLOC_WINDOW_MS));
-        ect_sweep();
-    });
+    let ld = mirror_load(mirror);
+    let sample = bps as u64;
+    let old = ld.steady_rate_bps.load(Ordering::Relaxed);
+    let ema = if old == 0 { sample } else { old * 3 / 4 + sample / 4 };
+    ld.steady_rate_bps.store(ema, Ordering::Relaxed);
 }
 
 /// 记账守卫：派发记在途、逐帧归还、Drop 清残余；归还封顶于记账额，采样走原始字节。
@@ -168,7 +158,7 @@ impl LoadGuard {
         self
     }
 
-    /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；大文件流顺带喂窗口采样。
+    /// 交付一帧：按记账额归还(封顶防下溢)，原始字节照常累计；速度不在这里采——走 MergeBody 的 600ms 稳态窗。
     pub(super) fn on_frame(&mut self, n: u64) {
         if n > 0 && self.seg_first.is_none() {
             let at = Instant::now();
@@ -186,11 +176,6 @@ impl LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(credit, Ordering::Relaxed);
         }
-        if !self.big {
-            return;
-        }
-        // 镜像级累计：ECT 的分母是这家的总吞吐（整窗实收），不是某一条流自己的均速。
-        self.load.alloc_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// 响应头到达时重置测速时钟：建连等待只算墙钟，不进速度样本（否则快镜像被稀释得更狠）。
@@ -210,30 +195,32 @@ impl Drop for LoadGuard {
                 .in_flight_bytes
                 .fetch_sub(residual, Ordering::Relaxed);
         }
-        // 流数随流终结归位(正常读完/断开都走这里)。分配窗累计清零：镜像转闲，下窗沿用旧值。
-        if self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.load.alloc_bytes.store(0, Ordering::Relaxed);
-        }
+        // 流数随流终结归位(正常读完/断开都走这里)。稳态速度沿用旧值——它是镜像能力估计，不随流闲重置。
+        self.load.in_flight_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// ECT 派发：score=(在途+新增)×5ms÷上窗实收 + 本家爬坡毫秒，真毫秒；最小者胜、无容差。
-/// 单窗：新连接/补发/重派共读同一张 5ms 账。ttfb 不掺——它只进探针排序（1 字节请求的完成时间就是 ttfb）。
+/// ECT 派发：score=(在途+新增)÷(单流稳态速度×在途流数) + 本家爬坡毫秒，真毫秒；最小者胜、无容差。
+/// 分母是估出来的镜像吞吐（N×单流速度），不是实测窗——派发几微秒排完，实测没有时间窗可用。
+/// 乐观估计靠 ECT 负反馈自纠：派多了在途涨、分数变高，下一轮就不派了。
+/// ttfb 不掺——它只进探针排序（1 字节请求的完成时间就是 ttfb）。
 fn pick_mirror(chain: &[String], new_bytes: u64) -> usize {
     let now = now_ms();
     let loads: Vec<Arc<MirrorLoad>> = chain.iter().map(|m| mirror_load(m)).collect();
     let ect_of = |ld: &MirrorLoad| -> u64 {
-        let w = ld.alloc_prev.load(Ordering::Relaxed);
+        let rate = ld.steady_rate_bps.load(Ordering::Relaxed);
         let ramp = ld.ramp_ms.load(Ordering::Relaxed);
-        if w == 0 {
+        if rate == 0 {
             // 零历史：整体 +∞ 垫底，档内按在途字节排梯度（闲者先试），仍高于任何有历史者。爬坡项照样加。
             return u64::MAX / 2 + ld.in_flight_bytes.load(Ordering::Relaxed) + ramp;
         }
+        let streams = ld.in_flight_streams.load(Ordering::Relaxed).max(1);
+        let capacity = rate.saturating_mul(streams); // B/s，镜像并行吞吐估计
         ld.in_flight_bytes
             .load(Ordering::Relaxed)
             .saturating_add(new_bytes)
-            * ALLOC_WINDOW_MS
-            / w
+            .saturating_mul(1000) // 秒 → 毫秒
+            / capacity.max(1)
             + ramp
     };
 
@@ -923,7 +910,7 @@ async fn split_download(
     // 带 Range 的请求（下载器自己拆好的分片连接）→ 单流 ECT 最优，并行度归下载器。
     let unmeasured = healthy
         .iter()
-        .any(|m| mirror_load(m).alloc_prev.load(Ordering::Relaxed) == 0);
+        .any(|m| mirror_load(m).steady_rate_bps.load(Ordering::Relaxed) == 0);
     let all_idle = healthy
         .iter()
         .all(|m| mirror_load(m).in_flight_bytes.load(Ordering::Relaxed) == 0);
@@ -1456,8 +1443,12 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                             let _ = tx.send(msg).await;
                         });
                     }
+                    // 段级稳态速度落定（600ms 窗或提前收尾）→ 喂镜像级 EMA，ECT 下一拍就能用。
+                    for (owner, rate) in mb.take_steady_events() {
+                        note_steady(&owner, rate);
+                    }
                     // 体检：停滞收尸、速率比例重分配。数据一直在流也要做——涓流不触发超时。
-                    // 快段提前下完会置完成标志，据此立刻体检一次，不等 500ms 兜底时钟。
+                    // 段速度落定会置完成标志，据此立刻体检一次，不等 500ms 兜底时钟。
                     let done_event = mb.take_done_probe();
                     if done_event || mb.tick_due(Instant::now()) {
                         let now = Instant::now();
@@ -1479,7 +1470,7 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                                 ),
                                 None => String::new(),
                             };
-                            let trigger = if done_event { "段完成" } else { "体检" };
+                            let trigger = if done_event { "速度落定" } else { "体检" };
                             (ctx.log)(&format!(
                                 "[切片] {} 校准重分配({trigger}): {owner} {note} (共 {}KB)",
                                 ctx.host,

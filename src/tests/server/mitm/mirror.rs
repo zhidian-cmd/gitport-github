@@ -270,35 +270,32 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     Box::pin(async { Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into()) })
 }
 
-/// 单窗结算规则：只有分配窗(5ms)，零收一律沿用（速率估计，卡死语义归收尸管）——零 sleep 确定性验证。
+/// 段级稳态速度 EMA：首样直入、二次平滑；0/非有限值不写（别把 EMA 拉成假慢）。
 #[test]
-fn single_window_snapshot_rules() {
+fn steady_rate_note_ema() {
     let ld = mirror_load("ect-slot.test");
-    let mut g = LoadGuard::charge(ld.clone(), 8 * 1024 * 1024, true);
-    g.on_frame(3 * 1024 * 1024);
-    ect_sweep();
+    ld.steady_rate_bps.store(0, Ordering::Relaxed);
+    note_steady("ect-slot.test", 8.0 * 1024.0 * 1024.0);
     assert_eq!(
-        ld.alloc_prev.load(Ordering::Relaxed),
-        3 * 1024 * 1024,
-        "分配窗本拍快照"
+        ld.steady_rate_bps.load(Ordering::Relaxed),
+        8 * 1024 * 1024,
+        "首样直入"
     );
+    note_steady("ect-slot.test", 4.0 * 1024.0 * 1024.0);
     assert_eq!(
-        ld.alloc_bytes.load(Ordering::Relaxed),
-        0,
-        "快照后本窗清零重开"
+        ld.steady_rate_bps.load(Ordering::Relaxed),
+        7 * 1024 * 1024,
+        "EMA 8M×3/4 + 4M×1/4 = 7M"
     );
-    // 零收（有债也在内）：沿用旧值——卡死语义归收尸管。
-    ect_sweep();
+    // 零值与非有限值不覆盖旧值。
+    note_steady("ect-slot.test", 0.0);
+    note_steady("ect-slot.test", f64::NAN);
     assert_eq!(
-        ld.alloc_prev.load(Ordering::Relaxed),
-        3 * 1024 * 1024,
-        "零收沿用"
+        ld.steady_rate_bps.load(Ordering::Relaxed),
+        7 * 1024 * 1024,
+        "零/NaN 不写，避免假慢"
     );
-    // 恢复出货：换新值。
-    g.on_frame(4 * 1024 * 1024);
-    ect_sweep();
-    assert_eq!(ld.alloc_prev.load(Ordering::Relaxed), 4 * 1024 * 1024);
-    ld.alloc_prev.store(0, Ordering::Relaxed);
+    ld.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 /// 爬坡 EMA：首样直入、二次平滑；用 note_ramp 直接验证记账公式（打点在 LoadGuard::on_frame 首帧）。
@@ -317,34 +314,34 @@ fn ramp_note_ema() {
     ld.ramp_ms.store(0, Ordering::Relaxed);
 }
 
-/// ECT 派发把本家 ramp 加进分数：同排水下爬坡小的胜；ramp 足够大时能翻盘。
+/// ECT 派发把本家 ramp 加进分数：同吞吐下爬坡小的胜；ramp 足够大时能翻盘。
 #[test]
 fn ect_adds_ramp_to_score() {
     let fast = mirror_load("ect-ramp-a.test");
-    fast.alloc_prev.store(1024 * 1024, Ordering::Relaxed); // 排空 5ms
-    fast.ramp_ms.store(400, Ordering::Relaxed); // 总分 405
+    fast.steady_rate_bps.store(200 * 1024 * 1024, Ordering::Relaxed);
+    fast.ramp_ms.store(400, Ordering::Relaxed);
     let slow = mirror_load("ect-ramp-b.test");
-    slow.alloc_prev.store(1024 * 1024, Ordering::Relaxed); // 排空 5ms
-    slow.ramp_ms.store(100, Ordering::Relaxed); // 总分 105
+    slow.steady_rate_bps.store(200 * 1024 * 1024, Ordering::Relaxed);
+    slow.ramp_ms.store(100, Ordering::Relaxed);
     let chain = vec!["ect-ramp-a.test".to_string(), "ect-ramp-b.test".to_string()];
-    assert_eq!(pick_mirror(&chain, 1024), 1, "同排水下爬坡小的胜");
-    // 翻盘：A 排水略快但 ramp 巨大 → 选 B。
-    fast.alloc_prev.store(4 * 1024 * 1024, Ordering::Relaxed); // 排空 ~1ms
-    fast.ramp_ms.store(2000, Ordering::Relaxed); // 总分 ~2001
+    assert_eq!(pick_mirror(&chain, 1024), 1, "同吞吐下爬坡小的胜");
+    // 翻盘：A 吞吐略快但 ramp 巨大 → 选 B。
+    fast.steady_rate_bps.store(800 * 1024 * 1024, Ordering::Relaxed);
+    fast.ramp_ms.store(2000, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 1024), 1, "ramp 项能翻转排序");
-    fast.alloc_prev.store(0, Ordering::Relaxed);
+    fast.steady_rate_bps.store(0, Ordering::Relaxed);
     fast.ramp_ms.store(0, Ordering::Relaxed);
-    slow.alloc_prev.store(0, Ordering::Relaxed);
+    slow.steady_rate_bps.store(0, Ordering::Relaxed);
     slow.ramp_ms.store(0, Ordering::Relaxed);
 }
 
-/// 先验退役：未交卷候选在 ECT 里按无穷大垫底——已交卷的慢腿也胜过它。
+/// 先验退役：无稳态速度的候选在 ECT 里按无穷大垫底——有速度的慢腿也胜过它。
 #[test]
 fn ect_after_retirement_unprobed_loses_to_probed_slow() {
     let slow = mirror_load("retire-slow.test");
-    slow.alloc_prev.store(100 * 1024, Ordering::Relaxed); // 100KB/5ms 已交卷
+    slow.steady_rate_bps.store(20 * 1024 * 1024, Ordering::Relaxed); // 已交卷的慢腿
     let unprobed = mirror_load("retire-unprobed.test");
-    unprobed.alloc_prev.store(0, Ordering::Relaxed);
+    unprobed.steady_rate_bps.store(0, Ordering::Relaxed);
     let chain = vec![
         "retire-slow.test".to_string(),
         "retire-unprobed.test".to_string(),
@@ -354,7 +351,7 @@ fn ect_after_retirement_unprobed_loses_to_probed_slow() {
         0,
         "未交卷者 ECT 无穷大, 已交卷的慢腿也胜出(先验不再掺和)"
     );
-    slow.alloc_prev.store(0, Ordering::Relaxed);
+    slow.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 /// 直连同台：candidates = 镜像 + direct/{host}，ECT 统一派发。
@@ -363,9 +360,9 @@ fn direct_competes_as_candidate() {
     let chain = vec!["cand-m.test".to_string()];
     let cands = [chain.as_slice(), &[direct_load_key("cand-host.test")][..]];
     let all: Vec<String> = cands.concat();
-    // 直连快(8MB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
+    // 直连快(1.6GB/s 实测) 镜像未交卷(ECT 无穷大垫底): 直连胜出。
     let d = mirror_load(&direct_load_key("cand-host.test"));
-    d.alloc_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
+    d.steady_rate_bps.store(1600 * 1024 * 1024, Ordering::Relaxed);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(
         all[pick],
@@ -376,7 +373,7 @@ fn direct_competes_as_candidate() {
     mark_fail(&d, false);
     let pick = pick_mirror(&all, 8 * 1024 * 1024);
     assert_eq!(all[pick], "cand-m.test", "直连降权后应选镜像");
-    d.alloc_prev.store(0, Ordering::Relaxed);
+    d.steady_rate_bps.store(0, Ordering::Relaxed);
     d.fail_until.store(0, Ordering::Relaxed);
     // 零镜像: candidates 只有直连, pick 恒 0(直连键)。
     let only_direct = vec![direct_load_key("cand-host.test")];
@@ -390,19 +387,21 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     let a = mirror_load("ect-a.test");
     let b = mirror_load("ect-b.test");
     a.in_flight_bytes.store(512 * 1024, Ordering::Relaxed);
-    a.alloc_prev.store(5 * 1024 * 1024, Ordering::Relaxed);
+    a.steady_rate_bps
+        .store(1024 * 1024 * 1024, Ordering::Relaxed); // 1GB/s，10MB 排空 ~10ms
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(512 * 1024, Ordering::Relaxed);
+    b.steady_rate_bps
+        .store(100 * 1024 * 1024, Ordering::Relaxed); // 100MB/s，10MB 排空 100ms
     let chain = vec!["ect-a.test".to_string(), "ect-b.test".to_string()];
-    // A (0.5+10)/5 ≈ 2s < B 10/0.5 = 20s → A。
+    // A 在途 0.5MB 按 1GB/s ≈ 10ms < B 100ms → A。
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 0);
-    // A (100+10)/5 = 22 > B 20 → B。
+    // A 在途 100MB → 110ms > B 100ms → B。
     a.in_flight_bytes
         .store(100 * 1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 10 * 1024 * 1024), 1);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.alloc_prev.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(0, Ordering::Relaxed);
+    a.steady_rate_bps.store(0, Ordering::Relaxed);
+    b.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 /// 段级派发无视 ttfb（h2 复用后镜像/直连首字节对称，ttfb 只进探针排序）：快镜像 ttfb 600ms 仍按纯排水胜出。
@@ -410,19 +409,20 @@ fn ect_prefers_busy_fast_over_idle_slow() {
 #[test]
 fn ect_ignores_ttfb_for_segments() {
     let fast = mirror_load("ect-fast.test");
-    fast.alloc_prev.store(8 * 1024 * 1024, Ordering::Relaxed);
+    fast.steady_rate_bps
+        .store(1600 * 1024 * 1024, Ordering::Relaxed);
     fast.ttfb_ms.store(600, Ordering::Relaxed);
     let slow = mirror_load("ect-slow.test");
-    slow.alloc_prev.store(1024 * 1024, Ordering::Relaxed);
+    slow.steady_rate_bps.store(200 * 1024 * 1024, Ordering::Relaxed);
     let chain = vec!["ect-fast.test".to_string(), "ect-slow.test".to_string()];
     assert_eq!(
         pick_mirror(&chain, 2 * 1024 * 1024),
         0,
         "纯排水 20ms < 160ms, 快镜像胜"
     );
-    fast.alloc_prev.store(0, Ordering::Relaxed);
+    fast.steady_rate_bps.store(0, Ordering::Relaxed);
     fast.ttfb_ms.store(0, Ordering::Relaxed);
-    slow.alloc_prev.store(0, Ordering::Relaxed);
+    slow.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 /// ttfb 入账语义：首样直入，之后 EMA α=1/4 平滑；直连键永不入账恒 0。
@@ -519,17 +519,17 @@ async fn mirror_h2_body_probe() {
     );
 }
 
-/// 全未交卷(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
+/// 全零历史(ECT 同为无穷大、并列) → 轮转均摊；在途越深越垫底，闲者胜出。
 #[test]
 fn cold_start_falls_back_to_chain_order() {
     let a = mirror_load("cold-a.test");
     let b = mirror_load("cold-b.test");
-    a.alloc_prev.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(0, Ordering::Relaxed);
+    a.steady_rate_bps.store(0, Ordering::Relaxed);
+    b.steady_rate_bps.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["cold-a.test".to_string(), "cold-b.test".to_string()];
-    // 全未交卷 → ECT 同为无穷大 → 并列 → 轮转(先验已退役, 不再按链位铺开)。
+    // 全零历史 → ECT 同为无穷大 → 并列 → 轮转(先验已退役, 不再按链位铺开)。
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
     let mut seen = std::collections::HashSet::new();
@@ -538,48 +538,53 @@ fn cold_start_falls_back_to_chain_order() {
     }
     assert!(
         seen.contains(&0) && seen.contains(&1),
-        "冷启动全空应在容差内轮转均摊, 不塞链头: {seen:?}"
+        "冷启动全空应轮转均摊, 不塞链头: {seen:?}"
     );
-    // 在途拉开(超容差) → 严格选闲者。
+    // 在途拉开 → 严格选闲者。
     a.in_flight_bytes.store(8 * 1024 * 1024, Ordering::Relaxed);
-    assert_eq!(pick_mirror(&chain, 1024), 1, "梯度速率下按在途字节分");
+    assert_eq!(pick_mirror(&chain, 1024), 1, "零历史档内按在途字节分");
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
 }
 
-/// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转——高压镜像(流多)不再被继续堆片，从源头减少掐断误判。
+/// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转。
+/// 分母是 rate×streams，所以并列要构造等价容量：A 单流快但只有 1 条，B 单流慢但有 2 条。
 #[test]
 fn tie_prefers_fewer_inflight_streams() {
     let a = mirror_load("streams-a.test");
     let b = mirror_load("streams-b.test");
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
-    a.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
-    a.in_flight_streams.store(0, Ordering::Relaxed);
-    b.in_flight_streams.store(0, Ordering::Relaxed);
+    // A: 400MB/s × 1 流 = 400M；B: 200MB/s × 2 流 = 400M → ECT 并列。
+    a.steady_rate_bps
+        .store(400 * 1024 * 1024, Ordering::Relaxed);
+    b.steady_rate_bps
+        .store(200 * 1024 * 1024, Ordering::Relaxed);
+    a.in_flight_streams.store(1, Ordering::Relaxed);
+    b.in_flight_streams.store(2, Ordering::Relaxed);
     let chain = vec!["streams-a.test".to_string(), "streams-b.test".to_string()];
-    // ECT 并列(同速同在途字节)、A 已压 3 流 B 空闲 → 恒选 B。
-    a.in_flight_streams.store(3, Ordering::Relaxed);
+    // 容量并列、ECT 相等 → 选流少的 A。
     for _ in 0..10 {
-        assert_eq!(pick_mirror(&chain, 1024), 1, "流少的 B 应胜出");
+        assert_eq!(pick_mirror(&chain, 1024), 0, "ECT 并列时流少的 A 应胜出");
     }
-    // B 也压上 3 流 → 流数并列 → 轮转两家都出。
-    b.in_flight_streams.store(3, Ordering::Relaxed);
+    // 流数也对齐（各 2 流，B 降速到 400MB/s 保持容量并列）→ 轮转。
+    a.in_flight_streams.store(2, Ordering::Relaxed);
+    a.steady_rate_bps
+        .store(200 * 1024 * 1024, Ordering::Relaxed);
     let mut seen = std::collections::HashSet::new();
     for _ in 0..20 {
         seen.insert(pick_mirror(&chain, 1024));
     }
     assert!(
         seen.contains(&0) && seen.contains(&1),
-        "流数并列应轮转: {seen:?}"
+        "ECT 与流数都并列应轮转: {seen:?}"
     );
     // 清场。
     a.in_flight_streams.store(0, Ordering::Relaxed);
     b.in_flight_streams.store(0, Ordering::Relaxed);
-    a.alloc_prev.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(0, Ordering::Relaxed);
+    a.steady_rate_bps.store(0, Ordering::Relaxed);
+    b.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 /// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废；仅 ECT 完全相等才走二级(流数/轮转)。
@@ -591,8 +596,10 @@ fn ect_strict_minimum_no_tolerance() {
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["tie-a.test".to_string(), "tie-b.test".to_string()];
     // 速度差 4% → 恒选快者 b(容差时代会轮转)。
-    a.alloc_prev.store(2 * 1024 * 1024, Ordering::Relaxed);
-    b.alloc_prev.store(2088 * 1024, Ordering::Relaxed); // +4%
+    a.steady_rate_bps
+        .store(400 * 1024 * 1024, Ordering::Relaxed);
+    b.steady_rate_bps
+        .store(416 * 1024 * 1024, Ordering::Relaxed); // +4%
     for _ in 0..10 {
         assert_eq!(
             pick_mirror(&chain, 8 * 1024 * 1024),
@@ -600,16 +607,16 @@ fn ect_strict_minimum_no_tolerance() {
             "无容差: 4% 差距也严格选快"
         );
     }
-    a.alloc_prev.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(0, Ordering::Relaxed);
+    a.steady_rate_bps.store(0, Ordering::Relaxed);
+    b.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
 #[test]
 fn recent_failure_deprioritized() {
     let a = mirror_load("fail-a.test");
     let b = mirror_load("fail-b.test");
-    a.alloc_prev.store(0, Ordering::Relaxed);
-    b.alloc_prev.store(0, Ordering::Relaxed);
+    a.steady_rate_bps.store(0, Ordering::Relaxed);
+    b.steady_rate_bps.store(0, Ordering::Relaxed);
     a.in_flight_bytes.store(0, Ordering::Relaxed);
     b.in_flight_bytes.store(0, Ordering::Relaxed);
     let chain = vec!["fail-a.test".to_string(), "fail-b.test".to_string()];
@@ -617,7 +624,7 @@ fn recent_failure_deprioritized() {
     assert_eq!(pick_mirror(&chain, 1024), 1);
     // 全体都在窗内：放开过滤，ECT 照常按吞吐选（b 有历史胜过零历史的 a）。
     mark_fail(&b, false);
-    b.alloc_prev.store(1024 * 1024, Ordering::Relaxed);
+    b.steady_rate_bps.store(200 * 1024 * 1024, Ordering::Relaxed);
     assert_eq!(pick_mirror(&chain, 1024), 1);
     a.fail_until.store(0, Ordering::Relaxed);
     b.fail_until.store(0, Ordering::Relaxed);
@@ -746,7 +753,7 @@ fn small_stream_never_touches_big_file_state() {
     let ld = mirror_load("small-decoupled.test");
     ld.in_flight_bytes.store(0, Ordering::Relaxed);
     ld.in_flight_streams.store(0, Ordering::Relaxed);
-    ld.alloc_prev.store(0, Ordering::Relaxed);
+    ld.steady_rate_bps.store(0, Ordering::Relaxed);
     let mut g = LoadGuard::charge(ld.clone(), 1024 * 1024, false); // 小文件流
     g.on_frame(1024 * 1024);
     std::thread::sleep(Duration::from_millis(120));
@@ -763,11 +770,10 @@ fn small_stream_never_touches_big_file_state() {
         "流数零接触"
     );
     assert_eq!(
-        ld.alloc_bytes.load(Ordering::Relaxed),
+        ld.steady_rate_bps.load(Ordering::Relaxed),
         0,
-        "小文件不进时间槽"
+        "小文件不喂稳态速度, 零历史保持垫底"
     );
-    assert_eq!(ld.alloc_prev.load(Ordering::Relaxed), 0, "零历史保持垫底");
 }
 
 // ---- 切片驱动：缺口自己续、失败只算空手、绝不提前收尾 ----
