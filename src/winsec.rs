@@ -12,7 +12,7 @@ use windows::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
     Authorization::{
         ConvertStringSidToSidW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SetEntriesInAclW,
-        SetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_FORM, TRUSTEE_IS_SID,
+        SetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_IS_SID,
         TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_TYPE, TRUSTEE_W,
     },
 };
@@ -20,17 +20,20 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// 受保护 DACL（文件版）：仅 SYSTEM 与当前用户，完全控制——icacls 的裸 (F)。
 pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
-    restrict(path, GENERIC_ALL.0)
+    restrict(path, GENERIC_ALL.0, ACE_FLAGS(0))
 }
 
-/// 受保护 DACL（目录版）：授权带对象/容器继承，否则断继承后旧子目录被剥成空 DACL，缓存全写不进去。
+/// 受保护 DACL（目录版）：完全控制 + 对象/容器继承，否则断继承后旧子目录被剥成空 DACL，缓存全写不进去。
+/// 继承标志必须放 grfInheritance 字段——混进权限掩码会让子目录继承出空 DACL，缓存写盘全部拒绝访问。
 pub fn restrict_dir_to_current_user(path: &str) -> Result<(), String> {
-    // icacls 的 (OI)(CI)：目录上对象/容器两个继承位，与 GENERIC_ALL 并进一条授权。
-    let inherit = OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0;
-    restrict(path, GENERIC_ALL.0 | inherit)
+    restrict(
+        path,
+        GENERIC_ALL.0,
+        ACE_FLAGS(OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0),
+    )
 }
 
-fn restrict(path: &str, rights: u32) -> Result<(), String> {
+fn restrict(path: &str, rights: u32, inheritance: ACE_FLAGS) -> Result<(), String> {
     unsafe {
         // 1) 当前用户 SID：从进程令牌直取（比按用户名解析精确，无同名歧义）。
         //    SID 指向 _sid_buf 内部，_sid_buf 必须活到 SetEntriesInAclW 之后。
@@ -48,8 +51,8 @@ fn restrict(path: &str, rights: u32) -> Result<(), String> {
         // 3) 两条授权条目：当前用户 + SYSTEM。SetEntriesInAclW 的基线传 None =
         //    从零构建新 DACL（等价 icacls /grant:r 的替换语义），继承由 PROTECTED 标志断开。
         let entries = [
-            explicit_access(&user_sid, rights, TRUSTEE_IS_USER),
-            explicit_access(&system_sid, rights, TRUSTEE_IS_WELL_KNOWN_GROUP),
+            explicit_access(&user_sid, rights, inheritance, TRUSTEE_IS_USER),
+            explicit_access(&system_sid, rights, inheritance, TRUSTEE_IS_WELL_KNOWN_GROUP),
         ];
         let mut new_dacl: *mut ACL = std::ptr::null_mut();
         let ret = SetEntriesInAclW(Some(&entries), None, &mut new_dacl);
@@ -76,11 +79,16 @@ fn restrict(path: &str, rights: u32) -> Result<(), String> {
     }
 }
 
-fn explicit_access(sid: &PSID, rights: u32, trustee_type: TRUSTEE_TYPE) -> EXPLICIT_ACCESS_W {
+fn explicit_access(
+    sid: &PSID,
+    rights: u32,
+    inheritance: ACE_FLAGS,
+    trustee_type: TRUSTEE_TYPE,
+) -> EXPLICIT_ACCESS_W {
     EXPLICIT_ACCESS_W {
         grfAccessPermissions: rights,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: ACE_FLAGS(0),
+        grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
