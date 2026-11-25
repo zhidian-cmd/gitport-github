@@ -37,6 +37,12 @@ fn is_document_nav<B>(req: &hyper::Request<B>) -> bool {
         .unwrap_or(true)
 }
 
+/// 文档导航禁止取 XHR 内存缓存：同一 URL 的 JSON（JS 取数）与 HTML（浏览器导航）共用 XHR 键，
+/// 后退/刷新重导航若命中 JSON，浏览器会把裸 JSON 当页面正文显示（实测回归）。
+fn xhr_lookup_allowed<B>(req: &hyper::Request<B>) -> bool {
+    !is_document_nav(req)
+}
+
 /// 首页：纯骨架（会变的全是 XHR），跨会话长寿命缓存。
 fn is_home_path(path: &str) -> bool {
     path == "/" || path.is_empty()
@@ -127,29 +133,33 @@ pub(super) fn cache_take<B>(
     let enc = upstream::encoding_bucket(req);
 
     // ① XHR 内存命中（15 分钟 TTL，键含 cs 身份标签防跨账号）：dashboard/通知/搜索数据等全部 JSON/纯文本。
-    if let Some((status, hdrs, body)) = xhr_take(&xhr_cache_key(req.uri(), host, cookies, enc)) {
-        if super::quiet::first_time("xhrhit", &path) {
-            (log)(&format!("[缓存] XHR 回放 {path} ({})", fmt_size(body.len())));
-        }
-        let mut hdrmap = hyper::HeaderMap::new();
-        for pair in &hdrs {
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(pair[0].as_bytes()),
-                hyper::header::HeaderValue::from_str(&pair[1]),
-            ) {
-                hdrmap.insert(name, val);
+    //    文档导航必须跳过：同一 URL 的 JSON（JS 取数）和 HTML（前进/后退/刷新）共用此键，
+    //    命中就把裸 JSON 当页面正文回放（实测回归）；导航只走下面的 keep 骨架或回源。
+    if xhr_lookup_allowed(req) {
+        if let Some((status, hdrs, body)) = xhr_take(&xhr_cache_key(req.uri(), host, cookies, enc)) {
+            if super::quiet::first_time("xhrhit", &path) {
+                (log)(&format!("[缓存] XHR 回放 {path} ({})", fmt_size(body.len())));
             }
+            let mut hdrmap = hyper::HeaderMap::new();
+            for pair in &hdrs {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(pair[0].as_bytes()),
+                    hyper::header::HeaderValue::from_str(&pair[1]),
+                ) {
+                    hdrmap.insert(name, val);
+                }
+            }
+            let mut resp = hyper::Response::builder()
+                .status(status)
+                .body(protocol::full_body(body))
+                .unwrap();
+            *resp.headers_mut() = hdrmap;
+            resp.headers_mut().insert(
+                "x-gitport-cache",
+                hyper::header::HeaderValue::from_static("xhr"),
+            );
+            return Some(resp);
         }
-        let mut resp = hyper::Response::builder()
-            .status(status)
-            .body(protocol::full_body(body))
-            .unwrap();
-        *resp.headers_mut() = hdrmap;
-        resp.headers_mut().insert(
-            "x-gitport-cache",
-            hyper::header::HeaderValue::from_static("xhr"),
-        );
-        return Some(resp);
     }
 
     // ② keep 命中：首页/搜索页骨架（键无会话号，跨会话/跨重启命中）；SWR 过期交旧 + 后台重拉。

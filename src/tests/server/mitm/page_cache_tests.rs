@@ -726,6 +726,41 @@ fn document_nav_gate() {
     assert!(!is_document_nav(&mk(Some("iframe"))), "iframe 子文档按片段路径");
 }
 
+/// 回归钉子：JS 取数存进 XHR 的搜索 JSON，绝不能给文档导航（前进/后退/刷新）回放成裸 JSON 页面。
+#[test]
+fn document_nav_must_not_take_xhr() {
+    let uri: http::Uri = "https://github.com/search?q=hakim_regression&type=repositories&p=1"
+        .parse()
+        .unwrap();
+    let key = xhr_cache_key(&uri, "github.com", None, "gzip");
+    xhr_store(
+        &key,
+        200,
+        vec![vec![
+            "content-type".to_string(),
+            "application/json".to_string(),
+        ]],
+        Bytes::from_static(b"{\"payload\":1}"),
+    );
+    // 键里没有请求形态：同一 URL 的 JSON 确实能被取到，门检是唯一防线。
+    assert!(xhr_take(&key).is_some(), "JS 取数的 JSON 应确实在 XHR 池里");
+
+    let mk = |dest: Option<&str>| {
+        let mut b = hyper::Request::builder().uri(uri.clone());
+        if let Some(d) = dest {
+            b = b.header("sec-fetch-dest", d);
+        }
+        b.body(protocol::empty_body()).unwrap()
+    };
+    assert!(!xhr_lookup_allowed(&mk(Some("document"))), "导航不得取 XHR");
+    assert!(!xhr_lookup_allowed(&mk(None)), "无头保守按导航，不得取 XHR");
+    assert!(xhr_lookup_allowed(&mk(Some("empty"))), "fetch 取数照常命中");
+    assert!(
+        xhr_lookup_allowed(&mk(Some("iframe"))),
+        "iframe 子请求照常命中"
+    );
+}
+
 /// XHR 正文判定覆盖面：标准 JSON、`+json` 家族、ndjson、纯文本都收；HTML/二进制等不收。
 #[test]
 fn xhr_body_types_cover_json_family_and_ndjson() {
