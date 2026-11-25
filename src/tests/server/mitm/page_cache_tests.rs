@@ -691,7 +691,106 @@ fn write_invalidation_marks_keep_snapshot_expired() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 软导航 HTML 片段：局部 HTML（无 <html 根）且体积在上限内才收；整页 HTML / 超限不收。
+#[test]
+fn html_fragment_gate() {
+    let ct = "text/html; charset=utf-8";
+    assert!(is_html_fragment(ct, b"<div id=\"results\">partial</div>", "identity"));
+    assert!(is_html_fragment(ct, b"<turbo-frame id=\"x\">ok</turbo-frame>", "identity"));
+    assert!(
+        !is_html_fragment(ct, b"<!DOCTYPE html><html><body>full</body></html>", "identity"),
+        "整页 HTML 不得当片段收"
+    );
+    assert!(
+        !is_html_fragment("application/json", b"{}", "identity"),
+        "非 HTML 类型不是片段"
+    );
+    let big = vec![b'x'; HTML_FRAGMENT_MAX_BYTES + 1];
+    assert!(!is_html_fragment(ct, &big, "identity"), "超限不收");
+}
+
+/// 文档导航判定：只有 sec-fetch-dest=document 是整页；无该头保守按整页处理（curl/Git）。
+#[test]
+fn document_nav_gate() {
+    let mk = |dest: Option<&str>| {
+        let mut b = hyper::Request::builder().uri("https://github.com/conduit/x");
+        if let Some(d) = dest {
+            b = b.header("sec-fetch-dest", d);
+        }
+        b.body(protocol::empty_body()).unwrap()
+    };
+    assert!(is_document_nav(&mk(Some("document"))));
+    assert!(is_document_nav(&mk(Some("Document"))), "大小写不敏感");
+    assert!(is_document_nav(&mk(None)), "无头按整页，保守不收片段");
+    assert!(!is_document_nav(&mk(Some("empty"))), "fetch 片段请求");
+    assert!(!is_document_nav(&mk(Some("iframe"))), "iframe 子文档按片段路径");
+}
+
+/// XHR 正文判定覆盖面：标准 JSON、`+json` 家族、ndjson、纯文本都收；HTML/二进制等不收。
+#[test]
+fn xhr_body_types_cover_json_family_and_ndjson() {
+    for ct in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "text/plain; charset=utf-8",
+        "application/vnd.github+json",
+        "application/problem+json; charset=utf-8",
+        "application/graphql-response+json",
+        "application/x-ndjson",
+    ] {
+        assert!(is_xhr_body(ct), "应收进 XHR: {ct}");
+        assert!(!keep_route("/search", ct), "数据正文不得进 keep 骨架: {ct}");
+    }
+    for ct in [
+        "text/html; charset=utf-8",
+        "application/octet-stream",
+        "image/svg+xml",
+        "",
+    ] {
+        assert!(!is_xhr_body(ct), "不得进 XHR: {ct}");
+    }
+}
+
+/// 首页骨架取存两侧键一致：取侧曾误用空变体（GET github.com/-gz-k），存侧写 -html-k → 永不命中。
+#[test]
+fn home_keep_lookup_variant_matches_store() {
+    let uri: http::Uri = "https://github.com/".parse().unwrap();
+    let lookup = live_cache_key(&uri, "github.com", "gzip", keep_lookup_variant("/", None));
+    let store = live_cache_key(&uri, "github.com", "gzip", "-html");
+    assert_eq!(lookup, store, "首页取侧键必须与存侧键一致，否则骨架永不命中");
+    // 搜索页按 Accept 预测保持不变
+    assert_eq!(
+        keep_lookup_variant("/search", Some("text/html,application/json")),
+        "-html"
+    );
+    assert_eq!(
+        keep_lookup_variant("/search", Some("application/json")),
+        "-json"
+    );
+}
+
 // ---------- XHR 15 分钟内存缓存 ----------
+
+/// 首页/搜索页 JSON 改道 XHR：这两条路径上的 JSON 是数据不是壳，不再送进 keep 分支落盘。
+#[test]
+fn home_search_json_routes_to_xhr_not_keep() {
+    let json = "application/json; charset=utf-8";
+    assert!(!keep_route("/", json), "首页 JSON 必须改道 XHR");
+    assert!(!keep_route("/search", json), "搜索页 JSON 必须改道 XHR");
+    assert!(keep_route("/", "text/html"), "首页 HTML 仍走 keep 骨架");
+    assert!(
+        keep_route("/search", "text/html"),
+        "搜索页 HTML 仍走 keep 骨架"
+    );
+    assert!(
+        !keep_route("/octocat/repo", "text/html"),
+        "仓库页 HTML 永不进 keep"
+    );
+    // 取侧键形态不变：XHR 命中先于 keep，-json 变体文件不再产生。
+    let uri: http::Uri = "https://github.com/search?q=rust".parse().unwrap();
+    let key = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip");
+    assert!(!key.contains("-k"), "XHR 键不带 keep 后缀");
+}
 
 /// XHR 回放与 TTL：入库即命中（200/头/体原样），过期后 miss 且条目被惰性清除。
 #[tokio::test]

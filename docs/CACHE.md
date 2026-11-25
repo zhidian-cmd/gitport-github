@@ -11,9 +11,9 @@
 | 浏览器缓存 | githubassets 的 js/css/字体 | 浏览器自己的磁盘 | 一年 immutable | 请求都发不到代理，热身后日志里没有命中行是正常态 |
 | 资产库 | githubassets 的 js/css/字体 | `.cache/assets/`（磁盘） | 20MB，按文件年龄淘汰 | 浏览器缓存冷了也不出 CDN；URL 即内容指纹，时代中立 |
 | HTML 骨架缓存 | 仅首页 `/` 与搜索页 `/search` 的 HTML | `.cache/keep/`（磁盘） | 7 天，累计写满 5MB 整盘清 | 纯壳跨会话/跨重启命中；数据全走 XHR，过期交旧 + 后台重拉 |
-| XHR 内存缓存 | github.com 全部 JSON / 纯文本响应 | 进程内存（不落盘） | 15 分钟 TTL，总量 5MB | 通知、计数、搜索结果、信息流全收；重启即清零，不留陈旧数据 |
+| XHR 内存缓存 | github.com 全部数据响应：JSON 家族（`application/json`、`+json`、`ndjson`）、纯文本、软导航 HTML 片段 | 进程内存（不落盘） | 15 分钟 TTL，总量 5MB | 通知、计数、搜索结果、信息流、局部软导航片段全收；重启即清零，不留陈旧数据 |
 
-**不缓存**：仓库页 HTML（零转换直出）、列表/详情等含服务端数据的页面、头像/raw/camo/私有图、渲染域、service worker 脚本、settings/表单/登录页、非 200 响应、闸门页与截断页。
+**不缓存**：仓库页等整页 HTML（零转换直出）、列表/详情页的完整 HTML、头像/raw/camo/私有图、渲染域、service worker 脚本、settings/表单/登录页、非 200 响应、闸门页与截断页。
 
 ---
 
@@ -21,7 +21,7 @@
 
 - **资产 → 磁盘**：immutable 资产的内容哈希永久有效，跨进程、跨重启复用价值极高；浏览器命中不了时由本地顶上。
 - **HTML 骨架 → 磁盘**：首页/搜索页是无数据的纯框架，跨会话复用能秒出；但 GitHub 改版会让旧壳变坏，所以给 7 天保质期并配 SWR，不无限信任。
-- **XHR → 内存**：全是会变的账号数据，15 分钟内高频复用（一页十几个计数/通知接口），进程退出即清零正好避免陈旧跨重启复活；不落盘也省掉个人信息写盘面。
+- **XHR → 内存**：全是会变的账号数据，15 分钟内高频复用（一页十几个计数/通知接口），进程退出即清零正好避免陈旧跨重启复活；不落盘也省掉个人信息写盘面。软导航 HTML 片段（`conduit`/`_filter` 等局部填充）虽是 HTML，但没有 `<html>` 根、是数据不是整页，同样归这一层。
 
 三者键空间独立，互不失效：登录态变化只让 XHR 换键（骨架是纯壳不受影响），写操作只让骨架标过期（XHR 靠 15 分钟 TTL 自然翻篇）。
 
@@ -37,11 +37,14 @@
 
 githubassets 的资产不走这条链：它在 mitm 入口被强绑定分支接管（见第 3 节）。
 
-**存**（`cache_put`）：先按 Host 分流——资产 host 收体投资产库；github.com 只收 200，再按路径与 `Content-Type` 分类：
+**存**（`cache_put`）：先按 Host 分流——资产 host 收体投资产库；github.com 只收 200，再按路径、导航形态与 `Content-Type` 分类：
 
-- 首页/搜索页路径 + `text/html` → keep 骨架（磁盘）；
-- 任意路径 + `application/json` 或 `text/plain` → XHR（内存），**不枚举路径前缀**，新接口自动覆盖；
-- 其余（图片、二进制、其他页面 HTML）→ 原样透传，不缓存。
+- 首页/搜索页路径 + 文档导航（`sec-fetch-dest=document`）+ `text/html` → keep 骨架（磁盘）；
+- 任意路径 + 数据正文（`application/json`、`+json` 家族如 `vnd.github+json`、`x-ndjson`、`text/plain`）→ XHR（内存），**不枚举路径前缀**，新接口自动覆盖；
+- 非文档导航 + `text/html` + 解压后无 `<html>` 根 + 256KB 内 → 软导航 HTML 片段，走 XHR（内存）；声称片段却是整页或超限则原样交回、不收；
+- 其余（图片、二进制、整页 HTML）→ 原样透传，不缓存。
+
+首页/搜索页路径上的 JSON 是数据不是壳，改道 XHR（不再被 keep 吞掉）；骨架取侧变体固定 `-html`，与存侧写键一致。
 
 写盘类任务投给单个串行管家线程（有界队列 64，满了就丢弃，缓存是 best-effort），主路径不等磁盘；XHR 入库是纯内存操作，直接在请求线程完成。
 
@@ -74,7 +77,11 @@ githubassets 的资产不走这条链：它在 mitm 入口被强绑定分支接�
 
 ## 5. XHR 内存缓存（进程内存，不落盘）
 
-- **收录门**：github.com 的 GET、200、`Content-Type` 为 `application/json` 或 `text/plain`（大小写不敏感）。**不限路径**：dashboard、通知、计数、搜索结果、信息流等全部自动覆盖。Ctrl+F5 带 `no-cache` 直通。
+- **收录门**：github.com 的 GET、200，正文属于以下任一类（类型判定大小写不敏感）：
+  - 数据正文：`application/json`、`application/*+json`（`vnd.github+json`、`problem+json`、`graphql-response+json` 等）、`*ndjson`、`text/plain`；
+  - 软导航 HTML 片段：请求 `sec-fetch-dest` 不是 `document`（无该头按整页处理，保守不收）+ `text/html` + 解压后无 `<html`/`<!doctype` 根 + 256KB 内。无根检查在收体后做，声称片段却是整页或超限的原样交回、不收。
+  - 首页/搜索页路径的 JSON 也归这一层（改道自 keep，因为它是数据不是壳）。
+  - **不限路径**：dashboard、通知、计数、搜索结果、信息流、`conduit`/`_filter` 局部片段等全部自动覆盖，不维护前缀白名单。Ctrl+F5 带 `no-cache` 直通。
 - **键**：`GET + host + 路径 + 查询串原样 + 身份标签 + 编码标签`。身份标签：未登录 `-cloggedout`，登录为 `user_session` 值的稳定摘要（`-cs…`）——不用账号名（客户端自报可伪造），不用轮换 cookie（否则每次轮换都换键）；Cookie 被 h2 拆成多行时要全拼再找 `user_session`。
 - **TTL**：15 分钟，用 `Instant` 判定（不受系统时钟回拨影响）。命中时若已过期，惰性删除当 miss；写入时顺带批量清扫过期条目，没有后台定时器。
 - **容量**：总量 5MB，超限时按**过期时间最早**先淘汰（即将到期的先腾位），删到限额内；**没有单条大小上限**——大 JSON 也可以存，只要总量不超。同键覆盖先扣旧账再加新账。
@@ -143,7 +150,9 @@ githubassets 的资产不走这条链：它在 mitm 入口被强绑定分支接�
 - 头像 / raw / camo / 私有图、渲染域、service worker 脚本不收，保持直连。
 - Range 请求不走资产库（只收完整 GET）。
 - XHR 15 分钟是固定 TTL，不读上游 `Cache-Control`；写操作后 XHR 不主动失效，靠 TTL 翻篇。
-- 搜索骨架的 `-json` 变体取侧按 `Accept` 预测，猜错只是 miss；`application/json` 的搜索响应不进 keep（keep 只收 HTML），数据由 XHR 层负责。
+- 搜索骨架取侧仍按 `Accept` 猜 `-html`/`-json` 变体，猜错只是 miss；首页取侧变体固定 `-html`，与存侧写键一致（曾因取侧用空串导致首页骨架永不命中）。首页/搜索页的 JSON 响应不进 keep，数据由 XHR 层负责。
+- SSE（`text/event-stream`）不收：响应体不结束、事件流有游标语义，无法按"完整响应"缓存；WebSocket 长连接走转发，不进任何缓存层。
+- 软导航片段靠"非 document 导航 + 无 html 根 + 256KB 内"三重门检识别；上游若把片段包成完整 HTML（带根）则不收，宁可漏存不误存整页。
 - 5MB 骨架清盘按累计写入量触发，不是精确目录统计；清盘后下轮访问重建，无害。
 - 登录态切换 = XHR 身份标签变 = 内存缓存全 miss 一次（骨架与资产不受影响）。
 - GitHub 发版日：新哈希资产有一波一次性拉取——这是新 JS 配新数据的必要成本。

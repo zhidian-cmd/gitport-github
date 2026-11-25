@@ -24,6 +24,19 @@ const WORKER_CHANNEL_CAP: usize = 64; // 任务筐上限：满了丢弃（缓存
 /// 长寿命条目的保质期：GitHub 改版后旧骨架就是坏的，超期交旧 + 后台重拉（SWR，不判死）。
 const KEEP_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// 软导航 HTML 片段体积上限：超过按整页处理不收，避免大响应挤占内存池。
+const HTML_FRAGMENT_MAX_BYTES: usize = 256 * 1024;
+
+/// 请求是否为文档导航：只有 sec-fetch-dest=document 算整页导航；无该头（curl 等）保守按导航处理，
+/// 避免把整页 HTML 误当软导航片段收进内存缓存。
+fn is_document_nav<B>(req: &hyper::Request<B>) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .map(|d| d.eq_ignore_ascii_case("document"))
+        .unwrap_or(true)
+}
+
 /// 首页：纯骨架（会变的全是 XHR），跨会话长寿命缓存。
 fn is_home_path(path: &str) -> bool {
     path == "/" || path.is_empty()
@@ -32,6 +45,21 @@ fn is_home_path(path: &str) -> bool {
 /// 搜索页：骨架与查询无关（结果全走 XHR），跨会话长寿命缓存。
 fn is_search_page(path: &str) -> bool {
     path == "/search"
+}
+
+/// XHR 数据正文判定（存侧分类与 keep 改道共用同一口径）：标准 JSON、`+json` 家族
+/// （vnd/problem/graphql-response 等）、ndjson、纯文本；其余类型不进内存缓存。
+fn is_xhr_body(ct_lower: &str) -> bool {
+    ct_lower.starts_with("application/json")
+        || ct_lower.starts_with("text/plain")
+        || ct_lower.contains("+json")
+        || ct_lower.contains("ndjson")
+}
+
+/// 首页/搜索页骨架路由（纯函数形态便于测试）：XHR 数据是数据不是壳，改道 XHR 内存缓存（15 分钟）；
+/// 只有非 XHR 正文才进 keep 分支（落盘门检仍只收完整 HTML）。
+fn keep_route(path: &str, ct_lower: &str) -> bool {
+    (is_home_path(path) || is_search_page(path)) && !is_xhr_body(ct_lower)
 }
 
 /// 条目目录：首页/搜索页骨架进 keep/（不再有会话目录 pages/）。
@@ -129,11 +157,10 @@ pub(super) fn cache_take<B>(
     if !(is_home_path(req.uri().path()) || search_page) {
         return None; // 其他页面骨架不缓存：列表页含服务端渲染数据，仓库页防旧 JS 配新数据白屏
     }
-    let variant = if search_page {
-        search_variant(req.headers().get("accept").and_then(|v| v.to_str().ok()))
-    } else {
-        ""
-    };
+    let variant = keep_lookup_variant(
+        req.uri().path(),
+        req.headers().get("accept").and_then(|v| v.to_str().ok()),
+    );
     let key = live_cache_key(req.uri(), host, enc, variant);
     let ((status, hdrs, body), swr_expired) =
         match load_disk_entry_reason(&key, session_value(cookies).is_some())
@@ -299,14 +326,14 @@ pub(super) async fn cache_put(
         .map(|v| v.to_ascii_lowercase())
         .unwrap_or_default();
 
+    // 软导航 HTML 片段：非 document 导航的 text/html 是局部数据（conduit/filter 等），
+    // 与 XHR 同走 15 分钟内存缓存；整页 HTML 由 keep_route 走 keep 骨架或直出。
+    let soft_html = !is_document_nav(req) && ct_lower.starts_with("text/html");
+
     // ② keep 骨架：首页/搜索页 HTML，7 天跨会话（键无会话号）。
-    if is_home_path(path) || search_page {
-        let variant = if ct_lower.starts_with("application/json") {
-            "-json"
-        } else {
-            "-html"
-        };
-        let key = live_cache_key(req.uri(), host, upstream::encoding_bucket(req), variant);
+    //    数据正文（JSON/ndjson）与软导航片段都不进 keep。
+    if keep_route(path, &ct_lower) && !soft_html {
+        let key = live_cache_key(req.uri(), host, upstream::encoding_bucket(req), "-html");
         return collect_and_submit_keep(
             log,
             &key,
@@ -317,8 +344,8 @@ pub(super) async fn cache_put(
         .await;
     }
 
-    // ③ XHR 内存缓存：JSON/纯文本 15 分钟（仓库/搜索/首页的全部数据接口，不再枚举前缀）。
-    if ct_lower.starts_with("application/json") || ct_lower.starts_with("text/plain") {
+    // ③ XHR 内存缓存：数据正文 + 软导航 HTML 片段 15 分钟（不再枚举前缀）。
+    if is_xhr_body(&ct_lower) || soft_html {
         let (mut parts, body) = resp.into_parts();
         // 嗅探读走的前几帧要拼回，否则入库半帧。
         let mut peek: Vec<u8> = Vec::new();
@@ -344,6 +371,18 @@ pub(super) async fn cache_put(
             full.extend_from_slice(&collected);
             Bytes::from(full)
         };
+        // 声称是片段却实际带 <html 根或超限 = 整页 HTML，不收，原样交回（防误收整页）。
+        if soft_html {
+            let enc = parts
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .map(body_encoding)
+                .unwrap_or("identity");
+            if !is_html_fragment(&ct_lower, &bytes, enc) {
+                return hyper::Response::from_parts(parts, protocol::full_body(bytes));
+            }
+        }
         // Set-Cookie 只从缓存元数据剔除（回灌旧值会冻 cookie），响应原样给浏览器。
         let cache_hdrs: Vec<Vec<String>> = parts
             .headers
@@ -546,6 +585,16 @@ fn search_variant(accept: Option<&str>) -> &'static str {
     }
 }
 
+/// 取侧骨架变体：首页恒 "-html"（与存侧一致，修历史上取侧用空串导致首页骨架永不命中的 bug）；
+/// 搜索页按 Accept 预测，猜错只是 miss。
+fn keep_lookup_variant(path: &str, accept: Option<&str>) -> &'static str {
+    if is_search_page(path) {
+        search_variant(accept)
+    } else {
+        "-html"
+    }
+}
+
 /// keep 骨架键 = 方法 + host + 路径查询 + 变体 + 编码标签；**不含会话号/身份标签**——
 /// 骨架是纯壳（无账号数据），跨会话/跨登录/跨重启命中（旧版键带身份标签，换登录即孤儿——已修复）。
 fn live_cache_key(uri: &http::Uri, host: &str, enc: &str, variant: &str) -> String {
@@ -616,6 +665,16 @@ fn is_search_skeleton(key: &str, bytes: &[u8], enc: &str) -> bool {
 /// 未登录页：带会话却拿到这类 body = 会话已死，不存也不当命中（防污染）。
 fn is_logged_out_body(plain: &str) -> bool {
     plain.contains("logged-out env-") || plain.contains("class=\"logged-out")
+}
+
+/// 软导航 HTML 片段判定：text/html 响应、解压后无 <html 根、体积在上限内——
+/// 配合调用处的"非 document 导航"条件，整页 HTML 不会误收；片段供 React 软导航填充局部。
+fn is_html_fragment(ct_lower: &str, bytes: &[u8], enc: &str) -> bool {
+    if !ct_lower.starts_with("text/html") || bytes.len() > HTML_FRAGMENT_MAX_BYTES {
+        return false;
+    }
+    let p = plain_prefix(bytes, enc);
+    !p.contains("<html") && !p.contains("<!doctype")
 }
 
 /// HTML 完整性（末 2KB 有 </html>）：h2 响应无 content-length，中途断流时 collect 仍 Ok，截断页进 keep/ 会 7 天内反复命中=必现白屏；读写两侧都查。
