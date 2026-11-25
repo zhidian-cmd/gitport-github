@@ -1,4 +1,5 @@
 use super::*;
+use crate::pool::{dial_cooling, serial_load};
 use crate::pool::TEST_LOCK;
 use std::sync::Arc;
 
@@ -28,6 +29,21 @@ fn probe_begin_guard_roundtrip() {
     drop(crate::pool::probe::ProbeGuard);
     assert!(probe_begin(), "释放后应可再次获得");
     drop(crate::pool::probe::ProbeGuard);
+}
+
+// 死亡退避清除：note_dead 进表后 clear_dead 移除，dial_cooling 由 true 翻 false。
+#[test]
+fn clear_dead_releases_cooling() {
+    let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join(format!("gitport_probe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    serial_load(&dir, Vec::new(), None); // SERIAL 装载（routes.json 缺失也置 Some，dead 表可用）
+    note_dead("198.51.100.7");
+    assert!(dial_cooling("198.51.100.7", "github.com"), "退避期内应被拦");
+    clear_dead("198.51.100.7");
+    assert!(!dial_cooling("198.51.100.7", "github.com"), "清除后应放行");
+    std::fs::remove_dir_all(&dir).ok();
+    route::install(vec![], vec![]); // 清场
 }
 
 // 真实拨号：对 routes.json 全部 IP 串发建通道（约 65 个，1~2 分钟）。验证延迟落盘与游标清空。

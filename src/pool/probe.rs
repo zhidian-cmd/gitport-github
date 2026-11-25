@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use super::{dial, msg_is_tcp_dead, note_dead, route};
+use super::{clear_dead, dial, msg_is_tcp_dead, note_dead, route};
 use crate::util::{lock, LogFn};
 
 pub static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -55,6 +55,8 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
             Ok(_conn) => {
                 let ms = t0.elapsed().as_millis() as u64;
                 route::set_latency(&t.ip, ms);
+                // 测速成功即证明 IP 活着：顺带清死亡退避，运行时不必再绕行等待。
+                clear_dead(&t.ip);
                 ok += 1;
                 rows.push(format!("{} [{}] 通，{}ms", t.ip, sni_show, ms));
                 (log)(&format!("[IP 测速] {} [{}] 通，{}ms", t.ip, sni_show, ms));

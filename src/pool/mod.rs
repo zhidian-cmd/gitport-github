@@ -781,6 +781,14 @@ pub fn note_dead(ip: &str) {
     }
 }
 
+/// 清除死亡退避：IP 测速成功（建连成功）即证明它活着，运行时不必再绕行等待。
+pub(crate) fn clear_dead(ip: &str) {
+    let mut g = lock(&SERIAL);
+    if let Some(t) = g.as_mut() {
+        t.dead.remove(ip);
+    }
+}
+
 /// 该 IP 或该节点（ip|sni）是否在死亡冷却中：竞速取候选与外部预检共用这一个口径。
 pub fn dial_cooling(ip: &str, sni: &str) -> bool {
     let g = lock(&SERIAL);
