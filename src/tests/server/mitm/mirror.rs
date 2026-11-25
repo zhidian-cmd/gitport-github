@@ -918,6 +918,27 @@ fn mirror_gates_serialize_same_mirror() {
     assert!(sem.try_acquire().is_ok(), "首片响应头到手后应放行下一片");
 }
 
+/// 闸门进程级共享：下载器一次性给多个 Range 请求时，各自走一次 split_download，
+/// 两次调用同一家必须拿到同一把闸，否则跨请求同家片照样同时拨号（局部闸门的洞）。
+#[test]
+fn mirror_gates_shared_across_calls() {
+    let a = mirror_gates(&["shared-mirror.test"]);
+    let b = mirror_gates(&["shared-mirror.test"]);
+    assert!(
+        Arc::ptr_eq(&a["shared-mirror.test"], &b["shared-mirror.test"]),
+        "两次调用同家必须共享同一把闸"
+    );
+    // 第一把持住不放，第二把也拿不到——证明真的是同一把，不是各建各的。
+    let first = a["shared-mirror.test"]
+        .try_acquire()
+        .expect("首次应拿到");
+    assert!(
+        b["shared-mirror.test"].try_acquire().is_err(),
+        "跨请求同家必须互相挡住"
+    );
+    drop(first);
+}
+
 /// 206 起点不符或缺 Content-Range 都不能拼进合并流。
 #[test]
 fn segment_206_must_match_requested_start() {

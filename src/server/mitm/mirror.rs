@@ -859,21 +859,33 @@ fn split_want(no_range: bool, candidates: usize) -> usize {
     }
 }
 
-/// 首轮分片建连闸门：按 mirror 去重后每家一把（不是每片一把）。
+/// 首轮分片建连闸门：按 mirror 每家一把（不是每片一把），且进程级共享。
 /// hyper 的 legacy 池冷启动时，同一家若有两片同时发，两片会各拨一条 h2（一流一连接），
 /// 即便协商出 h2 也不搭车——首轮成对的拨号就是这么来的。
-/// 用每家一把 Semaphore(1)：首片建连+拿响应头后才放行同家下一片，此时连接已入池，
-/// 下一片直接复用同一条 h2 开新 stream；不同家互不阻塞，仍全并发。
+/// 每家 Semaphore(1)：首片建连+拿响应头后才放行下一片，此时连接已入池，
+/// 下一片复用同一条 h2 开新 stream；不同家互不阻塞，仍全并发。
+/// 必须进程级共享：下载器一次性甩出多个 Range 请求时，每个请求各自走一次 split_download，
+/// 若闸门是局部的，跨请求的同家片照样同时拨号——那个洞和单次 16 片是同一个。
+static MIRROR_GATES: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn mirror_gates<'a>(idle: &[&'a str]) -> HashMap<&'a str, Arc<Semaphore>> {
-    let mut seen: HashMap<&'a str, Arc<Semaphore>> = HashMap::new();
+    let mut global = MIRROR_GATES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut out: HashMap<&'a str, Arc<Semaphore>> = HashMap::new();
     for &m in idle {
         // 直连腿走自管 h2（conn_pool + claim_dial），不在 mirror_client 池里，无需闸门。
         if m.starts_with("direct/") {
             continue;
         }
-        seen.entry(m).or_insert_with(|| Arc::new(Semaphore::new(1)));
+        let gate = global
+            .entry(m.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone();
+        out.insert(m, gate);
     }
-    seen
+    out
 }
 
 /// 切片下载：校准（未测镜像>0 且候选全闲）或原生浏览器下载（无 Range）→ 每镜像一片；
