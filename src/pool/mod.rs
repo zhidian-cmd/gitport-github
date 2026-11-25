@@ -1,6 +1,7 @@
 ﻿//! 拨号与连接池：二部图（ips × hosts）唯一权威；内容域竞速取最速一条，会话/低频域串发（游标驻留、失败前移），取用统一走 get_or_build。
 pub mod dial;
 pub mod edges;
+pub mod probe;
 pub mod route;
 pub mod speed;
 
@@ -1215,10 +1216,8 @@ pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), Stri
     for node in cands {
         let tx2 = tx.clone();
         tokio::spawn(async move {
-            let t0 = Instant::now();
             match dial::dial_one(&node.ip, &node.sni, &node.verify, false).await {
                 Ok(conn) => {
-                    route::note_latency(&node.ip, t0.elapsed().as_millis() as u64);
                     let _ = tx2.send(Ok((conn, node.ip.clone()))).await;
                 }
                 Err(e) => {
@@ -1291,11 +1290,9 @@ async fn overflow_build(
     let Ok(_guard) = gate.try_lock() else {
         return None; // 建造/溢出在途：不排队，用现有通道凑合
     };
-    let t0 = Instant::now();
     let conn = dial::dial_one(&node.ip, &node.sni, &node.verify, true).await.ok()?;
     match chan::h2_from_dialed(host, conn, &node.ip, log).await {
         Ok(mut up) => {
-            route::note_latency(&node.ip, t0.elapsed().as_millis() as u64);
             up.overflow = true;
             (log)(&format!("[溢出] {host} 零通道 IP 补建: {}", node.ip));
             Some(chan::store_h2(&node.ip, up))

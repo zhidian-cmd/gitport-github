@@ -244,7 +244,7 @@ fn encode_routes_roundtrip() {
             "https://v4.gh-proxy.org".to_string(),
         ],
     );
-    route::note_latency("1.2.3.4", 111);
+    route::set_latency("1.2.3.4", 111);
     let big = vec![
         "https://big-a.example".to_string(),
         "https://big-b.example".to_string(),

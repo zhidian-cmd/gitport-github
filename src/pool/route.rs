@@ -322,7 +322,8 @@ fn node_index_by_ip(topo: &Topology, ip: &str) -> Option<usize> {
 }
 
 /// 拨号实测回流：与旧值取均值防 GFW 抖动一刀切；未测直入。
-pub fn note_latency(ip: &str, ms: u64) {
+/// 测速直写：节点级 latency 覆盖为测得毫秒（0 = 未测，排序垫底保表序）。
+pub fn set_latency(ip: &str, ms: u64) {
     let topo = match lock(&TABLE).as_ref() {
         Some(t) => t.clone(),
         None => return,
@@ -330,10 +331,45 @@ pub fn note_latency(ip: &str, ms: u64) {
     let Some(i) = node_index_by_ip(&topo, ip) else {
         return;
     };
-    let node = &topo.nodes[i];
-    let old = node.latency.load(Ordering::Relaxed);
-    let v = if old == 0 { ms } else { (old + ms) / 2 };
-    node.latency.store(v, Ordering::Relaxed);
+    topo.nodes[i].latency.store(ms, Ordering::Relaxed);
+}
+
+/// 测速目标：全部节点的全部 IP 展开（ip/sni/verify/latency），表序。
+/// verify 空 → 该节点服务的第一个路由键的裸域名（与 dial_targets 的锚点兜底同语义）。
+/// 不做冷却/可用性过滤——测速是全量基准，不受代理运行时状态影响。
+pub fn probe_targets() -> Vec<NodeIp> {
+    let topo = match lock(&TABLE).as_ref() {
+        Some(t) => t.clone(),
+        None => return Vec::new(),
+    };
+    // 节点主域名：表序第一个引用此节点的路由行的裸域名。
+    let mut primary: HashMap<usize, String> = HashMap::new();
+    for row in &topo.rows {
+        for &ni in topo.host_index.get(&row.key).into_iter().flatten() {
+            primary.entry(ni).or_insert_with(|| row.bare.clone());
+        }
+    }
+    let mut out: Vec<NodeIp> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (ni, node) in topo.nodes.iter().enumerate() {
+        for ip in &node.ips {
+            if !seen.insert(ip.as_str()) {
+                continue;
+            }
+            let primary_host = primary.get(&ni).cloned().unwrap_or_default();
+            out.push(NodeIp {
+                ip: ip.clone(),
+                sni: node.sni.clone(),
+                verify: if node.verify.is_empty() {
+                    primary_host
+                } else {
+                    node.verify.clone()
+                },
+                latency: node.latency.load(Ordering::Relaxed),
+            });
+        }
+    }
+    out
 }
 
 /// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选，60s 内随正常样本稀释恢复。

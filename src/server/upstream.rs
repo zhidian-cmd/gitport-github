@@ -461,8 +461,7 @@ pub(crate) async fn h2_dial(
     .await
     .map_err(|e| e.to_string())?;
     let dial_ms = t_dial.elapsed().as_millis();
-    // 实测建连用时进排序表（内存态），慢 IP 沉底；撞 GFW 抖动时游标挪窝，别让上次成功黏住一页请求。
-    pool::route::note_latency(&ip, dial_ms as u64);
+    // 拨号慢的 IP 游标挪窝（排序基线由设置页「IP 测速」统一刷新，运行时不再记账）。
     if dial_ms as u64 >= DIAL_SLOW_MS {
         pool::cursor_note(host, &ip, false);
     }
@@ -549,7 +548,6 @@ async fn race_build(host: &str, log: &LogFn) -> Result<H2Upstream, String> {
                 }
             };
             let dial_ms = t0.elapsed().as_millis() as u64;
-            pool::route::note_latency(&node.ip, dial_ms);
             let up = match h2_from_dialed(&host2, conn, &node.ip, &log2).await {
                 Ok(u) => u,
                 Err(e) => {

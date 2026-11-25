@@ -115,6 +115,10 @@ pub async fn serve(app: Arc<App>) -> Result<(), String> {
             "/api/calibrate",
             axum::routing::get(api_calib_status).post(api_calibrate),
         )
+        .route(
+            "/api/probe",
+            axum::routing::get(api_probe_status).post(api_probe),
+        )
         .with_state(app.clone())
         .layer(axum::middleware::from_fn(local_guard));
     let port = config::webui_port();
@@ -302,6 +306,44 @@ async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
         ],
         "图片链校准已在后台开始：进度与结果见「运行日志」页，完成后新链序自动保存。\
              关闭窗口进托盘不影响任务。"
+            .to_string(),
+    )
+        .into_response()
+            .into_response()
+}
+
+async fn api_probe_status() -> Response {
+    write_json(&serde_json::json!({
+        "running": pool::probe::PROBE_RUNNING.load(std::sync::atomic::Ordering::SeqCst),
+        "report": pool::probe::probe_report(),
+    }))
+}
+
+async fn api_probe(State(st): State<Arc<App>>) -> Response {
+    let log = st.log_fn();
+    if !pool::probe::probe_begin() {
+        return (
+            [
+                ("content-type", "text/plain; charset=utf-8"),
+                ("cache-control", "no-store"),
+            ],
+            "IP 测速已在后台进行中，请等当前测速结束（进度见运行日志页）".to_string(),
+        )
+            .into_response();
+    }
+    tokio::spawn(async move {
+        // 护栏：任务 panic / 提前返回也要把"进行中"复位，否则按钮永久卡在"进行中"。
+        let _done = pool::probe::ProbeGuard;
+        let report = pool::probe::probe_serial_domains(&log).await;
+        pool::probe::set_probe_report(Some(report));
+    });
+    (
+        [
+            ("content-type", "text/plain; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        "IP 串发测速已在后台开始：逐 IP 串发建通道（建完即断），建连耗时写入排序基线并清空游标。\
+             进度与结果见「运行日志」页，关闭窗口进托盘不影响任务。"
             .to_string(),
     )
         .into_response()

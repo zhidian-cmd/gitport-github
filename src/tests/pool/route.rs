@@ -308,12 +308,10 @@ fn latency_note_and_sink_semantics() {
         )
         .unwrap()],
     );
-    note_latency("9.9.9.9", 800);
-    note_latency("9.9.9.9", 200);
-    assert_eq!(latency_of("9.9.9.9"), 500, "(800+200)/2");
-    sink_latency("9.9.9.9");
-    assert_eq!(latency_of("9.9.9.9"), 3000, "沉到已测队尾: 3s 下限");
-    sink_latency("8.8.8.8");
+    set_latency("9.9.9.9", 800);
+    set_latency("9.9.9.9", 200);
+    assert_eq!(latency_of("9.9.9.9"), 200, "测速直写：后一次覆盖前一次");
+    set_latency("8.8.8.8", 0);
     assert_eq!(latency_of("8.8.8.8"), 0, "表外 IP no-op 不炸");
     install(vec![], vec![]); // 清场
 }

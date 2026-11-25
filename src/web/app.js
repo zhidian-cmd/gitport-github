@@ -287,6 +287,37 @@ async function runCal(btn) {
 }
 $('calImgBtn').onclick = () => runCal($('calImgBtn'));
 
+/* ---------- IP 串发测速 ---------- */
+// 点击 → 通道池驱动搭建机器人在全部 IP 上串发建通道（TCP+TLS，建完即断）→ 建连耗时写排序基线（routes.json）+ 清空游标（settings.json）→ 结果回显。
+// 串发顺序此后由「latency 升序 + 同 IP 互避防串」接管，游标由运行时成功驻留自然重建。
+async function runProbe(btn) {
+  const box = $('probeResult');
+  btn.disabled = true;
+  box.style.display = 'block';
+  try {
+    const r = await fetch('/api/probe', {method: 'POST', headers: {'Content-Type': 'application/json','X-GitPort-Request':'1'}, body: '{}'});
+    const text = await r.text();
+    box.textContent = text;
+    toast('IP 测速已在后台开始');
+    refreshLogs();
+    // 后台任务完成前轮询状态；完成后把测速报告（逐 IP 延迟 + 汇总）回显出来
+    const timer = setInterval(async () => {
+      try {
+        const st = await (await fetch('/api/probe')).json();
+        if (st.running) { box.textContent = '测速中…'; return; }
+        clearInterval(timer);
+        box.textContent = st.report || 'IP 测速完成';
+        toast('IP 测速完成');
+        refreshLogs();
+      } catch (e) { /* 网络抖动继续轮询 */ }
+    }, 1500);
+  } catch (e) {
+    box.textContent = '测速启动失败: ' + e;
+  }
+  btn.disabled = false; // 测速已后台化，按钮立即恢复（防重入在服务端）
+}
+$('probeBtn').onclick = () => runProbe($('probeBtn'));
+
 /* ---------- 启动 ---------- */
 route(); refreshStatus(); refreshLogs(); refreshSettings();
 // 页面在后台(挂托盘/切走)时完全停轮询 —— 后台零请求
