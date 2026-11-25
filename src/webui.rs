@@ -13,12 +13,13 @@ const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLE_CSS: &str = include_str!("web/style.css");
 const APP_JS: &str = include_str!("web/app.js");
 /// 部署教程截图（free_proxy 同款五步图，编译期内嵌）
-const GUIDE_JPEGS: [&[u8]; 5] = [
-    include_bytes!("web/guide/step1.jpg"),
-    include_bytes!("web/guide/step2.jpg"),
-    include_bytes!("web/guide/step3.jpg"),
-    include_bytes!("web/guide/step4.jpg"),
-    include_bytes!("web/guide/step5.jpg"),
+/// 原来是 JPEG（132KB），转 WebP q=75 后 89KB——截图类图 WebP 的收益没有照片大，但纯赚。
+const GUIDE_IMAGES: [&[u8]; 5] = [
+    include_bytes!("web/guide/step1.webp"),
+    include_bytes!("web/guide/step2.webp"),
+    include_bytes!("web/guide/step3.webp"),
+    include_bytes!("web/guide/step4.webp"),
+    include_bytes!("web/guide/step5.webp"),
 ];
 
 #[derive(Clone)]
@@ -159,7 +160,7 @@ async fn index() -> Response {
     (headers, INDEX_HTML).into_response()
 }
 
-/// 静态资源统一响应（style/app_js/img_jpeg 三处同构收口）：no-cache + mime 覆盖。
+/// 静态资源统一响应（style/app_js/img_webp 三处同构收口）：no-cache + mime 覆盖。
 fn static_asset<T: axum::response::IntoResponse>(body: T, mime: &'static str) -> Response {
     let mut resp = body.into_response();
     let h = resp.headers_mut();
@@ -177,19 +178,19 @@ async fn app_js() -> Response {
 }
 
 /// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
-async fn img_jpeg(bytes: &'static [u8]) -> Response {
-    static_asset(bytes, "image/jpeg")
+async fn img_webp(bytes: &'static [u8]) -> Response {
+    static_asset(bytes, "image/webp")
 }
 
-/// /guide/stepN.jpg → GUIDE_JPEGS[n-1]；其余 404。
+/// /guide/stepN.webp → GUIDE_IMAGES[n-1]；其余 404。
 async fn guide_img(Path(file): Path<String>) -> Response {
     let n = file
         .strip_prefix("step")
-        .and_then(|s| s.strip_suffix(".jpg"))
+        .and_then(|s| s.strip_suffix(".webp"))
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| (1..=GUIDE_JPEGS.len()).contains(n));
+        .filter(|n| (1..=GUIDE_IMAGES.len()).contains(n));
     match n {
-        Some(n) => img_jpeg(GUIDE_JPEGS[n - 1]).await,
+        Some(n) => img_webp(GUIDE_IMAGES[n - 1]).await,
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
