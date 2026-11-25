@@ -1417,7 +1417,9 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                         });
                     }
                     // 体检：停滞收尸、速率比例重分配。数据一直在流也要做——涓流不触发超时。
-                    if mb.tick_due(Instant::now()) {
+                    // 快段提前下完会置完成标志，据此立刻体检一次，不等 500ms 兜底时钟。
+                    let done_event = mb.take_done_probe();
+                    if done_event || mb.tick_due(Instant::now()) {
                         let now = Instant::now();
                         if mb.reap_stalled(now) {
                             (ctx.log)(&format!("[切片] {} 有段停滞, 尾巴转补发", ctx.host));
@@ -1437,8 +1439,9 @@ pub(super) fn drive_split(mb: MergeBody, ctx: SplitCtx) -> BoxBody {
                                 ),
                                 None => String::new(),
                             };
+                            let trigger = if done_event { "段完成" } else { "体检" };
                             (ctx.log)(&format!(
-                                "[切片] {} 校准重分配: {owner} {note} (共 {}KB)",
+                                "[切片] {} 校准重分配({trigger}): {owner} {note} (共 {}KB)",
                                 ctx.host,
                                 moved / 1024
                             ));

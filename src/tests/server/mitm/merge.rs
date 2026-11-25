@@ -456,6 +456,57 @@ fn rebalance_single_seg_never_cuts() {
     assert!(m.fill.is_empty());
 }
 
+/// 快段在体检点之前下完也要当基准：它冻结的速率进 fastest 比较后，慢段按它算切量；
+/// 否则只剩活段的旧速度，切量偏小，快段白跑。done 段本身不进 cands、不被切。
+#[test]
+fn rebalance_done_segment_rate_becomes_baseline() {
+    let now = Instant::now();
+    let mut m = MergeBody::new(
+        vec![
+            t(0, 1_000, now, seg(b"")),
+            t(1_000_000, 2_000_000, now, stalled(b"")),
+        ],
+        2_000_000,
+    );
+    // A 已正常收尾，冻结 500k/s；B 活着 100k/s、R=900k。
+    m.segs.get_mut(&0).unwrap().done = true;
+    m.segs.get_mut(&0).unwrap().frozen_rate = Some(500_000.0);
+    with_rate(&mut m, 1_000_000, 100_000, now);
+    // C = 900000 × 500000/(500000+100000) = 750000。
+    assert_eq!(m.rebalance(now), 750_000, "快段冻结速率必须进基准");
+    assert_eq!(m.segs.get(&0).unwrap().end, 1_000, "done 段不参与被切");
+
+    // 对照：没有快段基准时，这段自己就是全场最快，不动刀——证明切量确实来自冻结速率。
+    let mut alone = MergeBody::new(
+        vec![t(1_000_000, 2_000_000, now, stalled(b""))],
+        2_000_000,
+    );
+    with_rate(&mut alone, 1_000_000, 100_000, now);
+    assert_eq!(alone.rebalance(now), 0, "无快段基准时单段不切自己");
+}
+
+/// 段正常收尾置完成标志：驱动循环据此提前体检，取走即清、不会重复触发。
+#[test]
+fn segment_completion_raises_done_probe() {
+    let now = Instant::now();
+    // A 先给 2B 再 EOF，B 留在后面：A 不会被缺口分支从 segs 里移除，能查到冻结值。
+    let mut m = MergeBody::new(
+        vec![t(0, 2, now, seg(b"AA")), t(2, 10, now, stalled(b""))],
+        10,
+    );
+    assert!(!m.take_done_probe(), "没段收尾不该有信号");
+    let mut out = Vec::new();
+    assert!(!drain(&mut m, &mut out), "第二段没货，交付不会结束");
+    assert_eq!(out, b"AA");
+    assert!(m.segs.get(&0).unwrap().done, "段已 EOF 收尾");
+    assert!(
+        m.segs.get(&0).unwrap().frozen_rate.is_some(),
+        "收尾时定格速率，供基准比较"
+    );
+    assert!(m.take_done_probe(), "完成事件必须置位");
+    assert!(!m.take_done_probe(), "取走即清，避免重复触发");
+}
+
 /// 近期速率：首帧起算、样本按滑窗折算，无预热门槛。
 #[test]
 fn recent_rate_prefers_sliding_window() {

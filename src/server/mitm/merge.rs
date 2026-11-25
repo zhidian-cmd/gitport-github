@@ -16,8 +16,9 @@ const RECENT_WIN: Duration = Duration::from_millis(1_500);
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
 /// 轮询断档超过这么久，回来后重新起算停滞——那是我们自己在忙队首，不是上游死了。
 const POLL_GAP: Duration = Duration::from_millis(1_500);
-/// 体检/重分配间隔：与测速窗同节奏（350ms），切片起 350ms 出成绩即首轮重分配。
-const TICK_MS: u64 = 350;
+/// 体检/重分配间隔：与 SPLIT_TICK（驱动循环唤醒）对齐的 500ms 兜底时钟。
+/// 快段提前下完会通过完成事件提前触发体检，不必等这 500ms；本时钟只兜底一直没下完的活段。
+const TICK_MS: u64 = 500;
 
 /// 平均切 [base, base+len) 为 n 段：相邻共享边界，零重叠零缝，余数归最后一段；n 超字节数时收缩到字节数，每段至少 1 字节。
 pub(super) fn split_even(base: u64, len: u64, n: usize) -> Vec<(u64, u64)> {
@@ -219,6 +220,9 @@ pub(super) struct MergeBody {
     pub(super) allow_yield: bool,
     /// 已经切过一次：校准期那轮重分配只做一次，之后所有派发交给 5ms ECT 市场。
     rebalanced: bool,
+    /// 段正常收尾（freeze 定格速率）后置位：驱动循环据此提前跑一次 rebalance。
+    /// 只作触发信号，要不要切由 rebalance 自己算；取走即清。
+    done_probe: bool,
     /// 本轮切尾的段来自哪家（供上层日志显示）。
     pub(super) last_cut_owner: Option<String>,
     /// 最后一次切割的留切明细：(留字节, 留字节传完毫秒, 切字节, 切字节交快流传完毫秒)。
@@ -248,6 +252,7 @@ impl MergeBody {
             last_tick: Instant::now(),
             allow_yield: true,
             rebalanced: false,
+            done_probe: false,
             last_cut_owner: None,
             last_cut: None,
             finished: false,
@@ -287,6 +292,12 @@ impl MergeBody {
         }
         self.last_tick = now;
         true
+    }
+
+    /// 段收尾事件：有段刚定格速率就返回 true 并清标志。
+    /// 驱动循环据此提前体检，让快段的冻结速率立刻进基准，不等 500ms 时钟。
+    pub(super) fn take_done_probe(&mut self) -> bool {
+        std::mem::take(&mut self.done_probe)
     }
 
     /// 取一个待发区间（缺口 / 重分配尾巴）。派出即登记在途，回来（feed/retry_fill）才清。
@@ -332,6 +343,7 @@ impl MergeBody {
     fn fill_all(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         let now = Instant::now();
         let mut progressed = false;
+        let mut just_done = false;
         for seg in self.segs.values_mut() {
             // 重分配后的父段：掐掉上游流停止白下载（刀口外字节要丢），缓冲里已到的照常交付；这段必须排在缓冲守卫之前，否则父段灌满 2MB 时守卫 continue 会永远跳过掐流。
             if seg.cut && seg.pos() >= seg.end {
@@ -381,11 +393,15 @@ impl MergeBody {
                     progressed = true;
                     seg.freeze(now); // 定格这家的实测速度，供别人当"最快"基准
                     seg.done = true;
+                    just_done = true; // 借用结束后交给驱动循环提前体检，不在这里直接 rebalance
                 }
                 std::task::Poll::Pending => {
                     seg.stalled_since.get_or_insert(now);
                 }
             }
+        }
+        if just_done {
+            self.done_probe = true;
         }
         progressed
     }
@@ -428,6 +444,7 @@ impl MergeBody {
     }
 
     /// 校准期那一次重分配：全组跑得最快的那段保留不切（含并列）——它本就满速跑，切下来重派反而亏。
+    /// 基准从活段当前速率与已正常收尾段的冻结速率里选——快段提前下完不必等体检点才当基准。
     /// 其余段算"切多少"：本段剩余 R、本段速率 V、全场最快速率 V_fast、接手方爬坡 P（取最快那家的 ramp）。
     ///   C = (R − P·V) × V_fast / (V_fast + V)
     /// 让"留下的 R−C 按 V 传完"与"切走的 C 交快流、爬坡后传完"同时到——谁也不拖，不造新尾巴。
@@ -439,11 +456,25 @@ impl MergeBody {
         }
         // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，记全场最快纯排水速率与那家的 ramp。
         // 只收有首帧的活段：没首帧 = 没速率样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
+        // 已正常收尾的段不进 cands（下完了，切它没意义），但它 freeze 的速率要参与最快比较——
+        // 快段可能在体检点之前就跑完，不拿它的速度当基准就只能按活段的旧速度切，切量偏小。
+        // 出错/停滞收尾的段不算基准，避免把假快速度喂给判据。
         let mut cands: Vec<(u64, u64, u64, String, f64, u64)> = Vec::new();
         let mut fastest = 0.0f64;
         let mut fastest_ramp = 0u64;
         for s in self.segs.values() {
-            if s.done || s.first_at.is_none() {
+            if s.done {
+                if s.err.is_none() {
+                    if let Some(v) = s.frozen_rate {
+                        if v > fastest {
+                            fastest = v;
+                            fastest_ramp = s.ramp;
+                        }
+                    }
+                }
+                continue;
+            }
+            if s.first_at.is_none() {
                 continue;
             }
             if now.saturating_duration_since(s.last_poll) > POLL_GAP
