@@ -468,8 +468,8 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
                     }
                 }
                 CacheMsg::Invalidate { host, path } => {
-                    let (d, k) = invalidate_prefix_blocking(dir, &host, &path);
-                    if d + k > 0 {
+                    let k = invalidate_prefix_blocking(dir, &host, &path);
+                    if k > 0 {
                         (log)(&format!(
                             "[缓存] 写后失效 {host}{path} (keep 快照标过期 {k})"
                         ));
@@ -481,12 +481,14 @@ fn worker_loop(log: LogFn, rx: mpsc::Receiver<CacheTask>) {
 }
 
 /// 清盘 keep（缓存可再生：骨架超 5MB 就整盘重来，不做淘汰排序），返回条目数；一切错误吞掉。
+/// 顺带删掉旧版停用的 pages/ 残留——失效扫描已不再碰它。
 fn wipe_pages(dir: &std::path::Path) -> usize {
     let n = std::fs::read_dir(dir.join("keep"))
         .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count())
         .unwrap_or(0);
     let _ = std::fs::remove_dir_all(dir.join("keep"));
     let _ = std::fs::remove_dir_all(dir.join("tmp"));
+    let _ = std::fs::remove_dir_all(dir.join("pages"));
     let _ = std::fs::create_dir_all(dir.join("keep"));
     BYTES_SINCE_WIPE.store(0, Ordering::Relaxed);
     n
@@ -1191,13 +1193,10 @@ async fn collect_asset<B>(
             log,
         ) && super::quiet::first_time("assetnew", &name)
         {
-            // 小正文（GitHub 的迷你 chunk 常只有几百字节）按字节显示，别被整数除法抹成 0KB。
-            let size = if bytes.len() < 1024 {
-                format!("{}B", bytes.len())
-            } else {
-                format!("{}KB", bytes.len() / 1024)
-            };
-            (log)(&format!("[资产] 入库 {name} ({size})"));
+            (log)(&format!(
+                "[资产] 入库 {name} ({})",
+                fmt_size(bytes.len())
+            ));
         }
     }
     hyper::Response::from_parts(parts, protocol::full_body(bytes))
@@ -1215,8 +1214,8 @@ fn mark_entry_expired(p: &std::path::Path) {
 }
 
 /// 写后失效：前缀匹配，父路径也匹配（写端点多是子路径；至少两级，免得 /o 扫全表）。
-/// 返回 (删除的会话条目数, 标记过期的 keep 快照数)，调用方据此决定是否落日志。
-fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) -> (usize, usize) {
+/// 返回标记过期的 keep 快照数，调用方据此决定是否落日志。
+fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) -> usize {
     let mut prefixes = vec![format!("GET {host}{path}")];
     if let Some(i) = path.rfind('/') {
         let parent = &path[..i];
@@ -1224,32 +1223,24 @@ fn invalidate_prefix_blocking(dir: &std::path::Path, host: &str, path: &str) -> 
             prefixes.push(format!("GET {host}{parent}"));
         }
     }
-    let mut deleted = 0usize;
     let mut marked = 0usize;
-    // 会话条目在 pages/（照删）；仓库页快照/首页骨架在 keep/（v6.12 起不删——标数据过期：
-    // 旧壳照常可交，下次命中走既有 SWR 管道交旧 + 后台重拉，重拉覆盖后自动解除）。
-    for sub in ["pages", "keep"] {
-        let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
+    // keep 快照不删——标数据过期：旧壳照常可交，命中走既有 SWR 管道交旧 + 后台重拉，
+    // 重拉覆盖后自动解除。旧版会话目录 pages/ 早已停写停读，不再扫。
+    let Ok(rd) = std::fs::read_dir(dir.join("keep")) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(key) = read_page_key(&p) else {
             continue;
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            let Some(key) = read_page_key(&p) else {
-                continue;
-            };
-            if !prefixes.iter().any(|pre| key.starts_with(pre)) {
-                continue;
-            }
-            if sub == "keep" {
-                mark_entry_expired(&p);
-                marked += 1;
-            } else {
-                let _ = std::fs::remove_file(&p);
-                deleted += 1;
-            }
+        if !prefixes.iter().any(|pre| key.starts_with(pre)) {
+            continue;
         }
+        mark_entry_expired(&p);
+        marked += 1;
     }
-    (deleted, marked)
+    marked
 }
 
 /// 只读页面文件的 header 段取 key（失效前缀匹配用，不读 body）。

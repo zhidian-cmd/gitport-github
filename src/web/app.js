@@ -15,9 +15,9 @@ let logSeq = 0;
 let S = { running: false, mitm: false, port: 7810 };
 
 const titles = {
-  overview: ['概览'],
-  logs:     ['日志'],
-  settings: ['设置'],
+  overview: '概览',
+  logs:     '日志',
+  settings: '设置',
 };
 
 async function copyText(t) {
@@ -49,8 +49,7 @@ function route() {
   const el = $('view-' + view);
   if (el) el.classList.add('active');
   document.querySelectorAll('.item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
-  const t = titles[view] || titles.overview;
-  $('pageTitle').textContent = t[0];
+  $('pageTitle').textContent = titles[view] || titles.overview;
 }
 window.onhashchange = route;
 

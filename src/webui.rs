@@ -309,7 +309,6 @@ async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
             .to_string(),
     )
         .into_response()
-            .into_response()
 }
 
 async fn api_probe_status() -> Response {

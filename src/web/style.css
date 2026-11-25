@@ -82,7 +82,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .topbar{min-height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;
         padding:0 14px;border-bottom:1px solid var(--line)}
 .topbar h1{font-size:15.5px;font-weight:600}
-.top-sub{font-size:12px;color:var(--faint);margin-top:3px}
 
 .views{flex:1;overflow-y:auto;padding:12px 14px 16px;min-height:0}
 .view{display:none}
@@ -101,8 +100,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 
 .hint{font-size:12.5px;color:var(--faint);line-height:1.7;margin-top:6px}
 .label{font-size:12px;color:var(--sub)}
-.link{font-size:12.5px;color:var(--green);text-decoration:none}
-.link:hover{text-decoration:underline}
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
 .head-row{margin-top:0}
 .view-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
@@ -129,7 +126,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .hero-addr .hint{margin-top:auto;padding-top:10px}
 
 /* 校准报告：与卡片同规范的框，不再是裸文字 */
-#calResult,#ipTestResult{margin-top:10px;white-space:pre-wrap;display:none;max-height:280px;overflow:auto;
+#calResult{margin-top:10px;white-space:pre-wrap;display:none;max-height:280px;overflow:auto;
   background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:12px 14px;
   font:12px var(--mono);color:var(--mid);line-height:1.7}
 
@@ -169,8 +166,6 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
 .code{margin-top:9px;background:var(--panel-2);border:1px solid var(--line-strong);border-radius:9px;
       padding:12px 14px;font:12px var(--mono);color:var(--mid);line-height:1.7;white-space:pre-wrap;
       word-break:break-all;max-height:260px;overflow:auto}
-.add-row{margin-top:10px}
-.add-row .text-input{flex:1;min-width:220px;max-width:none;margin-top:0}
 /* 自定义镜像行：地址 + 启停 + 垃圾桶 */
 .mirror-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
 .mirror-row .text-input{margin-top:0;flex:1;max-width:none}

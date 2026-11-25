@@ -547,11 +547,12 @@ fn create_window(
         let y = ((sh as f64 - WIN_H) / 2.0 + WIN_DY).max(0.0) as i32;
         (x, y, WIN_W as i32, WIN_H as i32)
     };
-    let (l, t, w, h) = match settings::window_rect() {
+    let saved_rect = settings::window_rect();
+    let (l, t, w, h) = match saved_rect {
         Some((l, t, w, h)) if l < sw && t < sh && l + w > 0 && t + h > 0 => (l, t, w, h),
         _ => default_rect(),
     };
-    if settings::window_rect() != Some((l, t, w, h)) {
+    if saved_rect != Some((l, t, w, h)) {
         let _ = settings::set_window_rect(l, t, w, h);
     }
     let window = match WindowBuilder::new()
