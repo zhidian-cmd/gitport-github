@@ -895,6 +895,29 @@ fn segment_range_uses_inclusive_end() {
     assert_eq!(segment_range(0, 0).unwrap(), "bytes=0-0");
 }
 
+/// 首轮闸门按 mirror 去重、直连腿不建闸：同家多片共用一把，冷启动才不会一流一连接。
+#[test]
+fn mirror_gates_dedup_per_mirror_and_skip_direct() {
+    let idle = ["m1", "m2", "m1", "direct/x", "m2", "m1"];
+    let g = mirror_gates(&idle);
+    assert_eq!(g.len(), 2, "每家一把闸，直连不算");
+    assert!(g.contains_key("m1"));
+    assert!(g.contains_key("m2"));
+    assert!(!g.contains_key("direct/x"), "直连走自管池，不进 mirror 闸");
+}
+
+/// 同家串行：首片持闸期间第二片拿不到，首片放行（响应头到手）后第二片才能发、搭同一条 h2。
+#[test]
+fn mirror_gates_serialize_same_mirror() {
+    let idle = ["m1", "m1"];
+    let g = mirror_gates(&idle);
+    let sem = &g["m1"];
+    let first = sem.try_acquire().expect("首片应拿到闸");
+    assert!(sem.try_acquire().is_err(), "同家第二片必须等首片放行");
+    drop(first);
+    assert!(sem.try_acquire().is_ok(), "首片响应头到手后应放行下一片");
+}
+
 /// 206 起点不符或缺 Content-Range 都不能拼进合并流。
 #[test]
 fn segment_206_must_match_requested_start() {

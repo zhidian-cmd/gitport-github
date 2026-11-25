@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 const MIRROR_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// 直连按跳记响应头预算（每跳 2s，不罩整段）：release 要跟 302 两跳，罩全程会把好腿掐死。
@@ -858,6 +859,23 @@ fn split_want(no_range: bool, candidates: usize) -> usize {
     }
 }
 
+/// 首轮分片建连闸门：按 mirror 去重后每家一把（不是每片一把）。
+/// hyper 的 legacy 池冷启动时，同一家若有两片同时发，两片会各拨一条 h2（一流一连接），
+/// 即便协商出 h2 也不搭车——首轮成对的拨号就是这么来的。
+/// 用每家一把 Semaphore(1)：首片建连+拿响应头后才放行同家下一片，此时连接已入池，
+/// 下一片直接复用同一条 h2 开新 stream；不同家互不阻塞，仍全并发。
+fn mirror_gates<'a>(idle: &[&'a str]) -> HashMap<&'a str, Arc<Semaphore>> {
+    let mut seen: HashMap<&'a str, Arc<Semaphore>> = HashMap::new();
+    for &m in idle {
+        // 直连腿走自管 h2（conn_pool + claim_dial），不在 mirror_client 池里，无需闸门。
+        if m.starts_with("direct/") {
+            continue;
+        }
+        seen.entry(m).or_insert_with(|| Arc::new(Semaphore::new(1)));
+    }
+    seen
+}
+
 /// 切片下载：校准（未测镜像>0 且候选全闲）或原生浏览器下载（无 Range）→ 每镜像一片；
 /// 带 Range 的请求（下载器自己拆好的连接）单流 ECT 最优——并行度归下载器。
 async fn split_download(
@@ -953,8 +971,12 @@ async fn split_download(
     ));
     // 有镜像兜底才给直连设按跳预算；没镜像（用户没配/链全灭）时直连是唯一的路，不能掐，交给它按 IP 表自己换、自己等。
     let has_mirror = healthy.iter().any(|m| !m.starts_with("direct/"));
+    // 首轮同家多片串行建连、跨家全并发：冷启动池空时，同家两片同时发会各拨一条 h2
+    // （见 mirror_gates）。每家一把闸，首片拿到响应头即放行下一片搭同一条连接。
+    let gates = mirror_gates(&idle);
     let futs = segs.iter().enumerate().map(|(i, &(s, e))| {
         let m = idle[i % idle.len()];
+        let gate = gates.get(m).cloned();
         let host = host.to_string();
         let tpl = tpl.clone();
         async move {
@@ -964,6 +986,12 @@ async fn split_download(
                 // 直连分段：预算按跳记（每跳 2s）、整段 ≤2 跳——拿 2s 罩两跳两拨会掐死好腿，release 要跟 302，旧实现正是这样丢速率的。
                 fetch_segment_direct(log, &tpl, &host, info, replay, m, s, e, has_mirror).await
             } else {
+                // 同家串行闸：持有到响应头到手（连接已建并入池）即释放，
+                // 让同家下一片复用这条 h2 开新 stream，不再各拨一条。
+                let _gate_permit = match &gate {
+                    Some(g) => Some(g.acquire().await.expect("mirror gate 未关闭")),
+                    None => None,
+                };
                 let guard = LoadGuard::charge(mirror_load(m), e - s, true);
                 let resp = match mirror_request(out, m, orig_url) {
                     Ok(mut req) => {
