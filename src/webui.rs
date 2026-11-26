@@ -12,8 +12,7 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLE_CSS: &str = include_str!("web/style.css");
 const APP_JS: &str = include_str!("web/app.js");
-/// 部署教程截图（free_proxy 同款五步图，编译期内嵌）
-/// 原来是 JPEG（132KB），转 WebP q=75 后 89KB——截图类图 WebP 的收益没有照片大，但纯赚。
+/// 部署教程截图（五步图，编译期内嵌 WebP q=75）。
 const GUIDE_IMAGES: [&[u8]; 5] = [
     include_bytes!("web/guide/step1.webp"),
     include_bytes!("web/guide/step2.webp"),
@@ -26,12 +25,12 @@ const GUIDE_IMAGES: [&[u8]; 5] = [
 pub struct App {
     pub logs: Arc<Logger>,
     pub ca: Option<Arc<Authority>>,
-    pub dir: String, // exe 目录(CA 证书所在)
+    pub dir: String, // exe 目录（CA 证书所在）
     pub version: &'static str,
 }
 
 impl App {
-    /// 日志闭包收口：LogFn 拼装的唯一出口。
+    /// LogFn 拼装的唯一出口。
     fn log_fn(&self) -> crate::util::LogFn {
         let logs = self.logs.clone();
         Arc::new(move |m: &str| logs.log(m))
@@ -146,7 +145,7 @@ async fn index() -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    // CSP 锁 self 断外传数据；unsafe-inline 供内联脚本（注入源已在 pool 层收口，此处第二道）。
+    // CSP 锁 self；unsafe-inline 供内联脚本（第二道防护）。
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
@@ -160,7 +159,7 @@ async fn index() -> Response {
     (headers, INDEX_HTML).into_response()
 }
 
-/// 静态资源统一响应（style/app_js/img_webp 三处同构收口）：no-cache + mime 覆盖。
+/// 静态资源统一响应：no-cache + mime 覆盖。
 fn static_asset<T: axum::response::IntoResponse>(body: T, mime: &'static str) -> Response {
     let mut resp = body.into_response();
     let h = resp.headers_mut();
@@ -177,7 +176,7 @@ async fn app_js() -> Response {
     static_asset(APP_JS, "application/javascript; charset=utf-8")
 }
 
-/// 教程截图响应（jpeg，编译期内嵌零磁盘依赖）
+/// 教程截图响应（WebP，编译期内嵌）。
 async fn img_webp(bytes: &'static [u8]) -> Response {
     static_asset(bytes, "image/webp")
 }
@@ -194,7 +193,7 @@ async fn guide_img(Path(file): Path<String>) -> Response {
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
-/// 分流 PAC：host 名单全部来自路由表（`pac` 字段），不再另存一份。
+/// 分流 PAC：host 名单来自路由表。
 fn pac_script() -> String {
     let (proxy_hosts, direct_hosts) = crate::pool::route::pac_lists();
     let domains = if settings::github_pac() {
@@ -246,7 +245,7 @@ async fn proxy_pac() -> Response {
 }
 
 #[derive(Serialize)]
-// 键名 camelCase：曾输出 snake_case 导致前端读不到。
+// 键名 camelCase。
 #[serde(rename_all = "camelCase")]
 struct StatusResp {
     version: String,
@@ -254,7 +253,7 @@ struct StatusResp {
     port: u16,
     mitm: bool,
     domain_count: usize,
-    /// 路由种子展开后的具体 IP 总数（原 IP 池页删除后并入状态，概览只显示一个数）。
+    /// 路由种子展开后的具体 IP 总数。
     pool_total: usize,
 }
 
@@ -271,7 +270,7 @@ async fn api_status(State(st): State<Arc<App>>) -> Response {
     })
 }
 
-/// 校准任务结束标志：Drop 里复位，panic 展开也会走到，否则按钮永久卡在“进行中”。
+/// 校准结束标志：Drop 复位（panic 也走到），否则按钮卡在“进行中”。
 struct CalibDone;
 
 impl Drop for CalibDone {
@@ -293,7 +292,7 @@ async fn api_calibrate(State(st): State<Arc<App>>) -> Response {
             .into_response();
     }
     tokio::spawn(async move {
-        // 护栏：任务 panic / 提前返回也要把"进行中"复位，否则按钮永久回"已在后台进行中"。
+        // 护栏：panic/提前返回也复位"进行中"标志。
         let _done = CalibDone;
         crate::server::mitm::set_calibrate_report(None);
         let report = crate::server::mitm::calibrate_chains(&log).await;
@@ -332,7 +331,7 @@ async fn api_probe(State(st): State<Arc<App>>) -> Response {
             .into_response();
     }
     tokio::spawn(async move {
-        // 护栏：任务 panic / 提前返回也要把"进行中"复位，否则按钮永久卡在"进行中"。
+        // 护栏：panic/提前返回也复位"进行中"标志。
         let _done = pool::probe::ProbeGuard;
         let report = pool::probe::probe_serial_domains(&log).await;
         pool::probe::set_probe_report(Some(report));
@@ -381,18 +380,18 @@ struct OnBody {
 
 #[derive(Deserialize)]
 struct WorkerMirrorsBody {
-    /// 完整镜像注册表清单（前端每次变更提交全量，后端按新旧差集对齐链）
+    /// 完整镜像注册表清单（按新旧差集对齐链）。
     mirrors: Vec<crate::settings::WorkerMirror>,
 }
 
-/// 整表保存自定义镜像：按新旧差集对齐镜像链（删除即消失），新增的后台探测用法、命中存模板，全不中摘出注册表。
+/// 整表保存镜像：差集对齐链，新增项后台探测并保存模板/标红。
 async fn api_worker_mirrors(
     State(st): State<Arc<App>>,
     axum::Json(body): axum::Json<WorkerMirrorsBody>,
 ) -> Response {
     match settings::set_worker_mirrors(body.mirrors) {
         Ok((_, removed, added)) => {
-            // 链对齐是 pool 的事：settings 只负责存，存完由这里推一次。
+            // settings 只存，链对齐由 pool 推一次。
             pool::sync_custom_mirrors(&removed, true);
             let log = st.log_fn();
             for url in added {
@@ -404,7 +403,7 @@ async fn api_worker_mirrors(
                             (log)(&format!("[镜像] {url} 用法已保存, 后续按模板使用"));
                         }
                         Err(e) => {
-                            // 试探是 best-effort：不删条目，标红留给用户在界面上改或删。
+                            // 试探 best-effort：不删条目，标红可改可删。
                             (log)(&format!(
                                 "[镜像] {url} {e}, 已标红(不进镜像链, 界面可改或删)"
                             ));
@@ -450,7 +449,7 @@ async fn api_mitm(State(st): State<Arc<App>>, axum::Json(body): axum::Json<OnBod
 }
 
 #[derive(Serialize)]
-// 键名 camelCase：前端读 s.closeToTray / s.githubPAC。
+// 键名 camelCase。
 #[serde(rename_all = "camelCase")]
 struct SettingsResp {
     autostart: bool,
@@ -477,7 +476,7 @@ async fn api_calib_status() -> Response {
 }
 
 async fn api_show() -> Response {
-    // 界面已死的旧实例必须让位：它占着单实例锁会让新启动静默消失（实测踩到）；回 ok:false 后自退，新实例等锁接管。
+    // 界面已死的旧实例让位：回 ok:false 自退，新实例等锁接管。
     if crate::desktop::ui_dead() {
         crate::desktop::quit_via_proxy();
         write_json(&serde_json::json!({"ok": false, "error": "界面不可用, 旧实例退出中"}))

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// 状态行节奏：30s 一拍。
 const STATUS_INTERVAL_SECS: u64 = 30;
-/// 最近有活动才打：通道空闲，避免给闲置 host 刷屏。
+/// 只打最近有活动的 host（避免刷屏）。
 const ACTIVE_WINDOW_SECS: u64 = 90;
 
 pub fn start_ticker(log: LogFn) {

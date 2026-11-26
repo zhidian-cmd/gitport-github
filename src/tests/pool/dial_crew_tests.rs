@@ -11,7 +11,7 @@ fn claim_dial_excludes_peer() {
     release_dial("5.6.7.8");
 }
 
-/// 并发竞争：两线程对同一 IP 各认领 5000 次，成功总数恰为 1——跨 host 拨号去重的根基，互斥坏了会静默退化成同 IP 双连。
+/// 并发竞争：两线程对同一 IP 各认领 5000 次，成功总数恰为 1。
 #[test]
 fn claim_dial_race_yields_exactly_one_winner() {
     let ok = std::sync::Arc::new(AtomicUsize::new(0));

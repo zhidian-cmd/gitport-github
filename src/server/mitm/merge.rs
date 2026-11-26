@@ -8,20 +8,19 @@ use std::time::{Duration, Instant};
 
 /// 单段缓冲上限：快段先到先存，超过就暂时不读它，等交付线推进再读。
 pub(super) const SEG_BUFFER_MAX: usize = 2 * 1024 * 1024;
-/// 多久没收到字节算死。5s 忍得住 CDN 抖动，又不让死连接白占位置。
+/// 停滞判定 5s。
 pub(super) const STALL_MS: u64 = 5_000;
-/// 稳态速度采样：首帧后 500ms 记基线、600ms 落定，取这 100ms 的增量；增量 0 不落定，留给整段均速兜底。
+/// 稳态速度：首帧后 500ms 基线、600ms 落定取 100ms 增量；增量为 0 时用整段均速兜底。
 const STEADY_BASE_MS: u64 = 500;
 const STEADY_RATE_MS: u64 = 600;
 /// 连续多少次补发一个字节都没下到就认输（有进展立刻清零）。
 pub(super) const MAX_DEAD_FILLS: u32 = 6;
-/// 轮询断档超过这么久，回来后重新起算停滞——那是我们自己在忙队首，不是上游死了。
+/// 轮询断档超过此值重新起算停滞（忙队首，非上游死）。
 const POLL_GAP: Duration = Duration::from_millis(1_500);
-/// 体检/重分配间隔：与 SPLIT_TICK（驱动循环唤醒）对齐的 500ms 兜底时钟。
-/// 快段提前下完会通过完成事件提前触发体检，不必等这 500ms；本时钟只兜底一直没下完的活段。
+/// 体检/重分配兜底时钟 500ms（快段提前下完会提前触发体检）。
 const TICK_MS: u64 = 500;
 
-/// 平均切 [base, base+len) 为 n 段：相邻共享边界，零重叠零缝，余数归最后一段；n 超字节数时收缩到字节数，每段至少 1 字节。
+/// 均切 [base, base+len) 为 n 段：零重叠零缝，余数归末段，n 超字节数时收缩。
 pub(super) fn split_even(base: u64, len: u64, n: usize) -> Vec<(u64, u64)> {
     if len == 0 {
         return Vec::new();
@@ -38,7 +37,7 @@ pub(super) fn split_even(base: u64, len: u64, n: usize) -> Vec<(u64, u64)> {
     out
 }
 
-/// 客户端 Range 的 (起点, 终点含)。无 Range、多区间、畸形 → None。
+/// 客户端 Range 的 (起点, 终点含)；无/多区间/畸形 → None。
 pub(super) fn parse_range(range: Option<&str>) -> Option<(u64, Option<u64>)> {
     let spec = range?.trim().strip_prefix("bytes=")?;
     if spec.contains(',') {
@@ -53,12 +52,12 @@ pub(super) fn parse_range(range: Option<&str>) -> Option<(u64, Option<u64>)> {
     Some((a, b))
 }
 
-/// 单字节探片（bytes=N-N）：下载器先探文件大小，不切分也不记分；大文件域直连第一棒（chain_fetch 起轮点），镜像兜底。
+/// 单字节探片：探文件大小，不切分不记分；直连第一棒、镜像兜底。
 pub(super) fn is_probe_range(range: Option<&str>) -> bool {
     matches!(parse_range(range), Some((a, Some(b))) if a == b)
 }
 
-/// 从 `Content-Range: bytes 0-0/2097152000` 取文件总长；`*` 或缺失/畸形 → None。
+/// 从 Content-Range 取文件总长；`*` 或缺失/畸形 → None。
 pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
     let t = v?.trim().rsplit('/').next()?.trim();
     if t == "*" {
@@ -67,7 +66,7 @@ pub(super) fn content_range_total(v: Option<&str>) -> Option<u64> {
     t.parse().ok()
 }
 
-/// 取 `bytes 262144-524287/1608296` 里的区间部分。标准头用空格，也容忍 "bytes=" 写法。
+/// 取 Content-Range 的区间部分（空格或 "bytes=" 写法）。
 fn range_span(v: Option<&str>) -> Option<&str> {
     let s = v?.trim();
     s.strip_prefix("bytes ")
@@ -76,7 +75,7 @@ fn range_span(v: Option<&str>) -> Option<&str> {
         .next()
 }
 
-/// 本段起点。206 的起点必须等于请求段的起点，否则字节会错位拼进合并流。
+/// 本段起点；206 起点必须匹配，否则字节错位。
 pub(super) fn content_range_start(v: Option<&str>) -> Option<u64> {
     range_span(v)?.split('-').next()?.trim().parse().ok()
 }
@@ -86,7 +85,7 @@ pub(super) fn content_range_end(v: Option<&str>) -> Option<u64> {
     range_span(v)?.split_once('-')?.1.trim().parse().ok()
 }
 
-/// 206 起点校验（两处共用）：起点必须等于本段请求起点，否则字节错位拼进合并流，宁可当失败走补发。
+/// 206 起点校验：不匹配当失败走补发。
 pub(super) fn check_segment_start(v: Option<&str>, start: u64) -> Result<(), String> {
     match content_range_start(v) {
         Some(got) if got == start => Ok(()),
@@ -95,7 +94,7 @@ pub(super) fn check_segment_start(v: Option<&str>, start: u64) -> Result<(), Str
     }
 }
 
-/// 一段：自己的响应体 + 自己的缓冲 + 自己的实测。边界可以被外面改小。
+/// 一段：响应体 + 缓冲 + 实测；边界可被改小。
 struct Seg {
     /// 段起点（相对区间）。
     start: u64,
@@ -109,10 +108,10 @@ struct Seg {
     got: u64,
     /// 速率起点（首帧到达时刻），算速率用；首帧前为 None。
     first_at: Option<Instant>,
-    /// 稳态窗基线：首帧后 500ms 的 (时刻, 已收字节)，600ms 时用 (now−base) 算速度。
+    /// 稳态窗基线：首帧后 500ms 的 (时刻, 字节)，600ms 算速度。
     w1_at: Option<Instant>,
     w1_got: u64,
-    /// 段级稳态速度 B/s：500→600ms 窗的实测；一趟到齐等不到窗时用整段已知长度算全程均速。
+    /// 段级稳态速度：500→600ms 窗实测；一趟到齐用整段均速。
     /// 一旦落定值不再变；没样本为 None，不动刀、不进 V_fast。
     steady_rate: Option<f64>,
     /// 首帧前的占位起点，仅用于 last_poll 初始化。
@@ -125,7 +124,7 @@ struct Seg {
     last_poll: Instant,
     /// 开始"推了没数据"的时刻；None = 有数据或没在看。
     stalled_since: Option<Instant>,
-    /// 被重分配缩过边界：下载越过刀口即掐流（正常段要 poll 到 EOF，不在此列）。
+    /// 边界被缩过：越过刀口即掐流。
     cut: bool,
     /// 上游已结束（正常收尾、出错、或被停滞收割）。
     done: bool,
@@ -170,8 +169,7 @@ impl Seg {
         }
     }
 
-    /// 采样稳态速度的首帧后基线（500ms）：此刻的已收字节作分子起点，爬坡已单独计价。
-    /// 返回 true 表示本拍落下了一个稳态速度，调用方据此喂镜像 EMA 并提前体检。
+    /// 记录稳态采样基线；返回 true = 本拍落下速度。
     fn sample_steady(&mut self, now: Instant) -> bool {
         if self.steady_rate.is_some() {
             return false;
@@ -193,16 +191,14 @@ impl Seg {
         let el = now.saturating_duration_since(t0).as_secs_f64().max(0.001);
         let bytes = self.got.saturating_sub(self.w1_got);
         if bytes == 0 {
-            // 这 100ms 一个字节没进：一趟到齐的特征，写 0 没意义。留给 freeze 用整段均速兜底。
+            // 100ms 无字节 = 一趟到齐，留给整段均速兜底。
             return false;
         }
         self.steady_rate = Some(bytes as f64 / el);
         true
     }
 
-    /// 收尾定格：已有 600ms 窗速度就留着；没有才用整段已知长度算全程均速（一趟到齐也能测到）。
-    /// 出错/停滞段不落样本——它的速度不代表链路快慢，不进基准也不喂 EMA。
-    /// 返回 true 表示本拍落下了速度样本（供 EMA/体检），已落定过返回 false 不重复喂。
+    /// 收尾定格速度；出错/停滞段不落样本；返回 true = 本拍落下样本。
     fn freeze(&mut self, now: Instant, ok: bool) -> bool {
         if self.steady_rate.is_some() || !ok {
             return false;
@@ -211,8 +207,7 @@ impl Seg {
             return false; // 连首帧都没到，没样本，不动刀、不进基准
         };
         let el = now.saturating_duration_since(first).as_secs_f64().max(0.001);
-        // 一趟到齐时 got == end-start，行为不变；206 声明了完整区间却中途 EOF 时按实收计价，
-        // 别把只下了 100KB 的截断腿记成下了 1MB，否则派发会把流量导向坏腿。
+        // 中途 EOF 按实收计价，避免截断腿被高估。
         let bytes = self
             .got
             .min(self.end.saturating_sub(self.start));
@@ -230,33 +225,33 @@ pub(super) struct MergeBody {
     total: u64,
     /// 待发请求的区间：缺口、被重分配切掉的尾巴。
     fill: VecDeque<(u64, u64)>,
-    /// 已派出未回话的区间也要去重：只查 fill 队列会漏在途的，同一区间派两条流会错位重复吐字节。
+    /// 区间去重含在途（不只查 fill 队列）。
     inflight: HashSet<(u64, u64)>,
     /// 连续"补发一个字节都没下到"的次数，有进展清零。
     dead_fills: u32,
     /// 上次体检时刻。
     last_tick: Instant,
-    /// 重分配开关：直连腿骑单通道，段间重分配无意义（所有段同一根水管），关掉。
+    /// 重分配开关：直连单通道时关掉。
     pub(super) allow_yield: bool,
-    /// 已经切过一次：校准期那轮重分配只做一次，之后所有派发交给 5ms ECT 市场。
+    /// 校准期重分配只做一次，之后交 5ms ECT。
     rebalanced: bool,
-    /// 有新段落定稳态速度（600ms 采样或提前收尾）后置位：驱动循环据此提前跑一次 rebalance。
+    /// 新段落定稳态速度后置位，触发提前 rebalance。
     /// 只作触发信号，要不要切由 rebalance 自己算；取走即清。
     done_probe: bool,
-    /// 本拍新落定的段级稳态速度 (owner, B/s)：驱动循环取走喂镜像级 EMA。
+    /// 本拍新落定的段级速度 (owner, B/s)。
     steady_events: Vec<(String, f64)>,
     /// 本轮切尾的段来自哪家（供上层日志显示）。
     pub(super) last_cut_owner: Option<String>,
-    /// 最后一次切割的留切明细：(留字节, 留字节传完毫秒, 切字节, 切字节交快流传完毫秒)。
+    /// 留切明细：(留字节, 留毫秒, 切字节, 切毫秒)。
     /// 两端应当同时完成——日志打出来，实测可直接核对拖尾来源。
     pub(super) last_cut: Option<(u64, u64, u64, u64)>,
     finished: bool,
-    /// 生命周期钩子：随 body 一起丢弃（切片计划里登记的在途区间靠它注销）。
+    /// 生命周期钩子：随 body 丢弃注销在途区间。
     _guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl MergeBody {
-    /// segs: (start, end, 起跑时刻, 响应体, 所属上游, 本家爬坡毫秒)，必须连续覆盖 [0, total)。
+    /// segs: (start, end, 起跑时刻, 响应体, 上游, 爬坡毫秒)，连续覆盖 [0, total)。
     pub(super) fn new(
         segs: Vec<(u64, u64, Instant, BoxBody, String, u64)>,
         total: u64,
@@ -283,13 +278,13 @@ impl MergeBody {
         }
     }
 
-    /// 关掉重分配（直连腿用）：所有段骑同一根通道，段间摊派无意义，只走停滞补发。
+    /// 关掉重分配（直连腿）：只走停滞补发。
     pub(super) fn without_yield(mut self) -> Self {
         self.allow_yield = false;
         self
     }
 
-    /// 挂一个生命周期钩子：body 被丢弃时一起释放（用于注销在途区间登记）。
+    /// 挂生命周期钩子，body 丢弃时注销登记。
     pub(super) fn hold(mut self, g: Box<dyn Send + Sync>) -> Self {
         self._guard = Some(g);
         self
@@ -308,7 +303,7 @@ impl MergeBody {
         self.dead_fills >= MAX_DEAD_FILLS
     }
 
-    /// 到体检点了吗。数据一直在流也要跑——涓流不触发超时，却一样拖死整条河。
+    /// 到体检点否（涓流也要体检）。
     pub(super) fn tick_due(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.last_tick) < Duration::from_millis(TICK_MS) {
             return false;
@@ -318,7 +313,7 @@ impl MergeBody {
     }
 
     /// 段收尾/稳态采样事件：有段刚落定速度就返回 true 并清标志。
-    /// 驱动循环据此提前体检，让快段的稳态速率立刻进基准，不等 500ms 时钟。
+    /// 据此提前体检，快段速率立即进基准。
     pub(super) fn take_done_probe(&mut self) -> bool {
         std::mem::take(&mut self.done_probe)
     }
@@ -328,21 +323,21 @@ impl MergeBody {
         std::mem::take(&mut self.steady_events)
     }
 
-    /// 取一个待发区间（缺口 / 重分配尾巴）。派出即登记在途，回来（feed/retry_fill）才清。
+    /// 取待发区间；派出登记在途，回来才清。
     pub(super) fn take_fill(&mut self) -> Option<(u64, u64)> {
         let iv = self.fill.pop_front()?;
         self.inflight.insert(iv);
         Some(iv)
     }
 
-    /// 起流失败把这段塞回队尾重试，否则没人管这个洞；补发失败记一次空手，下次换家。
+    /// 起流失败塞回队尾；补发失败记空手，下次换家。
     pub(super) fn retry_fill(&mut self, from: u64, to: u64) {
         self.dead_fills += 1;
         self.inflight.remove(&(from, to));
         self.queue_fill(from, to);
     }
 
-    /// 接管一条流：把 [start, end) 交给它。owner/ramp 来自派发时挑中的那家。
+    /// 接管流：[start, end)，owner/ramp 来自派发。
     pub(super) fn feed(
         &mut self,
         start: u64,
@@ -367,18 +362,18 @@ impl MergeBody {
         self.fill.push_back((from, to));
     }
 
-    /// 把还在跑的段各推一轮填进各自缓冲，返回是否有进展（拿到数据或某段结束）；缓冲满的段暂不推——waker 不再注册，等交付线推进后自然会再推它。
+    /// 推动各段填缓冲，返回是否有进展；缓冲满的段暂不推。
     fn fill_all(&mut self, cx: &mut std::task::Context<'_>) -> bool {
         let now = Instant::now();
         let mut progressed = false;
         let mut just_done = false;
         let mut steady = Vec::new();
         for seg in self.segs.values_mut() {
-            // 重分配后的父段：掐掉上游流停止白下载（刀口外字节要丢），缓冲里已到的照常交付；这段必须排在缓冲守卫之前，否则父段灌满 2MB 时守卫 continue 会永远跳过掐流。
+            // 重分配父段掐流停白下载，须排在缓冲守卫之前。
             if seg.cut && seg.pos() >= seg.end {
                 seg.body = protocol::empty_body();
             }
-            // 稳态采样不依赖缓冲水位：哪怕段被缓冲守卫跳过，600ms 窗也要照常落定。
+            // 稳态采样不依赖缓冲水位。
             if !seg.done && seg.sample_steady(now) {
                 steady.push((seg.owner.clone(), seg.steady_rate.unwrap()));
             }
@@ -433,7 +428,7 @@ impl MergeBody {
         progressed
     }
 
-    /// 收尸真停滞的段：已收到的留下、没收到的那截排进补发——是"缩边界"不是"整段重下"，缓冲里的字节一个都不丢。
+    /// 收尸停滞段：缩边界、缺口排补发，缓冲字节不丢。
     pub(super) fn reap_stalled(&mut self, now: Instant) -> bool {
         let mut any = false;
         let mut tails: Vec<(u64, u64)> = Vec::new();
@@ -463,28 +458,21 @@ impl MergeBody {
             tails.push((pos, old_end));
             any = true;
         }
-        // 迭代借用结束后再排队——queue_fill 借整个 self，不能在 values_mut() 循环里调。
+        // 迭代结束后再排队（queue_fill 借整个 self）。
         for (pos, old_end) in tails {
             self.queue_fill(pos, old_end);
         }
         any
     }
 
-    /// 校准期那一次重分配：全组跑得最快的那段保留不切（含并列）——它本就满速跑，切下来重派反而亏。
-    /// 基准从活段当前速率与已正常收尾段的冻结速率里选——快段提前下完不必等体检点才当基准。
-    /// 其余段算"切多少"：本段剩余 R、本段速率 V、全场最快速率 V_fast、接手方爬坡 P（取最快那家的 ramp）。
-    ///   C = (R − P·V) × V_fast / (V_fast + V)
-    /// 让"留下的 R−C 按 V 传完"与"切走的 C 交快流、爬坡后传完"同时到——谁也不拖，不造新尾巴。
-    /// R − P·V ≤ 0（本段预计传完不比爬坡久）→ C ≤ 0 → 不切。只切尾部 C 字节，留下的原地跑、不重爬。
+    /// 校准期重分配：最快段不切；基准取活段/已收尾段的最快速率。
+    /// 切量 C = (R − P·V) × V_fast / (V_fast + V)，让留下与切走同时传完；C ≤ 0 不切，只切尾部。
     /// 一次切完即锁死；之后派发全交给 5ms 市场。停滞收尸是独立路径。
     pub(super) fn rebalance(&mut self, now: Instant) -> u64 {
         if !self.allow_yield || self.rebalanced || !self.fill.is_empty() {
             return 0;
         }
-        // 第一遍：收集活段快照 (start, pos, end, owner, v, ramp)，记全场最快纯排水速率与那家的 ramp。
-        // 只收已落定稳态速度的活段：600ms 窗没到 = 没样本，不动刀；没在看的（忙队首）与缓冲顶格的信号不可信。
-        // 已正常收尾的段不进 cands（下完了，切它没意义），但它定格的稳态速度要参与最快比较——
-        // 快段可能在体检点之前就跑完，不拿它的速度当基准就只能按活段的速度切，切量偏小。
+        // 收集已落定速度的活段快照与最快速率；无样本不动刀；收尾段速度参与比较但不进 cands。
         // 出错/停滞收尾的段不算基准，避免把假快速度喂给判据。
         let mut cands: Vec<(u64, u64, u64, String, f64, u64)> = Vec::new();
         let mut fastest = 0.0f64;
@@ -501,7 +489,7 @@ impl MergeBody {
                 }
                 continue;
             }
-            // 稳态速度还没落定（首帧未到 / 没到 600ms 窗）→ 不动刀，等下次体检。
+            // 速度未落定不动刀。
             let Some(v) = s.steady_rate else {
                 continue;
             };
@@ -525,7 +513,7 @@ impl MergeBody {
             cands.push((s.start, pos, s.end, s.owner.clone(), v, s.ramp));
         }
         // 第二遍：最快段（含并列）保留；其余按公式算切量。
-        // V、V_fast 是 B/s，P 由 ramp 毫秒换秒；C = (R − P·V) × V_fast / (V_fast + V)。
+        // V/V_fast 为 B/s，P 由 ramp 毫秒换秒。
         let p_sec = fastest_ramp as f64 / 1000.0;
         let mut tails: Vec<(u64, u64, u64, u64, String, u64, u64, u64)> = Vec::new();
         // (start, cut_at, kept, cut_bytes, owner, kept_ms, cut_ms, _end)
@@ -561,8 +549,7 @@ impl MergeBody {
         moved
     }
 
-    /// 把段边界缩到 cut，[cut, old_end) 排补发（缓冲里已到的字节照常交付）。
-    /// cut == pos 即整段让出（停滞收尸走这条），cut > pos 是重分配的部分切；到新边界掐流停白下载。
+    /// 边界缩到 cut，[cut, old_end) 排补发；cut == pos 整段让出，到新边界掐流。
     fn cut(&mut self, start: u64, cut: u64) -> Option<(u64, u64)> {
         let seg = self.segs.get_mut(&start)?;
         let old_end = seg.end;
@@ -650,7 +637,7 @@ impl hyper::body::Body for MergeBody {
                 me.segs.remove(&k);
                 continue;
             }
-            // 队首还没货：把其余段各推一轮（数据先进各自缓冲），有进展就回头再看队首；全体没动静才是真的 Pending。
+            // 队首没货先推其余段；全体无进展才是真 Pending。
             if me.fill_all(cx) {
                 continue;
             }

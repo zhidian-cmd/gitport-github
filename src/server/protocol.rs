@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 pub type Incoming = hyper::body::Incoming;
 
-/// BoxBody 构造收口：全仓的 Empty/Full + io 错误映射统一走这两个入口。
+/// BoxBody 构造收口：Empty/Full + io 错误映射统一走此。
 pub fn empty_body() -> BoxBody {
     BoxBody::new(http_body_util::Empty::<Bytes>::new().map_err(std::io::Error::other))
 }
@@ -15,5 +15,5 @@ pub fn full_body(b: Bytes) -> BoxBody {
     BoxBody::new(http_body_util::Full::new(b).map_err(std::io::Error::other))
 }
 
-/// 其他域（文档站/静态 CDN/杂项子域）响应头预算：静态内容 2s 无头基本可判该 IP 有问题。
+/// 其他域响应头预算 2s。
 pub const REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);

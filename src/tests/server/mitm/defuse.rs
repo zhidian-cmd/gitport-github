@@ -7,7 +7,7 @@ fn defuse_retry_decision() {
     assert!(defuse_retry(true, 0, 0));
     assert!(defuse_retry(true, 3, 0));
     assert!(!defuse_retry(true, 4, 0));
-    // 有归属：试满 DEFUSE_MAX_TRIES 才停；同 IP 再现不再提前放弃（排除链有洞，由日志 IP 链取证）
+    // 有归属：试满 DEFUSE_MAX_TRIES 才停；同 IP 再现不提前放弃。
     assert!(defuse_retry(false, 0, 0));
     assert!(defuse_retry(false, 0, DEFUSE_MAX_TRIES - 1));
     assert!(!defuse_retry(false, 0, DEFUSE_MAX_TRIES));
@@ -71,9 +71,7 @@ fn html_resp(status: u16, body: &[u8]) -> hyper::Response<protocol::BoxBody> {
     hyper::Response::from_parts(parts, protocol::full_body(Bytes::from(body.to_vec())))
 }
 
-/// 通用 400 页不得判成风控：这不是 IP 被拦，是客户端发错了请求。
-/// 旧逻辑 `status==400 && 正文含 "bad request"` 会把这种页当拦截，连拨 24 个候选、
-/// 每个记 10 分钟冷却 —— 一次畸形请求就让整站降级。
+/// 通用 400 页不得判成风控。
 #[tokio::test]
 async fn generic_bad_request_page_is_not_block() {
     let page = br#"<!DOCTYPE html>
@@ -87,7 +85,7 @@ async fn generic_bad_request_page_is_not_block() {
     );
 }
 
-/// GitHub 自己的两种拦截文案仍必须识别，修复不能把真风控一起关掉。
+/// GitHub 两种拦截文案仍须识别。
 #[tokio::test]
 async fn github_block_wording_still_detected() {
     let whoa = b"<html><body><h1>Whoa there!</h1><p>You have exceeded a secondary rate limit.</p></body></html>";

@@ -132,7 +132,7 @@ fn ttfb_rank_fastest_first_failures_last() {
     assert_eq!(order, ["fast", "mid", "slow", "dead"], "{rows:?}");
 }
 
-/// 纯直连耗尽(零镜像)不给镜像链上熔断——链没参与，别连坐。
+/// 纯直连耗尽不触发镜像链熔断。
 #[tokio::test]
 async fn direct_only_exhaustion_spares_chain_breaker() {
     let log: LogFn = Arc::new(|_: &str| {});
@@ -159,7 +159,7 @@ async fn direct_only_exhaustion_spares_chain_breaker() {
     );
 }
 
-/// 审计 #3 回归: 熔断只拦有镜像候选的请求——零镜像时直连独走, 不得撞为镜像设的熔断(哪怕熔断正开着)。
+/// 熔断只拦有镜像候选的请求，零镜像直连独走不撞熔断。
 #[tokio::test]
 async fn breaker_spares_direct_only_requests() {
     let log: LogFn = Arc::new(|_: &str| {});
@@ -185,13 +185,13 @@ async fn breaker_spares_direct_only_requests() {
     pool::MIRROR_BREAKER.clear(host);
 }
 
-/// 探片直连先行：大文件域 bytes=N-N 探测起轮点在直连腿（旧序从链头镜像起轮），镜像全程不被碰。
+/// 探片从直连腿起轮，不碰镜像。
 #[tokio::test]
 async fn probe_range_starts_at_direct_leg() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    // 隔离：serial_load 会把链上镜像收编进注册表并跨测试持久化，先清空。
+    // 隔离：先清空注册表。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = std::env::temp_dir().join("gitport_probe_direct_seed");
     let _ = std::fs::remove_dir_all(&dir);
@@ -250,7 +250,7 @@ async fn probe_range_starts_at_direct_leg() {
     crate::settings::save_worker_mirrors(Vec::new());
 }
 
-/// 审计 #2 回归: cap 窗口吃掉直连位时——健康直连追加为末位; 失败窗未过的不追加, 已在窗内不重复。
+/// 健康直连追加为末位；失败窗未过或已在窗内不追加。
 #[test]
 fn append_direct_gated_by_health_and_presence() {
     let mut order = vec![0usize, 1, 2, 3, 4];
@@ -270,7 +270,7 @@ fn mirror_test_direct_leg() -> DirectLeg<'static> {
     Box::pin(async { Err::<hyper::Response<BoxBody>, String>("test: direct unavailable".into()) })
 }
 
-/// 段级稳态速度 EMA：首样直入、二次平滑；0/非有限值不写（别把 EMA 拉成假慢）。
+/// 段级稳态速度 EMA：首样直入、二次平滑；0/非有限值不写。
 #[test]
 fn steady_rate_note_ema() {
     let ld = mirror_load("ect-slot.test");
@@ -298,7 +298,7 @@ fn steady_rate_note_ema() {
     ld.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
-/// 爬坡 EMA：首样直入、二次平滑；用 note_ramp 直接验证记账公式（打点在 LoadGuard::on_frame 首帧）。
+/// 爬坡 EMA：首样直入、二次平滑。
 #[test]
 fn ramp_note_ema() {
     let ld = mirror_load("https://ramp-ema.test");
@@ -335,7 +335,7 @@ fn ect_adds_ramp_to_score() {
     slow.ramp_ms.store(0, Ordering::Relaxed);
 }
 
-/// 先验退役：无稳态速度的候选在 ECT 里按无穷大垫底——有速度的慢腿也胜过它。
+/// 无稳态速度的候选在 ECT 里按无穷大垫底。
 #[test]
 fn ect_after_retirement_unprobed_loses_to_probed_slow() {
     let slow = mirror_load("retire-slow.test");
@@ -404,8 +404,7 @@ fn ect_prefers_busy_fast_over_idle_slow() {
     b.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
-/// 段级派发无视 ttfb（h2 复用后镜像/直连首字节对称，ttfb 只进探针排序）：快镜像 ttfb 600ms 仍按纯排水胜出。
-/// 谁把 ttfb 加回段级谁挂（620ms > 160ms 时会错选慢腿）。
+/// 段级派发无视 ttfb，快镜像按纯排水胜出。
 #[test]
 fn ect_ignores_ttfb_for_segments() {
     let fast = mirror_load("ect-fast.test");
@@ -442,9 +441,7 @@ fn ttfb_note_ema_and_direct_free() {
     m.ttfb_ms.store(0, Ordering::Relaxed);
 }
 
-/// 实网验尸：gh-proxy.org(CF) 协商 h2 拉带 Range 的真文件段，体必须读满 content-length。
-/// 当年 h2 被关的坑是"头正常、体 0B EOF"，此探针即其回归测试。网络测试，#[ignore]：
-/// `cargo test mirror_h2_body_probe -- --ignored` 单独验。
+/// 实网验尸：h2 拉 Range 段，体必须读满 content-length（回归"头正常体 0B EOF"）。
 #[tokio::test]
 #[ignore]
 async fn mirror_h2_body_probe() {
@@ -484,8 +481,7 @@ async fn mirror_h2_body_probe() {
         }
     }
     let resp = resp.expect("3 次尝试全失败");
-    // raw 路径部分镜像忽略 Range 回 200 全量（gh-proxy.org 实测），与 h2 无关——靶子是体完整性：
-    // 旧坑"头正常、体 0B EOF"的回归点 = 体读不满 content-length。
+    // 靶子：体必须读满 content-length（回归"头正常体 0B EOF"）。
     let status = resp.status().as_u16();
     assert!(
         status == 206 || status == 200,
@@ -548,8 +544,7 @@ fn cold_start_falls_back_to_chain_order() {
     b.in_flight_streams.store(0, Ordering::Relaxed);
 }
 
-/// 二级判据：ECT 并列组内选在途流最少者；流数也相同才轮转。
-/// 分母是 rate×streams，所以并列要构造等价容量：A 单流快但只有 1 条，B 单流慢但有 2 条。
+/// 二级判据：ECT 并列组内选在途流最少者，流数也相同才轮转。
 #[test]
 fn tie_prefers_fewer_inflight_streams() {
     let a = mirror_load("streams-a.test");
@@ -587,7 +582,7 @@ fn tie_prefers_fewer_inflight_streams() {
     b.steady_rate_bps.store(0, Ordering::Relaxed);
 }
 
-/// ECT 绝对最小(无容差): 速度差 4% 也严格选快者——5% 容差已废；仅 ECT 完全相等才走二级(流数/轮转)。
+/// ECT 无容差：速度差 4% 也严格选快者，仅完全相等才走二级。
 #[test]
 fn ect_strict_minimum_no_tolerance() {
     let a = mirror_load("tie-a.test");
@@ -689,7 +684,7 @@ fn mirror_response_validation() {
     assert!(validate_mirror_response(false, 200, "text/html; charset=utf-8", false).is_err());
 }
 
-/// 整包 GET(没带 Range)收到 206 分片：按这家失败处理，绝不当完整文件交出去（静默截断）。
+/// 整包 GET 收到 206 按失败处理，不当完整文件交付。
 #[test]
 fn stream_start_rejects_206_without_range() {
     let resp = |status: u16, cr: &str| {
@@ -876,8 +871,7 @@ fn silent_body(prefix: &'static [u8]) -> BoxBody {
     })
 }
 
-/// 静默装死的上游不许永久挂死（直连切片搬来的回归钉子）：waker 注册进静默上游永不触发，
-/// drive_split 的 500ms Tick 是唯一唤醒源——停滞收尸 → 补发 → 连续空手 → 错误上抛。
+/// 静默装死上游不许永久挂死，须停滞收尸、补发后错误上抛。
 #[tokio::test]
 async fn driver_silent_upstream_wakes_and_errors() {
     let now = Instant::now();
@@ -901,7 +895,7 @@ fn segment_range_uses_inclusive_end() {
     assert_eq!(segment_range(0, 0).unwrap(), "bytes=0-0");
 }
 
-/// 首轮闸门按 mirror 去重、直连腿不建闸：同家多片共用一把，冷启动才不会一流一连接。
+/// 首轮闸门按 mirror 去重、直连腿不建闸。
 #[test]
 fn mirror_gates_dedup_per_mirror_and_skip_direct() {
     let idle = ["m1", "m2", "m1", "direct/x", "m2", "m1"];
@@ -924,8 +918,7 @@ fn mirror_gates_serialize_same_mirror() {
     assert!(sem.try_acquire().is_ok(), "首片响应头到手后应放行下一片");
 }
 
-/// 闸门进程级共享：下载器一次性给多个 Range 请求时，各自走一次 split_download，
-/// 两次调用同一家必须拿到同一把闸，否则跨请求同家片照样同时拨号（局部闸门的洞）。
+/// 闸门进程级共享：两次调用同一家必须拿到同一把闸。
 #[test]
 fn mirror_gates_shared_across_calls() {
     let a = mirror_gates(&["shared-mirror.test"]);

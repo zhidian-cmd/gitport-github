@@ -1,4 +1,4 @@
-/// 骨架拦截三态:正常结果页与真实零结果页恒含 embeddedData(缓存),blackbird 限流骨架恒缺(拦截);GitHub 改 payload 封装名时这里会红,避免搜索页缓存静默失效。
+/// 骨架拦截三态：正常/零结果页含 embeddedData 则缓存，限流骨架缺则拦截。
 #[test]
 fn search_skeleton_gate() {
     let k = "GET github.com/search?q=x&type=repositories-gz";
@@ -11,7 +11,7 @@ fn search_skeleton_gate() {
         is_search_skeleton(k, b"<html>Your search did not match</html>", "identity"),
         "无结果载体的骨架应拦截"
     );
-    // 非 /search? 键不受此判定(count XHR 的骨架照缓存,无害)
+    // 非 /search? 键不受此判定。
     assert!(!is_search_skeleton(
         "GET github.com/search/count?q=x",
         b"{}",
@@ -42,8 +42,7 @@ fn search_skeleton_gate_gzip() {
 
 use super::*;
 
-/// Ctrl+F5 直通：带 no-cache 的请求必须回源（github.com 全域）；max-age=0 不算——浏览器后退/前进也带它，当成强制刷新会让缓存永远命不中。
-/// 准入已放宽为 github.com GET 全候选（列表页/仓库页/详情页都在准入内——是否缓存由响应阶段按 Content-Type 分流）。
+/// 带 no-cache 直通回源；max-age=0 不算；github.com GET 全候选准入。
 #[test]
 fn no_cache_header_bypasses_cache() {
     for path in ["/", "/search", "/octocat/repo/issues", "/octocat/repo"] {
@@ -65,8 +64,7 @@ fn no_cache_header_bypasses_cache() {
     assert!(!cache_eligible_rules("github.com", &Method::POST, None));
 }
 
-/// /search 查询串归一化：p=1 与无 p、参数重排均同键；其他路径的查询串一个字符都不动（参数顺序可能有语义）。
-/// 键不再含身份标签/会话号（骨架是纯壳，跨会话/跨登录命中）。
+/// /search 查询串归一化：p=1/参数重排同键；其他路径原样；键不含身份标签/会话号。
 #[test]
 fn search_query_normalization() {
     let mk = |path: &str, q: Option<&str>| {
@@ -136,9 +134,7 @@ fn own_dir(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>
     (dir, guard)
 }
 
-/// 缓存测试串行闸：目录覆盖（CACHE_DIR_OVERRIDE）和 XHR 池都是进程级单值，
-/// 并行用例会互相清空/覆盖——典型症状是"刚写入的条目 -> 无此条目"。
-/// 只碰全局状态、不需要自己临时目录的用例用这把锁，别再裸调 page_cache_clear。
+/// 缓存测试串行闸：目录覆盖与 XHR 池为进程级单值，只碰全局状态的用例用此锁。
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -389,8 +385,7 @@ async fn keys_invalidation_and_pollution() {
     let (dir, _dir_guard) = own_dir("key");
     let log = log_sink();
 
-    // ⑨ 写后失效：keep 条目不删，改标过期（mtime 拨线）→ 命中走 SWR（交旧 + 后台重拉）
-    // 键用生产形态（-k 尾，SWR 判定要求）；查询串走归一化
+    // 写后失效：keep 条目不删，改标过期走 SWR（交旧+后台重拉）；键用生产形态。
     let mk_search = |q: &str| {
         let uri: http::Uri = format!("https://github.com/search?{q}").parse().unwrap();
         live_cache_key(&uri, "github.com", "gzip", "-html")
@@ -427,8 +422,7 @@ async fn keys_invalidation_and_pollution() {
             &test_hdrs(),
         );
     }
-    // 生产形态：invalidate_after_write 传的是 path()（无查询串）→ 宽前缀波及全部 /search 骨架
-    // （POST /search 后各查询的骨架全部标过期交旧重拉——搜索页更新影响所有查询，属预期行为）
+    // invalidate_after_write 传 path()，宽前缀波及全部 /search 骨架。
     invalidate_prefix_blocking(&dir, "github.com", "/search");
     let sub_expired = load_disk_entry_reason(&sub).unwrap().1;
     let other_expired = load_disk_entry_reason(&other).unwrap().1;
@@ -462,8 +456,7 @@ async fn keys_invalidation_and_pollution() {
         "{search_key}"
     );
 
-    // ⑪ 纯壳化：骨架是无账号数据的纯壳，不再分登录/未登录变体——
-    // 带 logged-out class 的 HTML 只要无账号数据也照存照命中，任何会话态读同一份。
+    // 纯壳化：骨架不分登录/未登录变体，任何会话态读同一份。
     let anon_uri: http::Uri = "https://github.com/".parse().unwrap();
     let anon_key = live_cache_key(&anon_uri, "github.com", "identity", "-html");
     let anon = b"<html><body class=\"logged-out env-production\">results</body></html>";
@@ -565,7 +558,7 @@ fn keep_scope_is_home_and_search_only() {
     assert!(repo.ends_with("-k"), "{repo}");
 }
 
-/// 截断的 keep 骨架（无 </html>）必须读失败并删文件自愈：h2 响应无 content-length，中途断流 collect 照样成功，截断页 7 天内每次后退都命中=必现白屏。
+/// 截断 keep 骨架须读失败并删文件自愈。
 #[test]
 fn truncated_keep_entry_self_destructs() {
     let (dir, _g) = own_dir("trunc");
@@ -616,10 +609,10 @@ fn split_cookie_headers_still_fingerprint_account() {
     );
 }
 
-/// v6.9 资产缓存已物理删除（实测 48 分钟 132 请求 0 命中）；本测试的存在就是文档——想重启先读 git 历史里三颗雷：逻辑键互踩、缺 CORS、单 token br 收窄。
+/// 资产缓存已删除；本测试仅钉页面缓存键不含资产域。
 #[test]
 fn asset_cache_is_removed_by_design() {
-    // 没有可断言的函数了（is_asset_req/asset_cache_key 已删）；这里只钉页面缓存键从不含资产域。
+    // 只钉页面缓存键从不含资产域。
     let mk = |p: &str| page_cache_key(&p.parse::<http::Uri>().unwrap(), "github.com", "br");
     assert!(
         !mk("/octocat/repo").contains("githubassets"),
@@ -627,7 +620,7 @@ fn asset_cache_is_removed_by_design() {
     );
 }
 
-/// no-store 不落盘；private 不拒——GitHub 用它表达浏览器别共享，代理按会话分键语义等价，全拒会干掉页面缓存。
+/// no-store 不落盘；private 不拒。
 #[test]
 fn no_store_responses_are_never_saved() {
     let mk = |cc: &str| {
@@ -641,7 +634,7 @@ fn no_store_responses_are_never_saved() {
     assert!(!resp_no_store(&http::HeaderMap::new()));
 }
 
-/// 写失效改标过期（keep 骨架）：写失效不再删 keep 条目，改把 mtime 拨过期（交旧+后台重拉）；重拉覆盖后自动解除。
+/// 写失效改标过期（keep 骨架）：mtime 拨过期，重拉覆盖后解除。
 #[test]
 fn write_invalidation_marks_keep_snapshot_expired() {
     let (dir, _g) = own_dir("stalemark");
@@ -722,7 +715,7 @@ fn document_nav_gate() {
     assert!(!is_document_nav(&mk(Some("iframe"))), "iframe 子文档按片段路径");
 }
 
-/// 回归钉子：JS 取数存进 XHR 的搜索 JSON，绝不能给文档导航（前进/后退/刷新）回放成裸 JSON 页面。
+/// XHR 搜索 JSON 不得给文档导航回放成裸 JSON；整页 "-p" 桶与 "-j" 键互斥。
 #[test]
 fn document_nav_must_not_take_xhr() {
     let _g = serial(); // 直接读写全局 XHR 池，必须与其他缓存用例串行
@@ -739,7 +732,7 @@ fn document_nav_must_not_take_xhr() {
         ]],
         Bytes::from_static(b"{\"payload\":1}"),
     );
-    // 键里没有请求形态：同一 URL 的 JSON 确实能被取到，门检是唯一防线。
+    // 键里没有请求形态：同一 URL 的 JSON 确实能被取到，桶隔离是唯一防线。
     assert!(xhr_take(&key).is_some(), "JS 取数的 JSON 应确实在 XHR 池里");
 
     let mk = |dest: Option<&str>| {
@@ -749,13 +742,91 @@ fn document_nav_must_not_take_xhr() {
         }
         b.body(protocol::empty_body()).unwrap()
     };
-    assert!(!xhr_lookup_allowed(&mk(Some("document"))), "导航不得取 XHR");
-    assert!(!xhr_lookup_allowed(&mk(None)), "无头保守按导航，不得取 XHR");
-    assert!(xhr_lookup_allowed(&mk(Some("empty"))), "fetch 取数照常命中");
-    assert!(
-        xhr_lookup_allowed(&mk(Some("iframe"))),
-        "iframe 子请求照常命中"
+    // 文档导航只认 "-p" 整页桶，绝不落到存着 JSON 的 "-j" 桶。
+    assert_eq!(xhr_lookup_kind(&mk(Some("document")), None), Some("-p"));
+    assert_eq!(xhr_lookup_kind(&mk(None), None), Some("-p"));
+    assert_eq!(
+        xhr_lookup_kind(&mk(Some("empty")), Some("application/json")),
+        Some("-j")
     );
+    assert_eq!(
+        xhr_lookup_kind(&mk(Some("iframe")), Some("application/json")),
+        Some("-j")
+    );
+    // "-p" 键与 "-j" 键不同：JSON 正文不会被当成整页回放。
+    let page_key = xhr_cache_key(&uri, "github.com", None, "gzip", "-p");
+    assert_ne!(page_key, key, "整页桶与 JSON 桶必须互斥");
+    assert!(xhr_take(&page_key).is_none(), "整页桶不该里有 JSON");
+}
+
+/// 文档导航按 xhr_lookup_kind 选 "-p" 桶取回完整 HTML，不回放成裸 JSON。
+#[test]
+fn search_nav_replays_full_page_from_own_bucket() {
+    let _g = serial();
+    page_cache_clear();
+    let uri: http::Uri = "https://github.com/search?q=relay&type=repositories"
+        .parse()
+        .unwrap();
+    let cookies = Some("user_session=relayuser");
+    let enc = "gzip";
+    let full_html = b"<html>react-app.embeddedData results</html>".as_slice();
+
+    // 存侧：整页 → -p；JS 取数的 JSON → -j（两者共存）
+    let pkey = xhr_cache_key(&uri, "github.com", cookies, enc, "-p");
+    let jkey = xhr_cache_key(&uri, "github.com", cookies, enc, "-j");
+    xhr_store(
+        &pkey,
+        200,
+        vec![vec!["content-type".into(), "text/html; charset=utf-8".into()]],
+        Bytes::copy_from_slice(full_html),
+    );
+    xhr_store(
+        &jkey,
+        200,
+        vec![vec!["content-type".into(), "application/json".into()]],
+        Bytes::from_static(b"{\"payload\":{\"count\":42}}"),
+    );
+
+    // 取侧：文档导航选 -p，取回完整 HTML（不是 JSON）
+    let nav = hyper::Request::builder()
+        .uri(uri.clone())
+        .header("sec-fetch-dest", "document")
+        .header("cookie", "user_session=relayuser")
+        .body(protocol::empty_body())
+        .unwrap();
+    let nav_cookies = all_cookies(nav.headers());
+    let kind = xhr_lookup_kind(&nav, Some("text/html,application/xhtml+xml"));
+    assert_eq!(kind, Some("-p"));
+    let (_, hdrs, body) = xhr_take(&xhr_cache_key(
+        &uri,
+        "github.com",
+        nav_cookies.as_deref(),
+        enc,
+        kind.unwrap(),
+    ))
+    .expect("文档导航应命中整页桶");
+    assert!(
+        hdrs.iter().any(|h| h[0].eq_ignore_ascii_case("content-type")
+            && h[1].contains("text/html")),
+        "回放的必须是 HTML 整页"
+    );
+    assert_eq!(body.as_ref(), full_html, "不得是裸 JSON");
+    // JSON 桶仍在，供 JS 取数照常命中，互不干扰。
+    assert!(xhr_take(&jkey).is_some(), "JSON 桶不受影响");
+}
+
+/// 首页文档导航不走 XHR（走 keep 7 天骨架），其余路径文档导航回源。
+#[test]
+fn document_nav_outside_search_has_no_xhr_bucket() {
+    for uri in ["https://github.com/", "https://github.com/octocat/repo"] {
+        let uri: http::Uri = uri.parse().unwrap();
+        let req = hyper::Request::builder()
+            .uri(uri)
+            .header("sec-fetch-dest", "document")
+            .body(protocol::empty_body())
+            .unwrap();
+        assert_eq!(xhr_lookup_kind(&req, Some("text/html")), None);
+    }
 }
 
 /// XHR 正文判定覆盖面：标准 JSON、`+json` 家族、ndjson、纯文本都收；HTML/二进制等不收。
@@ -783,7 +854,7 @@ fn xhr_body_types_cover_json_family_and_ndjson() {
     }
 }
 
-/// 首页骨架取存两侧键一致：取侧曾误用空变体（GET github.com/-gz-k），存侧写 -html-k → 永不命中。
+/// 首页骨架取存两侧键须一致。
 #[test]
 fn home_keep_lookup_variant_matches_store() {
     let uri: http::Uri = "https://github.com/".parse().unwrap();
@@ -801,6 +872,22 @@ fn home_keep_lookup_variant_matches_store() {
     );
 }
 
+/// 搜索页整页进 "-p" 桶：键带身份、15 分钟 TTL、与 "-j" 互斥；导航只回放完整 HTML。
+#[test]
+fn search_full_page_uses_isolated_identity_scoped_bucket() {
+    let uri: http::Uri = "https://github.com/search?q=rust&type=repositories"
+        .parse()
+        .unwrap();
+    let alice = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip", "-p");
+    let bob = xhr_cache_key(&uri, "github.com", Some("user_session=xyz"), "gzip", "-p");
+    let json = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip", "-j");
+    let frag = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip", "-h");
+    assert_ne!(alice, bob, "搜索页含 csrf_tokens，跨账号必须分键");
+    assert_ne!(alice, json, "整页与 JSON 必须分键");
+    assert_ne!(alice, frag, "整页与软导航片段必须分键");
+    assert!(alice.contains("-p") && !alice.contains("-k"), "整页桶是 -p 且不带磁盘 keep 后缀");
+}
+
 // ---------- XHR 15 分钟内存缓存 ----------
 
 /// 首页/搜索页 JSON 改道 XHR：这两条路径上的 JSON 是数据不是壳，不再送进 keep 分支落盘。
@@ -811,8 +898,8 @@ fn home_search_json_routes_to_xhr_not_keep() {
     assert!(!keep_route("/search", json), "搜索页 JSON 必须改道 XHR");
     assert!(keep_route("/", "text/html"), "首页 HTML 仍走 keep 骨架");
     assert!(
-        keep_route("/search", "text/html"),
-        "搜索页 HTML 仍走 keep 骨架"
+        !keep_route("/search", "text/html"),
+        "搜索页整页 HTML 内嵌结果，必须走 15 分钟内存桶，不再落盘 7 天"
     );
     assert!(
         !keep_route("/octocat/repo", "text/html"),
@@ -862,7 +949,7 @@ fn xhr_cache_key_separates_identity_and_encoding() {
     assert_ne!(alice, bob, "不同账号必须分键（A 的通知不能给 B）");
     let gz = mk(Some("user_session=abc"), "br");
     assert_ne!(gz, alice, "编码不同必须分键");
-    // 同一 URL 按 Accept 协商返回 JSON / HTML 片段，两者共用一个键会互相串（裸 JSON 被当片段塞进 DOM）。
+    // JSON 与 HTML 片段必须分键，防互相串。
     let u: http::Uri = "https://github.com/notifications/indicator".parse().unwrap();
     let json = xhr_cache_key(&u, "github.com", None, "gzip", "-j");
     let html = xhr_cache_key(&u, "github.com", None, "gzip", "-h");
@@ -876,8 +963,7 @@ fn xhr_cache_key_separates_identity_and_encoding() {
 /// XHR 容量护栏：总量超 5MB 按过期时间最早先淘汰；刚入库的条目不自删。
 #[test]
 fn xhr_cache_evicts_oldest_at_cap() {
-    // page_cache_clear 会连磁盘目录一起清，必须和所有碰缓存的用例串行，
-    // 否则并行时会把别人刚写入的条目删掉（表现为"无此条目"）。
+    // page_cache_clear 会连磁盘目录一起清，必须与碰缓存的用例串行。
     let _g = serial();
     page_cache_clear(); // 清空共享 XHR_CACHE（其他用例可能存过）
     let hdrs = vec![vec!["content-type".into(), "application/json".into()]];

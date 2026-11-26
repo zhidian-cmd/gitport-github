@@ -47,7 +47,7 @@ async fn give_take_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 未入库 URL 不命中；非 200 拒收；白名单外类型拒收；异 URL 异文件（碰撞由条目内 key 校验兜底）。
+/// 未入库 miss；非 200/白名单外类型拒收；异 URL 异文件。
 #[test]
 fn gates_and_misses() {
     let dir = dir_tag("gate");
@@ -100,7 +100,7 @@ fn logical_name_families() {
     );
 }
 
-/// 名字键：同资产新哈希入库覆盖旧版本（只留最新）；旧哈希 URL 因 key 不匹配当 miss（不服务陈旧占用）。
+/// 同资产新哈希覆盖旧版本；旧哈希 URL 当 miss。
 #[tokio::test]
 async fn same_name_new_hash_overwrites_and_old_url_misses() {
     let dir = dir_tag("namekey");
@@ -116,7 +116,7 @@ async fn same_name_new_hash_overwrites_and_old_url_misses() {
         .unwrap()
         .to_bytes();
     assert_eq!(body.as_ref(), b"new bytes", "必须是新内容");
-    // 旧 URL：key 不匹配 = miss（不服务陈旧占用）
+    // 旧 URL key 不匹配 = miss。
     assert!(
         take(&dir, old).is_none(),
         "旧哈希 URL 不得命中新内容（防陈旧占用）"
@@ -158,8 +158,7 @@ fn cap_evicts_oldest_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 等待者中继语义：首个=发起者、后续=等待者；signal_done 全员唤醒并撤销登记；之后重新武装。
-/// （失败/panic 后若不撤销登记，同 URL 会永久楔死——发现 1/2 的反面钉子。）
+/// 等待者中继：首个=发起者、后续=等待者；signal_done 全员唤醒并撤销登记、重新武装。
 #[tokio::test]
 async fn waiter_relay_rearm_and_wake() {
     let url = "https://github.githubassets.com/relay-11112222.js";
@@ -181,8 +180,7 @@ async fn waiter_relay_rearm_and_wake() {
     let _ = rx3.await;
 }
 
-/// 发现 1 回归钉子：上游全灭时，并发 miss 的等待者必须限时拿到 None 且登记清空，
-/// 绝不永久挂在 rx 上（装死上游曾让同 URL 楔死到重启）。
+/// 上游全灭时并发 miss 等待者须限时拿到 None 且登记清空，不得挂死。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // TEST_LOCK 护全局路由表/串发表，跨 await 有意为之
 async fn miss_dead_upstream_releases_waiters() {
@@ -282,7 +280,7 @@ fn silent_after(data: &'static [u8]) -> BoxBody {
     })
 }
 
-/// 停滞界判据（发现 1 修复核心）：慢滴流拉多久都不杀，零帧停滞才判死。
+/// 停滞界判据：慢滴流不杀，零帧停滞才判死。
 #[tokio::test]
 async fn collect_stall_bounded_slow_frames_pass_and_silence_fails() {
     // 慢帧：每 40ms 吐 3 帧（真实时钟 ~120ms < 200ms 界）→ 成功收集

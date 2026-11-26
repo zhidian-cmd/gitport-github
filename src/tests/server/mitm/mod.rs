@@ -1,4 +1,4 @@
-/// 审计 #1 回归：镜像胜出时直连 future 未钧即弃（charge 在 future 内）——零残留，账面不得出现幽灵在途字节/流数。
+/// 镜像胜出时直连 future 未 poll 即弃，零残留（无幽灵在途字节/流数）。
 #[test]
 fn direct_leg_unpolled_leaves_zero_debt() {
     let key = mirror::direct_load_key("debt.test");
@@ -42,7 +42,7 @@ use super::*;
 #[test]
 fn release_asset_path_gate() {
     use pool::route::is_mirror_route;
-    // 断言依赖种子表的 hosts 声明；别的测试会换全局表，先锁住并装回种子再判。
+    // 先锁住全局表并装回种子，再判（断言依赖种子 hosts 声明）。
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -151,7 +151,7 @@ fn client_gone_text_only_matches_disconnects() {
     assert!(!client_gone_text("service task panicked"));
 }
 
-/// 断开提示同 host 只留首条，第二个 host 不受影响；表满清空属既有行为。
+/// 断开提示同 host 只留首条，第二个 host 不受影响。
 #[test]
 fn client_gone_log_is_first_per_host() {
     let a = quiet::first_time("client-gone", "gone-a.test");
@@ -190,7 +190,7 @@ fn codeload_alias_rewrites_host_keeps_path() {
         codeload_alias_host("github.com", "/o/r/tar.gz/refs/tags/v1"),
         Some("codeload.github.com")
     );
-    // 已经在 codeload 域、正常 archive、别的内容域，都不触发，免得反复改或误伤。
+    // 已在 codeload 域、正常 archive、别的内容域都不触发。
     assert_eq!(
         codeload_alias_host("codeload.github.com", "/o/r/zip/refs/heads/main"),
         None
@@ -216,7 +216,7 @@ fn codeload_alias_rewrites_host_keeps_path() {
     );
 }
 
-/// 复用失败两种病不能混：超时写明响应超时(Ns)，真断链才叫连接已断；线上曾把 4s 预算超时印成连接已断，看着像链路故障。
+/// 复用失败：超时写明响应超时(Ns)，真断链才叫连接已断。
 #[test]
 fn reuse_failure_text_keeps_timeout_and_broken_conn_apart() {
     assert_eq!(

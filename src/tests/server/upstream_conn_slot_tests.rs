@@ -1,6 +1,6 @@
 use super::*;
 
-/// 造一条合法 H2Upstream：h2 握手用本机 duplex 对拉（无需真网），server 端由 h2::server 回 SETTINGS 即完成。
+/// 造合法 H2Upstream：本机 duplex 对拉 h2 握手，无真网。
 async fn mk_up(ip: &str) -> H2Upstream {
     let (client_io, server_io) = tokio::io::duplex(4096);
     tokio::spawn(async move {
@@ -22,7 +22,7 @@ async fn mk_up(ip: &str) -> H2Upstream {
     }
 }
 
-/// 造一条能回 200 并把 `:authority` 回显到响应头的活连接：v2 共享连接上发谁就路由谁的核心证据。
+/// 造能回 200 并把 `:authority` 回显到响应头的活连接。
 async fn live_conn(ip: &str) -> H2Upstream {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -97,7 +97,7 @@ async fn one_ip_one_channel() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 竞速排名：按拨号耗时升序——通道即用即建几乎全新，拨号快慢是唯一速度先验。
+/// 竞速排名：按拨号耗时升序。
 #[tokio::test]
 async fn race_ranks_by_dial_ms() {
     let legs = vec![
@@ -151,7 +151,7 @@ async fn content_ip_keeps_single_channel() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 正编被摘光、池里只剩溢出时，不能把溢出句柄递给请求（在途归零即被掐断）。
+/// 池里只剩溢出时不外发溢出句柄。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn overflow_only_pool_never_hands_out_overflow_handle() {
@@ -190,7 +190,7 @@ async fn overflow_only_pool_never_hands_out_overflow_handle() {
     let _ = lock(conn_pool()).remove(ip);
 }
 
-/// 只有真连接算已有通道，空壳不算占用（防候选全被占的误判；api.github.com 曾连刷 24 行同样失败）。
+/// 只有真连接算已有通道，空壳不算占用。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn empty_entry_is_not_an_occupied_channel() {
@@ -447,7 +447,7 @@ async fn probe_new_hosts() {
     ];
     let log: crate::util::LogFn = Arc::new(|_: &str| {});
     for host in hosts {
-        // 证书锚点：先按域名本身，其次回落到基础域（GitHub 证书常见多 SAN）。
+        // 证书锚点：先按域名本身，再回落基础域。
         let anchors: Vec<&str> = match host {
             "api.mcp.github.com" => vec![host, "github.com"],
             "githubapp.com" => vec!["githubapp.com"],
@@ -601,7 +601,7 @@ async fn probe_baseline_actions() {
     }
 }
 
-/// 通道自己断掉必须自己除名：池是「这个 IP 已有通道」唯一登记处，僵尸会让该 IP 一直占名额、下次请求白撞一次发送；对端 50~65s 回收空闲连接天天发生，必须静默收尾。
+/// 通道自己断掉必须自己从池除名。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn conn_end_removes_itself_from_pool() {
@@ -613,7 +613,7 @@ async fn conn_end_removes_itself_from_pool() {
 
     let ip = "9.9.9.5";
 
-    // 内存 duplex 对拉：server 端只完成握手就收摊（对端回收）；任务 abort 连 socket 一起丢，客户端照样读到 EOF。
+    // 内存 duplex 对拉：server 握完手即 abort，客户端读到 EOF。
     let (client_io, server_io) = tokio::io::duplex(4096);
     let mut server = tokio::spawn(async move {
         let _ = h2::server::handshake(server_io).await;
@@ -643,11 +643,11 @@ async fn conn_end_removes_itself_from_pool() {
         close: std::sync::Arc::new(tokio::sync::Notify::new()),
         log: Arc::new(|_| {}),
     });
-    // 给 server 端一点时间把握手走完，再掐掉它；没走完也一样，abort 会连 socket 一起丢。
+    // 给 server 握完手的时间再 abort。
     let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
     server.abort();
 
-    // 不拿固定 sleep 赌时序：轮询到驱动任务把自己从池里摘走为止。
+    // 轮询到驱动任务把自己从池里摘走。
     let mut gone = false;
     for _ in 0..100 {
         if lock(conn_pool()).get(ip).is_none() {
@@ -677,7 +677,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     normal.owner = Some("raw.githubusercontent.com".to_string());
     let normal_id = normal.id;
     store_h2(ip_normal, normal);
-    // 溢出通道：与正编同 IP（同 IP 溢出例外），标了 overflow。
+    // 溢出通道：与正编同 IP，标 overflow。
     let mut temp = mk_up(ip_normal).await;
     temp.owner = Some("raw.githubusercontent.com".to_string());
     temp.overflow = true;
@@ -693,7 +693,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     assert_eq!(back.id, normal_id, "拒收时递回正编通道");
 
     let ips = vec![ip_normal.to_string()];
-    // pick 永远只给正常通道：溢出通道对后来者不存在。
+    // pick 只给正常通道，不外发溢出句柄。
     for _ in 0..3 {
         assert_eq!(
             cached_h2_in(&ips).expect("正常通道应在池").id,
@@ -701,7 +701,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
             "pick 不得外发溢出通道句柄"
         );
     }
-    // 通道清单同理：只列正常的，摊段调用方拿不到溢出品。
+    // 通道清单只列正常通道。
     let listed = channels_for(&ips);
     assert_eq!(listed.len(), 1, "清单只含非溢出通道");
     assert_eq!(listed[0].id, normal_id);
@@ -714,7 +714,7 @@ async fn overflow_channel_handle_is_never_handed_out_again() {
     let _ = lock(conn_pool()).remove(ip_normal);
 }
 
-/// get_or_build 步骤①：池里有闲通道直接骑（fresh=false），绝不拨号；建造路径要真网，单测不碰。
+/// get_or_build：池里有闲通道直接骑（fresh=false），不拨号。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn get_or_build_rides_pool_channel_without_dialing() {
@@ -722,7 +722,7 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     crate::pool::install_seed_routes();
-    // 必须落在路由表候选里，pick 才看得见；表外 IP 会被当成池空去真拨号。
+    // IP 须在路由表候选里，pick 才看得见。
     let ip = crate::pool::route::dial_targets("github.com")
         .expect("种子表必有 github.com 行")[0]
         .ip
@@ -740,14 +740,14 @@ async fn get_or_build_rides_pool_channel_without_dialing() {
     let _ = lock(conn_pool()).remove(&ip);
 }
 
-/// 失败记账顺序（审计 #14）：report_failure 必须先挪游标再拉黑——反了候选圈滤掉该 IP，游标永远挪不动。
+/// 失败记账：report_failure 必须先挪游标再拉黑。
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn report_failure_moves_cursor_before_blacklisting() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    // 清场：游标清零（跨测试残留会让断言碰巧成立）、边冷却清空——断言的是顺序本身，不能依赖前一个测试的状态。
+    // 清场：游标清零、边冷却清空，断言不依赖前序状态。
     let dir = std::env::temp_dir().join("gitport_cursor_order_seed");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
@@ -769,7 +769,7 @@ async fn report_failure_moves_cursor_before_blacklisting() {
         Some(next.as_str()),
         "失败后游标应挪到下一候选（顺序反了会停在原候选）"
     );
-    // 拉黑也要发生：dial_targets 会滤掉 is_bad 的 IP，表首应变成原第二候选
+    // 拉黑：dial_targets 滤掉 is_bad 的 IP，表首变原第二候选。
     assert_eq!(
         crate::pool::route::dial_targets("github.com").unwrap()[0].ip,
         next,
@@ -778,4 +778,4 @@ async fn report_failure_moves_cursor_before_blacklisting() {
     let _ = lock(conn_pool()).remove(&head);
 }
 
-// 看护任务不再保活/补拨（即用即建取代），旧隧道打点与补拨节流测试随之退役：连接死亡由请求结果发现，重建是下个请求的事。
+// 看护任务不再保活/补拨，连接死亡由请求结果发现。

@@ -1,4 +1,4 @@
-//! MITM 本地 CA：按域即时签发叶子证书，TLS 终结走 boring，每主机一个 SslContext 由 SNI 切换。
+//! MITM 本地 CA：按域即时签叶子证书，TLS 走 boring，每主机一个 SslContext 由 SNI 切换。
 
 use boring::pkey::{PKey, Private};
 use boring::ssl::{
@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 
-/// 叶子证书有效期 365 天，签发超过 358 天就重签，免得常驻进程满一年后集体握手失败。
+/// 叶子证书有效期 365 天，签发满 358 天重签。
 const LEAF_RENEW_AFTER: std::time::Duration = std::time::Duration::from_secs(358 * 24 * 3600);
-/// 叶子上下文缓存上限：受管行含通配（githubusercontent.com/github.io），只进不出会随浏览慢慢涨。
+/// 叶子上下文缓存上限（受管行含通配域）。
 const LEAVES_CAP: usize = 512;
 
 pub struct Authority {
@@ -26,9 +26,9 @@ pub struct Authority {
     cert_der: Vec<u8>,
     ca_key: KeyPair,
     ca_x509: X509,
-    /// 每主机缓存的 TLS 上下文（内含该主机的叶子证书链），值附签发时刻供到期重签。
+    /// 每主机 TLS 上下文缓存，值附签发时刻供到期重签。
     leaves: Mutex<HashMap<String, (SystemTime, Arc<SslContext>)>>,
-    /// 测试期签发次数：并发首握手去重是"只签一次"还是"各签各的"，只有计数能证明。
+    /// 测试期签发次数计数。
     #[cfg(test)]
     sign_count: std::sync::atomic::AtomicUsize,
 }
@@ -42,31 +42,28 @@ fn issuer_of<'a>(
 }
 
 impl Authority {
-    /// 主机 TLS 上下文：首次访问即签叶子并构建，缓存至 358 天重签；签发范围锁回受管域名。
-    /// 签发全程持锁：同域几十个并发握手若各自放锁去签，会并行生成几十份密钥、最后只留一份，
-    /// 首屏 CPU 瞬时飙高。持锁串行让后到的直接命中缓存，只签一次；命中路径仍是短临界区。
+    /// 主机 TLS 上下文：首次访问签叶子并构建，缓存至 358 天重签，仅对受管域名签发。
     fn leaf_ctx(&self, host: &str) -> Result<Arc<SslContext>, String> {
-        // 查表只占一小段锁：命中直接回，别把整段签发都锁在里面。
+        // 查表只占一小段锁，命中直接回。
         {
             let leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
             if let Some((issued, ctx)) = leaves.get(host) {
-                // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
+                // 命中也查年龄，过期或时钟回拨按过期处理。
                 if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
                     return Ok(ctx.clone());
                 }
             }
         }
-        // MITM 只校验 CONNECT 目标域，SNI 是客户端自己给的，不锁就能借根证书签走别的域。
+        // 签发范围锁回受管域：SNI 由客户端自报。
         if !crate::pool::route::is_managed(host) {
             return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
         }
-        // 锁外签发：这段是 CPU 活，还在 SNI 回调（reactor 线程）里跑。
-        // 持锁签会让"任何新主机签发期间，别的域连缓存命中的握手都排队"——一页要 8~10 个新域时首屏直接停顿。
+        // 锁外签发（CPU 活，在 SNI 回调/reactor 线程跑）。
         let ctx = Arc::new(sign_leaf(host, &self.cert_der, &self.ca_key, &self.ca_x509)?);
         #[cfg(test)]
         self.sign_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // 双检：并发同域可能都签完了，只留最早落表的那份，后来者拿同一份上下文。
+        // 双检：并发同域只留最早落表的那份上下文。
         let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((issued, existing)) = leaves.get(host) {
             if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
@@ -74,7 +71,7 @@ impl Authority {
             }
         }
         if leaves.len() >= LEAVES_CAP && !leaves.contains_key(host) {
-            // 超限清签发时刻最旧的一张：被逐出的域名下次访问照常重签，只是慢一次。
+            // 超限淘汰签发时刻最旧的一张。
             if let Some(oldest) = leaves
                 .iter()
                 .min_by_key(|(_, (t, _))| *t)
@@ -88,7 +85,7 @@ impl Authority {
     }
 }
 
-/// 签一张叶子证书并建 TLS 上下文（纯 CPU 活，不碰缓存表）。
+/// 签叶子证书并建 TLS 上下文（不碰缓存表）。
 fn sign_leaf(
     host: &str,
     cert_der: &[u8],
@@ -119,15 +116,15 @@ fn sign_leaf(
     mitm_host_ctx(&leaf_x509, ca_x509, &key)
 }
 
-/// 单主机上下文：证书链 + ALPN + 禁恢复。SNI 回调按主机切换到它。
+/// 单主机上下文：证书链 + ALPN + 禁恢复，SNI 回调按主机切换。
 fn mitm_host_ctx(leaf: &X509, ca: &X509, key: &PKey<Private>) -> Result<SslContext, String> {
     let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| format!("TLS 基座初始化失败: {e}"))?;
-    // ALPN h2/http/1.1（原 rustls 配置同款）。
+    // ALPN h2/http/1.1。
     b.set_alpn_select_callback(|_, client| {
         select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
     });
-    // schannel 会话恢复票据与本服务端互操作报 bad record MAC：禁票据 + 禁缓存。
+    // 禁票据 + 禁缓存：schannel 恢复票据报 bad record MAC。
     b.set_session_cache_mode(SslSessionCacheMode::OFF);
     b.set_options(SslOptions::NO_TICKET);
     b.set_certificate(leaf)
@@ -146,9 +143,9 @@ pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("TLS 基座初始化不会失败");
     base.set_servername_callback(move |ssl, _alert| {
         let Some(host) = ssl.servername(NameType::HOST_NAME) else {
-            return Err(SniError::ALERT_FATAL); // 无 SNI：没有可出的证书
+            return Err(SniError::ALERT_FATAL); // 无 SNI：无证书可出
         };
-        // SNI 大小写不敏感，查表统一转小写，否则 GitHub.com 会被当成非受管域名。
+        // 查表统一转小写（SNI 大小写不敏感）。
         let ctx = authority
             .leaf_ctx(&host.to_lowercase())
             .map_err(|_| SniError::ALERT_FATAL)?;
@@ -157,13 +154,13 @@ pub fn tls_acceptor_of(a: &Arc<Authority>) -> SslAcceptor {
     base.build()
 }
 
-/// 加载/生成 CA，load 分支也重申 key 的 ACL：根私钥可读 = 可伪造叶子证书，收紧失败即禁用 MITM。
+/// 加载/生成 CA；load 分支重申 key ACL，收紧失败即禁用 MITM。
 pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
     let cert_path = dir.join("ca.crt");
     let key_path = dir.join("ca.key");
     if let Ok(a) = load(&cert_path, &key_path) {
         let key_str = key_path.to_string_lossy().into_owned();
-        // 已有 CA 与首次生成同口径：ACL 收不紧就禁用 MITM；不删钥，免得已信任的 CA 作废。
+        // ACL 收不紧禁用 MITM；不删钥（保留已信任 CA）。
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_str) {
             return Err(format!("ca.key ACL 收紧失败, 禁用 MITM(已有 CA): {e}"));
         }
@@ -177,7 +174,7 @@ pub fn load_or_generate(dir: &Path) -> Result<Arc<Authority>, String> {
 fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Authority>, String> {
     let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| e.to_string())?;
     let key_pem = std::fs::read_to_string(key_path).map_err(|e| e.to_string())?;
-    // 只认 PKCS#8——本程序 save() 与 rcgen 写出的都是它；无法解析即当无 CA 重建（重装根证书）。
+    // 只认 PKCS#8；解析失败按无 CA 重建。
     let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| format!("ca.key 解析失败: {e}"))?;
     let ca_x509 = X509::from_pem(cert_pem.as_bytes())
         .map_err(|_| "ca.crt 不是可解析的 PEM 证书".to_string())?;
@@ -213,7 +210,7 @@ fn generate() -> Result<Arc<Authority>, String> {
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::CrlSign,
     ];
-    // pathlen 0：根证书只能签叶子，不能再签子 CA——收窄被滥用的理论面。
+    // pathlen 0：根证书只能签叶子，不能再签子 CA。
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     let cert_der = cert.der().to_vec();
@@ -234,9 +231,7 @@ impl Authority {
     fn save(&self, cert_path: &Path, key_path: &Path) -> Result<(), String> {
         std::fs::write(cert_path, &self.cert_pem).map_err(|e| e.to_string())?;
         use std::io::Write as _;
-        // 先建空文件、立刻收紧 ACL，再写私钥内容：
-        // 原来的 fs::write 会先以默认权限落明文私钥，收紧前被强杀就留下可被同机其他账户读的根钥。
-        // 现在写入窗口里文件是空的，即使中途被打断也没有私钥泄露。
+        // 先建空文件收紧 ACL，再写私钥：写入窗口文件为空，中断不泄露。
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -244,7 +239,7 @@ impl Authority {
             .open(key_path)
             .map_err(|e| e.to_string())?;
         if let Err(e) = crate::winsec::restrict_to_current_user(&key_path.to_string_lossy()) {
-            // 收紧失败 = 根私钥可被同机其他账户读走，删钥让 MITM 起不来，绝不带病上岗。
+            // 收紧失败即删钥禁用 MITM。
             drop(f);
             let _ = std::fs::remove_file(key_path);
             return Err(format!("ca.key 权限收紧失败, 已删除该文件(禁用 MITM): {e}"));
@@ -255,7 +250,7 @@ impl Authority {
     }
 }
 
-/// 把根证书装入当前用户受信任根存储（免管理员，重启后浏览器/schannel 即信任）；直接走证书存储 API 不起外部进程，失败能拿到错误码。
+/// 根证书装入当前用户受信任根存储（免管理员）；直调证书存储 API，失败可拿错误码。
 pub fn install_ca(dir: &str) -> Result<(), String> {
     use windows::Win32::Security::Cryptography::{
         CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, CERT_OPEN_STORE_FLAGS,
@@ -275,7 +270,7 @@ pub fn install_ca(dir: &str) -> Result<(), String> {
         .to_der()
         .map_err(|e| format!("ca.crt DER 转换失败: {e}"))?;
 
-    // "ROOT" 必须是宽字符：SYSTEM provider 的 pvpara 收的是 store 名的 LPCWSTR。
+    // "ROOT" 必须宽字符：SYSTEM provider 的 pvpara 收 LPCWSTR。
     let store_name = windows::core::w!("ROOT");
     unsafe {
         let store = CertOpenStore(

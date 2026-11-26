@@ -1,7 +1,7 @@
 use super::*;
 use std::time::Duration;
 
-/// 测试段：四元组补成生产六元组（owner/ramp 默认 0，普通合并测试用不到）。
+/// 测试段：四元组补成生产六元组（owner/ramp 默认 0）。
 fn t(s: u64, e: u64, at: Instant, b: BoxBody) -> (u64, u64, Instant, BoxBody, String, u64) {
     (s, e, at, b, "test".to_string(), 0)
 }
@@ -45,7 +45,7 @@ fn split_even_shrinks_below_byte_count() {
 fn parse_range_shapes() {
     assert_eq!(parse_range(Some("bytes=0-99")), Some((0, Some(99))));
     assert_eq!(parse_range(Some("bytes=100-")), Some((100, None)));
-    // 多区间响应是 multipart/byteranges，切分会拼出坏数据：直接不认。
+    // 多区间响应直接不认。
     assert_eq!(parse_range(Some("bytes=0-99,200-299")), None);
     assert_eq!(parse_range(None), None);
     assert_eq!(parse_range(Some("bytes=abc")), None);
@@ -163,7 +163,7 @@ fn merge_pumps_and_rescues() {
     assert_eq!(m.sent(), 10);
 }
 
-/// 九段必须并发读：队首卡住时，后面的段也要被推、数据进各自缓冲（旧实现只 poll 队首，排队的段在队列里烂掉，轮到它们时只剩一帧就断）。
+/// 九段必须并发读：队首卡住时后面的段也要被推。
 #[test]
 fn segments_are_read_concurrently() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -247,7 +247,7 @@ fn merge_no_gap_when_boundary_aligned() {
     assert_eq!(out, b"AAAABBBB");
 }
 
-/// 上游多给的尾巴不能溢出声明总长：交付线到 total 即收，多余字节丢弃（直连切片搬来的回归钉子）。
+/// 交付到 total 即收，多余字节丢弃。
 #[test]
 fn merge_stops_at_declared_total() {
     let now = Instant::now();
@@ -258,7 +258,7 @@ fn merge_stops_at_declared_total() {
     assert!(out.iter().all(|&b| b == 3));
 }
 
-/// 让位：父段边界一缩，交到新边界就放手，尾巴原样排给下一条流；多收到的字节必须丢掉，不能当成已交付——否则接手方会重下一遍。
+/// 让位：父段缩到新边界即放手，尾巴排给下一条流，多余字节丢弃。
 #[test]
 fn cut_shrinks_boundary_and_hands_off_tail() {
     let now = Instant::now();
@@ -309,8 +309,7 @@ fn reap_keeps_received_bytes() {
     assert_eq!(out, b"AAAABBBBBB");
 }
 
-/// 两段 fixture：慢段 [0,1M) v=100k/s（R=900k），快段 [1M,2M) v=500k/s（最快、保留）。
-/// P 取最快段那家的 ramp（fast_ramp）——判据用接手方爬坡，不用被切段自己的。
+/// 两段 fixture：慢段 [0,1M) 100k/s（R=900k）、快段 [1M,2M) 500k/s；P 取最快段 ramp。
 fn rebalance_two_seg_fixture(now: Instant, fast_ramp: u64) -> MergeBody {
     let mut m = MergeBody::new(
         vec![
@@ -360,7 +359,7 @@ fn rebalance_spares_when_keep_not_longer_than_ramp() {
     assert!(m.fill.is_empty());
 }
 
-/// P 取最快段那家的 ramp，不是被切段自己的——慢段 ramp 再大也不影响。
+/// P 取最快段 ramp，不用被切段的。
 #[test]
 fn rebalance_p_uses_fastest_owners_ramp() {
     let now = Instant::now();
@@ -409,7 +408,7 @@ fn rebalance_only_cuts_once() {
     assert!(m.fill.is_empty(), "第二轮没有再排队尾巴");
 }
 
-/// 最快段即使公式判切也保留不切（本就满速，切下来重派反而亏）；慢段照切。
+/// 最快段保留不切，慢段照切。
 #[test]
 fn rebalance_spares_fastest_even_if_worth_cutting() {
     let now = Instant::now();
@@ -456,8 +455,7 @@ fn rebalance_single_seg_never_cuts() {
     assert!(m.fill.is_empty());
 }
 
-/// 快段在体检点之前下完也要当基准：它定格的稳态速度进 fastest 比较后，慢段按它算切量；
-/// 否则只剩活段的速度，切量偏小，快段白跑。done 段本身不进 cands、不被切。
+/// 快段提前下完的稳态速度也进基准，done 段不参与被切。
 #[test]
 fn rebalance_done_segment_rate_becomes_baseline() {
     let now = Instant::now();
@@ -560,7 +558,7 @@ fn early_finish_freeze_uses_known_range() {
     assert!(!s.freeze(now, true), "已落定不重复喂");
 }
 
-/// 出错/停滞段不落速度样本——假速度不进基准、不喂 EMA。
+/// 出错/停滞段不落速度样本。
 #[test]
 fn freeze_skips_failed_segments() {
     let now = Instant::now();

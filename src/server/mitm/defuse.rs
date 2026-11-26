@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// 换尽 IP 仍是风控页的落盘限频：同 host 30s 只留首条（风暴时十几个并发会各走这里，连刷像系统出大事）。
+/// 换尽 IP 仍风控的落盘限频：同 host 30s 只留首条。
 static LAST_GIVEUP: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn giveup_logged_recently(host: &str) -> bool {
@@ -20,7 +20,7 @@ fn giveup_logged_recently(host: &str) -> bool {
     g.insert(host.to_string(), now).is_some()
 }
 
-/// 上游压缩协商（br/gzip）后边收边解压判前 4KB，已消费原始压缩帧原样保留（PeekRaw）。
+/// 边收边解压判前 4KB（br/gzip），原始压缩帧留作 PeekRaw。
 async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
     let ct = resp
         .headers()
@@ -73,15 +73,14 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         return false;
     }
     let chunk = String::from_utf8_lossy(&plain[..plain.len().min(4096)]).to_lowercase();
-    // 400 只认 GitHub 自己的风控文案。通用 400 页面（"Bad Request"）是客户端发错了请求，
-    // 换多少个出口 IP 都一样，当成风控会连拨 24 个 IP、把整张表打进 10 分钟冷却。
+    // 400 只认 GitHub 风控文案（"has been restricted"/"whoa there"）；通用 400 不换 IP。
     chunk.contains("has been restricted") || chunk.contains("whoa there")
 }
 
-/// 风控重试上限 ≈ 路由候选全试一遍：风控页偶尔换边缘真能通，不替 GitHub 提前放弃；后续请求共享边冷却不会重扫成风暴。
+/// 风控重试上限 24 ≈ 路由候选全试一遍；后续请求共享边冷却不重扫。
 const DEFUSE_MAX_TRIES: usize = 24;
 
-/// 解风控单步（纯函数）：归属缺失最多重试 3 次，正常分支试满 DEFUSE_MAX_TRIES；旧版同 IP 再现=全员拦截不成立，3 轮回头的根因是风控冷却被并发成功回写洗掉。
+/// 解风控单步：归属缺失最多重试 3 次，正常分支试满 DEFUSE_MAX_TRIES。
 fn defuse_retry(ip_empty: bool, empty_retries: u8, tried: usize) -> bool {
     if ip_empty {
         return empty_retries <= 3;
@@ -89,7 +88,7 @@ fn defuse_retry(ip_empty: bool, empty_retries: u8, tried: usize) -> bool {
     tried < DEFUSE_MAX_TRIES
 }
 
-/// 解压缩前 max 字节（page_cache 门检共用）：gzip→GzDecoder，br→BrotliDecoder，identity/未知→原样截取。
+/// 解压缩前 max 字节：gzip→GzDecoder，br→BrotliDecoder，其余原样截取。
 pub(super) fn decompress_partial(data: &[u8], enc: &str, max: usize) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -116,16 +115,16 @@ pub(super) async fn gh_defuse(
     body: &Option<Bytes>,
 ) -> Result<hyper::Response<BoxBody>, String> {
     let mut resp = get_direct(log, out, host, info, body).await?;
-    let mut tried = 0; // 已垫底重试候选数(仅日志)
-    let mut seen: Vec<String> = Vec::new(); // 本轮已试 IP，保序只为日志链
-    let mut empty_ip_retries = 0u8; // 归属缺失分支的重试上限
+    let mut tried = 0; // 已重试候选数（仅日志）
+    let mut seen: Vec<String> = Vec::new(); // 本轮已试 IP（仅日志链）
+    let mut empty_ip_retries = 0u8; // 归属缺失分支重试计数
     loop {
         if !is_gh_block_page(&mut resp).await {
             return Ok(resp);
         }
         let ip = info.lock().unwrap().clone();
         if !pool::route::is_managed(host) {
-            return Ok(resp); // 非受管域名: 无表可换, 诚实透传
+            return Ok(resp); // 非受管域名：无表可换，透传
         }
         if ip.is_empty() {
             empty_ip_retries += 1;
@@ -138,18 +137,18 @@ pub(super) async fn gh_defuse(
             };
             continue;
         }
-        pool::cursor_note(host, &ip, false); // 数据层失败: 记号前移, 重试自动跳过该 IP
-                                                // 风控页记 10 分钟边冷却, 免疫"成功"回写(否则会被并发的 block 页当场洗掉)。
+        pool::cursor_note(host, &ip, false); // 数据层失败：前移游标，重试跳过该 IP
+                                                // 风控页记 10 分钟边冷却，免疫成功回写。
         if let Some(row) = pool::route::route_for(host) {
             pool::edges::mark_risk(&ip, &row.key);
         }
         upstream::drop_h2(&ip);
-        // 直连腿每请求新拨号，无共享池可丢；垫底后下一轮串发自然跳过该 IP。
+        // 垫底后下一轮串发跳过该 IP。
         tried += 1;
-        // 垫底与拔连接必须在判定之前，否则坏连接还挂在缓存里；seen 只用于交付日志的 IP 链，链尾重复 = 风控冷却又被洗掉。
+        // 垫底+拔连接须在判定前；seen 仅用于日志 IP 链。
         seen.push(ip.to_string());
         if !defuse_retry(false, empty_ip_retries, tried) {
-            // 语气按真实严重度来：不是本程序故障，是 GitHub 对本机出口 IP 弹人机验证。
+            // 这是 GitHub 对本机出口 IP 的人机验证，不是本程序故障。
             if !giveup_logged_recently(host) {
                 (log)(&format!(
                     "[MITM] {host} 连换 {tried} 个 IP({}) 都是 GitHub 风控页, 原样返回该请求(后台请求页面未必看得见)",
@@ -158,10 +157,10 @@ pub(super) async fn gh_defuse(
             }
             return Ok(resp);
         }
-        // 每请求命中拦截页都打一条会在风暴时同秒刷十几行；物理换 IP 有上游拨号日志，这里静默重试。
+        // 静默重试（物理换 IP 有拨号日志）。
         resp = match get_direct(log, out, host, info, body).await {
             Ok(r) => r,
-            Err(e) => return Err(e), // 重试全灭(所有候选试遍): 交回错误
+            Err(e) => return Err(e), // 重试全灭：交回错误
         };
     }
 }

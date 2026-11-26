@@ -1,5 +1,5 @@
-//! 磁盘条目统一编解码：`[4B 头长][json{key,status,headers}][体]`——页面缓存与资产库共用一份盘上格式。
-//! 断电安全（tmp 写全量 + rename 原子覆盖）与容量治理留在各自调用方，这里只管单条目的字节进出。
+//! 磁盘条目编解码：`[4B 头长][json{key,status,headers}][体]`；页面缓存与资产库共用。
+//! 断电安全与容量治理在调用方，这里只管单条目字节进出。
 
 use bytes::Bytes;
 use hyper::header::{HeaderName, HeaderValue};
@@ -11,7 +11,7 @@ pub(super) struct DiskEntry {
     pub body: Bytes,
 }
 
-/// 编码单条目。headers 键值对与盘上 json 数组形态一一对应。
+/// 编码单条目；headers 与盘上 json 数组一一对应。
 pub(super) fn encode(key: &str, status: u16, headers: &[Vec<String>], body: &[u8]) -> Vec<u8> {
     let header = serde_json::json!({
         "key": key,
@@ -26,7 +26,7 @@ pub(super) fn encode(key: &str, status: u16, headers: &[Vec<String>], body: &[u8
     buf
 }
 
-/// 解码单条目：长度/截断/元数据/键/状态校验，拒绝原因串与命中侧日志逐字对应。
+/// 解码单条目：校验长度/截断/元数据/键/状态。
 pub(super) fn decode(raw: &[u8], want_key: &str) -> Result<DiskEntry, &'static str> {
     if raw.len() < 4 {
         return Err("文件过短");

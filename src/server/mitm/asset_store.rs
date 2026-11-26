@@ -1,7 +1,5 @@
-﻿//! githubassets 资产库：immutable 资产按"资产名"一存长用（同资产不同哈希只保留最新），本地透明回放。
-//! 落盘槽位按资产名寻址（URL 文件名去内容哈希）；条目 = [4B 头长][头 json(key/status/headers)][体]。
-//! 只收 js/css/字体；URL 一个字符不改地回放，CSP/SRI 天然完好。容量 20MB，超限按文件年龄淘汰。
-//! 时代中立：取侧校验条目 key 与请求 URL 精确相等——同资产换哈希 = miss = 回源拉新覆盖，永不跨发版给错内容。
+﻿//! githubassets 资产库：按资产名寻址（同资产不同哈希只留最新），URL 原样回放；只收 js/css/字体，容量 20MB 按年龄淘汰。
+//! 条目 = [4B 头长][头 json(key/status/headers)][体]；取侧校验 key 与 URL 精确相等，换哈希即 miss 回源覆盖。
 
 use crate::server::protocol::{self, BoxBody};
 use crate::server::upstream;
@@ -23,19 +21,17 @@ fn fnv1a(data: &[u8]) -> u64 {
     h
 }
 
-/// 容量上限 20MB（2026-11-25 15→20：GitHub 单页资产常超 15MB，热资产被驱逐导致反复回源）：超限按文件年龄从旧到新淘汰（旧代条目天然最老先走；误淘汰热资产无害，重拉后时间戳变新排回最后）。
+/// 容量上限 20MB；超限按文件年龄从旧到新淘汰。
 const ASSET_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const ASSET_DIR: &str = "assets";
 
-/// 只收 js/css/字体（GitHub 资产的内容类型族），其余透传不存。
+/// 只收 js/css/字体，其余透传不存。
 fn content_type_allowed(ct: &str) -> bool {
     let ct = ct.trim().to_ascii_lowercase();
     ct.contains("javascript") || ct.contains("css") || ct.contains("font")
 }
 
-/// 从 URL 文件名提取"资产名"（去内容哈希）：同资产不同哈希归并同一落盘槽位，写新版 = 覆盖旧版。
-/// 两族命名：JS `[名字]-[哈希]`（哈希 = 末 '-' 后段，8..=16 位 [A-Za-z0-9_-]）；CSS module `[名字].[16位hex].module.css`。
-/// 不匹配 = None（按完整 URL 落盘，不参与归并，无害）。
+/// 资产名（去哈希）：JS `[名字]-[哈希]`（8..=16 位）或 CSS `[名字].[16位hex].module.css`；不匹配按完整 URL 落盘。
 fn asset_logical_name(url: &str) -> Option<String> {
     let filename = url.rsplit('/').next()?;
     let dot = filename.rfind('.')?;
@@ -61,7 +57,7 @@ fn asset_logical_name(url: &str) -> Option<String> {
 }
 
 fn asset_path(dir: &std::path::Path, url: &str) -> std::path::PathBuf {
-    // 同资产（名字相同）不同哈希共用一个槽位：写新版本覆盖旧版本（只保留最新）。
+    // 同名不同哈希共用槽位，新版覆盖旧版。
     let key = asset_logical_name(url).unwrap_or_else(|| url.to_string());
     dir.join(ASSET_DIR).join(format!("{:016x}", fnv1a(key.as_bytes())))
 }
@@ -81,7 +77,7 @@ pub(super) fn asset_dbg_name(url: &str) -> &str {
     url.rsplit('/').next().unwrap_or(url)
 }
 
-/// 容量强制：总量超限则按修改时间从旧到新删，删到限额以内为止。返回淘汰条数。
+/// 容量强制：超限按修改时间从旧到新删；返回淘汰条数。
 fn enforce_cap(dir: &std::path::Path, max: u64) -> usize {
     let Ok(rd) = std::fs::read_dir(dir.join(ASSET_DIR)) else {
         return 0;
@@ -111,7 +107,7 @@ fn enforce_cap(dir: &std::path::Path, max: u64) -> usize {
     evicted
 }
 
-/// 本地命中：按 URL 读回条目并重建响应（头原样带回，浏览器拿到 immutable 后自会停问）。
+/// 本地命中：按 URL 读回条目重建响应，头原样带回。
 pub(super) fn take(dir: &std::path::Path, url: &str) -> Option<axum::response::Response<BoxBody>> {
     let raw = std::fs::read(asset_path(dir, url)).ok()?;
     let entry = super::entry::decode(&raw, url).ok()?;
@@ -150,7 +146,7 @@ pub(super) fn persist_blocking(
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })?;
-    // 容量强制：超限淘汰最旧（新写入的时间戳最新，天然排最后）
+    // 超限淘汰最旧。
     enforce_cap(dir, ASSET_MAX_BYTES);
     Ok(())
 }
@@ -162,7 +158,7 @@ pub(super) fn storable(status: StatusCode, content_type: &str) -> bool {
 
 // ---------- 强绑定服务：资产请求只问资产库 ----------
 
-/// 同 URL 在途拉取的等待者登记表：首个 miss 发起独立拉取，后续 miss 排队等同一份结果。
+/// 同 URL 在途等待者表：首个 miss 发起拉取，后续等同一份结果。
 static INFLIGHT: OnceLock<Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>>> =
     OnceLock::new();
 
@@ -170,7 +166,7 @@ fn inflight() -> &'static Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender
     INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 登记：返回 (完成通知接收端, 是否发起者)。发起者负责拉取并在完成后逐个唤醒。
+/// 登记：返回 (完成通知接收端, 是否发起者)；发起者负责拉取并唤醒。
 fn register_waiter(url: &str) -> (tokio::sync::oneshot::Receiver<()>, bool) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut g = crate::util::lock(inflight());
@@ -190,8 +186,7 @@ fn signal_done(url: &str) {
     }
 }
 
-/// 资产请求强绑定入口：命中本地回放；miss 独立拉取（与浏览器连接解耦——浏览器中途放弃，
-/// 拉取继续完成并入库）。返回 None = 独立拉取失败，调用方回落既有 switchboard 路径。
+/// 资产请求入口：命中回放；miss 独立拉取（浏览器断开不影响）；None = 拉取失败，回落 switchboard。
 pub(super) async fn serve_or_fetch<B>(
     log: &LogFn,
     req: &hyper::Request<B>,
@@ -206,29 +201,25 @@ pub(super) async fn serve_or_fetch<B>(
         }
         return Some(resp);
     }
-    // ② miss：登记等待者；发起者拉起独立拉取任务（浏览器断开不影响）
+    // ② miss：登记等待者，发起者拉起独立拉取。
     let (rx, initiator) = register_waiter(&url);
     if initiator {
         spawn_detached_fetch(dir.clone(), log.clone(), url.clone());
     }
-    // ③ 等完成（发起者与后续等待者都等同一份结果）
+    // ③ 等完成（所有等待者等同一份结果）。
     rx.await.ok()?;
-    // ④ 从库出：命中 = 交付；没有 = 拉取失败/不可收录 → None 回落
+    // ④ 命中交付；未入库 → None 回落。
     take(&dir, &url)
 }
 
-/// 停滞界：流被接受却 30s 不发头 / 连续 30s 零帧 = 装死（与 meter_body 的判黑同语义：
-/// 30s 零进度）。慢滴流每帧重置，拉多久都行——后台拉取不设总时限，慢极也要拉完入库。
+/// 停滞界 30s（发头/零帧）；慢滴流每帧重置，不设总时限。
 const HEAD_STALL_SECS: u64 = 30;
 const BODY_STALL_SECS: u64 = 30;
 
-/// 独立拉取任务：向通道池申请通道拉取资产，门检通过即入库。与浏览器连接解耦——
-/// 浏览器断开只影响 oneshot 接收端，任务持有发送端继续跑完。
-/// 任何退出路径（完成/失败/panic）都必须 signal_done：不收尾的话 sender 永远留在
-/// INFLIGHT 表里，等待者永久 pend，同 URL 从此楔死。
+/// 独立拉取任务：与浏览器解耦；任何退出路径都必须 signal_done，否则等待者永久 pend。
 fn spawn_detached_fetch(dir: std::path::PathBuf, log: LogFn, url: String) {
     tokio::spawn(async move {
-        // 内层任务跑拉取（所有 await 都有停滞界，必然终结）；外层收尾保证 signal_done 必达。
+        // 内层拉取有停滞界，外层收尾保证 signal_done 必达。
         let handle = tokio::spawn({
             let dir = dir.clone();
             let log = log.clone();
@@ -254,8 +245,7 @@ fn spawn_detached_fetch(dir: std::path::PathBuf, log: LogFn, url: String) {
     });
 }
 
-/// 逐帧收体：只设停滞界、不设总时限——每来一帧就重置，慢滴流拉多久都行，
-/// 连续 stall 零帧 = 上游装死，报错收尾（黑洞交 report_failure 上报池子）。
+/// 逐帧收体：只设停滞界不设总时限；连续 stall 零帧判装死。
 async fn collect_stall_bounded(
     mut body: BoxBody,
     stall: std::time::Duration,
@@ -275,10 +265,10 @@ async fn collect_stall_bounded(
     }
 }
 
-/// 拉取 + 门检 + 入库。结果只落日志——等待者无论成败都会走 take→回落。
+/// 拉取 + 门检 + 入库，结果只落日志。
 async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
     let name = asset_dbg_name(url);
-    // ① 通道：池内现成通道，没有就拨（内容域竞速 IP）
+    // ① 通道：池内现成通道或新拨。
     let (up, fresh) = match crate::pool::get_or_build(ASSET_HOST, log).await {
         Ok(v) => v,
         Err(e) => {
@@ -299,7 +289,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
             return;
         }
     };
-    // ③ 响应头（停滞界：流被接受却不发头 = 装死）
+    // ③ 响应头（30s 不发头判装死）。
     let resp = match tokio::time::timeout(
         std::time::Duration::from_secs(HEAD_STALL_SECS),
         upstream::h2_send(&up, &req, &None::<Bytes>),
@@ -309,7 +299,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             (log)(&format!("[资产] 独立拉取失败({e}), {name} 本次不入库"));
-            crate::pool::report_failure(&up, ASSET_HOST, fresh); // 通道类失败交池子摘除/换血
+            crate::pool::report_failure(&up, ASSET_HOST, fresh); // 通道失败交池子摘除/换血。
             return;
         }
         Err(_) => {
@@ -334,13 +324,12 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    // 拿到响应头就判类型：白名单外的资产（png/svg/wasm）不该 collect——
-    // 先整段拉进内存再丢弃，等待者还得陪跑完整一趟，白费一倍上游流量和首屏时间。
+    // 拿到响应头即判类型，白名单外立即回落。
     if !storable(StatusCode::OK, &ct) {
         (log)(&format!("[资产] 不收录({ct}), {name} 立即回落"));
         return;
     }
-    // ④ 收体（逐帧停滞界：慢滴流拉多久都行，零帧判装死）
+    // ④ 收体（逐帧停滞界）。
     let collected = match collect_stall_bounded(body, std::time::Duration::from_secs(BODY_STALL_SECS))
         .await
     {
@@ -351,7 +340,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
             return;
         }
     };
-    // ⑤ 入库（类型门已在拿到响应头时判过，这里只处理落盘）
+    // ⑤ 入库。
     let hdrs: Vec<Vec<String>> = parts
         .headers
         .iter()

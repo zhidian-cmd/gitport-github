@@ -1,4 +1,4 @@
-/// 备份判定: 别家同形态 PAC(127.0.0.1:port/proxy.pac)必须备份, 我们上次写的(last_pac)和正要写的不算。
+/// 备份判定：别家同形态 PAC 要备份，last_pac 与正要写的不算。
 #[test]
 fn should_backup_foreign_pac_shapes() {
     let pac = "http://127.0.0.1:7811/proxy.pac";
@@ -39,7 +39,7 @@ fn git_key_action_only_touches_ours() {
     assert!(matches!(git_key_action(None, ours, ""), GitKeyAction::Keep));
 }
 
-/// 清场只认 last_pac：运行期间别家接管了 PAC（同形态），不许当自己的删掉。
+/// 清场只认 last_pac，别家同形态不算我们的。
 #[test]
 fn clear_only_exact_last_pac() {
     let ours = "http://127.0.0.1:7811/proxy.pac";
@@ -58,7 +58,7 @@ fn clear_only_exact_last_pac() {
     assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
-/// 备份还原：别家同形态的备份必须还回去，只有"恰是我们写过的"才丢弃。
+/// 备份还原：别家同形态的备份须还回，仅我们自己写过的才丢弃。
 #[test]
 fn restore_keeps_foreign_same_shape_backup() {
     let last = "http://127.0.0.1:7811/proxy.pac";
@@ -73,7 +73,7 @@ fn restore_keeps_foreign_same_shape_backup() {
     assert!(!pac_is_ours("http://corp.example/pac.js", ""));
 }
 
-/// 自愈门: 开关关 + 无备份 = 我们从没摸过系统 PAC——形态再像也是别人的。
+/// 自愈门：开关关 + 无备份 = 从没摸过系统 PAC。
 #[test]
 fn heal_gate_spares_foreign_pac() {
     assert!(!heal_should_touch(false, ""));
@@ -117,20 +117,20 @@ fn keys(pairs: &[(String, String)]) -> Vec<&str> {
     pairs.iter().map(|(k, _)| k.as_str()).collect()
 }
 
-/// 读配置时路由表还没装载：游标原样保留，不能把上次驻留的位置丢掉。
+/// 路由表未装载时游标原样保留。
 #[test]
 fn last_ip_preserved_before_routes_load() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    // 明确装一张空表 = "路由还没装载"，免得别的用例先装好了。
+    // 装空表 = 路由还没装载。
     crate::pool::route::install(Vec::new(), Vec::new());
     let v = parse(
         r#"{"closeToTray":true,"mitm":true,"winRect":[0,0,800,600],"githubPAC":true,
                 "lastIp":{"edge/content":"185.199.110.133","core/all":"20.27.177.114"}}"#,
     );
     assert!(v.close_to_tray && v.mitm && v.github_pac, "其他字段被连坐");
-    // 对象形态经 serde 进 HashMap，顺序不保证；只验内容原样保留。
+    // 对象形态顺序不保证，只验内容原样保留。
     let mut marks = v.last_ip.marks().to_vec();
     marks.sort();
     assert_eq!(
@@ -142,7 +142,7 @@ fn last_ip_preserved_before_routes_load() {
         "路由表未装载时应原样保留"
     );
 
-    // 数组形态同样保留；整段缺失 = 空表，键位等路由装载后由 set_last_ips 铺。
+    // 数组形态同样保留；整段缺失 = 空表。
     let arr = parse(r#"{"lastIp":[["edge/io","1.2.3.4"]]}"#);
     assert_eq!(keys(arr.last_ip.marks()), ["edge/io"]);
     assert_eq!(arr.last_ip.marks()[0].1, "1.2.3.4");
@@ -259,7 +259,7 @@ fn worker_mirrors_roundtrip() {
     assert!(v3.mitm);
 }
 
-/// 手写注册表的常见写法都要认：只写 URL、snake_case 键名、省略 on、忘了数组括号。
+/// 手写注册表要认：只写 URL、snake_case 键名、省略 on、无数组括号。
 #[test]
 fn worker_mirrors_accepts_handwritten_forms() {
     let v = parse(r#"{"workerMirrors":["https://only-url.example"]}"#);
@@ -285,7 +285,7 @@ fn worker_mirrors_accepts_handwritten_forms() {
     assert!(v.mitm);
 }
 
-/// 坏 JSON 里字符串值自包含：语法坏的是别的字段，gitProxyBackup 要原样捞回；夹具用 serde_json::to_string 生成，与真实落盘一致。
+/// 坏 JSON 中 gitProxyBackup 值须原样捞回（夹具由 serde_json 生成）。
 #[test]
 fn salvage_recovers_git_proxy_backup_from_broken_json() {
     let sep = char::from_u32(1).unwrap();
@@ -321,9 +321,9 @@ fn salvage_gives_up_on_truncated_or_missing_value() {
     assert_eq!(super::salvage_str_field(r#"{"mitm":true}"#, "gitProxyBackup"), None);
 }
 
-// ---- gitconfig 文件编辑（替代 git.exe 子进程，根治关机 0xc0000142 弹窗）----
+// ---- gitconfig 文件编辑（替代 git.exe 子进程）----
 
-/// 样本：gitport 会碰的键都在，外加用户自己的内容；值含 git 写法的转义路径。
+/// 样本：含 gitport 会碰的键、用户内容与 git 转义路径。
 const GITCFG_SAMPLE: &str = "[core]\n\trepositoryformatversion = 0\n\
 [user]\n\tname = someone\n\
 [http]\n\tproxy = http://127.0.0.1:9999\n\
@@ -343,13 +343,13 @@ fn gitcfg_parse_reads_pairs_and_unescapes() {
     };
     assert_eq!(get("core.repositoryformatversion").as_deref(), Some("0"));
     assert_eq!(get("http.proxy").as_deref(), Some("http://127.0.0.1:9999"));
-    // 键名与 git config --list 同语义：key 部分一律小写（subsection 原样）
+    // 键名同 git config --list：key 部分小写，subsection 原样。
     assert_eq!(
         get("http.https://github.com/.sslcainfo").as_deref(),
         Some("C:\\Users\\me\\ca.crt"),
         "git 写文件的 \\\\ 转义要还原成真实路径"
     );
-    // 多值键取最后（HashMap 覆盖语义 = git --get 取最后一次出现）
+    // 多值键取最后（同 git --get）。
     let two = "[http]\n\tproxy = a\n\tproxy = b\n";
     let pairs = super::git_pairs(&super::git_parse(two).unwrap());
     let last = pairs.iter().rev().find(|(k, _)| k == "http.proxy").unwrap();
@@ -443,7 +443,7 @@ fn gitcfg_roundtrip_set_read_unset() {
     let round = super::git_parse(&entries.iter().map(|e| e.raw.as_str()).collect::<String>()).unwrap();
     let pairs = super::git_pairs(&round);
     assert!(!pairs.iter().any(|(k, v)| k == "http.proxy" && v == ours), "写完即删后不许残留");
-    // 没被编辑的 CA 键往返无损（转义 ↔ 反转义；键名与 git --list 同为小写）
+    // 未编辑的 CA 键往返无损。
     assert_eq!(
         pairs.iter().find(|(k, _)| k == "http.https://github.com/.sslcainfo").unwrap().1,
         "C:\\Users\\me\\ca.crt"
@@ -473,15 +473,14 @@ fn gitcfg_split_key_shapes() {
     assert_eq!(super::git_split_key(".proxy"), None);
 }
 
-/// 防回归：GIT_CA_KEYS 与解析器输出的键名（key 部分一律小写）必须精确对得上——
-/// 大小写错位会让 remove 判定查不到键，CA 键永远清不掉（2026-11-24 修复的既有 bug）。
+/// GIT_CA_KEYS 与解析器输出的键名（key 一律小写）须精确一致。
 #[test]
 fn gitcfg_ca_keys_match_parsed_names() {
     for key in super::GIT_CA_KEYS {
         let (_, Some(sub), _) = super::git_split_key(key).unwrap() else {
             panic!("CA 键 {key:?} 拆不出子节");
         };
-        // 子节按原样写回段头（URL 大小写敏感），键行用 git 实际写法（保留原大小写也能解析成小写键名）
+        // 子节原样写回段头（URL 大小写敏感），键行用 git 写法。
         let file = format!("[http \"{sub}\"]\n\tsslCAInfo = v\n");
         let entries = super::git_parse(&file).unwrap();
         let names: Vec<String> = super::git_pairs(&entries).into_iter().map(|(k, _)| k).collect();
@@ -492,8 +491,7 @@ fn gitcfg_ca_keys_match_parsed_names() {
     }
 }
 
-/// 非 UTF-8（GBK 中文 user.name）的 .gitconfig：整份解析必然失败，按字节兜底必须仍然
-/// 清掉我们写的 http.proxy / sslCAInfo，同时把 GBK 字节原样留住（不能顺手转码重写）。
+/// 非 UTF-8 .gitconfig：按字节兜底清我们的键，GBK 字节原样留住。
 #[test]
 fn git_byte_scrub_clears_ours_in_gbk_config() {
     let cfg = super::git_config_path();
@@ -504,7 +502,7 @@ fn git_byte_scrub_clears_ours_in_gbk_config() {
 
     let ours = super::git_proxy_url();
     let ca = super::exe_dir().join("ca.crt").to_string_lossy().to_string();
-    // 值必须按 git 的真实写法转义生成（Windows 路径的 \ → \\），手写单反斜杠会让测试假绿。
+    // 值按 git 真实写法转义生成（\ → \\）。
     let escaped_ours = super::git_escape_value(&ours);
     let escaped_ca = super::git_escape_value(&ca);
     let gbk_name: [u8; 4] = [0xD5, 0xC5, 0xC8, 0xFD]; // "张三" 的 GBK 编码，不是合法 UTF-8
@@ -526,7 +524,7 @@ fn git_byte_scrub_clears_ours_in_gbk_config() {
         String::from_utf8_lossy(&raw)
     );
 
-    // 前提：整份解析确实因非 UTF-8 失败（git_map 内部就是 read_to_string），否则走不到兜底分支。
+    // 前提：整份解析因非 UTF-8 失败，才走兜底分支。
     assert!(
         std::fs::read_to_string(&path).is_err(),
         "夹具必须是真非 UTF-8，否则测的不是兜底路径"

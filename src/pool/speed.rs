@@ -4,19 +4,19 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-/// 暂缓时长：判黑的通道先放着不发，到期复测，不重拨。
+/// 暂缓时长：判黑通道不发，到期复测，不重拨。
 const BENCH_SECS: u64 = 60;
-/// 每 host 两轮重建之间的最短间隔：一页几百个请求同时报黑也只触发一轮。
+/// 每 host 重建最短间隔：并发报黑只触发一轮。
 const REBUILD_COOLDOWN_SECS: u64 = 60;
 
 /// 暂缓表：ip → 到期时刻。
 static BENCH: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 暂缓：判黑的通道先不发（60 秒），到期复测，不重拨。
+/// 暂缓：判黑通道不发 60s，到期复测，不重拨。
 pub fn bench(ip: &str) {
     let mut t = lock(&BENCH);
-    // 过期清理在这里做（写入是低频事件）：usable 是每请求热路径，不在它身上全表扫。
+    // 过期清理放低频写入路径；usable 热路径不全表扫。
     let now = Instant::now();
     t.retain(|_, u| now < *u);
     let until = now + Duration::from_secs(BENCH_SECS);
@@ -25,7 +25,7 @@ pub fn bench(ip: &str) {
     }
 }
 
-/// 软排除只摘暂缓中的 IP；全暂缓则原样返回，绝不筛空候选；过期项由下次 bench 顺手清。
+/// 软排除只摘暂缓 IP；全暂缓则原样返回，绝不筛空。
 pub fn usable(ips: &[String]) -> Vec<String> {
     let t = lock(&BENCH);
     let now = Instant::now();
@@ -49,7 +49,7 @@ pub fn bench_remaining_secs(ip: &str) -> Option<u64> {
         .filter(|s| *s > 0)
 }
 
-/// 单 host 的重建节奏：60s 一轮限流（探针已摘，无熔断——限流即约束）。
+/// 单 host 重建节奏：60s 限流，无熔断。
 #[derive(Default)]
 struct HostRace {
     last: Option<Instant>,
@@ -58,10 +58,10 @@ struct HostRace {
 static HOSTS: LazyLock<Mutex<HashMap<String, HostRace>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 检查+写入必须一次持锁完成，否则一页几十个并发报黑全触发换血，同一批 IP 重复拨满闸门。
+/// 检查+写入必须一次持锁完成（否则并发报黑全触发换血）。
 pub fn try_begin_rebuild(host: &str) -> bool {
     let mut m = lock(&HOSTS);
-    // 顺带卫生：24h 没动静的 host 条目清掉；表只涨不清会跟着子域数膨胀。
+    // 清 24h 无动静的 host 条目。
     let cutoff = Instant::now() - Duration::from_secs(24 * 3600);
     m.retain(|_, st| st.last.is_some_and(|t| t > cutoff));
     if m.len() > 1024 {

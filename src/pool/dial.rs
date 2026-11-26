@@ -91,7 +91,7 @@ fn session_cache() -> &'static std::sync::Mutex<HashMap<String, SslSession>> {
 
 fn apply_cached_session(ssl: &mut Ssl, mode: &str) {
     if mode.is_empty() {
-        return; // 无 SNI 拨号从不进缓存，恒完整握手
+        return; // 无 SNI 拨号不进缓存，恒完整握手
     }
     let ticket = session_cache()
         .lock()
@@ -99,7 +99,7 @@ fn apply_cached_session(ssl: &mut Ssl, mode: &str) {
         .get(mode)
         .cloned();
     if let Some(s) = ticket {
-        // SAFETY: 必须在握手开始前注入；SslSession 是 Send+Sync，跨任务共享安全。
+        // SAFETY: 握手前注入；SslSession 是 Send+Sync。
         unsafe {
             let _ = ssl.set_session(&s);
         }
@@ -143,11 +143,11 @@ fn build_ssl_context(roots: Option<Vec<X509>>) -> std::io::Result<boring::ssl::S
     }
     ctx_b.set_verify(SslVerifyMode::PEER);
     ctx_b.set_grease_enabled(true); // Chrome GREASE（SSL_CTX_set_grease_enabled）
-                                    // ALPN：Chrome 指纹自带 h2,http/1.1；边缘按此协商出 h2（缺 ALPN 会全灭，已实锤）
+                                    // ALPN h2,http/1.1（缺 ALPN 会全灭）。
     ctx_b
         .set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
-    // 会话恢复：CLIENT 模式只为触发 new_session_cb，注入恒由 apply_cached_session 显式做。
+    // CLIENT 模式只触发 new_session_cb；注入由 apply_cached_session 显式做。
     ctx_b.set_session_cache_mode(boring::ssl::SslSessionCacheMode::CLIENT);
     ctx_b.set_new_session_callback(|ssl, session| {
         if let Some(sni) = ssl.servername(NameType::HOST_NAME) {
@@ -172,7 +172,7 @@ fn default_ssl_context() -> std::io::Result<&'static boring::ssl::SslContext> {
     Ok(CTX.get().expect("上下文刚已写入"))
 }
 
-/// 构建客户端连接：SNI = mode（非空才发扩展），校验名 = verify；ca_pem 为测试用内存信任锚。
+/// SNI=sni（非空才发扩展），校验名=verify；ca_pem 为测试信任锚。
 fn client_ssl(verify: &str, sni: &str, ca_pem: Option<&str>) -> std::io::Result<Ssl> {
     let mut ssl = match ca_pem {
         None => {
@@ -186,7 +186,7 @@ fn client_ssl(verify: &str, sni: &str, ca_pem: Option<&str>) -> std::io::Result<
         }
     };
 
-    // sni 透传:非空即作为 ClientHello SNI,空串 = 无 SNI 扩展;校验名 = verify(与 SNI 解耦)。
+    // sni 非空即 ClientHello SNI，空串无扩展；校验名=verify（与 SNI 解耦）。
     if !sni.is_empty() {
         ssl.set_hostname(sni)
             .map_err(|e| io_err(format!("SNI 设置失败: {e}")))?;
@@ -204,7 +204,7 @@ fn client_ssl(verify: &str, sni: &str, ca_pem: Option<&str>) -> std::io::Result<
     Ok(ssl)
 }
 
-/// 限时 TLS 握手共用尾：label 进错误文案（镜像腿与池腿归因可分）。
+/// 限时 TLS 握手共用尾：label 进错误文案以区分镜像腿/池腿。
 async fn tls_handshake(ssl: Ssl, tcp: TcpStream, label: &str) -> std::io::Result<BoringTls> {
     tokio::time::timeout(
         Duration::from_millis(TLS_HANDSHAKE_TIMEOUT_MS),
@@ -241,7 +241,7 @@ async fn gate_acquire() -> tokio::sync::SemaphorePermit<'static> {
     gate.acquire().await.expect("信号量未关闭")
 }
 
-/// 拨号端口：生产恒 443；测试可覆盖，否则核心重试逻辑没法在本地跑。
+/// 拨号端口：生产恒 443；测试可覆盖。
 #[cfg(not(test))]
 fn dial_port() -> u16 {
     443
@@ -264,7 +264,7 @@ pub fn set_dial_port(p: u16) {
     TEST_DIAL_PORT.store(p, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// 拨一条的内核：调用方已持有闸门名额。TCP → 可选 TLS（SNI=sni 骗墙，证书按 verify 锚点校验）。
+/// 拨一条内核：调用方持闸门名额；TCP → 可选 TLS（SNI 骗墙，按 verify 校验）。
 async fn dial_one_inner(
     ip: &str,
     sni: &str,
@@ -299,8 +299,7 @@ pub async fn dial_one(
     dial_one_inner(ip, sni, verify, tls_handshake).await
 }
 
-/// IP 测速专用：计时起点放在拿到闸门名额之后——排队是全局闸门拥堵，不是这个 IP 的建连延迟。
-/// 返回 (连接, 拨号毫秒, 排队毫秒)；排队耗时单独带回供日志，不进 latency。
+/// IP 测速专用：返回 (连接, 拨号毫秒, 排队毫秒)；计时从拿到闸门名额后起，排队不计入 latency。
 pub async fn dial_one_timed(
     ip: &str,
     sni: &str,
@@ -317,9 +316,7 @@ pub async fn dial_one_timed(
 
 pub async fn dial_tls_simple(host: &str) -> std::io::Result<BoringTls> {
     let mut ssl = client_ssl(host, host, None)?;
-    // 镜像腿报价 h2 + HTTP/1.1：CF 系多协商出 h2，一条连接多路复用，拨号风暴（一流一连接）随之消失。
-    // 早年 h2 被关是因为"头正常、体 0B EOF"；如今 Dialed::connected() 上报 negotiated_h2 + legacy 客户端
-    // http2(true) 齐活，回归探针 mirror_h2_body_probe（#[ignore]）单测验尸。
+    // 镜像腿报价 h2 + HTTP/1.1：CF 系多协商出 h2，单连接多路复用（探针 mirror_h2_body_probe）。
     ssl.set_alpn_protos(b"\x02h2\x08http/1.1")
         .map_err(|e| io_err(format!("ALPN 配置失败: {e}")))?;
     apply_cached_session(&mut ssl, host);

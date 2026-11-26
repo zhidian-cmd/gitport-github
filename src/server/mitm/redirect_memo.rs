@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// 记忆上限：条目按看过的用户数增长，超限整表重来（目标可随时重新学到）。
+/// 记忆上限 4096：超限整表重来。
 const MEMO_CAP: usize = 4096;
-/// 目标保质期：换头像后入口 URL 不变，过期重学一次，把旧图窗口限制在几小时内。
+/// 目标保质期 6h：过期重学。
 const MEMO_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 fn memo() -> &'static std::sync::Mutex<HashMap<String, (String, Instant)>> {
@@ -14,7 +14,7 @@ fn memo() -> &'static std::sync::Mutex<HashMap<String, (String, Instant)>> {
     M.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// 头像入口形态：github.com 单段路径、以 .png 结尾（如 /Venkateshvenki404224.png）。
+/// 头像入口形态：github.com 单段路径、.png 结尾。
 fn is_avatar_entry(path: &str) -> bool {
     let Some(name) = path.strip_prefix('/') else {
         return false;
@@ -29,7 +29,7 @@ fn memo_key(path: &str, query: Option<&str>) -> String {
     }
 }
 
-/// 302 落点必须是已知头像域：否则一次异常跳转会让该路径 6 小时内全部本地直答这个跳转。
+/// 302 落点须为已知头像域（user-images/private-user-images/avatars.*.githubusercontent.com）。
 fn is_avatar_target(location: &str) -> bool {
     let host = location
         .strip_prefix("https://")
@@ -49,7 +49,7 @@ fn is_avatar_target(location: &str) -> bool {
         || (host.starts_with("avatars") && host.ends_with(".githubusercontent.com"))
 }
 
-/// 命中 = 本地直答的 302 目标；未命中/过期 = None（照常走上游，顺手重学）。
+/// 命中 = 本地直答的 302 目标；未命中/过期 = None（走上游重学）。
 pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Option<String> {
     if host != "github.com" || !is_avatar_entry(path) {
         return None;
@@ -62,20 +62,20 @@ pub(super) fn cached_location(host: &str, path: &str, query: Option<&str>) -> Op
         return None;
     }
     if !is_avatar_target(&loc) {
-        g.remove(&k); // 历史遗留的异常落点：当场清掉
+        g.remove(&k); // 异常落点当场清掉
         return None;
     }
     Some(loc)
 }
 
-/// 从上游响应学习跳转目标：唯一学习点在 get_direct 成功路径——新拨与复用都经过它。
+/// 学习点：get_direct 成功路径（新拨与复用都经过）。
 pub(super) fn observe_response(
     host: &str,
     uri: &http::Uri,
     status: http::StatusCode,
     headers: &http::HeaderMap,
 ) {
-    // 头像入口偶尔走 301/307/308，只认 302 会漏学；落点仍由 is_avatar_target 严格校验。
+    // 301/302/307/308 都学；落点由 is_avatar_target 校验。
     if !matches!(
         status,
         http::StatusCode::MOVED_PERMANENTLY
@@ -90,7 +90,7 @@ pub(super) fn observe_response(
     }
 }
 
-/// 记一笔跳转（301/302/307/308；只认头像入口形态 + 头像域落点，其余不记）。
+/// 记跳转（301/302/307/308；仅头像入口+头像域落点）。
 pub(super) fn observe(host: &str, path: &str, query: Option<&str>, location: &str) {
     if host != "github.com"
         || !is_avatar_entry(path)

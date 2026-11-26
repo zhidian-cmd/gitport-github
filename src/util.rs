@@ -11,7 +11,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 锁中毒自愈：表只有内容语义，无半写坏中间态，取内层值继续。
+/// 锁中毒自愈：取内层值继续。
 pub(crate) fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }

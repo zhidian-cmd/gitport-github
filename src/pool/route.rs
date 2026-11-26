@@ -14,9 +14,9 @@ pub struct Flags {
     pub direct: bool,
     /// 内容域：短响应头预算（2s）、竞速拨号、游标不记。
     pub content: bool,
-    /// 会话域带用户会话、跨 IP 是风控特征，只标实测出拦截页的主站族，own 过滤只认自建通道；内容型子域写进 ips 节点的 hosts 即豁免通配。
+    /// 会话域：跨 IP 是风控特征，own 过滤只认自建通道；内容型子域写入 ips.hosts 豁免通配。
     pub session: bool,
-    /// 大文件域：单通道（一条长流占满槽位）+ 大镜像链。数据源自 mirrors_big 键集。
+    /// 大文件域：单通道 + 大镜像链；源 mirrors_big 键集。
     pub big: bool,
 }
 
@@ -37,7 +37,7 @@ pub struct HostSpec {
     pub action: Option<String>,
     #[serde(default)]
     pub content: bool,
-    /// 会话域：带用户会话、跨 IP 是风控特征——own 过滤（只认自建通道）。
+    /// 会话域：own 过滤只认自建通道。
     #[serde(default)]
     pub session: bool,
     /// 大文件域：单通道 + 大镜像链。
@@ -56,20 +56,18 @@ pub struct IpSpec {
     /// ClientHello SNI：骗墙用，与目标 host 无关。
     #[serde(default)]
     pub sni: String,
-    /// 证书校验锚点：空 = 按目标 host 校验；只有目标不在该 IP 默认证书 SAN 上才填，填哪个都行（域名由 :authority 定）。
+    /// 证书校验锚点：空 = 按目标 host 校验；填则任意（域名由 :authority 定）。
     #[serde(default)]
     pub verify: String,
     /// 本节点服务的路由键列表。
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// 拨号实测毫秒（0 = 未测）。旧文件曾用 `{具体 IP: 毫秒}` 映射，单 IP 节点收编为标量；
-    /// 兼容两种读取，写盘统一标量。
+    /// 拨号实测毫秒（0 = 未测）；兼容旧 `{IP: 毫秒}` 映射，写盘统一标量。
     #[serde(default, deserialize_with = "deserialize_latency")]
     pub latency: Option<u64>,
 }
 
-/// 旧布局兼容：节点条目里的 latency 曾是 `{具体 IP: 毫秒}` 映射（range 时代每个展开 IP 各记各的）。
-/// 单 IP 节点恰有一条 → 收编为标量；多条（旧范围节点）无法对应，放弃让拨号重测。
+/// 旧布局兼容：`{IP: 毫秒}` 单条收编为标量，多条放弃并让拨号重测。
 fn deserialize_latency<'de, D>(d: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -95,7 +93,7 @@ pub struct IpNode {
     pub verify: String,
     /// 服务的路由键。
     pub hosts: Vec<String>,
-    /// 拨号实测毫秒：拨号事件回流更新（原子量，拓扑在 Arc 下共享）。
+    /// 拨号实测毫秒：事件回流更新（原子量）。
     pub latency: AtomicU64,
 }
 
@@ -188,11 +186,11 @@ impl RouteRow {
         })
     }
 
-    /// host 命中要求点分隔：foo.github.com 命中 github.com，evilgithub.com 不命中。
+    /// host 命中要求点分隔边界（evilgithub.com 不命中 github.com）。
     #[inline]
     fn hits(&self, host_lower: &str) -> bool {
         if host_lower.len() > self.bare.len() && host_lower.ends_with(&self.bare) {
-            // 边界必须是点：github.com 命中，xgithub.com 不命中
+            // 边界必须是点（xgithub.com 不命中）。
             if host_lower.as_bytes()[host_lower.len() - self.bare.len() - 1] == b'.' {
                 return true;
             }
@@ -201,7 +199,7 @@ impl RouteRow {
     }
 }
 
-/// 表 + 反向索引一体：Arc 持有，脱离锁安全读（不出本模块，pub 字段供同模块方法用）。
+/// 表 + 反向索引一体：Arc 持有，脱离锁安全读。
 struct Topology {
     rows: Vec<RouteRow>,
     nodes: Vec<IpNode>,
@@ -227,11 +225,7 @@ impl Topology {
 
 static TABLE: Mutex<Option<Arc<Topology>>> = Mutex::new(None);
 
-/// 黑洞惩罚：ip → (到期毫秒, 惩罚延迟)。原来 sink_latency 直接改 node.latency，注释承诺
-/// "60s 内随正常样本稀释恢复"但运行期没有任何回写路径，进程不重启就永远垫底。
-/// 现在独立成带过期的表，到期自动失效；注意它只在内存里活 60s，不跨重启——
-/// 重启后回到 routes.json 里的测速值，但游标已由 on_channel_blackhole 前移，同域请求不会再先拨它。
-/// "60s 内稀释恢复"却没有任何回写路径，进程不重启就永远垫底。改成带过期的独立表，到期自动失效。
+/// 黑洞惩罚：ip → (到期毫秒, 惩罚延迟)；独立带过期表，60s 到期失效，不跨重启。
 static BLACKHOLE_PENALTY: std::sync::LazyLock<Mutex<HashMap<String, (u64, u64)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -244,7 +238,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 读有效延迟：惩罚未过期取较大者（沉到已测队尾但不沉过未测的 0），过期就地清掉还原真实值。
+/// 读有效延迟：惩罚未过期取较大者（不沉过未测的 0），过期还原真实值。
 fn effective_latency(ip: &str, real: u64) -> u64 {
     let now = now_ms();
     let mut g = lock(&*BLACKHOLE_PENALTY);
@@ -258,7 +252,7 @@ fn effective_latency(ip: &str, real: u64) -> u64 {
     }
 }
 
-/// host → 命中的下标；路由表装载后不再变化，缓存无需失效。
+/// host → 命中下标；装载后不变，缓存无需失效。
 static MEMO: Mutex<Option<HashMap<String, Option<usize>>>> = Mutex::new(None);
 
 /// 装载路由表（启动一次；测试可反复调用）。
@@ -288,14 +282,14 @@ pub fn route_for(host: &str) -> Option<Hit> {
     let idx = match memo.get(host) {
         Some(v) => *v,
         None => {
-            // 域名不区分大小写；每个 host 只算一次，结果进 memo。
+            // 转小写；每个 host 只算一次，结果进 memo。
             let lower = host.to_ascii_lowercase();
             let mut best: Option<usize> = None;
             for (i, r) in topo.rows.iter().enumerate() {
                 if !r.hits(&lower) {
                     continue;
                 }
-                // 同 rank 时更具体的声明胜，否则 github.com 与 *.github.com 谁赢靠文件顺序。
+                // 同 rank 时更具体的声明胜（避免靠文件顺序）。
                 let better = match best {
                     None => true,
                     Some(b) => {
@@ -352,8 +346,7 @@ fn node_index_by_ip(topo: &Topology, ip: &str) -> Option<usize> {
         .position(|n| n.ips.first().is_some_and(|a| a == ip))
 }
 
-/// 拨号实测回流：与旧值取均值防 GFW 抖动一刀切；未测直入。
-/// 测速直写：节点级 latency 覆盖为测得毫秒（0 = 未测，排序垫底保表序）。
+/// 测速直写：latency 覆盖为实测毫秒（0 = 未测，排序垫底保表序）。
 pub fn set_latency(ip: &str, ms: u64) {
     let topo = match lock(&TABLE).as_ref() {
         Some(t) => t.clone(),
@@ -363,19 +356,17 @@ pub fn set_latency(ip: &str, ms: u64) {
         return;
     };
     topo.nodes[i].latency.store(ms, Ordering::Relaxed);
-    // 测速直写是新的真实基线：清掉旧的黑洞惩罚，别让重测过的 IP 还挂着旧降权。
+    // 清掉旧黑洞惩罚。
     lock(&*BLACKHOLE_PENALTY).remove(ip);
 }
 
-/// 测速目标：全部节点的全部 IP 展开（ip/sni/verify/latency），表序。
-/// verify 空 → 该节点服务的第一个路由键的裸域名（与 dial_targets 的锚点兜底同语义）。
-/// 不做冷却/可用性过滤——测速是全量基准，不受代理运行时状态影响。
+/// 测速目标：全部 IP 展开（ip/sni/verify/latency），表序；verify 空取节点首个路由键裸域名；不过滤冷却/可用性。
 pub fn probe_targets() -> Vec<NodeIp> {
     let topo = match lock(&TABLE).as_ref() {
         Some(t) => t.clone(),
         None => return Vec::new(),
     };
-    // 节点主域名：表序第一个引用此节点的路由行的裸域名。
+    // 节点主域名：表序首个引用该节点的路由行裸域名。
     let mut primary: HashMap<usize, String> = HashMap::new();
     for row in &topo.rows {
         for &ni in topo.host_index.get(&row.key).into_iter().flatten() {
@@ -405,8 +396,7 @@ pub fn probe_targets() -> Vec<NodeIp> {
     out
 }
 
-/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾，不沉过未测候选。
-/// 惩罚带 60s 到期：到期自动恢复真实延迟，不再永久垫底；测速直写也会立刻清掉。
+/// 黑洞降权：实测翻倍（3s~10s）沉到已测队尾；60s 到期恢复，测速直写即清。
 pub fn sink_latency(ip: &str) {
     let topo = match lock(&TABLE).as_ref() {
         Some(t) => t.clone(),
@@ -420,7 +410,7 @@ pub fn sink_latency(ip: &str) {
         0 => 3000,
         o => (o * 2).clamp(3000, 10000),
     };
-    // 取更晚到期，别被并发的另一次黑洞判罚缩短了窗口。
+    // 取更晚到期，避免并发判罚缩短窗口。
     let mut g = lock(&*BLACKHOLE_PENALTY);
     let until = now_ms().saturating_add(BLACKHOLE_PENALTY_MS);
     let entry = g.entry(ip.to_string()).or_insert((0, 0));
@@ -452,7 +442,7 @@ pub fn fallback_for(host: &str) -> Fallback {
     route_for(host).map_or(Fallback::Dns, |r| r.fallback)
 }
 
-/// 游标键只记串发域主键；内容域竞速无人读、直连行不占键；settings.lastIp 键位顺序恒为此表。
+/// 游标键只记串发域主键；内容域/直连行不占键；settings.lastIp 键序同此表。
 pub fn cursor_keys() -> Vec<String> {
     let g = lock(&TABLE);
     let Some(t) = g.as_ref() else {
@@ -533,12 +523,12 @@ pub fn ip_count() -> usize {
 
 // ---- 镜像链归属（与拨号路由正交，仍按 host 形状判定）----
 
-/// 大文件域：objects/release-assets 附件 302 落点，由 hosts 标志 big:true 判定（数据，不硬编码域名）。
+/// 大文件域：附件 302 落点，按 hosts 标志 big:true 判定。
 pub fn is_big_file_host(host: &str) -> bool {
     route_for(host).is_some_and(|r| r.flags.big)
 }
 
-/// github.com 仓库附件下载路径（/releases/download/...）：镜像链归属 release-assets。
+/// github.com /releases/download/... → 归属 release-assets。
 fn is_release_asset_path(host: &str, path: &str) -> bool {
     if host != "github.com" {
         return false;
@@ -551,7 +541,7 @@ fn is_release_asset_path(host: &str, path: &str) -> bool {
     )
 }
 
-/// 镜像链归属：请求 host → 实际内容 host 的专属链。（codeload 已迁池，Archive 路径不再走镜像。）
+/// 镜像链归属：请求 host → 实际内容 host 的专属链。
 pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     if is_big_file_host(host) {
         return host;
@@ -563,8 +553,7 @@ pub fn mirror_chain_host<'a>(host: &'a str, path: &'a str) -> &'a str {
     }
 }
 
-/// 总路由判定：生产只分流镜像（大文件域/附件 GET|HEAD → Mirror），直连行/表外/其余
-/// 各走既定管线（System/Tunnel/Pool）——四值枚举里只有 Mirror 被读，坍成布尔。
+/// 总路由判定：大文件域/附件 GET|HEAD → Mirror；其余走 System/Tunnel/Pool；坍成布尔。
 pub fn is_mirror_route(host: &str, method: &str, path: &str) -> bool {
     let Some(row) = route_for(host) else {
         return false;

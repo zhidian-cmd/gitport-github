@@ -1,7 +1,5 @@
-//! IP 串发测速：通道池驱动搭建机器人在全部节点 IP 上串发建通道（TCP+TLS），
-//! 建连成功耗时即延迟，逐个掐断；结束后 latency 落盘 routes.json、清空游标——
-//! 串发顺序此后完全由「latency 升序 + 同 IP 互避防串」接管（游标由运行时驻留自然重建）。
-//! 通道搭建机器人只有通道池能叫：本模块是 pool 子模块，合法调度者。
+//! IP 串发测速：全部节点 IP 串发建通道（TCP+TLS），建连耗时即延迟，逐个掐断。
+//! latency 落盘 routes.json 并清游标；排序由 latency 升序 + 同 IP 互避接管。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -20,7 +18,7 @@ pub fn probe_report() -> Option<String> {
     lock(&REPORT).clone()
 }
 
-/// 防重入守卫：panic/提前返回也复位（照校准的 CalibDone 模式）。
+/// 防重入守卫：panic/提前返回也复位。
 pub struct ProbeGuard;
 impl Drop for ProbeGuard {
     fn drop(&mut self) {
@@ -33,8 +31,7 @@ pub fn probe_begin() -> bool {
     !PROBE_RUNNING.swap(true, Ordering::SeqCst)
 }
 
-/// 一条龙：全部节点 IP 串发建通道（TCP+TLS，建完即断）→ 计时写 latency
-/// → 落盘 routes.json + 清空游标。前置条件：probe_begin() 已返回 true。
+/// 串发建通道（TCP+TLS，建完即断）→ 写 latency → 落盘 routes.json + 清游标；前置 probe_begin() 为 true。
 pub async fn probe_serial_domains(log: &LogFn) -> String {
     let targets = route::probe_targets();
     if targets.is_empty() {
@@ -48,9 +45,9 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
     let mut ok = 0usize;
     let mut fail = 0usize;
     for t in &targets {
-        // sni 空串 = ClientHello 无 SNI 扩展（dial.rs 的既定语义），与代理拨号一致；显示口径对齐日志的「无SNI」。
+        // sni 空串 = ClientHello 无 SNI 扩展；显示记为「无SNI」。
         let sni_show = if t.sni.is_empty() { "无SNI".to_string() } else { t.sni.clone() };
-        // 计时起点在 dial_one_timed 内部、拿到全局闸门名额之后——排队是闸门拥堵，不算这个 IP 的延迟。
+        // 计时起点在拿到闸门名额后；排队不计入延迟。
         match dial::dial_one_timed(&t.ip, &t.sni, &t.verify, true).await {
             Ok((_conn, ms, queued_ms)) => {
                 if queued_ms >= 50 {
@@ -60,7 +57,7 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
                     ));
                 }
                 route::set_latency(&t.ip, ms);
-                // 测速成功即证明 IP 活着：顺带清死亡退避，运行时不必再绕行等待。
+                // 成功即清死亡退避。
                 clear_dead(&t.ip);
                 ok += 1;
                 rows.push(format!("{} [{}] 通，{}ms", t.ip, sni_show, ms));
@@ -68,7 +65,7 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
             }
             Err(e) => {
                 route::set_latency(&t.ip, 0);
-                // TCP 层失败 = IP 当下不通，进死亡退避（60s 内运行时绕行）；TLS 失败只清基线。
+                // TCP 失败进死亡退避（60s 绕行）；TLS 失败只清基线。
                 if msg_is_tcp_dead(&e) {
                     note_dead(&t.ip);
                 }
@@ -90,9 +87,9 @@ pub async fn probe_serial_domains(log: &LogFn) -> String {
     )
 }
 
-/// 测速结果落盘：latency 回流 routes.json + 游标全清（内存 SERIAL.cursor 与 settings.json 副本都清）。
+/// 测速结果落盘：latency 回流 routes.json，游标全清（内存 + settings.json）。
 fn save_results() {
-    clear_cursors(); // 先清内存正生效的表，否则下次成功拨号又写回磁盘
+    clear_cursors(); // 先清内存表，否则下次拨号又写回磁盘
     crate::pool::save_routes_now();
     crate::settings::set_last_ips(Vec::new());
 }

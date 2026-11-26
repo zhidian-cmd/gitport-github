@@ -31,7 +31,7 @@ fn leaf_cache_evicts_oldest_at_cap() {
     let a = load_or_generate(&dir).unwrap();
     let ctx = a.leaf_ctx("github.com").unwrap();
     {
-        // 直填 511 条把表顶到上限（github.com 占第 1 条），t0 伪造为最旧。
+        // 直填 511 条顶到上限，t0 设为最旧。
         let mut leaves = a.leaves.lock().unwrap();
         let now = SystemTime::now();
         for i in 0..LEAVES_CAP - 1 {
@@ -65,7 +65,7 @@ fn tls_acceptor_ok() {
     let _acc = tls_acceptor_of(&a);
 }
 
-// 用例独占路由表与本地监听端口，串行锁必须跨 await 持有；生产路径不这么用。
+// 测试独占路由表与端口，串行锁须跨 await 持有。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mitm_handshake_roundtrip() {
@@ -73,7 +73,7 @@ async fn mitm_handshake_roundtrip() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     crate::pool::install_seed_routes();
-    // rustls 客户端 ↔ boring 服务端：独立实现互验，本地终结栈换血后的互操作钉子。
+    // rustls 客户端 ↔ boring 服务端实现互验。
     let dir = std::env::temp_dir().join(format!("gitport_hs_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let a = load_or_generate(&dir).unwrap();
@@ -142,8 +142,7 @@ async fn mitm_rejects_unmanaged_sni() {
     assert!(srv.await.unwrap().is_err(), "服务端应因拒签而握手失败");
 }
 
-/// 首握手并发：锁外签发允许少量重复（同域最多 N 次），但双检必须让所有人拿到同一份上下文。
-/// 早期版本是全程持锁只签一次，代价是不同域名互相等；现在宁可重复签几次也不阻塞别的域。
+/// 并发首握手：锁外签发允许少量重复，双检保证所有请求拿到同一上下文。
 #[test]
 fn leaf_ctx_concurrent_returns_same_context() {
     let _g = crate::pool::TEST_LOCK
@@ -181,8 +180,7 @@ fn leaf_ctx_concurrent_returns_same_context() {
     }
 }
 
-/// CA 私钥落盘后的 ACL：只应有当前用户与 SYSTEM，不能给 Everyone / Users / Authenticated Users。
-/// 用 SID 判定而不是本地化组名，中英文 Windows 都成立。
+/// CA 私钥 ACL：仅当前用户与 SYSTEM，不含 Everyone/Users/Authenticated Users（按 SID 判定）。
 #[test]
 fn ca_key_acl_only_current_user_and_system() {
     let dir = std::env::temp_dir().join(format!("gitport_acl_{}", std::process::id()));

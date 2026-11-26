@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-/// 本地时区偏移（进程内缓存一次）：多线程探测偶发失败会致时间戳跳跃，缓存后恒定。
+/// 本地时区偏移（进程内缓存一次，避免多线程探测失败致时间戳跳跃）。
 static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
 
 fn now_str(fd: &[time::format_description::FormatItem<'static>]) -> String {
@@ -28,7 +28,7 @@ pub struct Logger {
 
 struct LoggerInner {
     seq: u64,
-    /// VecDeque：满员淘汰 O(1)；Vec::remove(0) 整段搬移不可忍。
+    /// VecDeque 满员淘汰 O(1)。
     buf: VecDeque<Entry>,
     echo_stdout: bool,
 }
@@ -56,7 +56,7 @@ impl Logger {
             now_str(format_description!("[hour]:[minute]:[second]")),
             msg
         );
-        // 启动打点不进 WebUI 环形缓冲，但写 .cache/tray.log 留取证，headless 下仍回显 stdout。
+        // 启动打点不进环形缓冲，只写 .cache/tray.log，headless 下仍回显 stdout。
         if msg.starts_with("[启动]") {
             tray_log(&line);            if self.inner.lock().unwrap().echo_stdout {
                 println!("{line}");
@@ -82,7 +82,7 @@ impl Logger {
         }
     }
 
-    /// seq 不清零：按旧 after 查询的增量客户端只会得到空增量，不会把日志序搅乱。
+    /// seq 不清零（避免增量客户端日志序错乱）。
     pub fn clear(&self) {
         self.inner.lock().unwrap().buf.clear();
     }
@@ -99,7 +99,7 @@ impl Logger {
     }
 }
 
-/// 启动打点/托盘失败共用落点：只落本地文件，不占 WebUI 日志流；一份文件不新增垃圾。
+/// 启动打点/托盘失败共用落点：只落本地文件，不占 WebUI 日志流。
 pub(crate) fn tray_log(line: &str) {
     use std::io::Write;
     let Ok(mut f) = std::fs::OpenOptions::new()

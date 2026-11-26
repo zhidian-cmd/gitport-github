@@ -24,9 +24,7 @@ fn arg_value(args: &[String], name: &str) -> Option<u16> {
 
 fn main() {
     logger::install_panic_hook();
-    // 主线程也套一层护栏，但目的不是"吞掉继续跑"：panic 掀翻主线程时补一次系统代理还原。
-    // 不补的话进程没了、PAC 还指着本机死端口，浏览器全断且日志里查不到原因。
-    // 后台任务的护栏在 logger::spawn 里，各自独立，不受这里影响。
+    // 主线程护栏：panic 时补一次系统代理还原（PAC 死端口会整机断网）。
     let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
     if crashed.is_err() {
         let note = settings::remove_system_proxy();
@@ -47,7 +45,7 @@ fn run() {
         if desktop::signal_show(config::webui_port()) {
             return;
         }
-        // ok:false = 旧实例界面已死；等它让出单实例锁后接管，一直不放才认已在运行。
+        // ok:false = 旧实例界面已死；等其让出单实例锁后接管。
         for _ in 0..20 {
             if !desktop::already_running() {
                 break;
@@ -59,7 +57,7 @@ fn run() {
             return;
         }
     }
-    // 工作目录切到 exe 目录：自启/快捷方式的 cwd 不可靠，数据文件按相对路径读写。
+    // 工作目录切到 exe 目录（自启/快捷方式 cwd 不可靠）。
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -83,7 +81,7 @@ fn run() {
     }
     let web_url = format!("http://127.0.0.1:{}", config::webui_port());
 
-    // 日志 stdout 回显仅 headless: GUI 构建的 stdout 重定向会把访问域名等浏览痕迹落盘
+    // 日志 stdout 回显仅 headless（GUI 重定向会落浏览痕迹）。
     let logs = Arc::new(logger::Logger::new(headless));
     let log_fn: util::LogFn = {
         let l = logs.clone();
@@ -116,13 +114,13 @@ fn run() {
     if let Err(e) = server::start_proxy_with(&rt, srv, config::proxy_port()) {
         log_fn(&format!("代理启动失败: {e}"));
     } else {
-        // 分流开关接管系统代理(全关 = no-op)。只在没接管成功时留痕：接上是常态，不占日志。
+        // 系统代理接管失败才留痕。
         if let Err(e) = settings::ensure_system_proxy() {
             log_fn(&format!("[启动] 系统代理: 未接管 —— {e}"));
         }
     }
     let t_proxy = t0.elapsed();
-    // 开机慢的取证：一看就知道卡在路由表、证书还是系统代理接管。
+    // 启动打点：区分卡在路由表/CA/系统代理。
     log_fn(&format!(
         "[启动] 核心 {}ms（配置 {} / 路由表 {} / CA {} / 代理 {}）",
         t_proxy.as_millis(),
@@ -133,7 +131,7 @@ fn run() {
     ));
     let me = settings::exe_name();
     match settings::autostart_state() {
-        // 登记的是本 exe（或本来就没登记）是常态，不出声；指向别处才是真问题。
+        // 开机自启指向别处才留痕。
         Ok(v) if !v.is_empty() && (me.is_empty() || !v.contains(me.as_str())) => {
             log_fn(&format!("[启动] 开机自启: 指向别处 —— {v}"))
         }
@@ -152,7 +150,7 @@ fn run() {
         let rt = rt.clone();
         let logs = logs.clone();
         logger::spawn("webui", move || {
-            // 绑定失败(端口被占等)必须留痕：静默吞掉会让用户"页面打不开却不知为何"
+            // 绑定失败必须留痕（否则页面打不开却不知原因）。
             if let Err(e) = rt.block_on(webui::serve(app)) {
                 logs.log(&format!("管理界面未启动: {e}"));
             }
@@ -166,9 +164,9 @@ fn run() {
     }
 
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        // 运行时延迟回流是内存态：退出时落一次盘，下次冷启动还有排序基线（事件驱动，无定时器）。
+        // 退出时落盘延迟回流（内存态，无定时器）。
         pool::save_routes_now();
-        // 还原失败必须留痕：进程一退，系统 PAC 若是死端口就是整机断网，日志是唯一线索。
+        // 系统代理还原失败必须留痕（PAC 死端口会整机断网）。
         let note = settings::remove_system_proxy();
         if note.contains("失败") {
             logger::tray_log(&format!("[退出] {note}"));

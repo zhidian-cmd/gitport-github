@@ -47,7 +47,7 @@ fn ttl_expiry() {
     );
 }
 
-/// 301/307/308 也是头像入口的合法跳转；只认 302 会漏学，每次渲染都要重问一遍。
+/// 301/307/308 也按头像入口跳转记录。
 #[test]
 fn other_redirect_statuses_are_learned() {
     for (i, st) in [

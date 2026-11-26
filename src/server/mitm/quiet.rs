@@ -23,7 +23,7 @@ fn reuse() -> &'static Mutex<HashMap<String, ReuseStat>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 该 host 的这类样板首次出现？表满整盘清空——纯日志用途，丢历史无副作用。
+/// 样板是否首现；表满整盘清空（纯日志用途）。
 pub(crate) fn first_time(tag: &str, host: &str) -> bool {
     let mut g = seen().lock().unwrap();
     if g.len() >= 512 {
@@ -32,7 +32,7 @@ pub(crate) fn first_time(tag: &str, host: &str) -> bool {
     g.insert(format!("{tag}\u{1}{host}"))
 }
 
-/// 该链上次成功的镜像换了没有；true = 换家，值得记一笔。
+/// 镜像是否换家（true = 换家）。
 pub(super) fn mirror_rotated(chain_host: &str, mirror: &str) -> bool {
     let mut g = rotated().lock().unwrap();
     if g.len() >= 256 {
@@ -47,7 +47,7 @@ pub(super) fn mirror_rotated(chain_host: &str, mirror: &str) -> bool {
     }
 }
 
-/// 复用连接记账：每个 host 满一分钟落一行汇总（含最近一次复用到的 IP），免得每请求一条。
+/// 复用连接记账：每 host 每 60s 汇总一行（含最近 IP）。
 pub(super) fn note_reuse(log: &LogFn, host: &str, ip: &str, ms: u64) {
     let mut g = reuse().lock().unwrap();
     if g.len() >= 128 {

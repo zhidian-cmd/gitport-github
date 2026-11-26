@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn probe_resets_running_flag_when_table_empty() {
     let _g = crate::pool::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    // 清场：显式装空表（TABLE 是进程级全局，其他用例可能装过数据）
+    // 清场：显式装空表。
     route::install(vec![], vec![]);
     assert!(route::probe_targets().is_empty(), "空表时无测速目标");
     let log: LogFn = Arc::new(|_| {});
@@ -45,7 +45,7 @@ fn clear_dead_releases_cooling() {
     route::install(vec![], vec![]); // 清场
 }
 
-// 真实拨号：对 routes.json 全部 IP 串发建通道（约 65 个，1~2 分钟）。验证延迟落盘与游标清空。
+// 真实拨号：对全部 IP 串发建通道，验证延迟落盘与游标清空。
 #[test]
 #[ignore = "真实网络：串发拨号全部节点 IP"]
 fn probe_serial_domains_real_network() {

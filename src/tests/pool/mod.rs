@@ -1,4 +1,4 @@
-// TEST_LOCK 跨 await 独占全局路由表/连接池是刻意的：用例跑在 current_thread runtime 上，无人抢锁。
+// TEST_LOCK 跨 await 独占全局路由表/连接池（测试用 current_thread runtime）。
 #![allow(clippy::await_holding_lock)]
 use super::*;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 fn tmpdir() -> PathBuf {
     let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("gitport_test_{}_{n}", std::process::id()));
-    // pid 会被系统复用：残留旧 routes/plans.json 会让"全新安装"测试读到旧表间歇性失败（实测踩到过）。
+    // 先删旧目录：防 pid 复用残留 routes/plans.json 干扰测试。
     let _ = std::fs::remove_dir_all(&d);
     if let Err(e) = std::fs::create_dir_all(&d) {
         panic!("测试临时目录创建失败 {d:?}: {e}");
@@ -36,7 +36,7 @@ fn target_ips(host: &str) -> Vec<String> {
 
 #[test]
 fn breakers_open_set_clear_by_host() {
-    // CONTENT_BREAKER 已删除，Breaker 类型的行为由 SERIAL_COOL 覆盖验证。
+    // Breaker 行为由 SERIAL_COOL 覆盖验证。
     let raw = "raw.githubusercontent.com";
     let camo = "camo.githubusercontent.com";
     assert!(!SERIAL_COOL.open(raw));
@@ -58,7 +58,7 @@ fn breakers_open_set_clear_by_host() {
 
 #[test]
 fn breaker_expired_entry_lazily_removed() {
-    // ttl=0：set 后立即过期。open 必须判 false 并把条目清掉——过期条目沉淀在表里只进不出（修复前 open 只读不删）。
+    // ttl=0：open 必须判 false 并惰性清除过期条目。
     let b = Breaker::new(0);
     b.set("expired.example");
     assert!(!b.open("expired.example"), "过期条目不得判熔断中");
@@ -115,7 +115,7 @@ fn bad_route_row_does_not_wipe_table() {
     assert!(dir.join("routes.json.bak").exists(), "有行写坏应备份原文件");
 }
 
-/// v1/0.5.3 旧格式不再被读懂：路由行按种子重建、原文件备份 .bak，绝不静默半重建。
+/// 旧格式路由行按种子重建、原文件备份 .bak，不静默半重建。
 #[test]
 fn old_format_routes_rebuild_from_seeds() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -157,7 +157,7 @@ fn old_format_routes_rebuild_from_seeds() {
 
 #[test]
 fn former_direct_domains_now_pooled() {
-    // v2：原 direct 4 域实测后进池（§8），hosts 行保留 pac 但不再直连。
+    // 原 direct 4 域已进池，hosts 行保留 pac 但不再直连。
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edges::clear_all();
     let dir = tmpdir();
@@ -250,7 +250,7 @@ fn encode_routes_roundtrip() {
         "https://big-b.example".to_string(),
     ];
     let b = encode_routes(&mirrors, &big);
-    // 大文件单链必须按列表落盘，且回读逐项相等（删掉落盘段/写成对象都会红）。
+    // 大文件单链按列表落盘且回读逐项相等。
     assert!(
         b.contains("\"mirrors_big\": ["),
         "大文件单链应按列表落盘: {b}"
@@ -308,7 +308,7 @@ fn encode_routes_roundtrip() {
     );
 }
 
-/// 落盘省略的默认域名，读回时从节点 hosts 补齐（否则 PAC/路由会丢域名）。
+/// 落盘省略的默认域名读回时从节点 hosts 补齐。
 #[test]
 fn hosts_filled_from_nodes() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -421,7 +421,7 @@ fn custom_mirrors_align() {
 
 #[test]
 fn worker_chain_replace_old_url() {
-    // 换地址：新地址追加到链尾的同时旧地址必须移除（防新旧并存）
+    // 换地址：新地址追加链尾，旧地址移除。
     let mut m: HashMap<String, Vec<String>> = HashMap::new();
     m.insert(
         "github.com".into(),
@@ -491,12 +491,12 @@ fn toggle_gates_big_file_chains_only() {
     crate::settings::save_worker_mirrors(Vec::new());
 }
 
-/// 裸 mirrors 旧字典已随两代迁移层停读：新字典照常生效，旧段整段忽略（gist 链不再并入）。
+/// 裸 mirrors 旧字典已停读，新字典生效、旧段整段忽略。
 #[test]
 fn bare_mirrors_segment_is_no_longer_read() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edges::clear_all();
-    // 隔离：.example 自建镜像会被收编进注册表并跨测试持久化，先清空。
+    // 隔离：先清空注册表，防自建镜像跨测试残留。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
@@ -534,11 +534,11 @@ fn bare_mirrors_segment_is_no_longer_read() {
             .contains(&"https://legacy-only.example".to_string()),
         "裸 mirrors 段的链不再并入"
     );
-    // 清场：正规路径删除自建镜像（注册表 + 全部链），不给后续测试留全局残留。
+    // 清场：正规路径删除自建镜像（注册表 + 全部链）。
     apply_worker_mirrors(Vec::new()).ok();
 }
 
-/// 手改进 mirrors_big 的镜像必须收编进注册表：否则工作台看不到、开关管不到、删不掉，界面和文件两套真相。
+/// 手改 mirrors_big 镜像必须收编进注册表。
 #[test]
 fn hand_written_big_mirror_is_adopted_into_registry() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -595,7 +595,7 @@ fn legacy_big_host_chains_are_merged_not_dropped() {
     crate::settings::save_worker_mirrors(Vec::new());
 }
 
-/// 全新安装+添加镜像 → 启用镜像必须落进全部内容域链（v0.5.0 回归：空表遍历不到，镜像只进注册表）。
+/// 全新安装时启用镜像必须落进全部内容域链。
 #[test]
 fn fresh_install_mirror_lands_in_all_chains() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -635,7 +635,7 @@ fn fresh_install_mirror_lands_in_all_chains() {
 fn mirror_chain_load_and_topup() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     edges::clear_all();
-    // 隔离：自定义镜像注册表经 settings.json 跨进程持久化（上一轮 serial_load 收养的自建镜像会留在里面），不清空的话 sync_custom_mirrors 会把它们追加进本测试的链。
+    // 隔离：先清空注册表，防跨进程残留镜像混入链。
     crate::settings::save_worker_mirrors(Vec::new());
     let dir = tmpdir();
     std::fs::write(
@@ -664,7 +664,7 @@ fn mirror_chain_load_and_topup() {
         ],
         "用户链原样保留(含自部署镜像): {raw_chain:?}"
     );
-    // 缺链 host：注册表有启用镜像时按 CONTENT_HOSTS 铺键并对齐全量(自建镜像进所有链是既有设计)；无启用镜像时该 host 真正无链。
+    // 缺链 host：有启用镜像时按 CONTENT_HOSTS 对齐填全量，否则无链。
     let media = mirror_chain("media.githubusercontent.com");
     assert_eq!(
         media,
@@ -674,7 +674,7 @@ fn mirror_chain_load_and_topup() {
         ],
         "media 无自带链, 应被注册表对齐填成启用镜像全量: {media:?}"
     );
-    // 启动不写盘：手改文件原样保留（未知 host 只在运行时表里被丢）。
+    // 启动不写盘，手改文件原样保留。
     let b = std::fs::read_to_string(dir.join("routes.json")).unwrap();
     assert!(
         b.contains("not-a-content.host"),
@@ -789,7 +789,7 @@ fn content_host_success_never_parks_cursor_but_clears_edges() {
     assert!(!edges::is_bad(&ip, &key), "内容域成功仍要洗白 421 短冷却");
 }
 
-/// 风控冷却免疫"成功"回写：block 页也算一次成功 HTTP 交换，可清就会在风暴中被并发回写洗掉（26 家候选 3 轮回头事件的根因）。
+/// 风控冷却免疫成功回写（block 页也算成功 HTTP 交换）。
 #[test]
 fn risk_cooldown_survives_success_note() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -811,7 +811,7 @@ fn risk_cooldown_survives_success_note() {
     assert!(edges::is_bad(&ip, "github.com"), "短冷却不得降级活着的风控");
 }
 
-/// 串发重试引擎实机圈：TCP 拒→沿圈到活条→驻留+死亡退避；跨 await 持 TEST_LOCK 是本意（独占全局表，current_thread runtime）。
+/// 串发重试：TCP 拒→沿圈到活条→驻留+死亡退避。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn serial_dial_rotates_on_failure_and_parks_on_success() {
@@ -878,7 +878,7 @@ async fn serial_dial_rotates_on_failure_and_parks_on_success() {
     dial::set_dial_port(0); // 复位，别影响别的测试
 }
 
-/// 种子表本身就是二部图格式：新装直接可用，不再依赖旧三池迁移。
+/// 种子表为二部图格式，新装直接可用。
 #[test]
 fn seeds_are_new_routes_format() {
     let seeds = seed_db();
@@ -1048,7 +1048,7 @@ fn media_rescue_chains_roundtrip_and_align_skip() {
             .any(|m| m == "https://a.example.com"),
         "注册表移除的镜像从普通链摘除（对照组）"
     );
-    // 小文件链照常对齐（对照组证明对齐逻辑本身还在跑）。
+    // 小文件链照常对齐（对照组）。
     assert!(
         mirrors["raw.githubusercontent.com"]
             .iter()

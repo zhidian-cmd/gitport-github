@@ -1,4 +1,4 @@
-﻿//! 拨号与连接池：二部图（ips × hosts）唯一权威；内容域竞速取最速一条，会话/低频域串发（游标驻留、失败前移），取用统一走 get_or_build。
+﻿//! 连接池：ips×hosts 二部图为唯一权威；内容域竞速取最速，会话/低频域串发（游标驻留/失败前移），统一走 get_or_build。
 pub mod dial;
 pub mod edges;
 pub mod probe;
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-/// 路由表文件名：`ips` 节点 + `hosts` 行 + 镜像链，手改入口。
+/// 路由表文件名：ips 节点 + hosts 行 + 镜像链，手改入口。
 const ROUTES_FILE: &str = "routes.json";
 
 const SEEDS_JSON: &str = include_str!("seeds.json");
@@ -28,17 +28,17 @@ pub const CONTENT_HOSTS: &[&str] = &[
     "media.githubusercontent.com",
 ];
 
-/// 媒体救援链（直连切片 5s 未完的段换镜像续传）：保留键、加载/落盘专门伺候；图片段走图片链、视频段走视频链。
+/// 媒体救援链为保留键（图片/视频各一链）：直连切片 5s 未完换镜像续传，加载/落盘单独处理。
 pub const MEDIA_IMAGE_CHAIN: &str = "图片";
 pub const MEDIA_VIDEO_CHAIN: &str = "视频";
 pub const MEDIA_CHAINS: &[&str] = &[MEDIA_IMAGE_CHAIN, MEDIA_VIDEO_CHAIN];
 
-/// routes.json 镜像链键的白名单口径：内容域 host + 媒体救援保留键。
+/// 镜像链键白名单 = 内容域 host + 媒体救援保留键。
 fn is_chain_key(key: &str) -> bool {
     CONTENT_HOSTS.contains(&key) || MEDIA_CHAINS.contains(&key)
 }
 
-/// 种子只剩两个用途：全新安装引导、给已有表补节点/边（不新建 hosts 行）。
+/// 种子用途：全新安装引导、给已有表补节点/边（不新建 hosts 行）。
 fn seed_db() -> TopoDoc {
     let Some((doc, _)) = parse_routes_tolerant(SEEDS_JSON, None) else {
         return TopoDoc::default();
@@ -49,20 +49,20 @@ fn seed_db() -> TopoDoc {
 const SERIAL_MAX_IPS: usize = 512;
 
 struct SerialTab {
-    /// TCP 层死亡退避 60s→5min→30min，成功拨号清除。
+    /// TCP 死亡退避 60→300→1800s，拨号成功清除。
     dead: HashMap<String, (Instant, u32)>,
-    /// 小文件/媒体救援链：1 host 1 条（含保留键）。
+    /// 小文件/媒体链：1 host 1 条（含保留键）。
     mirrors: HashMap<String, Vec<String>>,
-    /// 大文件域单链：所有 big host 共用一条（成员本就相同，per-host 是冗余）。
+    /// 大文件域单链：所有 big host 共用一条。
     big_mirrors: Vec<String>,
-    /// 每条串发路由（会话域+其他低频域）一个游标记号；内容域竞速不记；表序冻结，不随游标重排。
+    /// 串发路由（会话域+其他低频域）各一个游标；内容域不记；表序冻结不随游标重排。
     cursor: HashMap<String, String>,
 }
 
-/// 串发全灭冷却（30s 快速失败窗）：全灭后调用方直接走兜底，不再空转重试。
+/// 串发全灭冷却 30s：全灭后直接走兜底。
 pub static SERIAL_COOL: Breaker = Breaker::new(30);
 
-/// 测试专用：路由表/串发表都是进程级全局态，跨模块的用例靠它串行。
+/// 测试专用串行锁：路由表/串发表为进程级全局态。
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -70,17 +70,17 @@ static SERIAL: Mutex<Option<SerialTab>> = Mutex::new(None);
 static SERIAL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SERIAL_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
-/// 路由表文档：v2 给 ips+hosts（测速值在 ips 节点条目内）。
+/// 路由表文档 v2：ips + hosts，测速值在 ips 节点条目内。
 #[derive(Default)]
 struct TopoDoc {
     hosts: Vec<route::HostSpec>,
     ips: Vec<route::IpSpec>,
     chains: HashMap<String, Vec<String>>,
-    /// 大文件域单链（所有 big host 共用一条，不再每 host 一条）。
+    /// 大文件域单链（所有 big host 共用一条）。
     big: Vec<String>,
 }
 
-/// 容错解析：坏段只丢那一段；salvaged = 有段被丢弃，调用方备份原文件。
+/// 容错解析：坏段只丢该段；salvaged = 有段被丢弃，调用方备份原文件。
 fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, bool)> {
     let root: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = root.as_object()?;
@@ -136,7 +136,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         if !k.starts_with("mirrors") {
             continue;
         }
-        // 大文件域单链：新格式是列表；旧 per-host map 原地合并（各 host 链本就相同）。
+        // 大文件单链：列表；旧 per-host map 原地合并。
         if k == "mirrors_big" {
             match v {
                 serde_json::Value::Array(list) => {
@@ -152,7 +152,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
                     }
                 }
                 serde_json::Value::Object(m) => {
-                    // 旧 per-host map：按域名序把所有 host 的链去重合并成一条；排序只为确定性，是升级迁移路径。
+                    // 旧 per-host map 按域名序去重合并成一条链。
                     let mut keys: Vec<String> = m.keys().cloned().collect();
                     keys.sort();
                     for h in keys {
@@ -194,7 +194,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         };
         let slot = match k.as_str() {
             "mirrors_small" => &mut small,
-            // 0.5.2 前的裸 mirrors 旧字典（及未知 mirrors* 键）：随两代迁移层一并停读
+            // 裸 mirrors 旧字典及未知 mirrors* 键已停读。
             other => {
                 if let Some(l) = log {
                     l(&format!("[串发] routes.json {other} 段已停读(旧格式), 该段忽略"));
@@ -219,8 +219,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
         }
     }
     doc.chains = small;
-    // 测速值兼容：旧布局顶层 {ip: ms} 与节点条目内映射都已收编为节点标量（IpSpec.latency 反序列化处理），
-    // 这里只补顶层旧键 → 对应节点标量的一次迁移；新布局直接带节点标量。
+    // 测速值兼容：顶层旧键 {ip: ms} 迁移到节点标量（IpSpec.latency）；新布局自带节点标量。
     if let Some(serde_json::Value::Object(map)) = obj.get("latency") {
         for spec in &mut doc.ips {
             let ip = spec.ip.trim().to_string();
@@ -236,7 +235,7 @@ fn parse_routes_tolerant(raw: &str, log: Option<&LogFn>) -> Option<(TopoDoc, boo
 fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // 测速值跟着节点走：单 IP 节点一个标量，未测(0)不写。
+    // 测速值跟节点走：单 IP 一标量，未测(0)不写。
     let snapshot = route::nodes_snapshot();
     let nodes: Vec<String> = snapshot
         .iter()
@@ -257,7 +256,7 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> Stri
         .collect();
     parts.push(format!("  \"ips\": [\n{}\n  ]", nodes.join(",\n")));
 
-    // hosts 只落特殊属性/无节点的键：全默认判定必须把 session/big 算进去，否则第一次存盘就丢标志。
+    // hosts 只落特殊属性/无节点的键；全默认判定含 session/big。
     let served: std::collections::HashSet<&str> = snapshot
         .iter()
         .flat_map(|n| n.hosts.iter().map(|s| s.as_str()))
@@ -296,7 +295,7 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> Stri
             }
         })
         .collect();
-    // hosts 表压成一行：纯路由声明，逐行展开徒增文件高度。
+    // hosts 表压成一行。
     parts.push(format!("  \"hosts\": {{{}}}", rows.join(", ")));
 
     let mut small_rows: Vec<String> = Vec::new();
@@ -309,13 +308,13 @@ fn encode_routes(mirrors: &HashMap<String, Vec<String>>, big: &[String]) -> Stri
         let items: Vec<String> = c.iter().map(json_of).collect();
         small_rows.push(format!("    {}: [{}]", json_of(h), items.join(", ")));
     }
-    // 媒体救援链是保留键：原样回写进 mirrors_small，手改的内容不因落盘丢失。
+    // 媒体救援链为保留键：原样回写进 mirrors_small。
     for h in MEDIA_CHAINS {
         let Some(c) = mirrors.get(*h) else { continue };
         let items: Vec<String> = c.iter().map(json_of).collect();
         small_rows.push(format!("    {}: [{}]", json_of(h), items.join(", ")));
     }
-    // 大文件域单链：列表落盘（旧 per-host map 由解析端原地合并迁移）。
+    // 大文件单链列表落盘（旧 per-host map 由解析端合并迁移）。
     if !big.is_empty() {
         let items: Vec<String> = big.iter().map(json_of).collect();
         parts.push(format!("  \"mirrors_big\": [{}]", items.join(", ")));
@@ -333,16 +332,16 @@ fn json_of<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("JSON 序列化不会失败")
 }
 
-/// routes.json 写盘互斥：退出落盘与后台改镜像链可能同时写，撞在一起会把两份配置搅成一份。
+/// routes.json 写盘互斥。
 static ROUTES_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 fn write_routes_file(path: &Path) {
     let _guard = ROUTES_SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    // 快照必须在写锁内拍：调用方在锁外拍的话，删除镜像后另一路拿旧快照排队写，会把已删的复活。
+    // 快照必须在写锁内拍。
     let mirrors = mirror_chains_snapshot();
     let data = encode_routes(&mirrors, &big_chain());
     if let Err(e) = crate::fsx::write_atomic(path, data.as_bytes()) {
-        // 写盘失败无声 = 镜像链/表变更重启即丢且查无痕迹，必须留一行。
+        // 写盘失败必须留一行日志。
         if let Some(l) = lock(&SERIAL_LOG).as_ref() {
             l(&format!("[串发] routes.json 写盘失败: {e}"));
         }
@@ -356,7 +355,7 @@ fn routes_path() -> PathBuf {
     dir.join(ROUTES_FILE)
 }
 
-/// 立即把内存表（含 latency 回流）落盘，下次冷启动仍有拨号延迟基线。
+/// 立即把内存表（含 latency 回流）落盘，冷启动保留延迟基线。
 pub fn save_routes_now() {
     write_routes_file(&routes_path());
 }
@@ -369,7 +368,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let parsed = raw
         .as_deref()
         .and_then(|b| parse_routes_tolerant(b, log.as_ref()));
-    // 有段落坏/整份读不了：先备份原文件再重建，用户手排表可从 .bak 捡回。
+    // 有段损坏/整份读不了：先备份原文件再重建（.bak 可恢复）。
     let bak_why = match (&raw, &parsed) {
         (Some(_), None) => Some("解析失败, 本次按种子重建"),
         (Some(_), Some((_, true))) => Some("有段落坏已按种子重建"),
@@ -388,8 +387,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
     let seeds = seed_db();
     let mut doc = match parsed {
         Some((mut d, _)) => {
-            // v1/0.5.3 旧格式（routes 字典/旧三池）不再被读懂：文件在却拆不出任何路由行 = 旧格式或残缺，
-            // 路由行按种子重建（用户镜像链/测速值保留），绝不静默半重建——只有镜像链没有路由的表跑不起来。
+            // 无 ips/hosts 路由行（旧格式或残缺）：路由行按种子重建，保留镜像链/测速值。
             if d.hosts.is_empty() && d.ips.is_empty() {
                 if let Some(l) = log.as_ref() {
                     l("[串发] routes.json 无 ips/hosts 路由行(旧格式或残缺), 路由行按种子重建");
@@ -441,7 +439,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             }
         }
     }
-    // 只有真有行被丢弃才留底（用户手写的标记还能从 .bak 捡回）；健康表启动不留任何备份。
+    // 只有真有行被丢弃才备份；健康表启动不留备份。
     if dropped > 0 && !path.with_extension("json.bak").exists() {
         let _ = std::fs::copy(&path, path.with_extension("json.bak"));
     }
@@ -453,7 +451,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         big_mirrors: doc.big,
         cursor: HashMap::new(),
     };
-    // 游标圈预写空记号；settings.last_ip 非空值覆盖（表外旧键直接丢）。
+    // 游标圈预写空记号，settings.last_ip 非空值覆盖（表外键丢弃）。
         for key in route::cursor_keys() {
         tab.cursor.insert(key, String::new());
     }
@@ -471,7 +469,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             }
             continue;
         }
-        // 数据权威：不设白名单，自部署镜像可用；坏镜像运行期自然沉底。
+        // 不设白名单：自部署镜像可用，坏镜像运行期自然沉底。
         let vc: Vec<String> = chain
             .into_iter()
             .filter(|m| m.starts_with("https://") && !m.contains(' '))
@@ -480,7 +478,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             continue;
         }
         if route::is_big_file_host(&host) {
-            // 用户把 big host 的链放错字典：归位合并进大文件单链，不静默丢。
+            // big host 链放错字典：合并进大文件单链，不丢弃。
             for u in vc {
                 if !tab.big_mirrors.contains(&u) {
                     tab.big_mirrors.push(u);
@@ -490,7 +488,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
             tab.mirrors.insert(host, vc);
         }
     }
-    // 手改/收编的镜像进注册表(幂等)：工作台看得到、开关管得到、删得掉。
+    // 手改/收编镜像进注册表（幂等）。
     {
         let mut registry = crate::settings::worker_mirrors();
         let mut adopted = false;
@@ -511,7 +509,7 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
                 adopted = true;
             }
         }
-        // 手改的 big 镜像必须收编注册表：否则工作台看不到、开关管不到、删不掉。
+        // 手改的 big 镜像收编注册表。
         for u in &tab.big_mirrors {
             if registry.iter().any(|w| w.url == *u) {
                 continue;
@@ -529,15 +527,15 @@ pub fn serial_load(data_dir: &Path, last_ip: Vec<(String, String)>, log: Option<
         }
     }
     *lock(&SERIAL) = Some(tab);
-    // 注册表对齐只动内存：启动不写盘（routes.json 是手改入口，写盘只发生在运行时改链）。
+    // 注册表对齐只动内存，启动不写盘。
     sync_custom_mirrors(&[], false);
-    // 只有文件不存在（全新安装）才生成一次；之后的启动一律不重写，手改原样生效。
+    // 仅文件不存在（全新安装）时生成一次；之后启动不重写。
     if raw.is_none() {
         write_routes_file(&path);
     }
 }
 
-/// IpSpec → 运行时节点：单 IP 节点（范围写法已下线），latency 跟节点走。
+/// IpSpec → 运行时节点：单 IP 节点，latency 跟节点走。
 fn build_node(spec: route::IpSpec) -> Result<route::IpNode, String> {
     let ip = spec.ip.trim().to_string();
     let segs: Vec<&str> = ip.split('.').collect();
@@ -569,7 +567,7 @@ fn build_node(spec: route::IpSpec) -> Result<route::IpNode, String> {
     })
 }
 
-/// 测试专用：装一份种子路由表，供 certgen/settings 这类不经过 routes.json 的用例。
+/// 测试专用：装种子路由表供不经过 routes.json 的用例。
 #[cfg(test)]
 pub(crate) fn install_seed_routes() {
     let seeds = seed_db();
@@ -586,7 +584,7 @@ pub(crate) fn install_seed_routes() {
     route::install(rows, nodes);
 }
 
-/// 种子只补已有表的节点/边，不新建 hosts 行（用户删的不该被加回）；节点 hosts 里出现但 hosts 块没写的键按默认补行，落盘时省略。
+/// 种子只补已有表的节点/边，不新建 hosts 行；节点 hosts 中未写的键按默认补行（落盘省略）。
 fn fill_hosts_from_nodes(doc: &mut TopoDoc) {
     for spec in &doc.ips {
         for h in &spec.hosts {
@@ -594,7 +592,7 @@ fn fill_hosts_from_nodes(doc: &mut TopoDoc) {
             if key.is_empty() || doc.hosts.iter().any(|x| x.key == key) {
                 continue;
             }
-            // 通配键继承父域标志：*.github.com 从 github.com 拿 session，别让派生行丢主站会话语义。
+            // 通配键继承父域标志（*.github.com 继承 github.com 的 session）。
             let inherited = key
                 .strip_prefix("*.")
                 .and_then(|bare| doc.hosts.iter().find(|x| x.key == bare));
@@ -620,7 +618,7 @@ fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
             break;
         }
         let seed_ip = seed_node.ip.trim().to_string();
-        // 按"同地址"找现有节点；找不到且 hosts 行存在 → 新建节点。
+        // 按同地址找现有节点；找不到且 hosts 行存在则新建。
         let hit = doc
             .ips
             .iter_mut()
@@ -654,7 +652,7 @@ fn topup_from_seeds(doc: &mut TopoDoc, seeds: &TopoDoc, log: Option<&LogFn>) {
     }
 }
 
-/// 数据层结果回写游标：成功驻留、失败前移、零写盘；内容域竞速不记游标但仍清死亡退避与 421/超时短冷却。
+/// 结果回写游标：成功驻留/失败前移/零写盘；内容域不记游标但清死亡退避与 421/超时短冷却。
 pub fn cursor_note(host: &str, ip: &str, ok: bool) {
     let Some(row) = route::route_for(host) else {
         return;
@@ -680,7 +678,7 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool) {
         edges::clear(ip, &row.key); // 成功只清短冷却(超时/421)；风控冷却不可清，只随时间过期
         return;
     }
-    // 失败：前移到下一候选(整圈后自然复测)；内容域竞速选路，游标无人读，不挪。
+    // 失败：前移到下一候选（整圈后复测）；内容域不挪游标。
     if track {
         if let Some(pos) = circle.iter().position(|p| p.ip == ip) {
             let next = &circle[(pos + 1) % circle.len()];
@@ -689,7 +687,7 @@ pub fn cursor_note(host: &str, ip: &str, ok: bool) {
     }
 }
 
-/// 尝试顺序：游标 IP 优先，其余按实测延迟升序、未测垫底保持表序；内容域竞速不看此序。
+/// 尝试顺序：游标 IP 优先，其余按延迟升序、未测垫底保持表序；内容域竞速不看。
 fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..circle.len()).collect();
     order.sort_by_key(|&i| {
@@ -708,15 +706,15 @@ fn dial_order(circle: &[route::NodeIp], start_ip: Option<&str>) -> Vec<usize> {
     order
 }
 
-/// 全局拨号认领集：同一 IP 全进程至多一条腿在拨（跨 host 去重），窗口 = 起拨到入库/失败；TCP 隧道腿 1:1 不认领。
+/// 拨号认领集：同一 IP 全进程至多一条腿（跨 host 去重），窗口起拨到入库/失败；TCP 隧道腿不认领。
 static DIAL_CLAIMS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// 认领拨号：返回 false = 已有别的腿在拨这个 IP，本腿不出场。
+/// 认领拨号：false = 该 IP 已有腿在拨，本腿不出场。
 pub(crate) fn claim_dial(ip: &str) -> bool {
     lock(&DIAL_CLAIMS).insert(ip.to_string())
 }
 
-/// 释放认领：入库/失败后必调——漏放 = 该 IP 本进程永久哑火。
+/// 释放认领：入库/失败后必调。
 pub(crate) fn release_dial(ip: &str) {
     lock(&DIAL_CLAIMS).remove(ip);
 }
@@ -728,7 +726,7 @@ pub struct DialSkip<'a> {
     pub skip_ips: &'a [String],
 }
 
-/// 证书校验失败按小写子串认（错误串随 BoringSSL 版本变）；只认校验不过，不认系统根证书缺失那类。
+/// 证书校验失败按小写子串认，仅认校验不过，不认系统根证书缺失。
 fn cert_miss(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     [
@@ -741,7 +739,7 @@ fn cert_miss(msg: &str) -> bool {
     .any(|k| m.contains(*k))
 }
 
-/// 锚点选错提示：同一 (IP, 锚点) 只打一次；空锚点失败 = 默认证书没覆盖该域名。
+/// 锚点选错提示：同一 (IP, 锚点) 只打一次；空锚点 = 默认证书未覆盖该域名。
 fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&LogFn>) {
     let Some(log) = log else { return };
     static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -769,7 +767,7 @@ fn log_cert_miss(ip: &str, sni: &str, verify: &str, host: &str, log: Option<&Log
     ));
 }
 
-/// IP 级死亡退避（全局共享）：TCP 连不上 / h2 谈不成 = 该 IP 建不成通道，60/300/1800s 递增、自动过期。
+/// IP 级死亡退避（全局共享）：TCP/h2 失败即退避，60/300/1800s 递增、自动过期。
 pub fn note_dead(ip: &str) {
     let mut g = lock(&SERIAL);
     if let Some(t) = g.as_mut() {
@@ -783,7 +781,7 @@ pub fn note_dead(ip: &str) {
     }
 }
 
-/// 清除死亡退避：IP 测速成功（建连成功）即证明它活着，运行时不必再绕行等待。
+/// 清除死亡退避：IP 建连成功即清除。
 pub(crate) fn clear_dead(ip: &str) {
     let mut g = lock(&SERIAL);
     if let Some(t) = g.as_mut() {
@@ -791,8 +789,7 @@ pub(crate) fn clear_dead(ip: &str) {
     }
 }
 
-/// IP 测速后清空内存游标：游标正生效的地方是这里的 SERIAL.cursor，settings.json 只是副本。
-/// 不清内存的话下次成功拨号会把旧游标整份写回磁盘，"测速后纯按延迟排序"当场失效。
+/// IP 测速后清空内存游标（SERIAL.cursor 为权威，settings.json 为副本）。
 pub fn clear_cursors() {
     let mut g = lock(&SERIAL);
     if let Some(t) = g.as_mut() {
@@ -800,7 +797,7 @@ pub fn clear_cursors() {
     }
 }
 
-/// 该 IP 或该节点（ip|sni）是否在死亡冷却中：竞速取候选与外部预检共用这一个口径。
+/// 是否在死亡冷却：查 IP 或节点（ip|sni），竞速与外部预检共用此口径。
 pub fn dial_cooling(ip: &str, sni: &str) -> bool {
     let g = lock(&SERIAL);
     let Some(t) = g.as_ref() else { return false };
@@ -809,7 +806,7 @@ pub fn dial_cooling(ip: &str, sni: &str) -> bool {
     cooling(ip) || cooling(&format!("{ip}|{sni}"))
 }
 
-/// 串发日志限速：每 host 每 60s 最多 12 行，留证又不刷屏。
+/// 串发日志限速：每 host 每 60s 最多 12 行。
 fn serial_try_allowed(host: &str) -> bool {
     static Q: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -829,7 +826,7 @@ fn serial_try_allowed(host: &str) -> bool {
     true
 }
 
-/// 错误文案截断：串发日志一行一个，长错误会把整行撑爆。
+/// 错误文案截断至 60 字符。
 fn brief_err(msg: &str) -> String {
     let s = msg.trim();
     if s.chars().count() <= 60 {
@@ -839,7 +836,7 @@ fn brief_err(msg: &str) -> String {
     }
 }
 
-/// 圈式串发：游标起步逐个试，成功驻留、失败前移、全灭冷却 30s；skip_ips 硬排除已占用 IP，同 IP 不仲裁。
+/// 圈式串发：游标起步逐个试，成功驻留/失败前移/全灭冷却 30s；skip_ips 硬排除已占用 IP。
 pub async fn serial_dial_skip(
     req: DialSkip<'_>,
     log: Option<&LogFn>,
@@ -859,7 +856,7 @@ pub async fn serial_dial_skip(
         return Err(format!("直连域不进拨号({host})"));
     }
     let key = row.key.clone();
-    // 与 cursor_note 同一道闸：内容域竞速不记游标，候选剩 1 条退回串发时也不写孤儿游标。
+    // 与 cursor_note 同闸：内容域不记游标，退回串发也不写孤儿游标。
     let track = !row.flags.content;
     let mut circle = route::dial_targets(host).unwrap_or_default();
     let total_candidates = circle.len();
@@ -873,9 +870,9 @@ pub async fn serial_dial_skip(
             circle = filtered;
         }
     }
-    // 已有通道被 skip 掉的数量（过滤全部滤空时保留原表走入库去重，不计）。
+    // 已有通道被 skip 的数量（滤空时保留原表，不计）。
     let occupied_n = total_candidates - circle.len();
-    // 慢 IP 软排除：全慢时 usable 原样返回，一圈候选不会打空。会话域固定单 IP，不参与。
+    // 慢 IP 软排除：全慢时 usable 原样返回；会话域固定单 IP 不参与。
     let mut slow_skipped = 0usize;
     if crate::server::upstream::host_class(host) != crate::server::upstream::HostClass::Session {
         let ips: Vec<String> = circle.iter().map(|p| p.ip.clone()).collect();
@@ -888,7 +885,7 @@ pub async fn serial_dial_skip(
     if circle.is_empty() {
         return Err(format!("路由 [{key}] 没有可用候选 IP({host})"));
     }
-    // 尝试顺序：游标上的 IP（上次驻留）优先；其余按实测建连延迟升序，未测的垫底保持表序。
+    // 尝试顺序：游标 IP 优先，其余按建连延迟升序、未测垫底。
     let start_ip = {
         let g = lock(&SERIAL);
         g.as_ref().unwrap().cursor.get(&key).cloned()
@@ -901,12 +898,12 @@ pub async fn serial_dial_skip(
     let mut claimed_skipped = 0usize;
     for (oi, &ci) in order.iter().enumerate() {
         let p = &circle[ci];
-        // 死亡退避双键：TCP/h2 失败记 IP 粒度（与 SNI 无关）；TLS 握手超时记 ip|sni 节点粒度。
+        // 死亡退避双键：TCP/h2 失败记 IP 粒度；TLS 握手超时记 ip|sni 粒度。
         if dial_cooling(&p.ip, &p.sni) {
             dead_skipped += 1;
             continue;
         }
-        // TLS 拨号走全局认领：同一 IP 全进程至多一条腿（跨 host 去重）；TCP 隧道腿不认领。
+        // TLS 拨号走全局认领（同 IP 至多一条腿）；TCP 隧道腿不认领。
         if tls_handshake && !claim_dial(&p.ip) {
             claimed_skipped += 1;
             continue;
@@ -918,7 +915,7 @@ pub async fn serial_dial_skip(
             release_dial(&p.ip);
         }
         let dt = t0.elapsed();
-        // 每次尝试都留一行（限速）：换 IP 的全过程以前完全无日志，出问题查不到。
+        // 每次尝试留一行日志（限速）。
         if let Some(log) = log {
             if serial_try_allowed(host) {
                 let verdict = match &result {
@@ -936,7 +933,7 @@ pub async fn serial_dial_skip(
         }
         match result {
             Ok(conn) => {
-                // 成功驻留；变更落盘 settings.last_ip（set_last_ips 未变化时 no-op）。
+                // 成功驻留；落盘 settings.last_ip（无变化则 no-op）。
                 if track {
                     let snap = {
                         let mut g = lock(&SERIAL);
@@ -953,7 +950,7 @@ pub async fn serial_dial_skip(
             }
             Err(e) => {
                 last_err = Some(e.to_string());
-                // 前移到下一候选；物理顺序不动，零写盘（内容域不记游标）。
+                // 前移到下一候选；物理顺序不动、零写盘（内容域不记）。
                 if track {
                     let mut g = lock(&SERIAL);
                     let n = order.len();
@@ -962,9 +959,9 @@ pub async fn serial_dial_skip(
                         t.cursor.insert(key.clone(), next.ip.clone());
                     }
                 }
-                // TCP 失败 = IP 对谁都死，进死亡退避；TLS 失败是按域干扰，只前移。
+                // TCP 失败进死亡退避；TLS 失败只前移。
                 let msg = e.to_string();
-                // 证书校验失败 = 锚点没印在这张证书上，不是 IP 坏：留一行能照做的提示。
+                // 证书校验失败：锚点未印在证书上，留提示日志。
                 let cert_bad = msg.contains("TLS") && cert_miss(&msg);
                 if cert_bad {
                     log_cert_miss(&p.ip, &p.sni, &p.verify, host, log);
@@ -979,12 +976,12 @@ pub async fn serial_dial_skip(
                 if tcp_level {
                     note_dead(&p.ip);
                 }
-                // TLS 握手超时 = 节点级死亡退避：SNI 由节点配置决定，与请求 host 无关。
+                // TLS 握手超时 = 节点级死亡退避。
                 let timed_out = e.kind() == std::io::ErrorKind::TimedOut
                     || msg.contains("超时")
                     || msg.to_lowercase().contains("timed out");
                 if tls_handshake && !tcp_level && !cert_bad && timed_out {
-                    // 节点级死亡退避（键 = ip|sni）：握手超时；SNI 由节点配置决定，全局共享不冤枉。
+                    // 节点级死亡退避（键 = ip|sni）：握手超时。
                     note_dead(&format!("{}|{}", p.ip, p.sni));
                 }
                 continue;
@@ -993,7 +990,7 @@ pub async fn serial_dial_skip(
     }
 
     if tried == 0 {
-        // 一条腿都没轮到拨 = 候选全被别的 host 认领：哨兵让调用方稍候重查池。
+        // 一条腿都没轮到拨 = 候选全被认领：哨兵让调用方稍候重查池。
         if claimed_skipped > 0 {
             return Err(crate::server::upstream::ERR_ALL_CLAIMED.to_string());
         }
@@ -1002,7 +999,7 @@ pub async fn serial_dial_skip(
              {dead_skipped} 个死亡冷却, {slow_skipped} 个慢冷却"
         ));
     }
-    // 绕表全灭：无镜像兜底才冷却（camo 无链，豁免会让每张徽章重烧整表）。
+    // 绕表全灭：无镜像兜底才冷却。
     let has_mirror = !mirror_chain(host).is_empty();
     if !has_mirror {
         SERIAL_COOL.set(host);
@@ -1026,20 +1023,20 @@ pub async fn serial_dial_skip(
 
 /* ---------- 通道池统一入口 ---------- */
 
-/// per-host 建造锁：未命中只放一个进拨号，等锁者重查池子骑现成的。
+/// per-host 建造锁：未命中只放一个进拨号，等锁者重查池骑现成的。
 static BUILD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     std::sync::OnceLock::new();
 
-/// 建造等待上界 15s：必须盖过竞速全程（RACE_WINDOW 8s + h2 握手 5s）+ 余量，否则冷启动一页并发请求集体超时摔给兜底；同一把尺也量建造本身。
+/// 建造等待上界 15s（盖过 RACE_WINDOW 8s + h2 握手 5s + 余量），建造本身也受此限。
 pub(crate) const BUILD_WAIT_SECS: u64 = 15;
 
-/// 测试专用：读游标驻留（游标本身内存态、零写盘，没有别的读出口）。
+/// 测试专用：读游标驻留（内存态、零写盘）。
 #[cfg(test)]
 pub(crate) fn cursor_of(route_key: &str) -> Option<String> {
     lock(&SERIAL).as_ref()?.cursor.get(route_key).cloned()
 }
 
-/// 建造锁表容量：按 host 建键，常驻进程访问过上千子域后不能只涨不降。
+/// 建造锁表容量（按 host 建键）：防止常驻进程只涨不降。
 const BUILD_LOCK_CAP: usize = 1024;
 
 fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1048,7 +1045,7 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     if g.len() >= BUILD_LOCK_CAP {
-        // 只留还有调用方持有的锁：Arc 计数 > 1 说明有人正在等/在建，删了会拆掉雷群去重。
+        // 只留 Arc 引用计数 > 1 的锁（有人正在等/在建）。
         g.retain(|_, l| Arc::strong_count(l) > 1);
     }
     g.entry(host.to_string())
@@ -1056,7 +1053,7 @@ fn build_lock(host: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// 通道获取统一入口：从池取可用通道（取→建→溢出），来源对调用方不可见；fresh 只用于失败归因（新拨罚边，沿用只摘）。
+/// 通道获取统一入口：取→建→溢出，来源对调用方不可见；fresh 仅用于失败归因。
 pub async fn get_or_build(
     host: &str,
     log: &LogFn,
@@ -1070,7 +1067,7 @@ pub async fn get_or_build(
     }
     let ips: Vec<String> = targets.iter().map(|t| t.ip.clone()).collect();
     let session = chan::host_class(host) == chan::HostClass::Session;
-    // 慢 IP 软排除：usable 在全慢时原样返回，候选不会被打空。会话域固定单 IP，换 IP 是风控特征，不参与。
+    // 慢 IP 软排除：全慢时 usable 原样返回；会话域固定单 IP 不参与。
     let ips = if session { ips } else { speed::usable(&ips) };
 
     // 1) 选：会话域只认自己建的通道；内容域/其他谁闲用谁。
@@ -1080,14 +1077,14 @@ pub async fn get_or_build(
         if !saturated || session {
             return Ok((up, false));
         }
-        // 2) 溢出：全部通道顶满 → 补一条临时通道；补不出骑现有连接排队等释放。
+        // 2) 溢出：全满则补临时通道，补不出骑现有连接排队。
         return match overflow_build(host, &targets, log).await {
             Some(new) => Ok((new, true)),
             None => Ok((up, false)),
         };
     }
 
-    // 池空 → 排队等在途建造：锁队列即正在建造的登记簿，唤醒后双检、前一位失败则自己顶上；每人自己的 15s 上界盖过竞速全程。
+    // 池空排队等在途建造：锁队列即建造登记簿，唤醒后双检、前一位失败则顶上；每人 15s 上界。
     let gate = build_lock(host);
     let deadline = Instant::now() + Duration::from_secs(BUILD_WAIT_SECS);
     loop {
@@ -1106,14 +1103,14 @@ pub async fn get_or_build(
         if let Some(up) = pick_channel(host, &ips, session) {
             return Ok((up, false));
         }
-        // 建造（内容域竞速/其余串发）也受同一硬窗：否则抢到锁的人挂几十秒不返回也不兜底；串发是旁路，超窗只影响这条请求。
+        // 建造（内容域竞速/其余串发）也受同一硬窗；串发超窗只影响本请求。
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
             return Err(format!("{host} 建造在途等待超时({BUILD_WAIT_SECS}s), 走兜底"));
         }
         match tokio::time::timeout(remain, chan::dial_upstream(host, log)).await {
             Ok(Err(e)) if e == chan::ERR_ALL_CLAIMED => {
-                // 候选全被别的 host 在拨：松锁等它落池，50ms 后重查（界照旧）。
+                // 候选全被别的 host 在拨：松锁，50ms 后重查。
                 drop(_guard);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -1130,7 +1127,7 @@ pub async fn get_or_build(
 
 /* ---------- 黑洞触发链：池子摘出 → 通知建连机器人换血 ---------- */
 
-/// 黑洞按域处置：会话域摘黑+游标前移+预建；内容域软禁黑 IP 60s（不杀在途）+换血补缺；其他域暂缓即可。
+/// 黑洞按域处置：会话域摘黑+游标前移+预建；内容域软禁黑 IP 60s+换血补缺；其他域暂缓。
 pub fn on_channel_blackhole(host: &str, ip: &str, log: &LogFn) {
     use crate::server::upstream as chan;
     match chan::host_class(host) {
@@ -1149,7 +1146,7 @@ pub fn on_channel_blackhole(host: &str, ip: &str, log: &LogFn) {
             });
         }
         chan::HostClass::Content => {
-            // 软禁 60s 不杀在途：一条 h2 驮几十条流，个别流黑洞≠连接死，cull 会连坐全部在途流。
+            // 软禁 60s 不杀在途（cull 会连坐全部在途流）。
             speed::bench(ip);
             (log)(&format!(
                 "[黑洞] {host} {ip} 暂缓(数据窗零字节), 触发全量换血"
@@ -1179,7 +1176,7 @@ fn ensure_coverage(host: &str, log: LogFn) {
             let host2 = host.clone();
             let log2 = log.clone();
             let dial_job = async move {
-                // 拨号/握手失败各落一行：吞掉的话坏 IP 每 60 秒白付一次完整握手还查无痕迹。
+                // 拨号/握手失败各落一行日志。
                 let conn = match dial::dial_one(&t.ip, &t.sni, &t.verify, true).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -1200,12 +1197,12 @@ fn ensure_coverage(host: &str, log: LogFn) {
             tokio::spawn(dial_job);
             built += 1;
         }
-        // 派发数不是建成数——成没成由各腿自己的回执行说话，这里只报派了几条。
+        // 派发数非建成数，仅报派了几条腿。
         (log)(&format!("[池] {host} 换血: 派发 {built} 腿"));
     });
 }
 
-/// 竞速候选准备：路由候选→滤死亡冷却→滤暂缓（全滤空回退全表）；调用方须非会话域（会话域恒串发）。
+/// 竞速候选准备：滤死亡冷却→滤暂缓（全滤空回退全表）；调用方须非会话域。
 pub(crate) fn dial_candidates(host: &str) -> Vec<route::NodeIp> {
     let targets = route::dial_targets(host).unwrap_or_default();
     let alive: Vec<route::NodeIp> = targets
@@ -1222,7 +1219,7 @@ pub(crate) fn dial_candidates(host: &str) -> Vec<route::NodeIp> {
         .collect()
 }
 
-/// 内容域 TCP 竞速（仅 MITM 关的隧道用）：并发拨 TCP，第一个通的开管；不进认领（1:1 消费）、不错峰、不建池；会话域不进来（跨 IP SYN 是风控画像）。
+/// 内容域 TCP 竞速（仅 MITM 关隧道用）：并发拨 TCP，首个通的开管；不认领、不错峰、不建池；会话域不进。
 pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), String> {
     if SERIAL_COOL.open(host) {
         return Err("串发冷却中(全灭后 30s 内), 走兜底".to_string());
@@ -1240,7 +1237,7 @@ pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), Stri
                     let _ = tx2.send(Ok((conn, node.ip.clone()))).await;
                 }
                 Err(e) => {
-                    // TCP 失败 = IP 对谁都死，进死亡退避（与串发同款判据）。
+                    // TCP 失败进死亡退避（同串发判据）。
                     if msg_is_tcp_dead(&e) {
                         note_dead(&node.ip);
                     }
@@ -1250,14 +1247,14 @@ pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), Stri
         });
     }
     drop(tx);
-    // 第一个通的即胜，其余随 rx drop 自灭：未握手的 SYN 自消，已握手的 drop 即关。
+    // 首个通的即胜，其余随 rx drop 自灭。
     let mut last: Option<String> = None;
     loop {
         match rx.recv().await {
             Some(Ok((conn, ip))) => return Ok((conn, ip)),
             Some(Err(e)) => last = Some(e),
             None => {
-                // 全灭冷却：MITM 关模式下镜像腿不营业，无豁免，30s 内直落系统 DNS。
+                // 全灭冷却 30s（MITM 关模式无镜像豁免，直落系统 DNS）。
                 SERIAL_COOL.set(host);
                 return Err(last.unwrap_or_else(|| format!("{host} TCP 竞速全败")));
             }
@@ -1265,7 +1262,7 @@ pub async fn tcp_race_connect(host: &str) -> Result<(dial::Dialed, String), Stri
     }
 }
 
-/// TCP 层失败判据（与串发同款）：IP 对谁都死才进死亡退避。
+/// TCP 层失败判据（同串发）：IP 对谁都死才进死亡退避。
 fn msg_is_tcp_dead(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::ConnectionRefused
         || e.kind() == std::io::ErrorKind::ConnectionReset
@@ -1273,7 +1270,7 @@ fn msg_is_tcp_dead(e: &std::io::Error) -> bool {
         || e.to_string().starts_with("TCP")
 }
 
-/// 池内挑一条：会话域只认自己的通道（自建优先，不蹭公共通道），内容域/其他任意。
+/// 池内挑一条：会话域只认自建通道，内容域/其他任意。
 fn pick_channel(
     host: &str,
     ips: &[String],
@@ -1286,7 +1283,7 @@ fn pick_channel(
     }
 }
 
-/// 溢出只补零通道 IP 的临时通道（同 IP 溢出已废：多一条 TCP 只摊薄窗口）；满载骑排队；溢出句柄 pick 不外发、闲置即焚；会话域不溢出。
+/// 溢出只补零通道 IP 的临时通道；满载骑排队；溢出句柄不外发、闲置即焚；会话域不溢出。
 async fn overflow_build(
     host: &str,
     targets: &[route::NodeIp],
@@ -1317,14 +1314,14 @@ async fn overflow_build(
             Some(chan::store_h2(&node.ip, up))
         }
         Err(_) => {
-            // h2 谈不成 = 这个 IP 现在建不成通道，进死亡退避，别家串发直接跳过。
+            // h2 谈不成 = IP 建不成通道，进死亡退避。
             note_dead(&node.ip);
             None
         }
     }
 }
 
-/// 收齐 host 候选内最多 want 条通道：现成的直接给，不够建腿+溢出补，补不动交现有的；空 = 直连暂不可用。
+/// 收齐最多 want 条通道：现成直接给，不够建腿+溢出补，补不动交现有的；空 = 直连暂不可用。
 pub async fn gather_channels(
     host: &str,
     want: usize,
@@ -1343,7 +1340,7 @@ pub async fn gather_channels(
         got.truncate(want);
         return got;
     }
-    // 池空先建，再把池里现成的（可能不止这条）一并收进来。
+    // 池空先建，再把池里现成的通道一并收进来。
     if got.is_empty() {
         match get_or_build(host, log).await {
             Ok((up, _)) => got.push(up),
@@ -1365,14 +1362,14 @@ pub async fn gather_channels(
     got
 }
 
-/// 失败上报：摘通道+记账；新拨的游标前移+罚边冷却，骑来的旧通道只摘不罚（IP 没被试过）。
+/// 失败上报：摘通道+记账；新拨游标前移+罚边冷却，骑来的旧通道只摘不罚。
 pub fn report_failure(up: &crate::server::upstream::H2Upstream, host: &str, fresh: bool) {
     use crate::server::upstream as chan;
     chan::drop_h2_id(&up.ip, up.id);
     if !fresh {
         return;
     }
-    // 先挪游标再拉黑：反了的话候选圈滤掉该 IP，游标永远挪不动。
+    // 先挪游标再拉黑。
     cursor_note(host, &up.ip, false);
     if let Some(row) = route::route_for(host) {
         edges::mark_stall(&up.ip, &row.key);
@@ -1397,7 +1394,7 @@ fn align_chain(chain: &mut Vec<String>, en: &[String], dis: &[String]) -> bool {
     changed
 }
 
-/// 小文件/媒体链 per-host 对齐：全量保留注册表镜像、仅摘已删除地址（开关只管大文件单链）。
+/// 小文件/媒体链 per-host 对齐：全量保留注册表镜像、仅摘已删除地址。
 pub fn align_custom_mirrors(
     mirrors: &mut HashMap<String, Vec<String>>,
     enabled: &[String],
@@ -1412,10 +1409,10 @@ pub fn align_custom_mirrors(
     changed
 }
 
-/// 按注册表对齐全部镜像链（幂等）：开关只管大文件单链，小文件链全留、仅摘已删地址；persist=false 只改内存不落盘。
+/// 按注册表对齐镜像链（幂等）：开关只管大文件单链，小文件链全留仅摘已删；persist=false 只改内存。
 pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
     let registry = crate::settings::worker_mirrors();
-    // 探测标红的条目不进链：用法没验证过的镜像放进去只会白占链位。
+    // 探测标红（invalid）的条目不进链。
     let enabled: Vec<String> = registry
         .iter()
         .filter(|w| w.on && !w.invalid)
@@ -1433,7 +1430,7 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
         Some(t) => t,
         None => return,
     };
-    // 链全空时先建键，否则镜像落不进链；大文件域已单链化，不占 per-host 键位。
+    // 链全空时先建键；大文件域已单链化，不占 per-host 键位。
     if !all.is_empty() {
         for h in CONTENT_HOSTS.iter().copied().chain(MEDIA_CHAINS.iter().copied()) {
             if route::is_big_file_host(h) {
@@ -1443,11 +1440,11 @@ pub fn sync_custom_mirrors(removed: &[String], persist: bool) {
         }
     }
     let mut changed = align_custom_mirrors(&mut tab.mirrors, &all, removed);
-    // 大文件单链：开关只管它（启用者进链、停用者摘除）。
+    // 大文件单链：启用者进链、停用者摘除。
     if align_chain(&mut tab.big_mirrors, &enabled, &disabled) {
         changed = true;
     }
-    // 建了键但没启用镜像的 host 留空链无害(无链=回落语义)，不必回收。
+    // 建键但未启用镜像的 host 留空链无害（无链=回落语义）。
     drop(g);
     if changed && persist {
         write_routes_file(&routes_path());
@@ -1494,7 +1491,7 @@ pub fn set_mirror_chain(host: &str, chain: &[String], why: &str) -> bool {
         }
         tab.mirrors.insert(host.to_string(), vc);
     }
-    // 写者唯一（手动校准）：先放锁再同步落盘，写盘期间不挡拨号。
+    // 写者唯一：先放锁再同步落盘，写盘期间不挡拨号。
     write_routes_file(&routes_path());
     if let Some(log) = lock(&SERIAL_LOG).as_ref() {
         log(&format!("[镜像] {host} 链序更新({why})"));
@@ -1507,7 +1504,7 @@ pub fn mirror_chains_snapshot() -> HashMap<String, Vec<String>> {
     g.as_ref().unwrap().mirrors.clone()
 }
 
-/// 熔断：按 host 记账（全局单值会被别的域反复清掉）；过期惰性清除，硬顶防沉淀。
+/// 熔断：按 host 记账，过期惰性清除，硬顶防沉淀。
 pub struct Breaker {
     ttl_secs: u64,
     map: std::sync::OnceLock<Mutex<HashMap<String, Instant>>>,

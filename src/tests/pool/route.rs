@@ -27,7 +27,7 @@ fn install_rows(specs: &[(&str, &str)]) {
     install_table(specs, &[]);
 }
 
-/// 多条同时命中时取最长的键：更具体的域名天然压过父域，与书写顺序无关。
+/// 多条命中取最长键，与书写顺序无关。
 #[test]
 fn longest_key_wins() {
     let _g = crate::pool::TEST_LOCK
@@ -113,7 +113,7 @@ fn key_covers_self_and_subdomains() {
     );
 }
 
-/// 具体的直连键压过父域通配：objects-origin 不能被 githubusercontent 吞掉。
+/// 具体直连键压过父域通配。
 #[test]
 fn direct_key_beats_parent_wildcard() {
     let _g = crate::pool::TEST_LOCK
@@ -133,7 +133,7 @@ fn direct_key_beats_parent_wildcard() {
     assert!(is_managed("avatars.githubusercontent.com"), "其余仍走代理");
 }
 
-/// 域名不区分大小写，key 写大写小写都一样。
+/// 域名与 key 大小写不敏感。
 #[test]
 fn host_and_key_case_insensitive() {
     let _g = crate::pool::TEST_LOCK
@@ -212,8 +212,7 @@ fn cursor_keys_follow_routes() {
     );
 }
 
-/// 总路由判定：只有镜像分流被生产读取——大文件域/附件 GET|HEAD 为真，
-/// 直连行/表外/普通页面为假（原 System/Tunnel/Pool 语义由反面断言钉住）。
+/// 总路由判定：仅镜像分流被生产读取，大文件域/附件 GET|HEAD 为真，直连行/表外/普通页面为假。
 #[test]
 fn mirror_route_matches_big_and_attachment_only() {
     let _g = crate::pool::TEST_LOCK
@@ -227,15 +226,15 @@ fn mirror_route_matches_big_and_attachment_only() {
         ("github.com", "{}"),
         ("*.githubusercontent.com", r#"{"content":true}"#),
     ]);
-    // 直连行 → false（原 System 语义）
+    // 直连行 → false。
     assert!(!is_mirror_route(
         "objects-origin.githubusercontent.com",
         "PUT",
         "/x"
     ));
-    // 表外 → false（原 Tunnel 语义）
+    // 表外 → false。
     assert!(!is_mirror_route("example.com", "GET", "/"));
-    // 普通页面/archive/codeload → false（原 Pool 语义；codeload 已迁池）
+    // 普通页面/archive/codeload → false。
     assert!(!is_mirror_route("github.com", "GET", "/"));
     assert!(
         !is_mirror_route("github.com", "GET", "/o/r/archive/x.zip"),
@@ -245,7 +244,7 @@ fn mirror_route_matches_big_and_attachment_only() {
         !is_mirror_route("codeload.github.com", "GET", "/o/r/tar.gz/x"),
         "codeload 命中 github.com 裸键走池"
     );
-    // 附件下载 GET|HEAD → true（原 Mirror 语义）
+    // 附件下载 GET|HEAD → true。
     assert!(is_mirror_route(
         "github.com",
         "GET",
@@ -316,7 +315,7 @@ fn latency_note_and_sink_semantics() {
     install(vec![], vec![]); // 清场
 }
 
-/// build_node：范围/非法写法拒绝（单 IP 格式已下线多地址）。
+/// build_node：范围/非法写法拒绝。
 #[test]
 fn build_node_rejects_non_single_ip() {
     let spec = |ip: &str| serde_json::from_str::<IpSpec>(&format!(r#"{{"ip":"{ip}","hosts":["github.com"]}}"#)).unwrap();
@@ -353,7 +352,7 @@ fn dial_targets_dedup_and_filter() {
     crate::pool::edges::clear_all();
 }
 
-/// 节点 verify 留空 = 回退按目标 host 校验（迁移期安全默认；空串会让 BoringSSL 校验必败）。
+/// 节点 verify 留空 = 回退按目标 host 校验。
 #[test]
 fn empty_verify_falls_back_to_host() {
     let _g = crate::pool::TEST_LOCK
@@ -385,7 +384,7 @@ fn dial_targets_empty_vs_none() {
     crate::pool::edges::clear_all();
 }
 
-/// 通配键子域：边冷却必须按路由键记账才能滤到；老实现按子域 host 记，内容域超时冷却从来没滤到过。
+/// 通配键子域：边冷却按路由键记账才能滤到。
 #[test]
 fn wildcard_key_stall_filters_subdomain_dial() {
     let _g = crate::pool::TEST_LOCK
@@ -401,9 +400,7 @@ fn wildcard_key_stall_filters_subdomain_dial() {
     crate::pool::edges::clear_all();
 }
 
-/// 渲染族六域必须拨 k8s 边缘、不得落 Fastly 池：通配行把 *.githubusercontent.com 全压到 185.199，
-/// 而 Fastly 不伺服这些域（"500 Domain Not Found"→421 风暴把共享 IP 冤枉冷却 4 小时，
-/// notebook 渲染 "Unable to render code block"，2026-11-22 实证）。
+/// 渲染族六域必须拨 k8s 边缘，不得落 Fastly 池。
 #[test]
 fn render_family_dials_k8s_edge_not_fastly() {
     let _g = crate::pool::TEST_LOCK

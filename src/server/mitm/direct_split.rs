@@ -1,5 +1,5 @@
-﻿//! 大图/视频纯直连多段：多个 Range 在池内同一条通道上并发拉（stream 非连接），合成 200 流；不拨号、不进兜底。
-//! 段的交付/停滞收尸/补发统一挂镜像腿的 MergeBody+drive_split（见 merge.rs），本文件只管段位分配与救援闭包。
+﻿//! 大图/视频纯直连多段：多个 Range 在池内同一通道并发拉（stream 非连接），合成 200 流；不拨号不进兜底。
+//! 交付/停滞收尸/补发走 MergeBody+drive_split（merge.rs），本文件只管段位分配与救援闭包。
 use super::merge::MergeBody;
 use super::mirror::{drive_split, Fetch, FilledSeg, SplitCtx};
 use super::{merge, mirror, path_of, UpstreamInfo};
@@ -17,20 +17,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// 门槛：探片多一次往返，小图省不回来。切片判定（含 Range 路径）共用。
+/// 切片门槛：小于 512KB 不切。
 pub(super) const MIN_SPLIT_BYTES: u64 = 512 * 1024;
 /// 目标段大小；段数钳在 4~8。
 const SEG_TARGET_BYTES: u64 = 192 * 1024;
 const MAX_SEGS: usize = 8;
-/// 探片段大小：兼作交付首段前缀。
+/// 探片段 10KB：兼作交付首段前缀。
 const PROBE_BYTES: u64 = 10 * 1024;
-/// 同时在途的多段响应个数：按响应体生命周期计数，防一页并发把连接级窗口占死。
+/// 同时在途段数：按响应体生命周期计数，防占死连接级窗口。
 const MAX_ACTIVE: usize = 6;
-/// 段响应头预算：头应毫秒级，8s 只防上游装死。
+/// 段响应头预算 8s：防上游装死。
 const SEG_HEAD_BUDGET: Duration = Duration::from_secs(8);
 const MEMO_TTL: Duration = Duration::from_secs(600);
 
-/// 白名单只认静态 CDN；v6.7 起 githubassets 的 JS/CSS 不切（脚本分片无救援、9MB index.js 实测从未走通），改单流直连+缓存兜底。
+/// 白名单只认静态 CDN；githubassets JS/CSS 不切，走单流直连+缓存兜底。
 pub(super) fn is_split_host(host: &str) -> bool {
     matches!(
         host.to_ascii_lowercase().as_str(),
@@ -44,7 +44,7 @@ pub(super) fn is_split_host(host: &str) -> bool {
     )
 }
 
-/// 媒体判定：图片与视频都切；非媒体探一次记 10 分钟不再探。
+/// 媒体判定：图片与视频都切；非媒体 10 分钟内不再探。
 fn is_media(ct: Option<&str>) -> bool {
     MediaKind::of_content_type(ct).is_some()
 }
@@ -53,7 +53,7 @@ pub(super) fn seg_count(total: u64) -> usize {
     ((total / SEG_TARGET_BYTES) as usize).clamp(4, MAX_SEGS)
 }
 
-/// 段请求模板：原请求的 method/uri/headers，每次重建干净 GET；与镜像 segment_direct 共用。
+/// 段请求模板：原 method/uri/headers，每次重建干净 GET。
 #[derive(Clone)]
 pub(super) struct Tpl {
     pub(super) method: Method,
@@ -70,7 +70,7 @@ impl Tpl {
         }
     }
 
-    /// [s, e) → Range: bytes=s-(e-1)；URL 与凭据头原样保留，只剥改变段语义的头与逐跳头。
+    /// [s,e) → Range: bytes=s-(e-1)；URL/凭据头原样，剥段语义头与逐跳头。
     fn build(&self, s: u64, e: u64) -> Result<hyper::Request<BoxBody>, String> {
         let mut b = hyper::Request::builder()
             .method(self.method.clone())
@@ -88,7 +88,7 @@ impl Tpl {
     }
 }
 
-/// 段请求头过滤：Range 语义头与逐跳头不透传、条件头剥掉（不该 304）；accept-encoding 透传（压缩后传输量缩 3 倍，切片按压缩流字节切）。
+/// 段请求头过滤：剥 Range/逐跳/条件头；accept-encoding 透传（按压缩流切）。
 fn skip_request_header(k: &str) -> bool {
     matches!(
         k,
@@ -107,7 +107,7 @@ fn skip_request_header(k: &str) -> bool {
     )
 }
 
-/// 附加头过滤（镜像/直连共用）：Range 语义头与逐跳头不透传给浏览器。
+/// 响应头过滤（镜像/直连共用）：剥 Range 语义头与逐跳头。
 pub(super) fn skip_response_header(k: &str) -> bool {
     matches!(
         k,
@@ -120,9 +120,9 @@ pub(super) fn skip_response_header(k: &str) -> bool {
     )
 }
 
-// Content-Range 解析统一走 merge::{content_range_total/start/end}，与镜像链同一套标准。
+// Content-Range 解析统一走 merge::{content_range_total/start/end}。
 
-/// 媒体类别决定救援链：图片走图片链、视频走视频链；脚本段链为空——公共镜像不收 githubassets，直连独走不设救援。
+/// 媒体类别决定救援链：图片/视频走各自链；脚本链为空。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum MediaKind {
     Image,
@@ -172,7 +172,7 @@ fn memo_put(key: &str, total: u64, kind: MediaKind) {
     g.insert(key.to_string(), (total, kind, Instant::now()));
 }
 
-/// 救援链全灭熔断 60s：链死透时别让每段白付链序尝试。
+/// 救援链全灭熔断 60s。
 static MEDIA_RESCUE_BREAKER: pool::Breaker = pool::Breaker::new(60);
 
 async fn fetch_segment(
@@ -199,7 +199,7 @@ async fn fetch_segment(
     Ok((body, parts.headers))
 }
 
-/// 206 段边界校验：起点规则共用 merge::check_segment_start，另加终点不越界——越界会吃掉总长预算，尾段发不完。
+/// 206 段边界校验：起点走 merge::check_segment_start，终点不越界。
 fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), String> {
     merge::check_segment_start(cr, start)?;
     if merge::content_range_end(cr).is_some_and(|end| end >= e) {
@@ -208,8 +208,7 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// 探片段必须精确覆盖 [0, PROBE_BYTES)：起点为 0，终点恰好 PROBE_BYTES-1。
-/// 起点被归一化 → 首段错位；区间比请求短 → 10KB 标签下留洞，补发兜不住就整页坏。
+/// 探片须精确覆盖 [0, PROBE_BYTES)：起点 0，终点 PROBE_BYTES-1；错位/短缺退单流。
 fn probe_range_ok(cr: Option<&str>) -> Result<(), String> {
     check_segment_bounds(cr, 0, PROBE_BYTES)?;
     match merge::content_range_end(cr) {
@@ -221,12 +220,12 @@ fn probe_range_ok(cr: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// 探片体必须收满 PROBE_BYTES：头声明满、体提前结束（chunked 截断/连接断）时按常量记账会留洞。
+/// 探片体须收满 PROBE_BYTES，否则按常量记账会留洞。
 fn probe_body_ok(len: usize) -> bool {
     len as u64 == PROBE_BYTES
 }
 
-/// 段的镜像救援：从 start 续传到 e（已交付不重拉），链序逐个试、全灭记熔断；整段单流，链快照由调用方传入。
+/// 段镜像救援：从 start 续传到 e（已交付不重拉），链序逐个试，全灭记熔断。
 async fn rescue_segment(
     tpl: &Tpl,
     kind: MediaKind,
@@ -283,14 +282,14 @@ async fn rescue_segment(
     None
 }
 
-/// 跳过原因落一行（每 host 一次，不刷屏）：静默分支全部显式化，排查不再靠猜。
+/// 跳过原因每 host 记一行（不刷屏）。
 fn log_skip(log: &LogFn, host: &str, path: &str, why: &str) {
     if super::quiet::first_time("split-skip", host) {
         (log)(&format!("[直连切片] {host}{path} 单流直发({why})"));
     }
 }
 
-/// 切片主入口：总机下发片数，段级重试/续传内置，输出合并 200 流；任一段最终失败仍返回 None 交回单流（头未发出不会花掉）。
+/// 切片主入口：输出合并 200 流；任一段失败返回 None 交回单流（头未发出）。
 pub(super) async fn try_direct_split(
     log: &LogFn,
     out: &hyper::Request<BoxBody>,
@@ -299,7 +298,7 @@ pub(super) async fn try_direct_split(
     want_segs: usize,
 ) -> Option<hyper::Response<BoxBody>> {
     if out.method() != Method::GET || out.headers().contains_key(http::header::RANGE) {
-        return None; // 客户端自带 Range：multipart/byteranges 语义不同，别切
+        return None; // 客户端自带 Range：语义不同，不切。
     }
     if !is_split_host(host) {
         return None;
@@ -314,7 +313,7 @@ pub(super) async fn try_direct_split(
         Some(hit) => (hit.0, hit.1, None),
         None => {
             let tpl = Tpl::of(out);
-            // 探片要一条通道：池冷就借池子的建造（等在途建造最多 15s），建不出退单流。
+            // 探片借池子建造，等在途建造最多 15s。
             let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
                 log_skip(log, host, &path, "池冷且建连失败");
                 return None;
@@ -334,7 +333,7 @@ pub(super) async fn try_direct_split(
                 }
             };
             if resp.status() != StatusCode::PARTIAL_CONTENT {
-                memo_put(&key, 0, MediaKind::Image); // 上游忽略 Range：10 分钟内别再白探
+                memo_put(&key, 0, MediaKind::Image); // 上游忽略 Range：10 分钟内不再探。
                 log_skip(
                     log,
                     host,
@@ -352,8 +351,7 @@ pub(super) async fn try_direct_split(
                 log_skip(log, host, &path, "206 缺 Content-Range");
                 return None;
             };
-            // 探片段必须精确覆盖 [0, PROBE_BYTES)：起点被 CDN 归一化会让文件开头永久错位，
-            // 只回更短区间会在 10KB 标签下留洞。两者都退单流（头还没发，不花钱）。
+            // 探片区间异常（起点归一化/区间短缺）退单流。
             if let Err(e) = probe_range_ok(cr) {
                 log_skip(log, host, &path, &format!("探片 206 区间异常({e}), 退回单流"));
                 return None;
@@ -363,12 +361,12 @@ pub(super) async fn try_direct_split(
                     .get("content-type")
                     .and_then(|v| v.to_str().ok()),
             ) else {
-                drop(resp.into_body()); // 及时关掉流别占连接窗口
-                memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内别再探、更别切
+                drop(resp.into_body()); // 及时关流，别占连接窗口
+                memo_put(&key, 0, MediaKind::Image); // 非媒体：10 分钟内不再探。
                 log_skip(log, host, &path, "非媒体类响应");
                 return None;
             };
-            // 探片 10KB：字节不浪费，直接当交付首段。
+            // 探片 10KB 直接当交付首段。
             let probe_hs = resp.headers().clone();
             let probe_body = match tokio::time::timeout(
                 SEG_HEAD_BUDGET,
@@ -382,7 +380,7 @@ pub(super) async fn try_direct_split(
                     return None;
                 }
             };
-            // 头声明满 10KB、体却提前结束（chunked 截断/连接断）：按常量记账会留洞，直接退单流。
+            // 体不足 10KB 会留洞，退单流。
             if !probe_body_ok(probe_body.len()) {
                 log_skip(
                     log,
@@ -392,7 +390,7 @@ pub(super) async fn try_direct_split(
                 );
                 return None;
             }
-            memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
+            memo_put(&key, t, kind); // 记住总长与类别；小图下次被 MIN_SPLIT_BYTES 挡掉。
             (t, kind, Some((probe_body, probe_hs)))
         }
     };
@@ -405,7 +403,7 @@ pub(super) async fn try_direct_split(
         return None;
     };
     let tpl = Tpl::of(out);
-    // 恒 N 段：探片前缀存在则段从 10KB 后排，否则从头排；长度按 [seg_start,total)，传 total 会切到文件尾外 10KB 被严格 CDN 退单流。
+    // 段从 seg_start（有探片则 10KB）到 total，避免切到文件尾外。
     let seg_start = if prefix.is_some() { PROBE_BYTES } else { 0 };
     let segs = merge::split_even(
         seg_start,
@@ -415,12 +413,12 @@ pub(super) async fn try_direct_split(
     if segs.is_empty() {
         return None;
     }
-    // 单通道模型：全部段骑池给的这一条（并行 stream 不是并行连接——185.199 聚合水管恒定，多连接不加吞吐）。
+    // 全段骑池给的一条通道（并行 stream 非并行连接，多连接不加吞吐）。
     let Some(up) = pool::gather_channels(host, 1, log).await.into_iter().next() else {
         log_skip(log, host, &path, "池内无可用通道");
         return None;
     };
-    // 段级重试：头阶段失败（连接死/超时）→ 同通道再试，至多 3 次。
+    // 段级重试：头阶段失败同通道再试，至多 3 次。
     let futs = segs.iter().map(|&(s, e)| {
         let up = up.clone();
         let tpl2 = tpl.clone();
@@ -439,7 +437,7 @@ pub(super) async fn try_direct_split(
                         if attempt >= 3 {
                             return Err("段拉取重试耗尽".to_string());
                         }
-                        // 同通道重试：段边界不变整段重拉（共享通道不能中途摘，会杀死同通道其他段的在途流）。
+                        // 同通道重试整段重拉（不中途摘通道）。
                     }
                 }
             }
@@ -462,7 +460,7 @@ pub(super) async fn try_direct_split(
         Vec::with_capacity(segs.len() + 1);
     let mut first_headers: Option<HeaderMap> = None;
     if let Some((bytes, hs)) = &prefix {
-        // 探片 10KB = 交付首段：字节已在手，头用它（206 头，Range 语义头会被剥）。
+        // 探片 10KB 作首段，头用 206 头。
         first_headers = Some(hs.clone());
         entries.push((
             0,
@@ -487,7 +485,7 @@ pub(super) async fn try_direct_split(
             0,
         ));
     }
-    // 总长记忆命中时没走过探片，用第一段的 content-type 补一道媒体校验。
+    // 记忆命中时用首段 content-type 补媒体校验。
     let hs = first_headers.as_ref()?;
     if !is_media(hs.get("content-type").and_then(|v| v.to_str().ok())) {
         return None;
@@ -502,7 +500,7 @@ pub(super) async fn try_direct_split(
     builder = builder
         .header(http::header::CONTENT_LENGTH, total)
         .header(http::header::ACCEPT_RANGES, "bytes");
-    // 救援收口成一个 Fetch 闭包：有链（图片/视频）→ 镜像续传；无链（脚本/未配镜像）→ 直连同通道从剩余偏移重拉。
+    // 救援闭包：有链走镜像续传，无链走直连同通道重拉。
     let chain = match kind {
         MediaKind::Script => Vec::new(),
         _ => pool::mirror_chain(kind.chain()),
@@ -527,7 +525,7 @@ pub(super) async fn try_direct_split(
                         None => Err("镜像救援不可用(链全灭或熔断中)".to_string()),
                     };
                 }
-                // 无链：直连同通道从剩余偏移重拉（池自动重建死通道）。
+                // 无链：直连同通道重拉（池自动重建死通道）。
                 let (up, _) = pool::get_or_build(&host, &log).await?;
                 let req = tpl.build(from, to).map_err(|e| e.to_string())?;
                 let resp = tokio::time::timeout(
@@ -555,7 +553,7 @@ pub(super) async fn try_direct_split(
         })
     };
     let body = drive_split(
-        // 直连骑单通道：多开流不加吞吐（185.199 聚合水管恒定），不参与重分配，只走停滞补发。
+        // 直连骑单通道：不参与重分配，只走停滞补发。
         MergeBody::new(entries, total).without_yield().hold(Box::new(guard)),
         SplitCtx {
             fetch,

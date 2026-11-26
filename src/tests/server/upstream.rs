@@ -1,7 +1,7 @@
 use super::*;
 use crate::server::protocol::full_body;
 
-/// gzip;q=0 是明确拒绝：别再把压缩体塞给手写客户端(浏览器不受影响)。
+/// gzip;q=0 是明确拒绝。
 #[test]
 fn accepts_gzip_respects_explicit_reject() {
     let mk = |ae: &str| {
@@ -15,7 +15,7 @@ fn accepts_gzip_respects_explicit_reject() {
     assert!(accepts_gzip(&mk("br, gzip;q=1")));
     assert!(!accepts_gzip(&mk("gzip;q=0")));
     assert!(!accepts_gzip(&mk("br")));
-    // 分号/等号两侧的空白合法(HTTP OWS)，照样是明确拒绝
+    // 分号/等号两侧空白合法(HTTP OWS)，仍算明确拒绝。
     assert!(!accepts_gzip(&mk("gzip; q=0")));
     assert!(!accepts_gzip(&mk("gzip ; q=0")));
     assert!(!accepts_gzip(&mk("br, gzip;q=0")));
@@ -35,13 +35,13 @@ fn accepts_brotli_respects_explicit_reject() {
     assert!(accepts_brotli(&mk("gzip;q=1, br")));
     assert!(!accepts_brotli(&mk("br;q=0")));
     assert!(!accepts_brotli(&mk("gzip")));
-    // 分号/等号两侧的空白合法(HTTP OWS)，照样是明确拒绝
+    // 分号/等号两侧空白合法(HTTP OWS)，仍算明确拒绝。
     assert!(!accepts_brotli(&mk("br; q=0")));
     assert!(!accepts_brotli(&mk("br ; q=0")));
     assert!(!accepts_brotli(&mk("gzip, br;q=0")));
 }
 
-/// 上行泵（git push 请求体通道）：2MB 体必须一字节不差送达——此前无测试，窗口/背压改错只会让 push 卡住不会变红。
+/// 上行泵（git push 请求体）：2MB 体须一字节不差送达。
 #[tokio::test]
 async fn h2_body_pump_delivers_every_byte() {
     let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -150,7 +150,7 @@ fn forced_encoding_prefers_br_gzip_fallback() {
     );
 }
 
-/// 纯 CDN 域剥凭据：githubassets/github.io 全剥；githubusercontent 家族靠 Cookie 鉴权私有 raw/头像/codeload，剥了掐死私有内容。
+/// 纯 CDN 域剥凭据：githubassets/github.io 全剥；githubusercontent 家族保留。
 #[test]
 fn credentials_stripped_only_on_pure_cdn_hosts() {
     assert!(strip_credentials("github.githubassets.com"));
@@ -163,7 +163,7 @@ fn credentials_stripped_only_on_pure_cdn_hosts() {
     assert!(!strip_credentials("github.com"), "会话域更不能剥");
 }
 
-/// 单通道日志必须说清是「会话域规则」还是「候选真的不够」，别再混成一行。
+/// 单通道日志须区分「会话域规则」与「候选不足」。
 #[test]
 fn single_channel_reason_separates_rule_from_shortage() {
     let rule = single_channel_reason(HostClass::Session, 0);
@@ -200,7 +200,7 @@ fn host_classes_split_content_session_and_other() {
         HostClass::Session,
         "api 也是会话域"
     );
-    // 只主站族标 session：githubassets 等不标——长寿命通道会占走 185.199 跨类共享 IP；githubassets 是内容域，单流直连。
+    // 只主站族标 session；githubassets 归内容域。
     assert_eq!(host_class("githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.githubassets.com"), HostClass::Content);
     assert_eq!(host_class("github.io"), HostClass::Other);
@@ -214,7 +214,7 @@ fn host_classes_split_content_session_and_other() {
         HostClass::Content
     );
 
-    // 大文件域从内容域里摘出来：单通道、复用优先，不再给直连两片。
+    // 大文件域从内容域摘出：单通道、复用优先。
     assert_eq!(
         host_class("objects.githubusercontent.com"),
         HostClass::Other
@@ -223,7 +223,7 @@ fn host_classes_split_content_session_and_other() {
         host_class("release-assets.githubusercontent.com"),
         HostClass::Other
     );
-    // 只去 Fastly 边缘、不走主站的子域：一个都不能漏（清单见 docs/CONFIG.md）。
+    // 只去 Fastly 边缘的子域（清单见 docs/CONFIG.md）。
     for h in [
         "docs.github.com",
         "support.github.com",
@@ -248,7 +248,7 @@ fn host_classes_split_content_session_and_other() {
         !prefer_own_channel("objects.githubusercontent.com"),
         "大文件：复用优先"
     );
-    // raw.github.com 在「其他」，raw.githubusercontent.com 在内容域，别混。
+    // raw.github.com 归「其他」，raw.githubusercontent.com 归内容域。
     assert_eq!(host_class("raw.githubusercontent.com"), HostClass::Content);
     assert!(!prefer_own_channel("raw.githubusercontent.com"));
 }

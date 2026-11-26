@@ -23,7 +23,7 @@ fn ring_evicts_oldest_keeps_window() {
     assert_eq!(tail.len(), LOG_BUFFER_SIZE - 1);
 }
 
-/// 启动打点一律不进 WebUI 日志流：界面不该出现，也不该留开关。
+/// 启动打点不进 WebUI 日志流。
 #[test]
 fn boot_lines_never_reach_webui() {
     let lg = Logger::new(false);
@@ -38,7 +38,7 @@ fn boot_lines_never_reach_webui() {
     assert_eq!(latest, 1);
 }
 
-/// 清空只清缓冲、seq 保持单调：按旧 after 增量拉取只会得到空增量，客户端游标不乱。
+/// 清空只清缓冲，seq 保持单调。
 #[test]
 fn clear_empties_buffer_keeps_seq_monotonic() {
     let lg = Logger::new(false);

@@ -27,7 +27,7 @@ fn tpl() -> Tpl {
 
 #[test]
 fn session_hosts_never_enter_direct_split() {
-    // README /o/r/raw/... 第一跳在 github.com 是 302；会话域本就不在静态 CDN 白名单，不会进切片。
+    // 会话域不在静态 CDN 白名单，不进切片。
     for h in ["github.com", "api.github.com", "objects.githubusercontent.com"] {
         assert!(!is_split_host(h), "{h} 不该进纯直连切片");
     }
@@ -48,7 +48,7 @@ fn readme_image_cdns_are_allowed() {
     ] {
         assert!(is_split_host(h), "{h} 应该是静态资源落点");
     }
-    // v6.7：githubassets 的 JS/CSS 不切片——脚本分片无救援、9MB index.js 实测从未走通，改单流直连+缓存兜底。
+    // githubassets JS/CSS 不切片，走单流直连+缓存。
     assert!(
         !is_split_host("github.githubassets.com"),
         "githubassets 不得再进切片"
@@ -64,14 +64,14 @@ fn segment_request_keeps_credentials_and_sets_exact_range() {
         "bytes=262144-524287",
         "Range 是半开区间 [s,e) → s-(e-1)"
     );
-    // URL 与凭据头一字不改：签名可能在 query、Authorization 可能是取图凭据，剥掉只会把请求改坏。
+    // URL 与凭据头原样保留。
     assert_eq!(req.headers().get("cookie").unwrap(), "user_session=SECRET");
     assert_eq!(req.headers().get("authorization").unwrap(), "Bearer SECRET");
     assert_eq!(
         req.headers().get("proxy-authorization").unwrap(),
         "Basic SECRET"
     );
-    // 这几类会改变段语义或属于逐跳头，必须剥掉。accept-encoding 透传（压缩协商）。
+    // if-none-match/if-range/connection 剥掉；accept-encoding 透传。
     for k in ["if-none-match", "if-range", "connection"] {
         assert!(req.headers().get(k).is_none(), "{k} 不该被复制进段请求");
     }
@@ -122,7 +122,7 @@ fn seg_count_scales_with_size_and_is_capped() {
 
 #[test]
 fn eight_segments_cover_the_whole_file_without_gap_or_overlap() {
-    // 实测那张 1.6MB README 截图：段必须零重叠零缝，错一个字节图片就花。
+    // 段必须零重叠零缝。
     let total = 1_608_296u64;
     let segs = crate::server::mitm::merge::split_even(0, total, seg_count(total));
     assert_eq!(segs.len(), 8);
@@ -168,7 +168,7 @@ fn hop_by_hop_and_range_headers_are_not_carried_to_client() {
     for k in ["content-range", "content-length", "transfer-encoding", "connection"] {
         assert!(skip_response_header(k), "{k} 必须剥掉");
     }
-    // content-encoding 透传：压缩流原样交浏览器解压，代理不花 CPU。
+    // content-encoding 透传。
     assert!(!skip_response_header("content-encoding"));
     assert!(!skip_response_header("content-type"), "图片 content-type 必须保留");
     assert!(!skip_response_header("etag"));
@@ -185,7 +185,7 @@ fn media_kind_routes_to_its_chain() {
     use super::MediaKind;
     assert_eq!(MediaKind::Image.chain(), crate::pool::MEDIA_IMAGE_CHAIN);
     assert_eq!(MediaKind::Video.chain(), crate::pool::MEDIA_VIDEO_CHAIN);
-    // 脚本段救援链为空：公共镜像不收 githubassets，直连独走不设救援。
+    // 脚本段救援链为空。
     assert_eq!(MediaKind::Script.chain(), "");
     assert_eq!(
         MediaKind::of_content_type(Some("video/mp4")),
@@ -207,8 +207,7 @@ fn media_kind_routes_to_its_chain() {
     assert_eq!(MediaKind::of_content_type(None), None);
 }
 
-/// 探片区间必须精确覆盖 [0, 10240)：这是"短包留洞"那条修复的直接回归。
-/// 旧实现只拦终点越界，CDN 回 0-4095 也会被当成 10KB 记账，交付线后面留 6KB 洞。
+/// 探片区间必须精确覆盖 [0, 10240)。
 #[test]
 fn probe_range_must_be_exactly_first_10k() {
     assert!(probe_range_ok(Some("bytes 0-10239/200000")).is_ok());
@@ -225,7 +224,7 @@ fn probe_range_must_be_exactly_first_10k() {
     // 缺头 / 不合法。
     assert!(probe_range_ok(None).is_err());
     assert!(probe_range_ok(Some("bytes */200000")).is_err());
-    // bytes= 写法（部分 CDN 这么回）等价接受。
+    // bytes= 写法等价接受。
     assert!(probe_range_ok(Some("bytes=0-10239/200000")).is_ok());
 }
 

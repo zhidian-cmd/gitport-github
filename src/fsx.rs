@@ -1,4 +1,4 @@
-//! 原子写盘：先写唯一名 .tmp 再改名，避免断电留下半截 JSON。
+//! 原子写盘：先写唯一名 .tmp 再改名，避免半截 JSON。
 
 use std::io::Write;
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// tmp 文件 RAII 守卫：任何失败路径都删 tmp，成功 rename 后删除落空无害。
+/// tmp 文件 RAII 守卫：失败删 tmp，成功 rename 后删除落空无害。
 struct TmpGuard<'a>(&'a Path);
 
 impl Drop for TmpGuard<'_> {
@@ -16,7 +16,7 @@ impl Drop for TmpGuard<'_> {
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    // tmp 名带进程号+序号：固定名会让并发写者交错写同一个 tmp，rename 出混合 JSON。
+    // tmp 名带进程号+序号，避免并发写者复用同一 tmp。
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_file_name(format!(
         "{}.{}.{}.tmp",
@@ -25,9 +25,9 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         n
     ));
     let mut f = std::fs::File::create(&tmp)?;
-    let _guard = TmpGuard(&tmp); // create 成功即接管：此后任何 ? 早退都清 tmp
+    let _guard = TmpGuard(&tmp); // create 成功即接管，早退清 tmp
     f.write_all(data)?;
-    f.sync_all()?; // 断电也不留空/半截文件（flush 只到 OS 页缓存，不够）
+    f.sync_all()?; // 断电也不留空/半截文件（flush 只到页缓存）
     drop(f);
     std::fs::rename(&tmp, path)
 }

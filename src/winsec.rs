@@ -1,6 +1,5 @@
-//! Windows 文件 ACL 收紧：ca.key 与 settings.json 只授当前用户与 SYSTEM——根私钥可读即可伪造叶子证书。
-//! 原生 ACL API（SetNamedSecurityInfoW）实现。以前靠 spawn icacls 子进程，关机时序中子进程
-//! 启动失败会弹 0xc0000142 错误窗（git.exe 弹窗的同源第二来源），原生调用零子进程，任何时序都安全。
+//! Windows 文件 ACL 收紧：ca.key 与 settings.json 只授当前用户与 SYSTEM（私钥可读即可伪造叶子证书）。
+//! 用原生 SetNamedSecurityInfoW，零子进程（icacls 在关机时序会弹 0xc0000142）。
 
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{
@@ -18,13 +17,12 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// 受保护 DACL（文件版）：仅 SYSTEM 与当前用户，完全控制——icacls 的裸 (F)。
+/// 受保护 DACL（文件版）：仅 SYSTEM 与当前用户完全控制。
 pub fn restrict_to_current_user(path: &str) -> Result<(), String> {
     restrict(path, GENERIC_ALL.0, ACE_FLAGS(0))
 }
 
-/// 受保护 DACL（目录版）：完全控制 + 对象/容器继承，否则断继承后旧子目录被剥成空 DACL，缓存全写不进去。
-/// 继承标志必须放 grfInheritance 字段——混进权限掩码会让子目录继承出空 DACL，缓存写盘全部拒绝访问。
+/// 受保护 DACL（目录版）：完全控制 + 对象/容器继承；继承标志须放 grfInheritance 字段。
 pub fn restrict_dir_to_current_user(path: &str) -> Result<(), String> {
     restrict(
         path,
@@ -35,21 +33,19 @@ pub fn restrict_dir_to_current_user(path: &str) -> Result<(), String> {
 
 fn restrict(path: &str, rights: u32, inheritance: ACE_FLAGS) -> Result<(), String> {
     unsafe {
-        // 1) 当前用户 SID：从进程令牌直取（比按用户名解析精确，无同名歧义）。
-        //    SID 指向 _sid_buf 内部，_sid_buf 必须活到 SetEntriesInAclW 之后。
+        // 1) 当前用户 SID 从进程令牌直取；SID 指向 _sid_buf，须活到 SetEntriesInAclW 之后。
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
             .map_err(|e| format!("打开进程令牌失败: {e}"))?;
         let (user_sid, _sid_buf) = get_token_user_sid(token)?;
         let _ = CloseHandle(token);
 
-        // 2) SYSTEM 的 SID（S-1-5-18）：ConvertStringSidToSidW 分配，用完 LocalFree。
+        // 2) SYSTEM SID（S-1-5-18）：ConvertStringSidToSidW 分配，用完 LocalFree。
         let mut system_sid = PSID::default();
         ConvertStringSidToSidW(&HSTRING::from("S-1-5-18"), &mut system_sid)
             .map_err(|e| format!("构造 SYSTEM SID 失败: {e}"))?;
 
-        // 3) 两条授权条目：当前用户 + SYSTEM。SetEntriesInAclW 的基线传 None =
-        //    从零构建新 DACL（等价 icacls /grant:r 的替换语义），继承由 PROTECTED 标志断开。
+        // 3) 两条授权条目：当前用户 + SYSTEM；基线传 None 从零构建 DACL，PROTECTED 断继承。
         let entries = [
             explicit_access(&user_sid, rights, inheritance, TRUSTEE_IS_USER),
             explicit_access(&system_sid, rights, inheritance, TRUSTEE_IS_WELL_KNOWN_GROUP),
@@ -60,7 +56,7 @@ fn restrict(path: &str, rights: u32, inheritance: ACE_FLAGS) -> Result<(), Strin
             return Err(format!("构建新 DACL 失败: {}", ret.0));
         }
 
-        // 4) 落盘：PROTECTED_DACL_SECURITY_INFORMATION = icacls 的 /inheritance:r（断继承）。
+        // 4) 落盘：PROTECTED_DACL_SECURITY_INFORMATION 断继承。
         let ret = SetNamedSecurityInfoW(
             &HSTRING::from(path),
             SE_FILE_OBJECT,
@@ -99,7 +95,7 @@ fn explicit_access(
     }
 }
 
-/// 从进程令牌取当前用户的 SID。SID 指向返回的 buf 内部，buf 必须与 SID 同生命周期。
+/// 取当前用户 SID；SID 指向 buf 内部，buf 须与 SID 同生命周期。
 unsafe fn get_token_user_sid(token: HANDLE) -> Result<(PSID, Vec<u8>), String> {
     let mut len = 0u32;
     let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
