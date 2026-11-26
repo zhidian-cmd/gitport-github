@@ -60,3 +60,44 @@ async fn gzip_sniff_detects_block_and_keeps_raw_prefix() {
     let mut resp2 = hyper::Response::from_parts(parts2, body2);
     assert!(!is_gh_block_page(&mut resp2).await);
 }
+
+fn html_resp(status: u16, body: &[u8]) -> hyper::Response<protocol::BoxBody> {
+    let (parts, _) = hyper::Response::builder()
+        .status(status)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(())
+        .unwrap()
+        .into_parts();
+    hyper::Response::from_parts(parts, protocol::full_body(Bytes::from(body.to_vec())))
+}
+
+/// 通用 400 页不得判成风控：这不是 IP 被拦，是客户端发错了请求。
+/// 旧逻辑 `status==400 && 正文含 "bad request"` 会把这种页当拦截，连拨 24 个候选、
+/// 每个记 10 分钟冷却 —— 一次畸形请求就让整站降级。
+#[tokio::test]
+async fn generic_bad_request_page_is_not_block() {
+    let page = br#"<!DOCTYPE html>
+<html><head><title>400 Bad Request</title></head>
+<body><center><h1>400 Bad Request</h1></center>
+<p>Your browser sent a request that this server could not understand.</p>
+<hr><center>nginx</center></body></html>"#;
+    assert!(
+        !is_gh_block_page(&mut html_resp(400, page)).await,
+        "通用 400 页面被误判成风控"
+    );
+}
+
+/// GitHub 自己的两种拦截文案仍必须识别，修复不能把真风控一起关掉。
+#[tokio::test]
+async fn github_block_wording_still_detected() {
+    let whoa = b"<html><body><h1>Whoa there!</h1><p>You have exceeded a secondary rate limit.</p></body></html>";
+    assert!(
+        is_gh_block_page(&mut html_resp(400, whoa)).await,
+        "whoa there 应判拦截"
+    );
+    let restricted = b"<html><body><h1>Access to this repository has been restricted.</h1></body></html>";
+    assert!(
+        is_gh_block_page(&mut html_resp(403, restricted)).await,
+        "has been restricted 应判拦截"
+    );
+}

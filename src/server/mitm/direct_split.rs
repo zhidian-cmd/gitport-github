@@ -208,6 +208,24 @@ fn check_segment_bounds(cr: Option<&str>, start: u64, e: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// 探片段必须精确覆盖 [0, PROBE_BYTES)：起点为 0，终点恰好 PROBE_BYTES-1。
+/// 起点被归一化 → 首段错位；区间比请求短 → 10KB 标签下留洞，补发兜不住就整页坏。
+fn probe_range_ok(cr: Option<&str>) -> Result<(), String> {
+    check_segment_bounds(cr, 0, PROBE_BYTES)?;
+    match merge::content_range_end(cr) {
+        Some(end) if end == PROBE_BYTES - 1 => Ok(()),
+        other => Err(format!(
+            "区间不完整: 要 0-{}, 拿到 {cr:?}(end={other:?})",
+            PROBE_BYTES - 1
+        )),
+    }
+}
+
+/// 探片体必须收满 PROBE_BYTES：头声明满、体提前结束（chunked 截断/连接断）时按常量记账会留洞。
+fn probe_body_ok(len: usize) -> bool {
+    len as u64 == PROBE_BYTES
+}
+
 /// 段的镜像救援：从 start 续传到 e（已交付不重拉），链序逐个试、全灭记熔断；整段单流，链快照由调用方传入。
 async fn rescue_segment(
     tpl: &Tpl,
@@ -334,21 +352,10 @@ pub(super) async fn try_direct_split(
                 log_skip(log, host, &path, "206 缺 Content-Range");
                 return None;
             };
-            // 探片段必须真从 0 起：CDN 把 bytes=0-10239 归一化到别的起点时，
-            // 这 10KB 会被贴上 [0,10240) 标签交付，文件开头永久错位且不报错。
-            if let Err(e) = check_segment_bounds(cr, 0, PROBE_BYTES) {
-                log_skip(log, host, &path, &format!("探片 206 起点异常({e}), 退回单流"));
-                return None;
-            }
-            // 终点也必须精确命中：允许服务端回更短的区间，这 10KB 的标签下就可能只有 4KB，
-            // 交付线后面直接留一个 6KB 的洞，补发兜不住就整页坏。
-            if merge::content_range_end(cr) != Some(PROBE_BYTES - 1) {
-                log_skip(
-                    log,
-                    host,
-                    &path,
-                    &format!("探片 206 区间不完整({cr:?}), 退回单流"),
-                );
+            // 探片段必须精确覆盖 [0, PROBE_BYTES)：起点被 CDN 归一化会让文件开头永久错位，
+            // 只回更短区间会在 10KB 标签下留洞。两者都退单流（头还没发，不花钱）。
+            if let Err(e) = probe_range_ok(cr) {
+                log_skip(log, host, &path, &format!("探片 206 区间异常({e}), 退回单流"));
                 return None;
             }
             let Some(kind) = MediaKind::of_content_type(
@@ -376,7 +383,7 @@ pub(super) async fn try_direct_split(
                 }
             };
             // 头声明满 10KB、体却提前结束（chunked 截断/连接断）：按常量记账会留洞，直接退单流。
-            if probe_body.len() as u64 != PROBE_BYTES {
+            if !probe_body_ok(probe_body.len()) {
                 log_skip(
                     log,
                     host,
