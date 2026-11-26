@@ -136,7 +136,11 @@ pub(super) fn cache_take<B>(
     //    文档导航必须跳过：同一 URL 的 JSON（JS 取数）和 HTML（前进/后退/刷新）共用此键，
     //    命中就把裸 JSON 当页面正文回放（实测回归）；导航只走下面的 keep 骨架或回源。
     if xhr_lookup_allowed(req) {
-        if let Some((status, hdrs, body)) = xhr_take(&xhr_cache_key(req.uri(), host, cookies, enc)) {
+        // 表示档按请求的 Accept 预测：同一 URL 可能按协商返回 JSON 或 HTML 片段，共用一个键会互相串。
+        let kind = xhr_kind_from_accept(req.headers().get("accept").and_then(|v| v.to_str().ok()));
+        if let Some((status, hdrs, body)) =
+            xhr_take(&xhr_cache_key(req.uri(), host, cookies, enc, kind))
+        {
             if super::quiet::first_time("xhrhit", &path) {
                 (log)(&format!("[缓存] XHR 回放 {path} ({})", fmt_size(body.len())));
             }
@@ -220,7 +224,22 @@ const XHR_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const XHR_CACHE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// XHR 内存缓存键：完整 URL + 身份标签（通知/计数含账号数据，跨登录必须失效）+ 编码标签。
-fn xhr_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) -> String {
+/// 表示档：同一 URL 可能按 Accept 协商返回 JSON 或 HTML 片段，共用一个键会互相串。
+/// 存侧按响应实际 Content-Type 定，取侧按请求 Accept 预测；预测不中只是回源，不会错配。
+fn xhr_kind_from_accept(accept: Option<&str>) -> &'static str {
+    match accept {
+        Some(a) if a.to_ascii_lowercase().contains("html") => "-h",
+        _ => "-j",
+    }
+}
+
+fn xhr_cache_key(
+    uri: &http::Uri,
+    host: &str,
+    cookies: Option<&str>,
+    enc: &str,
+    kind: &str,
+) -> String {
     let path = uri.path();
     let q = uri
         .query()
@@ -232,7 +251,7 @@ fn xhr_cache_key(uri: &http::Uri, host: &str, cookies: Option<&str>, enc: &str) 
         "gzip" => "-gz",
         _ => "-id",
     };
-    format!("GET {host}{path}{q}{cookie_tag}{enc_tag}")
+    format!("GET {host}{path}{q}{cookie_tag}{enc_tag}{kind}")
 }
 
 /// XHR 回放：命中且未过期 → (状态, 头, 体)；过期惰性删除 → None。
@@ -385,7 +404,13 @@ pub(super) async fn cache_put(
             .collect();
         // 按响应实际编码分桶：强制 br+gzip 时上游可能回 gzip，不能按客户端声明塞进 br 桶。
         let enc = response_encoding(&parts.headers);
-        let key = xhr_cache_key(req.uri(), host, cookies, enc);
+        // 表示档按响应实际类型定：HTML 片段和 JSON 不能共用键，否则一方命中另一方的正文。
+        let kind = if ct_lower.starts_with("text/html") {
+            "-h"
+        } else {
+            "-j"
+        };
+        let key = xhr_cache_key(req.uri(), host, cookies, enc, kind);
         // 闸门/限流错误回 200 也不能存 15 分钟，否则前端一直拿错误数据；但响应照常交回浏览器。
         if xhr_should_reject(&bytes, enc) {
             (log)(&format!("[缓存] XHR 拒存 {path} (闸门/限流错误)"));
@@ -900,16 +925,21 @@ fn spawn_page_refetch(
                 }
             };
             let bytes = collected.to_bytes();
-            // ③ 门检：与正常写入共用同一套（体积/no-store/完整/会话/闸门/限流骨架）。
+            // ③ 门检：与正常写入共用同一套（体积/no-store/完整/闸门/限流骨架）。
             // 重拉货不合格就别覆盖——否则限流空壳被写进去、mtime 复新，坏页固化 7 天。
-            let enc = parts
-                .headers
-                .iter()
-                .find(|(k, _)| k.as_str() == "content-encoding")
-                .and_then(|(_, v)| v.to_str().ok())
-                .map(body_encoding)
-                .unwrap_or("identity");
-            if let Some(why) = skeleton_reject_reason(&key, &bytes, enc, &parts.headers) {
+            let enc = response_encoding(&parts.headers);
+            // 键的编码档必须按响应实际编码定：重拉沿用请求侧预测的桶，边缘回 gzip 时会写进 -br，
+            // 只声明 br 的客户端拿到 gzip 正文解不开，而那个桶永远命中不了、反复重拉。
+            let real_key = format!("https://{host}{path_q}")
+                .parse::<http::Uri>()
+                .map(|uri| live_cache_key(&uri, &host, enc, "-html"))
+                .unwrap_or_else(|_| key.clone());
+            if real_key != key {
+                // 旧键指向的条目内容已不可用（编码标签对不上），删掉免得被只声明旧编码的客户端命中。
+                let stale = entry_dir(&page_cache_dir()).join(page_file_name(&key));
+                let _ = std::fs::remove_file(stale);
+            }
+            if let Some(why) = skeleton_reject_reason(&real_key, &bytes, enc, &parts.headers) {
                 (log)(&format!(
                     "[缓存] 页面重拉第 {attempt} 次门检不过({why}), 60s 后再试, 旧壳继续"
                 ));
@@ -919,7 +949,7 @@ fn spawn_page_refetch(
             // ④ 覆盖入库（全量格式，替换旧骨架）；覆盖后 mtime 复新，过期标记自动解除。
             match write_entry_file(
                 &page_cache_dir(),
-                &key,
+                &real_key,
                 &bytes,
                 http::StatusCode::OK.as_u16(),
                 &hdrs,

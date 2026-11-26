@@ -228,6 +228,9 @@ impl Topology {
 static TABLE: Mutex<Option<Arc<Topology>>> = Mutex::new(None);
 
 /// 黑洞惩罚：ip → (到期毫秒, 惩罚延迟)。原来 sink_latency 直接改 node.latency，注释承诺
+/// "60s 内随正常样本稀释恢复"但运行期没有任何回写路径，进程不重启就永远垫底。
+/// 现在独立成带过期的表，到期自动失效；注意它只在内存里活 60s，不跨重启——
+/// 重启后回到 routes.json 里的测速值，但游标已由 on_channel_blackhole 前移，同域请求不会再先拨它。
 /// "60s 内稀释恢复"却没有任何回写路径，进程不重启就永远垫底。改成带过期的独立表，到期自动失效。
 static BLACKHOLE_PENALTY: std::sync::LazyLock<Mutex<HashMap<String, (u64, u64)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));

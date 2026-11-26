@@ -80,10 +80,16 @@ async fn plain_http_post_body_forwarded_intact() {
             1,
             "Content-Length 不应重复: {head_text}"
         );
-        // 逐跳头不过上游：客户端发来的 connection 必须在转发前剥掉（connection 白名单里的逐跳头与 proxy-*/host 一并在此兜底）。
+        // 逐跳头不过上游：客户端发来的 keep-alive 必须被剥掉；代理自己补的 Connection: close 是预期行为
+        // （明文路径只处理一个请求，必须强制一串一连接，否则第二个请求会被灌给第一个上游）。
+        let lower = head_text.to_lowercase();
         assert!(
-            !head_text.to_lowercase().contains("connection:"),
-            "connection 逐跳头泄漏到上游: {head_text}"
+            !lower.contains("keep-alive"),
+            "客户端的 Connection 头泄漏到上游: {head_text}"
+        );
+        assert!(
+            lower.contains("connection: close"),
+            "代理应补 Connection: close 强制单次交换: {head_text}"
         );
         sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .await
@@ -118,10 +124,22 @@ async fn plain_http_post_body_forwarded_intact() {
             .await
             .expect("客户端读超时: 未收到响应")
             .unwrap();
-        assert!(n > 0, "代理提前关闭客户端连接");
+        if n == 0 {
+            // 强制 Connection: close 后，上游发完响应就关、代理跟着关，属预期：只要响应收全即可。
+            break;
+        }
         resp.extend_from_slice(&chunk[..n]);
     }
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
+    assert!(
+        resp.ends_with(b"ok"),
+        "响应未收全: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200 OK"),
+        "状态行不对: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
 
     crate::pool::dial::set_dial_port(0); // 复位，别影响别的测试
     up_task.await.unwrap();

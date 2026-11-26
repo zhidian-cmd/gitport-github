@@ -142,10 +142,10 @@ async fn mitm_rejects_unmanaged_sni() {
     assert!(srv.await.unwrap().is_err(), "服务端应因拒签而握手失败");
 }
 
-/// 首握手并发去重：20 个线程同时要同一域名的叶子证书，只能真签一次。
-/// 这条不是逻辑推演——签发计数器是测试期真实累加的，多签一次就会读到 20。
+/// 首握手并发：锁外签发允许少量重复（同域最多 N 次），但双检必须让所有人拿到同一份上下文。
+/// 早期版本是全程持锁只签一次，代价是不同域名互相等；现在宁可重复签几次也不阻塞别的域。
 #[test]
-fn leaf_sign_once_under_concurrency() {
+fn leaf_ctx_concurrent_returns_same_context() {
     let _g = crate::pool::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -169,9 +169,15 @@ fn leaf_sign_once_under_concurrency() {
     let n = a
         .sign_count
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(n, 1, "20 个并发首握手只应签发一次，实际签了 {n} 次");
+    assert!(
+        (1..=20).contains(&n),
+        "签发次数应在 1..=20（锁外签发允许少量重复），实际 {n}"
+    );
     for c in &ctxs {
-        assert!(Arc::ptr_eq(c, &ctxs[0]), "并发请求必须拿到同一份上下文");
+        assert!(
+            Arc::ptr_eq(c, &ctxs[0]),
+            "双检后所有并发请求必须拿到同一份上下文"
+        );
     }
 }
 

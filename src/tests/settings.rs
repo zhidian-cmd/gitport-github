@@ -504,6 +504,9 @@ fn git_byte_scrub_clears_ours_in_gbk_config() {
 
     let ours = super::git_proxy_url();
     let ca = super::exe_dir().join("ca.crt").to_string_lossy().to_string();
+    // 值必须按 git 的真实写法转义生成（Windows 路径的 \ → \\），手写单反斜杠会让测试假绿。
+    let escaped_ours = super::git_escape_value(&ours);
+    let escaped_ca = super::git_escape_value(&ca);
     let gbk_name: [u8; 4] = [0xD5, 0xC5, 0xC8, 0xFD]; // "张三" 的 GBK 编码，不是合法 UTF-8
 
     let mut raw: Vec<u8> = Vec::new();
@@ -511,12 +514,17 @@ fn git_byte_scrub_clears_ours_in_gbk_config() {
     raw.extend_from_slice(&gbk_name);
     raw.extend_from_slice(b"\n\temail = me@example.com\n");
     raw.extend_from_slice(b"[http]\n\tproxy = ");
-    raw.extend_from_slice(ours.as_bytes());
+    raw.extend_from_slice(escaped_ours.as_bytes());
     raw.extend_from_slice(b"\n");
     raw.extend_from_slice(b"[http \"https://github.com/\"]\n\tsslCAInfo = ");
-    raw.extend_from_slice(ca.as_bytes());
+    raw.extend_from_slice(escaped_ca.as_bytes());
     raw.extend_from_slice(b"\n");
     std::fs::write(&path, &raw).unwrap();
+    assert!(
+        String::from_utf8_lossy(&raw).contains("\\\\"),
+        "夹具必须带 git 的转义反斜杠（真实文件形态）: {}",
+        String::from_utf8_lossy(&raw)
+    );
 
     // 前提：整份解析确实因非 UTF-8 失败（git_map 内部就是 read_to_string），否则走不到兜底分支。
     assert!(
@@ -527,8 +535,8 @@ fn git_byte_scrub_clears_ours_in_gbk_config() {
     assert!(super::git_byte_scrub(&path).unwrap(), "应清掉我们的键");
     let out = std::fs::read(&path).unwrap();
     let text = String::from_utf8_lossy(&out);
-    assert!(!text.contains(&ours), "http.proxy 残留: {text}");
-    assert!(!text.contains(&ca), "sslCAInfo 残留: {text}");
+    assert!(!text.contains(&escaped_ours), "http.proxy 残留: {text}");
+    assert!(!text.contains(&escaped_ca), "sslCAInfo 残留: {text}");
     assert!(text.contains("me@example.com"), "用户自己的键被误删: {text}");
     assert!(
         out.windows(gbk_name.len()).any(|w| w == gbk_name),

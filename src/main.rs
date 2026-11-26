@@ -24,7 +24,21 @@ fn arg_value(args: &[String], name: &str) -> Option<u16> {
 
 fn main() {
     logger::install_panic_hook();
-    logger::guard("main", run);
+    // 主线程也套一层护栏，但目的不是"吞掉继续跑"：panic 掀翻主线程时补一次系统代理还原。
+    // 不补的话进程没了、PAC 还指着本机死端口，浏览器全断且日志里查不到原因。
+    // 后台任务的护栏在 logger::spawn 里，各自独立，不受这里影响。
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    if crashed.is_err() {
+        let note = settings::remove_system_proxy();
+        logger::tray_log(&format!(
+            "[panic] 主线程护栏捕获, 系统代理还原{}",
+            if note.contains("失败") {
+                format!("失败: {note}")
+            } else {
+                "完成".to_string()
+            }
+        ));
+    }
 }
 
 fn run() {
@@ -154,7 +168,11 @@ fn run() {
     let on_quit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         // 运行时延迟回流是内存态：退出时落一次盘，下次冷启动还有排序基线（事件驱动，无定时器）。
         pool::save_routes_now();
-        settings::remove_system_proxy();
+        // 还原失败必须留痕：进程一退，系统 PAC 若是死端口就是整机断网，日志是唯一线索。
+        let note = settings::remove_system_proxy();
+        if note.contains("失败") {
+            logger::tray_log(&format!("[退出] {note}"));
+        }
         let rt = rt.clone();
         std::thread::spawn(move || {
             server::stop_proxy(&rt);

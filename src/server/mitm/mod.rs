@@ -229,18 +229,18 @@ async fn mitm_http(
         None => out,
     };
     // 总机分诊：镜像回落/切片/直连/风控重试的科室级联全在 switchboard，政策单点。
-    let resp = match switchboard::dispatch(&log, &req, &out_body, &host, &path, &info, &replay)
-        .await
-    {
-        Ok(r) => r,
-        Err(bail) => {
-            (log)(&format!(
-                "[请求] {host}{path} -> {} (不可用兜底)",
-                bail.status()
-            ));
-            return bail;
-        }
-    };
+    // 路由名跟响应一起回来，统一在下面包一次诊断头——各分支自己包会被这里按 "direct" 覆盖。
+    let (resp, route) =
+        match switchboard::dispatch(&log, &req, &out_body, &host, &path, &info, &replay).await {
+            Ok(v) => v,
+            Err(bail) => {
+                (log)(&format!(
+                    "[请求] {host}{path} -> {} (不可用兜底)",
+                    bail.status()
+                ));
+                return bail;
+            }
+        };
     // 写操作成功后缓存失效：内存热点同步清，磁盘半场交给管家线程。
     if host == "github.com"
         && matches!(
@@ -260,7 +260,7 @@ async fn mitm_http(
             HeaderValue::from_static("no-store"),
         );
     }
-    write_upstream(&log, resp, "direct", &info, &host, &path)
+    write_upstream(&log, resp, route, &info, &host, &path)
 }
 /// codeload 规范路径 /owner/repo/(zip|tar.gz)/refs/... 只在 codeload 存在；出现在 github.com 必是被错 IP 踢回的死路径，主站一律 404。
 fn is_codeload_alias_path(path: &str) -> bool {
@@ -522,7 +522,8 @@ fn direct_leg<'a>(
     fetch
 }
 
-/// 镜像派发（两处共用）：组装直连腿 + chain_fetch + 按胜者写诊断头；ECT 同台为主，直连全败才按链序兜底。
+/// 镜像派发（两处共用）：组装直连腿 + chain_fetch，把胜者连同路由名交给调用方统一包装一次。
+/// 这里不写诊断头——早退分支各包一次会被最外层按 "direct" 覆盖，最后谁都看不到真路由。
 async fn mirror_or_direct(
     log: &LogFn,
     out_body: &hyper::Request<BoxBody>,
@@ -531,7 +532,7 @@ async fn mirror_or_direct(
     new_bytes: u64,
     info: &UpstreamInfo,
     replay: &Option<Bytes>,
-) -> Result<hyper::Response<BoxBody>, String> {
+) -> Result<(hyper::Response<BoxBody>, &'static str), String> {
     let fetch = direct_leg(
         chain_host,
         new_bytes,
@@ -548,14 +549,7 @@ async fn mirror_or_direct(
         .get::<&'static str>()
         .copied()
         .unwrap_or("mirror");
-    Ok(write_upstream(
-        log,
-        resp,
-        route,
-        info,
-        host,
-        &path_of(out_body.uri()),
-    ))
+    Ok((resp, route))
 }
 
 /// 直连腿：通道获取走 pool::get_or_build，这里只管发请求与记账；失败摘通道换一条重试一次，再败交上层按 fallback 走镜像/DNS。

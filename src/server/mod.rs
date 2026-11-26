@@ -330,6 +330,9 @@ impl ProxyServer {
             req.push_str(l);
             req.push_str("\r\n");
         }
+        // 一次交换一条连接：明文路径只解析并重写了一个请求，复用连接上的第二个请求
+        // 会被原样灌给第一个上游（错 Host、错站点），所以强制上游关连接。
+        req.push_str("Connection: close\r\n");
         req.push_str("\r\n");
         // 先写重拼后的头，再补同包到达的体首段，之后交给双向泵。
         let mut head_sent = upstream.write_all(req.as_bytes()).await.is_ok();

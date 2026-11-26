@@ -459,6 +459,16 @@ pub fn quit_via_proxy() {
 pub fn already_running() -> bool {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
+    // 本进程已经持锁时直接认自己：接管路径会连续调用本函数，
+    // 同名互斥体再建一次必然报 ALREADY_EXISTS，等于把"自己"判成"另一个实例"，
+    // 结果新进程弹一句"已在运行"然后退出，一个都没跑。
+    if SINGLE_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+    {
+        return false;
+    }
     // CreateMutexW 在"互斥量已存在"时返回成功句柄，只在 LastError 报 ALREADY_EXISTS —— 必须查 LastError。
     let r = unsafe { CreateMutexW(None, false, windows::core::w!("Local\\gitport-github")) };
     match r {
@@ -591,6 +601,20 @@ fn create_window(
         std::thread::sleep(std::time::Duration::from_millis(300));
         built = build_wv(&data_dir);
         if built.is_err() && data_dir.join("EBWebView").exists() {
+            // 先清掉历史的轮换目录：每份都是完整 profile（几十到几百 MB），只留本次新生成的那份。
+            if let (Some(parent), Some(name)) = (
+                data_dir.parent(),
+                data_dir.file_name().and_then(|n| n.to_str()),
+            ) {
+                let prefix = format!("{name}.broken-");
+                if let Ok(rd) = std::fs::read_dir(parent) {
+                    for e in rd.flatten() {
+                        if e.file_name().to_string_lossy().starts_with(&prefix) {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
+                }
+            }
             let aside = data_dir.with_extension(format!("broken-{}", std::process::id()));
             // 刚失败的浏览器进程句柄还没放干净，rename 会短暂 err=5：300ms×3 重试。
             let mut renamed = Err(std::io::Error::other("未尝试"));

@@ -300,10 +300,18 @@ pub fn ensure_system_proxy() -> Result<String, String> {
             };
         // 顺带留一份镜像值：自愈与"是不是我们的"判断都靠它
         mirror_auto_config_url(Some(&pac));
+        // 回读确认镜像值真写进去了：写不进去（安全软件只拦注册表写）时连接级仍生效，
+        // 标记照留（关闭时要靠它认自己），但必须在返回里说清楚，别让用户以为一切正常。
+        let mirrored = get_auto_config_url(&key).trim() == pac.trim();
         *state().last_pac.lock().unwrap() = pac.clone(); // 记下我们写的
         refresh_wininet();
         let git_note = ensure_git_proxy();
         save_logged();
+        let note = if mirrored {
+            note
+        } else {
+            format!("{note}(注册表镜像值未写入, 关闭时将按连接级还原)")
+        };
         return Ok(format!("{note}; {git_note}"));
     }
     let git_note = remove_git_proxy();
@@ -314,8 +322,10 @@ pub fn ensure_system_proxy() -> Result<String, String> {
 /// 还原系统代理：只动上次写进去的那条 PAC（last_pac 精确比较），别家不碰；git 全局代理同款。
 pub fn remove_system_proxy() -> String {
     let git_note = remove_git_proxy();
-    let Ok(key) = internet_settings_key() else {
-        return git_note;
+    let key = match internet_settings_key() {
+        Ok(k) => k,
+        // 打不开键 = 还原不了，必须让调用方看见，不能返回一个看着正常的字符串。
+        Err(e) => return format!("{git_note}; 系统代理还原失败: {e}"),
     };
     let cur = get_auto_config_url(&key);
     match clear_if_ours(&key, &cur) {
@@ -384,7 +394,15 @@ fn restore_or_clear(key: &RegKey) -> Result<(), String> {
             force_conn_flags(flags)
                 .map_err(|e| format!("关闭自动配置失败(Win32 {code})，注册表补 flags 也失败: {e}"))?;
         }
-        let _ = key.delete_value("AutoConfigURL");
+        // 只读句柄删不了值，交给 mirror 那边开可写句柄删；删没删掉必须回读确认，
+        // 否则 last_pac 被清、下一次接管会把我们自己的残留当用户配置备份下来。
+        mirror_auto_config_url(None);
+        let left = get_auto_config_url(key);
+        if !left.trim().is_empty() {
+            return Err(format!(
+                "关闭 PAC 未生效(注册表仍有 {left:?}), 已保留标记以便重试"
+            ));
+        }
     }
     *state().proxy_backup.lock().unwrap() = String::new();
     *state().last_pac.lock().unwrap() = String::new();
@@ -405,7 +423,10 @@ fn manual_proxy_active(key: &RegKey) -> bool {
 /// 确实是上次我们写进去的那条 PAC 才还原（别的工具中途接管了就不碰）。
 fn clear_if_ours(key: &RegKey, cur: &str) -> Result<(), String> {
     let last = state().last_pac.lock().unwrap().clone();
-    if !pac_is_ours(cur, &last) {
+    // 注册表字符串对不上时先别撒手：last_pac 是我们写过的，说明确实接管过。
+    // 镜像值可能被安全软件拦掉（cur 还是用户原值），此时连接级仍指着我们，
+    // 直接返回会让"关闭分流"变成空操作、系统留一条死 PAC。
+    if !pac_is_ours(cur, &last) && !is_our_pac(&last) {
         return Ok(());
     }
     restore_or_clear(key)
@@ -437,9 +458,16 @@ pub fn set_window_rect(l: i32, t: i32, w: i32, h: i32) -> Result<(), String> {
 /// 布尔开关统一写法：存一次（Relaxed）+ 落盘（set_github_pac/set_close_to_tray/set_mitm 共用）。
 /// 落盘失败必须回滚内存：否则界面报"没关掉"但内存已关，下次任意成功保存又把假状态写进盘。
 fn set_flag(flag: &std::sync::atomic::AtomicBool, on: bool) -> Result<(), String> {
+    // 改内存和写盘必须在同一把锁里：否则 swap 之后、写盘之前，别处的 save() 会拍到
+    // 这个"尚未确认成功"的新值并写进盘，失败回滚只回滚内存，盘上留下假状态。
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let prev = flag.swap(on, std::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = save() {
-        flag.store(prev, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = save_locked() {
+        // 回滚前重读：并发下别人可能已经改了同一个开关，只有当前值仍是本次写入才回滚，
+        // 别拿 prev 无条件覆盖掉别人的成功写入。
+        if flag.load(std::sync::atomic::Ordering::Relaxed) == on {
+            flag.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err(e);
     }
     Ok(())
@@ -710,6 +738,11 @@ fn save_logged() {
 
 fn save() -> Result<(), String> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    save_locked()
+}
+
+/// 调用方已持 SAVE_LOCK 时用它：同一把锁不可重入，别再自己拿一次。
+fn save_locked() -> Result<(), String> {
     let s = state();
     let data = SettingsFile {
         close_to_tray: s.close_to_tray.load(std::sync::atomic::Ordering::Relaxed),
@@ -1193,8 +1226,9 @@ fn git_byte_scrub(path: &Path) -> Result<bool, String> {
             Some((s, None)) => format!("{s}.{key}"),
             None => String::new(),
         };
-        let ours_line = (GIT_PROXY_KEYS.contains(&full.as_str()) && value == ours)
-            || (GIT_CA_KEYS.contains(&full.as_str()) && value == ca_str);
+        let unescaped = git_unescape(value).unwrap_or_else(|_| value.to_string());
+        let ours_line = (GIT_PROXY_KEYS.contains(&full.as_str()) && unescaped == ours)
+            || (GIT_CA_KEYS.contains(&full.as_str()) && unescaped == ca_str);
         if ours_line {
             touched = true; // 丢整行
         } else {
@@ -1440,7 +1474,7 @@ pub fn set_worker_mirrors(
     // 读旧表、算差集、写新表必须同一把锁：原来三段分离，连续两次保存会都读到不含对方的旧表，后写覆盖先写。
     // save() 内部也要锁这张表，所以写完先放锁再落盘，避免自锁死锁。
     let mut norm: Vec<WorkerMirror> = Vec::new();
-    let result = {
+    let (result, old_snapshot) = {
         let mut guard = state().worker_mirrors.lock().unwrap();
         let old_snapshot = guard.clone();
         for w in list {
@@ -1483,9 +1517,14 @@ pub fn set_worker_mirrors(
             .map(|w| w.url.clone())
             .collect();
         *guard = norm;
-        (enabled, removed, added)
+        ((enabled, removed, added), old_snapshot)
     };
-    save()?; // 已写回内存，落盘读当前表完成
+    if let Err(e) = save() {
+        // 落盘失败要把内存回滚，与 set_flag 同一语义：否则界面报"没保存"、内存已是新表，
+        // 下一次任意成功保存会把它偷偷写进盘，重启后也生效。
+        *state().worker_mirrors.lock().unwrap() = old_snapshot;
+        return Err(e);
+    }
     Ok(result)
 }
 
@@ -1517,12 +1556,19 @@ pub fn set_mirror_invalid(url: &str, bad: bool) {
 
 fn update_mirror(url: &str, f: impl FnOnce(&mut WorkerMirror)) {
     let u = url.trim().trim_end_matches('/');
-    let mut list = worker_mirrors();
-    if let Some(w) = list.iter_mut().find(|w| w.url == u) {
+    {
+        let mut g = state()
+            .worker_mirrors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // 全程持锁原地改：旧写法"锁外克隆整表 → 锁内覆盖"会把并发保存的新条目整表回退，
+        // 出现"刚加的镜像消失 / 刚删的镜像复活"，而且立刻落盘。
+        let Some(w) = g.iter_mut().find(|w| w.url == u) else {
+            return;
+        };
         f(w);
-        *state().worker_mirrors.lock().unwrap() = list;
-        save_logged();
     }
+    save_logged();
 }
 
 #[cfg(test)]

@@ -721,7 +721,7 @@ fn document_nav_must_not_take_xhr() {
     let uri: http::Uri = "https://github.com/search?q=hakim_regression&type=repositories&p=1"
         .parse()
         .unwrap();
-    let key = xhr_cache_key(&uri, "github.com", None, "gzip");
+    let key = xhr_cache_key(&uri, "github.com", None, "gzip", "-j");
     xhr_store(
         &key,
         200,
@@ -812,7 +812,7 @@ fn home_search_json_routes_to_xhr_not_keep() {
     );
     // 取侧键形态不变：XHR 命中先于 keep，-json 变体文件不再产生。
     let uri: http::Uri = "https://github.com/search?q=rust".parse().unwrap();
-    let key = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip");
+    let key = xhr_cache_key(&uri, "github.com", Some("user_session=abc"), "gzip", "-j");
     assert!(!key.contains("-k"), "XHR 键不带 keep 后缀");
 }
 
@@ -846,13 +846,22 @@ async fn xhr_cache_ttl_and_replay() {
 fn xhr_cache_key_separates_identity_and_encoding() {
     let mk = |cookies: Option<&str>, enc: &str| {
         let uri: http::Uri = "https://github.com/notifications/indicator".parse().unwrap();
-        xhr_cache_key(&uri, "github.com", cookies, enc)
+        xhr_cache_key(&uri, "github.com", cookies, enc, "-j")
     };
     let alice = mk(Some("user_session=abc"), "gzip");
     let bob = mk(Some("user_session=xyz"), "gzip");
     assert_ne!(alice, bob, "不同账号必须分键（A 的通知不能给 B）");
     let gz = mk(Some("user_session=abc"), "br");
     assert_ne!(gz, alice, "编码不同必须分键");
+    // 同一 URL 按 Accept 协商返回 JSON / HTML 片段，两者共用一个键会互相串（裸 JSON 被当片段塞进 DOM）。
+    let u: http::Uri = "https://github.com/notifications/indicator".parse().unwrap();
+    let json = xhr_cache_key(&u, "github.com", None, "gzip", "-j");
+    let html = xhr_cache_key(&u, "github.com", None, "gzip", "-h");
+    assert_ne!(json, html, "JSON 与 HTML 片段必须分键");
+    assert!(
+        json.contains("-j") && html.contains("-h"),
+        "键里应能看出表示档: {json} / {html}"
+    );
 }
 
 /// XHR 容量护栏：总量超 5MB 按过期时间最早先淘汰；刚入库的条目不自删。

@@ -334,6 +334,12 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // 拿到响应头就判类型：白名单外的资产（png/svg/wasm）不该 collect——
+    // 先整段拉进内存再丢弃，等待者还得陪跑完整一趟，白费一倍上游流量和首屏时间。
+    if !storable(StatusCode::OK, &ct) {
+        (log)(&format!("[资产] 不收录({ct}), {name} 立即回落"));
+        return;
+    }
     // ④ 收体（逐帧停滞界：慢滴流拉多久都行，零帧判装死）
     let collected = match collect_stall_bounded(body, std::time::Duration::from_secs(BODY_STALL_SECS))
         .await
@@ -345,11 +351,7 @@ async fn fetch_and_store(dir: &std::path::Path, log: &LogFn, url: &str) {
             return;
         }
     };
-    // ⑤ 门检 + 入库（上游正常应答但不入库 ≠ 黑洞，不上报池子）
-    if !storable(StatusCode::OK, &ct) {
-        (log)(&format!("[资产] 不收录({ct} / {}B), {name} 回落", collected.len()));
-        return;
-    }
+    // ⑤ 入库（类型门已在拿到响应头时判过，这里只处理落盘）
     let hdrs: Vec<Vec<String>> = parts
         .headers
         .iter()

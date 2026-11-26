@@ -340,6 +340,17 @@ pub(super) async fn try_direct_split(
                 log_skip(log, host, &path, &format!("探片 206 起点异常({e}), 退回单流"));
                 return None;
             }
+            // 终点也必须精确命中：允许服务端回更短的区间，这 10KB 的标签下就可能只有 4KB，
+            // 交付线后面直接留一个 6KB 的洞，补发兜不住就整页坏。
+            if merge::content_range_end(cr) != Some(PROBE_BYTES - 1) {
+                log_skip(
+                    log,
+                    host,
+                    &path,
+                    &format!("探片 206 区间不完整({cr:?}), 退回单流"),
+                );
+                return None;
+            }
             let Some(kind) = MediaKind::of_content_type(
                 resp.headers()
                     .get("content-type")
@@ -364,6 +375,16 @@ pub(super) async fn try_direct_split(
                     return None;
                 }
             };
+            // 头声明满 10KB、体却提前结束（chunked 截断/连接断）：按常量记账会留洞，直接退单流。
+            if probe_body.len() as u64 != PROBE_BYTES {
+                log_skip(
+                    log,
+                    host,
+                    &path,
+                    &format!("探片体不足 10KB({}B), 退回单流", probe_body.len()),
+                );
+                return None;
+            }
             memo_put(&key, t, kind); // 记住总长与类别；小图下次直接被 MIN_SPLIT_BYTES 挡掉
             (t, kind, Some((probe_body, probe_hs)))
         }

@@ -73,9 +73,9 @@ async fn is_gh_block_page(resp: &mut hyper::Response<BoxBody>) -> bool {
         return false;
     }
     let chunk = String::from_utf8_lossy(&plain[..plain.len().min(4096)]).to_lowercase();
-    chunk.contains("has been restricted")
-        || chunk.contains("whoa there")
-        || (resp.status() == http::StatusCode::BAD_REQUEST && chunk.contains("bad request"))
+    // 400 只认 GitHub 自己的风控文案。通用 400 页面（"Bad Request"）是客户端发错了请求，
+    // 换多少个出口 IP 都一样，当成风控会连拨 24 个 IP、把整张表打进 10 分钟冷却。
+    chunk.contains("has been restricted") || chunk.contains("whoa there")
 }
 
 /// 风控重试上限 ≈ 路由候选全试一遍：风控页偶尔换边缘真能通，不替 GitHub 提前放弃；后续请求共享边冷却不会重扫成风暴。

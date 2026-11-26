@@ -1,7 +1,7 @@
 //! 总机：浏览器↔GitHub 第一接头人，URL 级分诊单点（缓存已在上游先行）；镜像回落域→镜像加速，切片资格域→直连切片，其余→直连线路优化；mitm_http 只管缓冲与响应善后。
 use super::{
     direct_split, dns_direct_fetch, gh_defuse, get_direct, mirror, mirror_or_direct,
-    mitm_unavailable, write_upstream, UpstreamInfo,
+    mitm_unavailable, UpstreamInfo,
 };
 use super::super::protocol::BoxBody;
 use crate::{pool, util::LogFn};
@@ -13,7 +13,7 @@ fn is_simple(method: &Method) -> bool {
     matches!(method, &Method::GET | &Method::HEAD)
 }
 
-/// 简单请求全科室路由：Ok = 上游响应到手（调用方做缓存善后），Err = 兜底也失败的最终应答（调用方直接返回）。
+/// 简单请求全科室路由：Ok = (上游响应, 真路由名)，包装交给调用方做一次；Err = 兜底也失败的最终应答（调用方直接返回）。
 pub(super) async fn dispatch(
     log: &LogFn,
     req: &hyper::Request<hyper::body::Incoming>,
@@ -22,7 +22,10 @@ pub(super) async fn dispatch(
     path: &str,
     info: &UpstreamInfo,
     replay: &Option<Bytes>,
-) -> Result<axum::response::Response<BoxBody>, axum::response::Response<BoxBody>> {
+) -> Result<
+    (axum::response::Response<BoxBody>, &'static str),
+    axum::response::Response<BoxBody>,
+> {
     let is_simple = is_simple(out_body.method());
     // 镜像回落域：镜像链 + 直连同台竞速，ECT 统一派发；全部候选耗尽才 502。
     if is_simple
@@ -32,7 +35,7 @@ pub(super) async fn dispatch(
         let new_bytes =
             mirror::range_bytes(req.headers().get("range").and_then(|v| v.to_str().ok()));
         match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay).await {
-            Ok(resp) => return Ok(resp),
+            Ok((resp, route)) => return Ok((resp, route)),
             // 原因落日志：熔断中/链全灭，一眼可辨，不再吞。
             Err(e) => (log)(&format!("[MITM] {host}{path} 镜像与直连均不可用({e})")),
         }
@@ -45,7 +48,7 @@ pub(super) async fn dispatch(
     // 大文件切片：总机下发片数（策略单点），切片器内置重试/续传/br 协商；不满足或段最终失败回单流。
     if is_simple {
         if let Some(resp) = direct_split::try_direct_split(log, out_body, host, info, 8).await {
-            return Ok(write_upstream(&log, resp, "direct-split", info, host, path));
+            return Ok((resp, "direct-split"));
         }
     }
     let mut resp = match get_direct(log, out_body, host, info, replay).await {
@@ -60,7 +63,7 @@ pub(super) async fn dispatch(
                     match mirror_or_direct(log, out_body, host, &chain_host, new_bytes, info, replay)
                         .await
                     {
-                        Ok(resp) => return Ok(resp),
+                        Ok((r, route)) => return Ok((r, route)),
                         Err(_) => (log)(&format!("[MITM] {host}{path} 直连和镜像都试不通")),
                     }
                 }
@@ -70,7 +73,7 @@ pub(super) async fn dispatch(
             }
             if is_simple {
                 match dns_direct_fetch(log, out_body, host, info, replay).await {
-                    Ok(r) => return Ok(write_upstream(&log, r, "dns", info, host, path)),
+                    Ok(r) => return Ok((r, "dns")),
                     Err(de) => {
                         (log)(&format!("[MITM] {host}{path} DNS 备用直连也失败({de})"));
                     }
@@ -100,5 +103,5 @@ pub(super) async fn dispatch(
             }
         }
     }
-    Ok(resp)
+    Ok((resp, "direct"))
 }

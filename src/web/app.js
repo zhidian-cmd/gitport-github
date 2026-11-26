@@ -17,6 +17,7 @@ let S = { running: false, mitm: false, port: 7810 };
 const titles = {
   overview: '概览',
   logs:     '日志',
+  mirrors:  '镜像',
   settings: '设置',
 };
 

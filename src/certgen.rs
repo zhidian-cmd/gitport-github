@@ -46,42 +46,33 @@ impl Authority {
     /// 签发全程持锁：同域几十个并发握手若各自放锁去签，会并行生成几十份密钥、最后只留一份，
     /// 首屏 CPU 瞬时飙高。持锁串行让后到的直接命中缓存，只签一次；命中路径仍是短临界区。
     fn leaf_ctx(&self, host: &str) -> Result<Arc<SslContext>, String> {
-        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((issued, ctx)) = leaves.get(host) {
-            // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
-            if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
-                return Ok(ctx.clone());
+        // 查表只占一小段锁：命中直接回，别把整段签发都锁在里面。
+        {
+            let leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((issued, ctx)) = leaves.get(host) {
+                // 命中也要看年龄，过期就重签；时钟回拨(elapsed 出错)同样按过期处理。
+                if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
+                    return Ok(ctx.clone());
+                }
             }
         }
         // MITM 只校验 CONNECT 目标域，SNI 是客户端自己给的，不锁就能借根证书签走别的域。
         if !crate::pool::route::is_managed(host) {
             return Err(format!("拒绝为受管域名之外的 {host} 签发证书"));
         }
-        let leaf_key = KeyPair::generate().map_err(|e| e.to_string())?;
-        let now = OffsetDateTime::now_utc();
-        let mut params =
-            CertificateParams::new(vec![host.to_string()]).map_err(|e| e.to_string())?;
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, host);
-        params.not_before = now - time::Duration::hours(1);
-        params.not_after = now + time::Duration::days(365); // 1 年
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let issuer = issuer_of(&self.cert_der, &self.ca_key).map_err(|e| e.to_string())?;
-        let cert = params
-            .signed_by(&leaf_key, &issuer)
-            .map_err(|e| e.to_string())?;
-        let leaf_x509 = X509::from_der(cert.der()).map_err(|e| format!("叶子证书解析失败: {e}"))?;
-        let key = PKey::private_key_from_der(&leaf_key.serialize_der())
-            .map_err(|e| format!("叶子私钥解析失败: {e}"))?;
-        let ctx = Arc::new(mitm_host_ctx(&leaf_x509, &self.ca_x509, &key)?);
+        // 锁外签发：这段是 CPU 活，还在 SNI 回调（reactor 线程）里跑。
+        // 持锁签会让"任何新主机签发期间，别的域连缓存命中的握手都排队"——一页要 8~10 个新域时首屏直接停顿。
+        let ctx = Arc::new(sign_leaf(host, &self.cert_der, &self.ca_key, &self.ca_x509)?);
         #[cfg(test)]
         self.sign_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 双检：并发同域可能都签完了，只留最早落表的那份，后来者拿同一份上下文。
+        let mut leaves = self.leaves.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((issued, existing)) = leaves.get(host) {
+            if issued.elapsed().is_ok_and(|age| age < LEAF_RENEW_AFTER) {
+                return Ok(existing.clone());
+            }
+        }
         if leaves.len() >= LEAVES_CAP && !leaves.contains_key(host) {
             // 超限清签发时刻最旧的一张：被逐出的域名下次访问照常重签，只是慢一次。
             if let Some(oldest) = leaves
@@ -95,6 +86,37 @@ impl Authority {
         leaves.insert(host.to_string(), (SystemTime::now(), ctx.clone()));
         Ok(ctx)
     }
+}
+
+/// 签一张叶子证书并建 TLS 上下文（纯 CPU 活，不碰缓存表）。
+fn sign_leaf(
+    host: &str,
+    cert_der: &[u8],
+    ca_key: &KeyPair,
+    ca_x509: &X509,
+) -> Result<SslContext, String> {
+    let leaf_key = KeyPair::generate().map_err(|e| e.to_string())?;
+    let now = OffsetDateTime::now_utc();
+    let mut params =
+        CertificateParams::new(vec![host.to_string()]).map_err(|e| e.to_string())?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, host);
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(365); // 1 年
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let issuer = issuer_of(cert_der, ca_key).map_err(|e| e.to_string())?;
+    let cert = params
+        .signed_by(&leaf_key, &issuer)
+        .map_err(|e| e.to_string())?;
+    let leaf_x509 = X509::from_der(cert.der()).map_err(|e| format!("叶子证书解析失败: {e}"))?;
+    let key = PKey::private_key_from_der(&leaf_key.serialize_der())
+        .map_err(|e| format!("叶子私钥解析失败: {e}"))?;
+    mitm_host_ctx(&leaf_x509, ca_x509, &key)
 }
 
 /// 单主机上下文：证书链 + ALPN + 禁恢复。SNI 回调按主机切换到它。
