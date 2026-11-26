@@ -136,6 +136,13 @@ fn own_dir(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>
     (dir, guard)
 }
 
+/// 缓存测试串行闸：目录覆盖（CACHE_DIR_OVERRIDE）和 XHR 池都是进程级单值，
+/// 并行用例会互相清空/覆盖——典型症状是"刚写入的条目 -> 无此条目"。
+/// 只碰全局状态、不需要自己临时目录的用例用这把锁，别再裸调 page_cache_clear。
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn log_sink() -> LogFn {
     std::sync::Arc::new(|_: &str| {})
 }
@@ -718,6 +725,7 @@ fn document_nav_gate() {
 /// 回归钉子：JS 取数存进 XHR 的搜索 JSON，绝不能给文档导航（前进/后退/刷新）回放成裸 JSON 页面。
 #[test]
 fn document_nav_must_not_take_xhr() {
+    let _g = serial(); // 直接读写全局 XHR 池，必须与其他缓存用例串行
     let uri: http::Uri = "https://github.com/search?q=hakim_regression&type=repositories&p=1"
         .parse()
         .unwrap();
@@ -819,6 +827,7 @@ fn home_search_json_routes_to_xhr_not_keep() {
 /// XHR 回放与 TTL：入库即命中（200/头/体原样），过期后 miss 且条目被惰性清除。
 #[tokio::test]
 async fn xhr_cache_ttl_and_replay() {
+    let _g = serial(); // 全局 XHR 池是进程级状态，与容量用例串行
     let hdrs = vec![vec!["content-type".into(), "application/json".into()]];
     let key = "GET github.com/conduit/filter-csabc-id";
     xhr_store(key, 200, hdrs.clone(), Bytes::from_static(b"{\"a\":1}"));
@@ -867,6 +876,9 @@ fn xhr_cache_key_separates_identity_and_encoding() {
 /// XHR 容量护栏：总量超 5MB 按过期时间最早先淘汰；刚入库的条目不自删。
 #[test]
 fn xhr_cache_evicts_oldest_at_cap() {
+    // page_cache_clear 会连磁盘目录一起清，必须和所有碰缓存的用例串行，
+    // 否则并行时会把别人刚写入的条目删掉（表现为"无此条目"）。
+    let _g = serial();
     page_cache_clear(); // 清空共享 XHR_CACHE（其他用例可能存过）
     let hdrs = vec![vec!["content-type".into(), "application/json".into()]];
     // 6 条 × 1MB（伪随机体高熵）= 6MB > 5MB
